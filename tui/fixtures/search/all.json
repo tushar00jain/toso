@@ -1,0 +1,27 @@
+{
+  "matches": [
+    {
+      "key": "model.layers.0.attn.wq.weight",
+      "object_type": "TENSOR_SLICE",
+      "dtype": "float32",
+      "global_shape": [4096, 4096],
+      "fully_committed": true,
+      "mesh_shape": [2, 2],
+      "shards": [
+        { "volume_id": "vol-0", "coordinates": [0, 0], "offsets": [0, 0], "local_shape": [2048, 2048] }
+      ]
+    },
+    {
+      "key": "model.layers.7.attn.wq.weight",
+      "object_type": "TENSOR_SLICE",
+      "dtype": "float32",
+      "global_shape": [4096, 4096],
+      "fully_committed": false,
+      "mesh_shape": [2, 2],
+      "shards": [
+        { "volume_id": "vol-0", "coordinates": [0, 0], "offsets": [0, 0], "local_shape": [2048, 2048] }
+      ]
+    }
+  ],
+  "next_cursor": null
+}

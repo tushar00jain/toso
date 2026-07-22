@@ -1,0 +1,13 @@
+{
+  "key": "model.layers.7.attn.wq.weight",
+  "object_type": "TENSOR_SLICE",
+  "dtype": "float32",
+  "global_shape": [4096, 4096],
+  "fully_committed": false,
+  "mesh_shape": [2, 2],
+  "shards": [
+    { "volume_id": "vol-0", "coordinates": [0, 0], "offsets": [0, 0], "local_shape": [2048, 2048] },
+    { "volume_id": "vol-1", "coordinates": [0, 1], "offsets": [0, 2048], "local_shape": [2048, 2048] },
+    { "volume_id": "vol-2", "coordinates": [1, 0], "offsets": [2048, 0], "local_shape": [2048, 2048] }
+  ]
+}

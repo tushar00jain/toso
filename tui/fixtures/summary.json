@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-17T17:40:00Z",
+  "store_name": "torchstore",
+  "strategy": "LocalRankStrategy",
+  "totals": {
+    "volumes": 1048576,
+    "keys": 5203,
+    "bytes": 9.2e15,
+    "partial_dtensors": 3
+  },
+  "volume_groups": [
+    {
+      "group": "rack:A12",
+      "volumes": 4096,
+      "keys": 5203,
+      "bytes": 3.1e14,
+      "transports": { "RDMA": 4090, "SharedMemory": 6 },
+      "reachable": 4094
+    },
+    {
+      "group": "rack:B07",
+      "volumes": 4096,
+      "keys": 5203,
+      "bytes": 3.0e14,
+      "transports": { "RDMA": 4096 },
+      "reachable": 4096
+    },
+    {
+      "group": "rack:C31",
+      "volumes": 2048,
+      "keys": 5203,
+      "bytes": 1.5e14,
+      "transports": { "RDMA": 2040, "gloo": 8 },
+      "reachable": 2044
+    }
+  ],
+  "key_prefixes": [
+    {
+      "prefix": "model",
+      "keys": 4820,
+      "objects": 0,
+      "tensors": 12,
+      "dtensors": 4808,
+      "partial": 2,
+      "bytes": 8.9e15
+    },
+    {
+      "prefix": "optimizer",
+      "keys": 380,
+      "objects": 0,
+      "tensors": 0,
+      "dtensors": 380,
+      "partial": 1,
+      "bytes": 3.0e14
+    },
+    {
+      "prefix": "metadata",
+      "keys": 3,
+      "objects": 3,
+      "bytes": 0
+    }
+  ],
+  "histograms": {
+    "shard_commit_pct": [[0, 5], [50, 12], [100, 4790]]
+  }
+}

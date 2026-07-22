@@ -1,0 +1,11 @@
+{
+  "key": "metadata.config",
+  "object_type": "OBJECT",
+  "dtype": null,
+  "global_shape": null,
+  "fully_committed": true,
+  "mesh_shape": null,
+  "shards": [
+    { "volume_id": "vol-3", "coordinates": [], "offsets": [], "local_shape": [] }
+  ]
+}

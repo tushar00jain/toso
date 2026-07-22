@@ -1,0 +1,37 @@
+{
+  "volumes": [
+    {
+      "volume_id": "vol-4",
+      "hostname": "host-a12-005",
+      "transport": "RDMA",
+      "num_keys": 5203,
+      "bytes": 7.6e10,
+      "reachable": true
+    },
+    {
+      "volume_id": "vol-5",
+      "hostname": "host-a12-006",
+      "transport": "RDMA",
+      "num_keys": 5203,
+      "bytes": 7.6e10,
+      "reachable": true
+    },
+    {
+      "volume_id": "vol-6",
+      "hostname": "host-a12-007",
+      "transport": "SharedMemory",
+      "num_keys": 5203,
+      "bytes": 7.6e10,
+      "reachable": true
+    },
+    {
+      "volume_id": "vol-7",
+      "hostname": "host-a12-008",
+      "transport": "RDMA",
+      "num_keys": 5203,
+      "bytes": 7.6e10,
+      "reachable": true
+    }
+  ],
+  "next_cursor": null
+}

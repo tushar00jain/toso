@@ -1,0 +1,30 @@
+[project]
+name = "toso"
+version = "0.0.0"
+description = "Runnable TorchStore SPMD examples, deps built from source"
+requires-python = ">=3.10"
+dependencies = [
+    "torchstore",
+    "torchmonarch",
+    "torch",
+    "pygtrie",
+    "portpicker",
+]
+
+[tool.uv.sources]
+# Both built from the in-repo source trees, editable so source edits are picked up
+# without reinstalling (Python edits are live; Rust edits need a recompile — see
+# build_from_source.sh / README).
+torchstore = { path = "../torchstore", editable = true }
+torchmonarch = { path = "../monarch", editable = true }
+
+[tool.uv]
+prerelease = "allow"
+# torchstore's metadata pins torchmonarch==0.4.1; relax it so the from-source
+# build (a different version) satisfies the requirement.
+override-dependencies = ["torchmonarch"]
+# Build monarch/torchstore against THIS env's torch rather than an isolated build
+# env that could pull a mismatched torch and break the C++/ABI link. The build
+# deps (setuptools-rust, wheel, numpy, torch) must already be installed — that
+# ordering is what build_from_source.sh handles.
+no-build-isolation-package = ["torchmonarch", "torchstore"]

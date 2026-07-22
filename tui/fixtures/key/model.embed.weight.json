@@ -1,0 +1,11 @@
+{
+  "key": "model.embed.weight",
+  "object_type": "TENSOR",
+  "dtype": "float32",
+  "global_shape": null,
+  "fully_committed": true,
+  "mesh_shape": null,
+  "shards": [
+    { "volume_id": "vol-12", "coordinates": [], "offsets": [], "local_shape": [50000, 4096] }
+  ]
+}

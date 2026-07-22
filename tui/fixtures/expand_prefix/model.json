@@ -1,0 +1,32 @@
+{
+  "children": [
+    {
+      "prefix": "model.layers",
+      "keys": 4800,
+      "objects": 0,
+      "tensors": 0,
+      "dtensors": 4800,
+      "partial": 2,
+      "bytes": 8.8e15
+    },
+    {
+      "prefix": "model.embed",
+      "keys": 2,
+      "objects": 0,
+      "tensors": 2,
+      "dtensors": 0,
+      "partial": 0,
+      "bytes": 5.2e13
+    },
+    {
+      "prefix": "model.norm",
+      "keys": 18,
+      "objects": 0,
+      "tensors": 10,
+      "dtensors": 8,
+      "partial": 0,
+      "bytes": 4.8e13
+    }
+  ],
+  "next_cursor": "model:page2"
+}
