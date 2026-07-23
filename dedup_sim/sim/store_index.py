@@ -21,30 +21,14 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Set
 
+from sim_common.controller_probe import HAVE_REAL  # noqa: F401
+
 from .model import Region
 
-# Attempt the real import for documentation/faithfulness (see module docstring).
-# The import (via Monarch) is noisy on stderr; silence it -- we do not use the
-# real controller anyway, we only record whether it is importable.
-import contextlib  # noqa: E402
-import io  # noqa: E402
-import os  # noqa: E402
-
-try:  # pragma: no cover - depends on Monarch being installed
-    with contextlib.redirect_stderr(io.StringIO()), \
-            contextlib.redirect_stdout(io.StringIO()):
-        with open(os.devnull, "w") as _devnull:
-            _saved = os.dup(2)
-            os.dup2(_devnull.fileno(), 2)
-            try:
-                from torchstore.controller import Controller as _RealController  # noqa: F401,E501
-            finally:
-                os.dup2(_saved, 2)
-                os.close(_saved)
-    HAVE_REAL = True
-except Exception:  # pragma: no cover
-    HAVE_REAL = False
-
+# ``HAVE_REAL`` (imported above) records whether the real ``torchstore.controller``
+# .``Controller`` is importable -- the silenced probe lives in
+# ``sim_common.controller_probe`` (see that module for why the import is silenced).
+#
 # We deliberately use the shim regardless of HAVE_REAL: the real controller's
 # endpoints are async Monarch-actor methods that need an actor runtime, which a
 # plain single-thread sim cannot provide. HAVE_REAL is recorded for reference.

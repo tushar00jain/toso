@@ -12,7 +12,7 @@ from typing import Dict, Iterable, List
 
 from .coordinator import Fetch
 from .cost import locality, TIER_LABEL, transfer_time
-from .engine import Sim
+from sim_common.engine import Sim
 from .model import decompose, Region, region_bytes, region_str, Volume
 from .trace import Metrics, Trace
 

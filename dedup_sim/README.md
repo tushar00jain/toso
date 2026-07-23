@@ -113,13 +113,16 @@ entirely *inside* `get`. `client.put(key, volume_id, region)` seeds the index.
 ## Module layout (SPEC §10)
 
 ```
+sim_common/            reusable DES library (repo root)
+  engine.py            Sim (DES event loop) + Promise (dependency primitive)
+  topology.py          Tier / TIER_LABEL / locality / transfer_time skeleton
+  controller_probe.py  silenced real-Controller import probe -> HAVE_REAL
 dedup_sim/
   SPEC.md              source-of-truth spec
   __main__.py          `python -m dedup_sim` demo (trace + summary + ASCII)
-  sim/engine.py        Sim (DES event loop) + Promise (dependency primitive)
-  sim/store_index.py   real-Controller import attempt + faithful shim
+  sim/store_index.py   real-Controller probe (HAVE_REAL from sim_common) + faithful shim
   sim/model.py         Volume, Region, atomic-region splitting
-  sim/cost.py          transfer_time + locality tiers (pure)
+  sim/cost.py          dedup TIERS + transfer_time (delegates to sim_common.topology)
   sim/coordinator.py   NaiveCoordinator (baseline) + DedupCoordinator (dynamic dedup)
   sim/client.py        Client.get/put -- the no-API-change entry point
   sim/trace.py         Trace recorder + event/summary/ASCII rendering
@@ -127,9 +130,14 @@ dedup_sim/
   tests/test_sim.py    SPEC §8 assertions (pytest, deterministic)
 ```
 
+The DES engine, the locality/transfer-time cost skeleton, and the silenced
+real-`Controller` import probe live in the repo-root `sim_common/` package (a
+reusable DES library); this sim keeps its own bandwidth constants and domain model.
+
 ## Store-index path
 
-We attempt to import the real `torchstore.controller.Controller`. Even when it
+We attempt to import the real `torchstore.controller.Controller` (via the shared
+`sim_common.controller_probe`, which exposes `HAVE_REAL`). Even when it
 imports, its endpoints are `@endpoint async` Monarch-actor methods that need an
 actor runtime to drive and operate on torchstore-internal
 `Request`/`TensorSlice`/`Trie` types -- neither of which a plain single-threaded

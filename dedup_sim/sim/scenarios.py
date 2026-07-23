@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple
 
 from .client import Client
 from .coordinator import DedupCoordinator, NaiveCoordinator
-from .engine import Sim
+from sim_common.engine import Sim
 from .model import Region, split_regions, union_bytes, Volume
 from .store_index import StoreIndex
 from .trace import Metrics, Trace

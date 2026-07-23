@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .cost import locality
-from .engine import Promise, Sim
+from sim_common.engine import Promise, Sim
 from .model import Region, Volume
 from .store_index import StoreIndex
 
