@@ -117,6 +117,8 @@ sim_common/            reusable DES library (repo root)
   engine.py            Sim (DES event loop) + Promise (dependency primitive)
   topology.py          Tier / TIER_LABEL / locality / transfer_time skeleton
   controller_probe.py  silenced real-Controller import probe -> HAVE_REAL
+  trace.py             generic Trace event recorder (record/render, tunable widths)
+  report.py            configure_logging + section header helpers for the demo
 dedup_sim/
   SPEC.md              source-of-truth spec
   __main__.py          `python -m dedup_sim` demo (trace + summary + ASCII)
@@ -125,14 +127,16 @@ dedup_sim/
   sim/cost.py          dedup TIERS + transfer_time (delegates to sim_common.topology)
   sim/coordinator.py   NaiveCoordinator (baseline) + DedupCoordinator (dynamic dedup)
   sim/client.py        Client.get/put -- the no-API-change entry point
-  sim/trace.py         Trace recorder + event/summary/ASCII rendering
+  sim/trace.py         dedup Metrics + event/summary/ASCII rendering (Trace from sim_common)
   sim/scenarios.py     toy burst, reshard, versioning scenarios + run harness
   tests/test_sim.py    SPEC §8 assertions (pytest, deterministic)
 ```
 
-The DES engine, the locality/transfer-time cost skeleton, and the silenced
+The DES engine, the locality/transfer-time cost skeleton, the generic `Trace`
+event recorder, the logging/section-header helpers, and the silenced
 real-`Controller` import probe live in the repo-root `sim_common/` package (a
-reusable DES library); this sim keeps its own bandwidth constants and domain model.
+reusable DES library); this sim keeps its own bandwidth constants, domain model,
+and the dedup-specific `Metrics` + ASCII rendering.
 
 ## Store-index path
 

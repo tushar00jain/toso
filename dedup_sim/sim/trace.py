@@ -1,4 +1,8 @@
-"""Trace recorder + event / summary / ASCII-diagram rendering."""
+"""Event / summary / ASCII-diagram rendering.
+
+The generic event recorder lives in ``sim_common.trace.Trace``; this module
+keeps the dedup-specific ``Metrics`` and the ASCII source->dest diagram.
+"""
 
 from __future__ import annotations
 
@@ -6,33 +10,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
+from sim_common.trace import Trace  # noqa: F401  (re-exported for scenarios)
+
 from .model import Region
-
-
-@dataclass
-class Trace:
-    """Chronological record of simulated events.
-
-    Each entry is ``(time, kind, message)``; rendering produces one line per
-    event. Because the sim is deterministic, two runs produce byte-identical
-    trace strings.
-    """
-
-    events: List[Tuple[float, str, str]] = field(default_factory=list)
-
-    def record(self, now: float, kind: str, msg: str) -> None:
-        """Append an event at ``now``."""
-        self.events.append((now, kind, msg))
-
-    def render_lines(self) -> List[str]:
-        """Render the event trace as a list of formatted lines (one per event)."""
-        return [
-            f"t={t:6.3f}  {kind:<6} {msg}" for (t, kind, msg) in self.events
-        ]
-
-    def render(self) -> str:
-        """Render the event trace, one line per event."""
-        return "\n".join(self.render_lines())
 
 
 @dataclass

@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
+
+from sim_common.report import configure_logging, section
 
 from .sim.scenarios import (
     reshard_scenario,
@@ -43,9 +44,7 @@ logger = logging.getLogger("dedup_sim")
 # Logging helpers -- INFO for the digest, DEBUG for the per-event trace.
 # --------------------------------------------------------------------------- #
 def _section(title: str) -> None:
-    logger.info("\n%s", "=" * 72)
-    logger.info(title)
-    logger.info("=" * 72)
+    section(logger, title)
 
 
 def _log_trace(trace, note: str = "") -> None:
@@ -181,15 +180,7 @@ def main(argv=None) -> None:
     )
     args = parser.parse_args(argv)
 
-    # force=True resets any root handlers a dependency may have installed at
-    # import time (e.g. torchstore/Monarch); otherwise basicConfig would no-op
-    # and our INFO/DEBUG output would be silently dropped.
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(message)s",
-        stream=sys.stdout,  # the demo output is the product -> stdout, as before
-        force=True,
-    )
+    configure_logging(logging.DEBUG if args.verbose else logging.INFO)
 
     if args.scenario is None:
         _toy()
