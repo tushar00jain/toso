@@ -106,7 +106,13 @@ class Cluster:
 
         self.controller = make_controller_adapter(real_directory)
         self.handle = self.controller.handle
-        self._volumes = {vid: FakeVolumeHandle() for vid in self.ids}
+        # Each volume's byte capacity comes from the run's profile
+        # (``storage_capacity_bytes``, default unbounded); the seam enforces it
+        # against the aggregate resident working set.
+        self._volumes = {
+            vid: FakeVolumeHandle(volume_id=topology[vid].id, profile=profile)
+            for vid in self.ids
+        }
         # One real LocalClient per instance (co-located with its own volume).
         self._adapters: Dict[str, RealClientAdapter] = {
             vid: RealClientAdapter(

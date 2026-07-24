@@ -25,6 +25,7 @@ from any real device; production callers supply their own from scenario config.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Mapping, Tuple
 
@@ -69,6 +70,16 @@ class MachineProfile:
         storage_read_bw / storage_write_bw: read / write bandwidth (bytes/time).
         storage_latency: fixed per-op storage latency (time), applied to both
             read and write.
+        storage_capacity_bytes: byte capacity of a single storage volume,
+            enforced against the aggregate resident working set on that volume
+            (the sum of all bytes currently resident) by the volume seam (see
+            :class:`realsim.seams.volume_handle.FakeVolumeHandle`). Like the
+            bandwidths this is a target-hardware descriptor, not a debug knob --
+            it changes the simulated result (an over-commit raises instead of
+            silently fitting), so it is an explicit profile field rather than an
+            ambient config flag. Defaults to ``math.inf`` (unbounded), which
+            disables the check and keeps the historical behavior byte-identical;
+            enforcement is active exactly when this is finite.
 
     Compute:
         gpu_flops: per-dtype device flop rate (flops/time), keyed by dtype name
@@ -97,6 +108,7 @@ class MachineProfile:
     storage_read_bw: float = 0.0
     storage_write_bw: float = 0.0
     storage_latency: float = 0.0
+    storage_capacity_bytes: float = math.inf
 
     gpu_flops: Mapping[str, float] = field(default_factory=dict)
     gpu_flops_default: float = 0.0

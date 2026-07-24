@@ -173,7 +173,13 @@ def build_burst(
     registry = ResourceRegistry.from_config()
 
     topology = _topology(num_readers)
-    volumes = {vid: FakeVolumeHandle() for vid in topology}
+    # Each volume's byte capacity comes from the run's profile
+    # (``storage_capacity_bytes``, default unbounded); the seam enforces it
+    # against the aggregate resident working set.
+    volumes = {
+        vid: FakeVolumeHandle(volume_id=ep.id, profile=profile)
+        for vid, ep in topology.items()
+    }
 
     # Real Trie directory by default; the opt-in shim (real_directory=False, or
     # the ambient config flag) swaps only the directory container -- see
@@ -278,6 +284,7 @@ def build_burst(
         "readers": readers,
         "coordinator": coordinator,
         "topology": topology,
+        "volumes": volumes,
         "expected": expected,
         "descriptor": descriptor,
         "mode": mode,
