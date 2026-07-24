@@ -27,7 +27,6 @@ import logging
 
 from sim_common.report import configure_logging, section
 
-from .sim.index import HAVE_REAL, USING_REAL
 from .sim.scenarios import (
     DISAGG_TARGET_TBT,
     EARLY_SLO_TBT,
@@ -63,19 +62,10 @@ def _log_trace(trace, limit: int = 60) -> None:
     logger.debug("")
 
 
-def _index_banner() -> str:
-    return (
-        "real torchstore.controller.Controller"
-        if USING_REAL
-        else f"faithful shim (real import {'available' if HAVE_REAL else 'unavailable'}, "
-        "not driveable single-threaded)"
-    )
-
-
 def _shared_prefix() -> None:
     cache_aware, baseline = run_shared_prefix()
     _section("SHARED PREFIX: conversations sharing a hot system prompt + context")
-    logger.info("block index: %s", _index_banner())
+    logger.info("directory: real torchstore.controller.Controller (off-actor)")
     logger.info("4 instances (2 nodes), 200 requests, 8 conversations, Zipf skew.")
     logger.info("Cache-aware routes same-prefix requests to the instance holding the")
     logger.info("prefix (or pulls it once), so shared prefixes are computed ~once;")

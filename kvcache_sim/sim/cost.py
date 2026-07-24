@@ -1,90 +1,111 @@
-"""Pure cost model: locality tiers, KV transfer time, prefill and decode time.
+"""KV-cache cost layer over the shared analytic cost model.
 
-No measurement. Durations are deterministic functions of size and locality.
-Constants are illustrative (units arbitrary but consistent); three properties are
-what matter, and they encode the core premise:
-  (a) recomputing a token costs time, so reusing a cached prefix is cheaper;
-  (b) **transferring a cached KV block is cheaper than recomputing it** -- else
-      remote reuse / hot-block replication would never pay off; and
-  (c) cross-node KV transfer is slower than intra-node, so *where* a reusable
-      prefix lives matters; and
-  (d) a decode step's per-token time (TBT) rises with the decode batch size, so
-      packing more concurrent requests onto an instance trades throughput for
-      latency -- the tension the TBT SLO bounds.
-The tier *shape* matches ``dedup_sim`` (SHM < NVLINK < RDMA); bandwidths are scaled
-up here so per-token transfer is well under per-token prefill compute (b).
+Every duration here is a deterministic function of a *modeled quantity* (uncached
+tokens, decode-batch size, KV byte count) and a target-machine
+:class:`~sim_common.cost_model.MachineProfile`. This module does **not** own any
+bandwidth/flop constants -- it composes the shared
+:mod:`sim_common.cost_model` primitives (``compute_time`` / ``network_time`` /
+``storage_time`` / ``mem_copy_time``), exactly as ``realsim``'s transport seam and
+``burst_get`` scenario do. The old ad-hoc ``TIERS`` / ``PREFILL_*`` / ``TBT_*``
+constants are gone; the profile is the single source of hardware truth.
+
+Three cost premises the KV-cache algorithm rests on, all preserved by the profile:
+
+* recomputing a token costs GPU compute, so reusing a cached prefix is cheaper
+  (:func:`prefill_time`);
+* moving a cached KV block over the fabric is cheaper than recomputing it, so
+  remote reuse / hot-block replication pays off (:func:`fetch_time` vs
+  :func:`prefill_time` per token, given :data:`PROFILE`);
+* a decode step's per-token time (TBT) rises with the decode-batch size, so
+  packing more concurrent requests trades throughput for latency
+  (:func:`decode_step_time`).
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from sim_common.cost_model import (
+    DEFAULT_PROFILE,
+    MachineProfile,
+    compute_time,
+    mem_copy_time,
+    network_time,
+    storage_time,
+)
+from sim_common.topology import Endpoint, Tier, TIER_LABEL, locality  # noqa: F401
 
-from sim_common import topology
-from sim_common.topology import locality, Tier, TIER_LABEL  # noqa: F401
+# The target-machine profile the simulation is charged against. We reuse the
+# shared illustrative DEFAULT_PROFILE (plausible *relative* magnitudes, not
+# measured): with it, a KV block's fabric fetch is well under the prefill compute
+# it avoids, which is the premise that makes prefix reuse and replication pay off.
+PROFILE: MachineProfile = DEFAULT_PROFILE
 
-from .model import Instance
+# KV blocks/tokens are modeled as bytes for the data plane: one modeled byte per
+# token (illustrative, keeps fabric numbers readable), so a B-token block is B
+# bytes. The metadata carrier (a uint8 TensorDescriptor of shape ``(B,)``) has
+# exactly this nbytes with zero real allocation.
+BYTES_PER_TOKEN = 1
 
+# Prefill is GPU compute proportional to the uncached-token count; the flop rate
+# comes from the profile (``gpu_flops``), so this is a pure cost-model call. The
+# per-token flop count is a modeled constant (a stand-in for the attention +
+# MLP flops a prefill token costs).
+PREFILL_FLOPS_PER_TOKEN = 1.6e6
 
-# tier -> (latency, bandwidth) in arbitrary-but-consistent units. Bandwidths are
-# high enough that per-token KV transfer (bytes_per_token / bw) is cheaper than
-# per-token prefill compute (PREFILL_PER_TOKEN) -- property (b) above.
-TIERS: Dict[Tier, Tuple[float, float]] = {
-    Tier.SHM: (0.001, 150000.0),
-    Tier.NVLINK: (0.002, 60000.0),
-    Tier.RDMA: (0.010, 10000.0),
-}
+# A decode step attends over the whole live batch, so its flop count scales with
+# the batch size; the step time is that compute charged on the GPU roofline. This
+# replaces the ad-hoc ``TBT_BASE + (b-1)*slope`` with a profile-driven compute
+# time that is monotonic in the batch (base at batch=1, strictly rising).
+DECODE_STEP_FLOPS_PER_REQ = 4.0e7
 
-# Prefill: fixed launch cost + per-uncached-token compute. This is the cost a
-# cache hit avoids -- the whole point of prefix reuse.
-PREFILL_LAT = 0.010
-PREFILL_PER_TOKEN = 0.0008
-
-# Decode: per-output-token occupancy on a decode instance (for load / TBT SLO).
-DECODE_PER_TOKEN = 0.0006
-
-# Batched decode / TBT (K6). A decode instance generates one token per *step* for
-# every request in its batch; the step's duration is the time-between-tokens (TBT)
-# every batched request observes for that token. TBT rises with the batch size --
-# more concurrent requests => more KV attended per step => a longer step. This is
-# the core tension the TBT SLO bounds (Mooncake §4.2, §5.2): larger batches raise
-# MFU/throughput but push TBT up.
-#
-#   decode_step_time(b) = TBT_BASE + (b - 1) * TBT_BATCH_SLOPE
-#
-# ``TBT_BASE`` is the uninterrupted (batch=1) per-token time -- the baseline a TBT
-# SLO is expressed as a multiple of. The slope is deliberately steep enough that a
-# handful of batched requests approaches a typical 5x SLO, so the sweet spot is a
-# small-but-nonzero batch (as in practice).
-TBT_BASE = 0.020
-TBT_BATCH_SLOPE = 0.015
+# Both compute steps are charged on the accelerator that serves the model.
+COMPUTE_DEVICE = "cuda"
+COMPUTE_DTYPE = "float16"
 
 
-def transfer_time(src: Instance, dst: Instance, nbytes: int) -> float:
-    """Simulated time to move ``nbytes`` of KV from ``src`` to ``dst`` (0 if same).
+def block_bytes(num_blocks: int, block_tokens: int) -> int:
+    """Modeled KV byte size of ``num_blocks`` blocks of ``block_tokens`` tokens."""
+    return num_blocks * block_tokens * BYTES_PER_TOKEN
 
-    Delegates to the shared skeleton with this sim's own :data:`TIERS` constants.
+
+def prefill_time(uncached_tokens: int, profile: MachineProfile = PROFILE) -> float:
+    """GPU prefill compute for the uncached suffix (0 if fully cached).
+
+    Charged through :func:`~sim_common.cost_model.compute_time` on the accelerator:
+    the cost a prefix cache hit avoids.
     """
-    return topology.transfer_time(src, dst, nbytes, TIERS)
-
-
-def prefill_time(uncached_tokens: int) -> float:
-    """Simulated prefill compute for the uncached suffix (0 if fully cached)."""
     if uncached_tokens <= 0:
         return 0.0
-    return PREFILL_LAT + uncached_tokens * PREFILL_PER_TOKEN
+    flops = PREFILL_FLOPS_PER_TOKEN * uncached_tokens
+    return compute_time(flops, COMPUTE_DTYPE, COMPUTE_DEVICE, profile)
 
 
-def decode_time(output_tokens: int) -> float:
-    """Simulated decode occupancy for ``output_tokens`` generated tokens (batch=1)."""
-    return output_tokens * DECODE_PER_TOKEN
-
-
-def decode_step_time(batch_size: int) -> float:
-    """Simulated time to generate one token for every request in a decode batch.
+def decode_step_time(batch_size: int, profile: MachineProfile = PROFILE) -> float:
+    """Time to generate one token for every request in a decode batch.
 
     This is the time-between-tokens (TBT) each batched request observes for that
-    step. Monotonically increasing in ``batch_size`` (>= :data:`TBT_BASE`), so a
-    request's TBT degrades as its decode instance fills up.
+    step. Charged as GPU compute proportional to the batch size (clamped to
+    ``>= 1``), so it is strictly increasing in the batch -- a request's TBT
+    degrades as its decode instance fills up.
     """
     b = max(1, batch_size)
-    return TBT_BASE + (b - 1) * TBT_BATCH_SLOPE
+    flops = DECODE_STEP_FLOPS_PER_REQ * b
+    return compute_time(flops, COMPUTE_DTYPE, COMPUTE_DEVICE, profile)
+
+
+def fetch_time(
+    src: Endpoint, dst: Endpoint, nbytes: int, profile: MachineProfile = PROFILE
+) -> float:
+    """Predicted cost of one client ``get`` of ``nbytes`` from ``src`` to ``dst``.
+
+    Mirrors the charges the real transport seam applies on a get -- persistent
+    ``storage`` read + host-RAM ``mem`` staging + ``network`` fabric -- so a
+    routing prediction made with this matches the time the real fetch advances the
+    clock by. A same-endpoint (local) fetch is free.
+    """
+    if src.id == dst.id or nbytes <= 0:
+        return 0.0
+    return (
+        storage_time(nbytes, "read", profile)
+        + mem_copy_time(nbytes, profile)
+        + network_time(src, dst, nbytes, profile)
+    )

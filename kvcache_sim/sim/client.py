@@ -1,72 +1,120 @@
-"""Simulated client / driver -- the request lifecycle.
+"""Async request lifecycle -- the driver a serving engine would run.
 
-Mirrors what a serving engine does against the store: on arrival it calls
-``scheduler.schedule`` (the cache-aware scheduler), and on prefill completion it publishes the
-computed KV blocks back into the cache via ``scheduler.on_complete`` (read-through,
-K4). The scheduler is the only decision-maker; the client just drives events and
-records outcomes.
+One coroutine per request drives the real request lifecycle on the shared
+:class:`~sim_common.async_engine.AsyncEngine` virtual clock:
+
+1. sleep until the request's arrival,
+2. ``await scheduler.schedule`` -- consult the **real** directory and route (the
+   real ``locate_volumes`` read completes without suspending the loop, so routing
+   is atomic: a consistent directory snapshot, like the coordinator's serialized
+   mailbox),
+3. wait out the prefill queue, then, if the plan pulls a remote prefix, drive a
+   **real** ``client.get`` (charging fabric via the cost model), then charge the
+   prefill compute,
+4. ``await scheduler.on_complete`` -- publish the computed KV blocks back into the
+   real directory (read-through) and evict,
+5. on the decode-simulating path, admit the request to a decode batch and finalize
+   its outcome when its last token is emitted.
 
 Simplification (documented in SPEC): a block becomes reusable at prefill
-*completion*, not while in flight. Unlike the dedup coordinator, this prototype does
-not treat an in-flight prefill as a promised cache source, so two requests racing
-for the same brand-new prefix may both compute it. Arrivals are typically spaced
-enough that this is rare; adding promises (as in ``dedup_sim``) is future work.
+*completion*, not while in flight, so two requests racing for the same brand-new
+prefix may both compute it. Arrivals are typically spaced enough that this is rare.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, List
 
-from sim_common.engine import Sim
+from .cluster import Cluster
 from .model import Request
 from .scheduler import Plan
 from .trace import Metrics, RequestResult, Trace
 
 
-class Client:
+class Driver:
     """Drives request arrivals through a scheduler and records metrics."""
 
-    def __init__(self, sim: Sim, scheduler, block_tokens: int, trace: Trace,
-                 metrics: Metrics) -> None:
-        self.sim = sim
+    def __init__(
+        self,
+        loop,
+        cluster: Cluster,
+        scheduler,
+        block_tokens: int,
+        trace: Trace,
+        metrics: Metrics,
+    ) -> None:
+        self.loop = loop
+        self.cluster = cluster
         self.scheduler = scheduler
         self.B = block_tokens
         self.trace = trace
         self.metrics = metrics
-        # When the scheduler simulates decode, acceptance is *provisional* until
-        # the request is admitted to a decode batch (it may still be shed on the
-        # TBT SLO). We stash the accepted row here and only publish it to metrics
-        # once decode finishes (success) or admission is refused (wasted prefill).
+        # On the decode-simulating path acceptance is provisional until the request
+        # is admitted to a decode batch (it may still be shed on the TBT SLO). We
+        # stash the accepted row here and publish it once decode finishes (success)
+        # or admission is refused (wasted prefill).
         self._pending: Dict[str, RequestResult] = {}
         if getattr(scheduler, "tbt_enabled", False):
             scheduler.on_decode_finish = self._decode_done
 
-    def submit(self, request: Request) -> None:
-        """Enqueue a request's arrival event at its arrival time."""
-        self.sim.schedule(request.arrival, lambda: self._arrive(request),
-                          label=f"arrive:{request.id}")
+    def _now(self) -> float:
+        return self.loop.time()
 
-    def _arrive(self, request: Request) -> None:
-        plan = self.scheduler.schedule(request, self.sim.now)
+    async def run(self, requests: List[Request]) -> None:
+        """Run every request to completion on the shared virtual-clock loop."""
+        ordered = sorted(requests, key=lambda r: (r.arrival, r.id))
+        with self.cluster.installed():
+            await asyncio.gather(*(self._run_request(r) for r in ordered))
+            # Request coroutines end at prefill completion; decode continues on its
+            # own step tasks, so keep the loop running until every token is emitted.
+            engine = getattr(self.scheduler, "engine", None)
+            if engine is not None:
+                await engine.drain()
+
+    async def _run_request(self, request: Request) -> None:
+        delay = request.arrival - self._now()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        plan = await self.scheduler.schedule(request, self._now())
         if plan is None:
-            # Pre-prefill rejection (TTFT/predicted-TBT SLO): no compute spent.
-            self.trace.record(self.sim.now, "REJECT",
-                              f"{request.id} rejected (SLO/overload)")
-            self.metrics.add(RequestResult(id=request.id, accepted=False,
-                                           prompt_tokens=request.prompt_tokens))
+            self.trace.record(
+                self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"
+            )
+            self.metrics.add(
+                RequestResult(
+                    id=request.id, accepted=False, prompt_tokens=request.prompt_tokens
+                )
+            )
             return
-        if not getattr(self.scheduler, "tbt_enabled", False):
-            self._record_accepted(plan)
-            self._trace_route(plan)
-            self.sim.schedule(plan.ttft, lambda: self._prefill_done(plan),
-                              label=f"prefill_done:{request.id}")
-            return
-        # Decode-simulating path: acceptance is provisional until decode admits.
-        self._trace_route(plan)
-        self._pending[request.id] = self._make_accepted(plan)
-        self.sim.schedule(plan.ttft, lambda: self._prefill_done(plan),
-                          label=f"prefill_done:{request.id}")
 
+        tbt = getattr(self.scheduler, "tbt_enabled", False)
+        self._trace_route(plan)
+        if not tbt:
+            self._record_accepted(plan)
+        else:
+            self._pending[request.id] = self._make_accepted(plan)
+
+        # (1) wait out the prefill queue at this instance.
+        if plan.queue_wait > 0:
+            await asyncio.sleep(plan.queue_wait)
+        # (2) pull the remote prefix (a real client.get -> real fabric cost).
+        if plan.reuse_source is not None and plan.pull_keys:
+            await self.cluster.fetch(plan.prefill, plan.pull_keys)
+        # (3) charge the prefill compute for the uncached suffix.
+        if plan.prefill_t > 0:
+            await asyncio.sleep(plan.prefill_t)
+
+        # (4) publish the computed KV blocks into the real directory; evict.
+        evicted = await self.scheduler.on_complete(plan)
+        # Keep the analytical queue tail consistent with the real ops' clock.
+        self.scheduler.busy_until[plan.prefill] = max(
+            self.scheduler.busy_until[plan.prefill], self._now()
+        )
+        self._prefill_done(plan, evicted)
+
+    # -- outcome bookkeeping ---------------------------------------------- #
     def _make_accepted(self, plan: Plan) -> RequestResult:
         return RequestResult(
             id=plan.request.id,
@@ -91,42 +139,43 @@ class Client:
         else:
             src = " cold (no reuse)"
         self.trace.record(
-            self.sim.now, "ROUTE",
+            self._now(),
+            "ROUTE",
             f"{plan.request.id} -> {plan.prefill}"
             f" (match {plan.match_blocks}blk,{src}, "
             f"compute {plan.uncached_tokens}tok, ttft {plan.ttft:.3f})",
         )
 
-    def _prefill_done(self, plan: Plan) -> None:
-        evicted = self.scheduler.on_complete(plan)
+    def _prefill_done(self, plan: Plan, evicted: List[str]) -> None:
         note = ""
         if evicted:
             note = f"; evicted {len(evicted)} blk from {plan.prefill}"
         if not getattr(self.scheduler, "tbt_enabled", False):
             self.trace.record(
-                self.sim.now, "DONE",
+                self._now(),
+                "DONE",
                 f"{plan.request.id} prefill done on {plan.prefill}"
                 f" (published {len(plan.request.block_keys)}blk){note}",
             )
             return
         # Decode-simulating path: try to admit the request to a decode batch.
-        admitted = self.scheduler.admit_decode(plan, self.sim.now)
+        admitted = self.scheduler.admit_decode(plan, self._now())
         if not admitted:
-            # Prefill already spent -> a wasted prefill (late TBT rejection).
             result = self._pending.pop(plan.request.id)
             result.accepted = False
             result.decode_rejected = True
             result.wasted_prefill = True
             self.metrics.add(result)
             self.trace.record(
-                self.sim.now, "REJECT",
+                self._now(),
+                "REJECT",
                 f"{plan.request.id} decode rejected on {plan.decode}"
                 f" (TBT SLO; wasted prefill on {plan.prefill}){note}",
             )
             return
-        # Admitted to decode: the provisional row stays until decode finishes.
         self.trace.record(
-            self.sim.now, "DONE",
+            self._now(),
+            "DONE",
             f"{plan.request.id} prefill done on {plan.prefill}"
             f" (published {len(plan.request.block_keys)}blk){note}"
             f"; decoding on {plan.decode}",
@@ -138,12 +187,5 @@ class Client:
         result.tbt = tbt
         self.metrics.add(result)
         self.trace.record(
-            self.sim.now, "DECODE",
-            f"{request.id} decode done (tbt {tbt:.3f})",
+            self._now(), "DECODE", f"{request.id} decode done (tbt {tbt:.3f})"
         )
-
-
-def submit_all(client: Client, requests: List[Request]) -> None:
-    """Enqueue every request's arrival."""
-    for r in requests:
-        client.submit(r)

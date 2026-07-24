@@ -1,47 +1,47 @@
-# kvcache_sim -- discrete-event simulation of a KV cache
+# kvcache_sim -- cache-aware KV-cache serving on the real TorchStore directory
 
-A single-threaded, deterministic discrete-event simulation (DES) of the cache-aware
-KV-cache serving design in `../docs/torchstore_kvcache_design.md`: the
-`CacheCoordinator` (a cache-aware coordinator) layered over TorchStore's
-existing storage volumes + transport, doing prefix-hash addressing, cache-aware
-routing, hot-block replication and LRU eviction.
+A single-threaded, deterministic simulation of the cache-aware KV-cache serving
+design in `../docs/torchstore_kvcache_design.md`: a cache-aware coordinator layered
+over TorchStore's storage volumes + transport, doing prefix-hash addressing,
+cache-aware routing, hot-block replication, LRU eviction, and batched decode.
 
-It exercises the *algorithm* and gives a *sense of relative performance* locally —
-it is **not** a vendor benchmark. "Time" is a unitless simulated clock; prefill,
-transfer and decode durations come from pure cost functions, never measurement.
-Pure Python stdlib only; the only randomness is one **seeded** RNG in the synthetic
-workload, so the same seed ⇒ byte-identical trace + identical metrics.
+It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsim`:
 
-This is the sibling of `../dedup_sim/` (the weight-sync dedup coordinator DES): same
-engine, same faithful-shim-controller approach, same determinism discipline. The
-shared pieces -- the DES engine (`Sim`, `Promise`), the locality/transfer-time cost
-skeleton, the generic `Trace` event recorder, the logging/section-header helpers, and
-the silenced real-`Controller` import probe (`HAVE_REAL`) -- live in the repo-root
-`sim_common/` package (`engine.py`, `topology.py`, `trace.py`, `report.py`,
-`controller_probe.py`) that both sims import; each sim keeps its own bandwidth
-constants, domain model, index shim, and outcome `Metrics` / summary rendering.
+- **Real directory.** KV-block presence is the real `torchstore.controller.Controller`
+  directory (`keys_to_storage_volumes`), driven off-actor through `realsim`'s
+  `RealControllerAdapter` / `FakeControllerHandle`. A KV block is a directory **key**
+  (the prefix-hash chain string); "instance X holds block K" is the directory entry
+  `K -> volume_X`. Routing consults the real `locate_volumes`.
+- **Real clients + types.** Each serving instance is a real storage volume with a
+  co-located real `LocalClient` (`realsim`'s `RealClientAdapter`). Publishing a
+  prefix after prefill is a real, **metadata-only** `put_batch` (a `(shape, dtype)`
+  `TensorDescriptor` per block -- zero real tensor storage) that records presence in
+  the real directory; a remote-prefix pull is a real `client.get_batch` driven
+  through `realsim`'s transport seam; eviction removes presence via the real
+  `notify_delete_batch`. A KV block is a directory key -- real types throughout,
+  with no translation layer.
+- **Real cost model.** Every duration -- prefill compute, decode-step time, and the
+  fabric/storage/RAM cost of a KV fetch -- is charged through
+  `sim_common.cost_model` from a target-machine `MachineProfile`, never measured on
+  the box running the sim.
+- **Real async engine.** The whole request lifecycle runs on `realsim`'s
+  deterministic virtual-clock `AsyncEngine`, so torchstore's real `async` client
+  code executes under simulated time, single-threaded and reproducibly.
 
-## Environment (uv)
+"Time" is a unitless simulated clock; the only randomness is one **seeded** RNG in
+the synthetic workload, so the same seed produces a byte-identical trace and
+identical metrics. It exercises the *algorithm* and gives a *sense of relative
+performance* -- it is **not** a vendor benchmark.
 
-The project uses [uv](https://docs.astral.sh/uv/) with a `.venv` at the repo root
-(`toso/.venv`). Run everything from the repo directory (the parent of
-`kvcache_sim/`). Either activate the venv:
+## Environment
+
+Run everything from the repo directory (the parent of `kvcache_sim/`) with the
+repo's virtualenv, which has `realsim` + `torchstore` importable:
 
 ```
 cd toso
-source .venv/bin/activate
-python -m kvcache_sim
+PYTHONPATH=. .venv/bin/python -m kvcache_sim
 ```
-
-or use `uv run` without activating:
-
-```
-cd toso
-uv run --no-sync python -m kvcache_sim
-```
-
-`kvcache_sim` is pure stdlib, so `--no-sync` reuses the existing `.venv` as-is
-(avoids re-resolving the repo's heavier optional deps).
 
 ## How to run
 
@@ -58,78 +58,89 @@ python -m kvcache_sim --help            # usage + valid scenario names
   closing takeaway).
 - `-v` / `--verbose` / `--debug` raises the log level to DEBUG so the `(a)` event
   trace prints (capped to the first 60 events per scenario); the default INFO level
-  prints only the `(b)` summaries. Output is routed through stdlib `logging` with a
-  bare `%(message)s` format.
+  prints only the `(b)` summaries.
 
 ## The scenarios
 
 - **shared_prefix** — many conversations share a hot system prompt + per-conversation
   context. Cache-aware routes same-prefix requests to the instance holding the prefix
   (or pulls it once), so shared prefixes are computed ~once; load-balance scatters
-  them and recomputes. Shows higher hit rate, less prefill compute, lower TTFT.
-- **eviction** — sweeps per-instance cache capacity and prints the hit-rate curve:
-  it rises as the hot working set fits, then plateaus (the ~30%→~50% shape).
-  Too-small caches can't even hold a full prefix ⇒ no reuse.
+  them and recomputes. Higher hit rate, less prefill compute, lower TTFT.
+- **eviction** — sweeps per-instance cache capacity and prints the hit-rate curve: it
+  rises as the hot working set fits, then plateaus. Too-small caches can't even hold
+  a full prefix ⇒ no reuse.
 - **hotspot** — one dominant conversation (extreme Zipf skew). Compares load-balance
-  vs cache-aware **without** replication (recompute a missing prefix) vs **with**
-  replication (pull it once, cheaply). Replication lowers prefill compute and p90
-  TTFT at the cost of KV fabric bytes.
+  vs cache-aware **without** replication vs **with** replication. Replication lowers
+  prefill compute and p90 TTFT at the cost of KV fabric bytes.
 - **overload** — high arrival rate with a TTFT SLO. Prefix reuse shortens prefill,
   freeing capacity, so cache-aware sheds fewer requests than load-balance.
-- **disaggregation** — batched decode under a TBT target. A dedicated decode pool
-  (its own compute timeline) protects served-request TBT from prefill interference;
+- **disaggregation** — batched decode under a TBT target. A dedicated decode pool (its
+  own compute timeline) protects served-request TBT from prefill interference;
   coupling prefill and decode on the same instances lets a prefill collide with a
-  decode step, so a large fraction of the *same* served load blows the target
-  (Mooncake's headline disaggregation result).
+  decode step, so a fraction of the *same* served load blows the target.
 - **early_rejection** — heavy decode load under a tight TBT SLO, comparing admission
-  policies `off`/`early`/`predict`. `off` late-checks decode load after prefill and
-  so wastes prefill on rejects; `early`/`predict` gate before prefill (no waste), but
-  only `predict` routes decode by the load foreseen at prefill completion, so it holds
-  the SLO where `early`'s stale snapshot cannot.
+  policies `off`/`early`/`predict`. `off` late-checks decode load after prefill and so
+  wastes prefill on rejects; `early`/`predict` gate before prefill (no waste), but only
+  `predict` routes decode by the load foreseen at prefill completion, so it holds the
+  SLO where `early`'s stale snapshot cannot.
 
 ## Testing
 
 ```
-uv run --with pytest pytest kvcache_sim/tests -q   # no install (needs a synced project)
-# or, if project sync fails / to reuse the existing .venv:
-uv pip install pytest
-python -m pytest kvcache_sim/tests -q
+PYTHONPATH=. .venv/bin/python -m pytest kvcache_sim/tests -q
 ```
 
-The tests are deterministic — they assert on the DES outcome (hit rate, compute,
-eviction bounds, rejections) and on byte-identical traces across runs, never on
-wall-clock timing.
+The tests are deterministic: they assert on block presence in the **real
+directory** (publish → `locate_volumes` → evict), on the outcome (hit rate, compute,
+eviction bounds, rejections, TBT), and on byte-identical traces across runs -- never
+on wall-clock timing.
 
 ## The user-facing entry point mirrors the store
 
-The only call a "serving engine" makes is:
+The only calls a "serving engine" makes are:
 
 ```python
-plan = scheduler.schedule(request, now)   # route (cache-aware); None => rejected
-...                                        # engine prefills the uncached suffix
-scheduler.on_complete(plan)               # publish computed KV blocks (read-through)
+plan = await scheduler.schedule(request, now)   # route; None => rejected
+...                                             # engine pulls any remote prefix + prefills
+await scheduler.on_complete(plan)               # publish computed KV blocks (read-through)
 ```
 
-No promise/pull/replication arguments leak to the caller — routing, remote-prefix
-pulls, replication and eviction are entirely internal to the coordinator, exactly as
-the design layers them over the existing `put`/`get` plumbing.
+Routing consults the real directory (`locate_volumes`); remote-prefix pulls
+(`client.get`), publishing (`client.put`) and eviction (`notify_delete`) are internal
+to the coordinator, layered over the existing `put`/`get` plumbing.
 
-## Store-index path
+## Layout
 
-As in `dedup_sim`, we attempt to import the real
-`torchstore.controller.Controller` (via the shared `sim_common.controller_probe`,
-which exposes `HAVE_REAL`). Even when it imports, its endpoints are
-`@endpoint async` Monarch-actor methods needing an actor runtime, so a plain
-single-threaded sim uses a **faithful shim** (`BlockIndex`) mirroring the storage
-index (`block_key → set[instance_id]`) with matching method names
-(`locate`/`notify_put`/`notify_delete`/`keys`) plus `instances_with_prefix` for the
-prefix-match query. `__main__` prints which path was taken.
+```
+kvcache_sim/
+  sim/model.py        # inference Request + prefix-hash chain (plain str keys)
+  sim/cost.py         # cost layer over sim_common.cost_model (prefill/decode/fetch)
+  sim/cluster.py      # real Controller directory + per-instance real clients + seam
+  sim/cache.py        # per-instance LRU eviction bookkeeping
+  sim/decode.py       # async DecodeEngine: batched, stepped decode -> TBT
+  sim/scheduler.py    # LoadBalance (baseline) + CacheAware coordinator (async)
+  sim/client.py       # async request-lifecycle driver
+  sim/workload.py     # seeded synthetic request generator (Zipf prefixes)
+  sim/trace.py        # RequestResult, Metrics + summary rendering
+  sim/scenarios.py    # scenario builders + the async run harness
+  __main__.py         # `python -m kvcache_sim [scenario] [-v]`
+  tests/test_sim.py   # deterministic tests (real-directory + outcome assertions)
+```
+
+The async engine, the cost model, the topology/`Endpoint` skeleton, the `Trace`
+recorder and the report helpers live in the repo-root `sim_common/`; the real
+client/controller/transport seams + adapters live in `realsim/`. This package holds
+only the KV-cache policy (scheduler, cache, decode, workload, scenarios).
 
 ## Honesty notes
 
-- This optimizes **prefix reuse / TTFT under a cost model**; the absolute numbers are
-  arbitrary units. Read the scenarios for *relative* wins (cache-aware vs
+- This optimizes **prefix reuse / TTFT / TBT under a cost model**; absolute numbers
+  are arbitrary units. Read the scenarios for *relative* wins (cache-aware vs
   load-balance) and *shapes* (hit rate vs capacity), not throughput claims.
-- Blocks become reusable at prefill **completion**, not while in flight (the dedup
-  sim's promise-based in-flight-as-source is not modelled here); with spaced arrivals
-  the difference is small. See SPEC §6.
+- Blocks become reusable at prefill **completion**, not while in flight; with spaced
+  arrivals the difference is small.
+- A remote pull is routed on the directory snapshot at the request's arrival, but the
+  fetch runs after the prefill queue; if a peer evicted a planned block meanwhile,
+  the read-through fetches only what remains present (the rest is recomputed) -- the
+  faithful real-directory behavior.
+```

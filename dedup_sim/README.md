@@ -1,170 +1,123 @@
-# dedup_sim -- discrete-event simulation of dynamic dedup
+# dedup_sim -- dedup read-routing on the real TorchStore directory
 
-A single-threaded, fully deterministic discrete-event simulation (DES) of the
-dynamic dedup coordinator in `../docs/torchstore_dedup_design.md`: the dynamic
-cache / routing / queuing coordinator that turns a burst of reads into a
-**1x-fabric**, balanced transfer.
+`dedup_sim` runs the **dedup algorithm on the real TorchStore directory and real
+types** (via [`realsim`](../realsim/)): a synchronized read burst is routed so
+that each unique byte crosses the fabric **exactly once (1x)**, versus **`m x`**
+for the naive baseline. The routing is a real
+`realsim.coordinator.model.ReadPolicy` (`dedup_sim.policy.DedupPolicy`) driving
+the real `Controller` directory, the real `LocalClient` planning core, and the
+real in-memory transport, all on `realsim`'s deterministic virtual-clock async
+engine.
 
-This exercises the *algorithm*, not performance. "Time" is a unitless simulated
-clock; transfer durations come from a pure cost function, never measurement.
-Pure Python stdlib only (`heapq`, `dataclasses`, `typing`) -- no
-torch/numpy/asyncio/threads/sleeps/randomness. Same input => byte-identical
-event trace.
+Everything is single-threaded, deterministic (byte-identical trace across runs),
+and **allocation-free**: the payload is carried by a `device="meta"` tensor (real
+tensor, zero storage) or a `(shape, dtype)` descriptor, so no real tensor bytes
+ever move no matter how large the modeled payload.
+
+For the capability's design see
+[`../docs/torchstore_dedup_design.md`](../docs/torchstore_dedup_design.md); for how
+the DES foundation works, [`../docs/des_explained.md`](../docs/des_explained.md).
+
+## How dedup gets to 1x on the real directory
+
+The naive policy (`realsim`'s `NaivePolicy`) fans every reader out concurrently;
+in a synchronized burst they all `locate_volumes` the origin before anyone
+finishes, so each pulls from the origin volume -- `m x` fabric.
+
+`DedupPolicy` stages the burst into a read-through **chain/tree** over the real
+directory:
+
+1. It consults the **real directory** (`locate_volumes` -> real `StorageInfo` /
+   `TensorSlice`) to find the origin(s) that hold the key.
+2. It plans a `cap`-ary tree of sources (`fanout_cap=1` -> a chain, `>=2` -> a
+   shallow tree): the **root** reader pulls from an origin (the single fabric
+   hop); every other reader is attached to a **peer**.
+3. After each reader fetches, the **real read-through** fires: the reader `put`s
+   the key into its own co-located volume -- a zero-fabric local write that, via
+   the real `client.put` path, both stores the payload there and calls the real
+   `notify_put_batch`. The reader is now a real directory source for the next
+   level.
+4. Each depth level executes concurrently (a level's sources were populated by
+   the previous level), so a wider tree narrows wallclock.
+
+Because exactly one reader ever pulls from an origin, the only origin-sourced
+transfer is that first hop: `fabric_bytes == 1x` the payload, for **any** fan-out
+cap. The naive baseline stays `m x`.
+
+The real `LocalClient` chooses a read source purely from what `locate_volumes`
+returns and takes no source argument, so the policy expresses each routing choice
+by giving that reader's client a `_RoutingControllerHandle` that answers
+`locate_volumes` from the **real** directory and then narrows the result to the
+chosen volume (returning the real `StorageInfo` unchanged). Every other endpoint
+-- notably `notify_put_batch` for read-through -- passes straight through, so the
+real directory stays the single source of truth.
 
 ## Environment (uv)
 
-The project uses [uv](https://docs.astral.sh/uv/) with a `.venv` at the repo
-root (`toso/.venv`). Run everything from the repo directory (the parent of
-`dedup_sim/`) so the package resolves. Either activate the venv:
+The project uses [uv](https://docs.astral.sh/uv/) with a `.venv` at the repo root
+(`toso/.venv`). Run everything from the repo root so packages resolve, with the
+repo on `PYTHONPATH` and the venv interpreter:
 
 ```
 cd toso
-source .venv/bin/activate
-python -m dedup_sim
+PYTHONPATH=. .venv/bin/python -m dedup_sim
 ```
 
-or use `uv run` without activating:
-
-```
-cd toso
-uv run python -m dedup_sim
-```
-
-`dedup_sim` itself is pure stdlib, so if the repo's heavier optional
-dependencies aren't built in your checkout and `uv run` tries (and fails) to
-sync them, add `--no-sync` to reuse the existing `.venv` as-is:
-
-```
-uv run --no-sync python -m dedup_sim
-```
+This sim imports `torch` + `torchstore` (through `realsim`), so use the project's
+`.venv` interpreter.
 
 ## How to run
 
 ```
-python -m dedup_sim                 # all scenarios, INFO: summaries + ASCII only
-python -m dedup_sim -v               # add the full per-event trace (DEBUG)
-python -m dedup_sim reshard          # run only the 'reshard' scenario
-python -m dedup_sim versioning -v    # one scenario, with the event trace
-python -m dedup_sim --help           # usage + the valid scenario names
+PYTHONPATH=. .venv/bin/python -m dedup_sim        # INFO: fabric summaries + ASCII
+PYTHONPATH=. .venv/bin/python -m dedup_sim -v     # add the full per-event trace (DEBUG)
+PYTHONPATH=. .venv/bin/python -m dedup_sim --help
 ```
 
-- Positional `scenario` is one of `toy`, `reshard`, `versioning`; omit it to run
-  all of them (plus a closing takeaway). An unknown name errors with the list of
-  valid names.
-- `-v` / `--verbose` / `--debug` raises the log level to DEBUG so the `(a)` event
-  trace prints; the default INFO level prints only the `(b)` summaries and ASCII
-  diagrams (no per-event spam). Output is routed through the stdlib `logging`
-  module with a bare `%(message)s` format, so it reads the same as plain prints.
+- `-v` / `--verbose` / `--debug` raises the log level to DEBUG so the `(a)`
+  per-event virtual-time trace prints; the default INFO level prints only the
+  `(b)` fabric summaries and the ASCII source->dest diagram.
 
-The demo prints three clearly-titled sections, each with (a) the event trace
-(DEBUG) and (b) the summary + ASCII diagram (INFO):
+The demo runs one synchronized read burst under three policies and prints, for
+each, the fabric summary (dedup 1x vs naive `m x`), the wallclock, and the
+who-served-whom diagram:
 
-- **toy** full-replication burst -- dedup vs naive, `FANOUT_CAP=1` (a chain) and
-  `FANOUT_CAP=2` (a shallow tree), with fabric bytes (1x vs mx) and wallclock.
-- **reshard** -- trainer partition != generator partition (with overlap); shows
-  fabric stays 1x (== union of needs) after atomic-region splitting.
-- **versioning** -- a burst, then a `put` that bumps the version, then a second
-  burst that re-pulls from the trainer (cache invalidated), vs a no-bump
-  contrast where the cache serves the second burst.
+- **dedup, `fanout_cap=1` (chain)** -- `origin -> r0 -> r1 -> r2`;
+- **dedup, `fanout_cap=2` (tree)** -- `origin -> r0 -> {r1, r2}` (narrower wallclock);
+- **naive baseline** -- every reader pulls from the origin (`m x` fabric).
 
 ## Testing
 
-`pytest` may not be installed in `.venv`. Run the tests with a one-off
-environment or install pytest into the venv:
-
 ```
-uv run --with pytest pytest dedup_sim/tests -q     # no install (needs a synced project)
-# or, if project sync fails / to reuse the existing .venv:
-uv pip install pytest
-python -m pytest dedup_sim/tests -q
+PYTHONPATH=. .venv/bin/python -m pytest dedup_sim/tests -q
 ```
 
-The tests are deterministic (they assert on the DES outcome and compare recorded
-trace strings, not on logging output or wall-clock timing).
+The tests assert the dedup **outcome** on the real directory (not wall-clock
+timing): every reader receives the payload; fabric is the 1x union vs `m x`
+naive; the fan-out cap shapes a chain/tree; and the trace is byte-identical
+across runs (default and under a fixed random-scheduling seed). The exact-byte
+reassembly guarantee of the real client is covered separately in
+`../realsim/tests/test_correctness.py`.
 
-## The user-facing entry point takes no extra args
-
-The only call a "user" makes is:
-
-```python
-client.get(reader, key, need)
-```
-
-exactly mirroring `ts.get` -- **no** promise/wait/dedup arguments leak to the
-caller. The coordinator (routing, promises, parking, fan-out) is invoked
-entirely *inside* `get`. `client.put(key, volume_id, region)` seeds the index.
-
-## What the coordinator does (as simulated here)
-
-- The first reader to need an atomic region pulls it from a **trainer** volume
-  and becomes its (promised) cache source.
-- Later readers of the same region are routed to a **present or promised** peer
-  -- never re-pulling from the trainer -- and are **parked** until the peer's
-  promise resolves (the store-mediated "done" = the puller's `notify_put`).
-- Source choice prefers locality (a pure cost model: shm < nvlink < cross-node).
-- A **fan-out cap** bounds concurrent serves per source, producing a balanced
-  chain (`cap=1`) or shallow tree (`cap>=1`) incrementally. Two counters keep
-  this honest: a plan-time tally shapes the tree; an execution-time slot queue
-  guarantees no source ever exceeds the cap (excess consumers queue instead of
-  re-pulling from the trainer, so fabric stays 1x).
-- State is per `(key, version)`; a new `put` bumps the version and drops stale
-  cache.
-
-## Module layout (SPEC §10)
+## Module layout
 
 ```
-sim_common/            reusable DES library (repo root)
-  engine.py            Sim (DES event loop) + Promise (dependency primitive)
-  topology.py          Tier / TIER_LABEL / locality / transfer_time skeleton
-  controller_probe.py  silenced real-Controller import probe -> HAVE_REAL
-  trace.py             generic Trace event recorder (record/render, tunable widths)
-  report.py            configure_logging + section header helpers for the demo
 dedup_sim/
-  SPEC.md              source-of-truth spec
-  __main__.py          `python -m dedup_sim` demo (trace + summary + ASCII)
-  sim/store_index.py   real-Controller probe (HAVE_REAL from sim_common) + faithful shim
-  sim/model.py         Volume, Region, atomic-region splitting
-  sim/cost.py          dedup TIERS + transfer_time (delegates to sim_common.topology)
-  sim/coordinator.py   NaiveCoordinator (baseline) + DedupCoordinator (dynamic dedup)
-  sim/client.py        Client.get/put -- the no-API-change entry point
-  sim/trace.py         dedup Metrics + event/summary/ASCII rendering (Trace from sim_common)
-  sim/scenarios.py     toy burst, reshard, versioning scenarios + run harness
-  tests/test_sim.py    SPEC §8 assertions (pytest, deterministic)
+  __init__.py     package doc
+  policy.py       DedupPolicy (a real realsim ReadPolicy) + the routing handle
+  scenario.py     build/run the dedup burst (reuses realsim wiring) + naive baseline
+  __main__.py     `python -m dedup_sim` demo (fabric summary + ASCII + trace)
+  tests/          the dedup-outcome assertions (pytest, deterministic)
 ```
 
-The DES engine, the locality/transfer-time cost skeleton, the generic `Trace`
-event recorder, the logging/section-header helpers, and the silenced
-real-`Controller` import probe live in the repo-root `sim_common/` package (a
-reusable DES library); this sim keeps its own bandwidth constants, domain model,
-and the dedup-specific `Metrics` + ASCII rendering.
+All the real-object plumbing -- adapters, seams, coordinator, cost model, async
+engine, meta/metadata carriers -- is imported from `realsim` / `sim_common`;
+`dedup_sim` adds only the dedup policy and its scenario.
 
-## Store-index path
+## Honesty note
 
-We attempt to import the real `torchstore.controller.Controller` (via the shared
-`sim_common.controller_probe`, which exposes `HAVE_REAL`). Even when it
-imports, its endpoints are `@endpoint async` Monarch-actor methods that need an
-actor runtime to drive and operate on torchstore-internal
-`Request`/`TensorSlice`/`Trie` types -- neither of which a plain single-threaded
-sim can use without spawning Monarch (out of scope). So the sim uses a
-**faithful shim** (`StoreIndex`) that mirrors the controller's storage-index
-semantics (`key -> {volume_id -> set[Region]}`) with matching method names
-(`locate` ~ `locate_volumes`, `notify_put` ~ `notify_put_batch`, `keys`), so a
-later swap to the real controller is mechanical. The `__main__` output prints
-which path was taken.
-
-## Scenarios & tests (SPEC §8)
-
-1. **Correctness** -- every generator ends holding exactly its `need`.
-2. **1x fabric** -- dedup trainer->gen bytes == union of needs; naive == mx;
-   dedup < naive.
-3. **Fan-out respected** -- no source exceeds `FANOUT_CAP` concurrent serves.
-4. **Determinism** -- two runs yield byte-identical trace strings.
-5. **Versioning** -- a `put` bump invalidates the cache (next burst re-pulls);
-   without a bump, the cache serves the second burst (zero trainer fabric).
-6. **Reshard** -- trainer stores one partition, generators want another (with
-   overlap); assembled result is correct and fabric is still 1x.
-
-Note (honesty): dedup optimizes **bytes moved**. Wallclock depends on
-`FANOUT_CAP`/topology -- a `cap=1` chain has more hops and can be slower in
-wallclock than the naive broadcast, while `cap=2` narrows the gap. The demo
-prints both so the tradeoff is visible.
+Dedup optimizes **fabric bytes**. Both policies deliver the full payload to every
+reader (`total delivered` is `m x` in both); dedup cuts the *origin* fabric to
+1x. Wallclock depends on `fanout_cap`/topology: a `cap=1` chain has more hops
+(more wallclock, still 1x fabric); a `cap=2` tree overlaps siblings and narrows
+the gap. The demo prints both so the tradeoff is visible.

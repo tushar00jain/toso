@@ -9,12 +9,34 @@ via the ``tiers`` argument.
 
 ``src`` and ``dst`` are duck-typed: they only need ``.id`` (identity),
 ``.host`` (shared-memory domain) and ``.node`` (intra-node domain) attributes.
+
+This module is the **canonical home** of the :class:`Endpoint` transfer-identity
+dataclass. Both ``dedup_sim``'s ``Volume`` and ``realsim``'s endpoints reduce to
+the same ``(id, host, node)`` trio -- reuse :class:`Endpoint` (``realsim`` also
+re-exports it from ``realsim.seams.transport``) rather than re-declaring it.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, Tuple
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """A transfer endpoint: the minimal locality identity :func:`transfer_time` needs.
+
+    Only three attributes matter to the cost model: ``id`` (identity -- a
+    same-``id`` transfer is free), ``host`` (shared-memory domain) and ``node``
+    (intra-node / NVLink domain). This is the shared shape that both the
+    ``dedup_sim`` ``Volume`` and ``realsim``'s endpoints reduce to; keep new
+    endpoint/locality types reusing this one instead of re-declaring the trio.
+    """
+
+    id: str
+    host: str
+    node: str
 
 
 class Tier(IntEnum):

@@ -180,7 +180,7 @@ combine rather than replace.
      │ aggregator│         │ aggregator│         │ aggregator│        aggregators
      │ (rack/rgn)│         │ (rack/rgn)│         │ (rack/rgn)│        (bounded fan-in)
      └─────┬─────┘         └─────┬─────┘         └─────┬─────┘
-           └───────────────┬─────┴───────────────────┘
+           └───────────────┬─────┴─────────────────────┘
                            ▼
               ┌──────────────────────────────┐    also pulls the keys→volumes
               │      ROOT aggregator          │◄── index from the torchstore
@@ -192,13 +192,13 @@ combine rather than replace.
                               │  one connection, line-JSON
                               ▼
  ┌──────────────────────── a machine elsewhere ────────────────────────┐
- │  toso-tui (Rust) — ONE connection, never touches nodes               │
- │    data::Provider (trait)                                            │
- │      ├─ FileProvider   (dev: static JSON fixtures)                   │
- │      └─ AggregatorClient (TCP; summary + drill-down queries)         │
- │    model:: Summary / Group / KeyEntry / ShardMap  (serde)            │
+ │  toso-tui (Rust) — ONE connection, never touches nodes              │
+ │    data::Provider (trait)                                           │
+ │      ├─ FileProvider   (dev: static JSON fixtures)                  │
+ │      └─ AggregatorClient (TCP; summary + drill-down queries)        │
+ │    model:: Summary / Group / KeyEntry / ShardMap  (serde)           │
  │    ui:: views + drill-stack + event loop (ratatui + crossterm)      │
- └──────────────────────────────────────────────────────────────────────┘
+ └─────────────────────────────────────────────────────────────────────┘
 ```
 
 The Rust binary never speaks Monarch or Python, never contacts a training node,
@@ -349,14 +349,14 @@ expand lazily via `expand_prefix` / `list_volumes` as the user drills in.
 ┌ toso-tui · torchstore · LocalRankStrategy · 1,048,576 vols · 5,203 keys · [live 2s] ┐
 │ keys ▸ model ▸ layers                              scope: (all)   sort: partial↓    │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
-│  NAME                    KEYS    DTENSORS   PARTIAL   BYTES     STATUS               │
-│  ▸ 0                       120        120       2 ⚠   1.4 TB    degraded             │
-│  ▸ 7                       120        120       1 ⚠   1.4 TB    degraded             │
-│  ▸ 1                       120        120       —     1.4 TB    ok                   │
-│  ▸ 2                       120        120       —     1.4 TB    ok                   │
+│  NAME                    KEYS    DTENSORS   PARTIAL   BYTES     STATUS              │
+│  ▸ 0                       120        120       2 ⚠   1.4 TB    degraded            │
+│  ▸ 7                       120        120       1 ⚠   1.4 TB    degraded            │
+│  ▸ 1                       120        120       —     1.4 TB    ok                  │
+│  ▸ 2                       120        120       —     1.4 TB    ok                  │
 │  … 28 more (window 4/32 · PgDn for next page — lazy, paged)                         │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
-│ ↑↓ move · l/⏎ drill · h/esc back · / filter · : jump · s sort · p peek · r · ? · q   │
+│ ↑↓ move · l/⏎ drill · h/esc back · / filter · : jump · s sort · p peek · r · ? · q  │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 

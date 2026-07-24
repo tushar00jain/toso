@@ -1,1 +1,1 @@
-"""Reusable building blocks for discrete-event simulations (engine, topology, controller probe)."""
+"""Reusable building blocks for discrete-event simulations (engines, topology/cost model, trace, reporting)."""

@@ -2,8 +2,8 @@
 
 A [`ratatui`](https://ratatui.rs) terminal UI for inspecting a running
 **TorchStore** — its topology (strategy, volumes, hosts) and contents (keys,
-tensor/object metadata, DTensor shard layout). Read-only. See `SPEC.md` for the
-design.
+tensor/object metadata, DTensor shard layout). Read-only. See
+[`../docs/tui_design.md`](../docs/tui_design.md) for the design.
 
 It reads from a `Provider`: either a directory of JSON snapshot files
 (`--fixtures`) or a live agent over TCP (`--aggregator`). Both speak the same §5

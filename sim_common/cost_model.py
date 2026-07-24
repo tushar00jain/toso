@@ -1,0 +1,224 @@
+"""Analytic, target-machine resource cost model (sibling to ``topology.py``).
+
+Every cost here is a *deterministic function of a modeled quantity* (``nbytes``
+or ``flops``) and a caller-supplied :class:`MachineProfile` of target-hardware
+constants. Nothing is measured on the host running the simulation -- measuring
+would couple the sim to the test box and misrepresent the production machine.
+This module generalizes :func:`sim_common.topology.transfer_time` (network is
+just one resource); it does not fork it -- :func:`network_time` wraps it.
+
+Design shape (mirrors ``transfer_time``):
+
+* constants live in the profile, never baked into the functions;
+* each cost fn is ``modeled_quantity x profile -> time`` and returns ``0.0`` for
+  a zero quantity (or a same-endpoint network transfer);
+* pure arithmetic only -- no clocks, threads, RNG, or measurement, so the whole
+  module passes ``realsim/tools/check_contract.py``.
+
+Units are arbitrary but must be *consistent within a profile*: a bandwidth is
+``bytes / time`` and a flop rate is ``flops / time``, so ``nbytes / bandwidth``
+and ``flops / flop_rate`` both come out in the profile's time unit (the same
+unit ``topology.transfer_time`` produces). :data:`DEFAULT_PROFILE` is an
+**illustrative** demo profile -- plausible relative magnitudes, *not measured*
+from any real device; production callers supply their own from scenario config.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Mapping, Tuple
+
+from sim_common.topology import Tier, transfer_time
+
+__all__ = [
+    "MachineProfile",
+    "DEFAULT_PROFILE",
+    "network_time",
+    "mem_copy_time",
+    "storage_time",
+    "compute_time",
+]
+
+# Device families the compute roofline understands. Anything in ``_GPU_DEVICES``
+# uses ``gpu_flops`` / ``gpu_mem_bandwidth``; everything else falls back to the
+# host (``cpu_flops`` / ``ram_bandwidth``).
+_GPU_DEVICES = frozenset({"cuda", "gpu", "hip", "xpu"})
+_STORAGE_KINDS = frozenset({"read", "write"})
+
+
+@dataclass(frozen=True)
+class MachineProfile:
+    """Target-hardware constants for the analytic cost model (caller-supplied).
+
+    All fields are hardware descriptors kept in scenario/config, never hard-coded
+    inside a seam. Bandwidths are ``bytes / time`` and flop rates are
+    ``flops / time`` in one consistent (arbitrary) time unit.
+
+    Network:
+        tiers: per-:class:`~sim_common.topology.Tier` ``(latency, bandwidth)``
+            map, exactly the shape :func:`~sim_common.topology.transfer_time`
+            consumes.
+
+    RAM / host memory:
+        ram_bandwidth: host memory copy bandwidth (bytes/time).
+        ram_latency: fixed per-copy host memory latency (time).
+
+    Persistent storage:
+        storage_read_bw / storage_write_bw: read / write bandwidth (bytes/time).
+        storage_latency: fixed per-op storage latency (time), applied to both
+            read and write.
+
+    Compute:
+        gpu_flops: per-dtype device flop rate (flops/time), keyed by dtype name
+            (e.g. ``"float32"``, ``"bfloat16"``). Missing dtypes fall back to
+            :attr:`gpu_flops_default` -- peak flops legitimately vary by dtype on
+            real accelerators, so this is a mapping rather than a scalar.
+        gpu_flops_default: fallback device flop rate for a dtype not in
+            :attr:`gpu_flops`.
+        gpu_mem_bandwidth: device (HBM) memory bandwidth (bytes/time); the memory
+            term of the compute roofline on a GPU device.
+        cpu_flops: host flop rate (flops/time); a single scalar (host dtype
+            differences are not modeled). The host memory term of the roofline
+            uses :attr:`ram_bandwidth`.
+
+    Host<->device transfer:
+        h2d_bandwidth / d2h_bandwidth: host-to-device / device-to-host copy
+            bandwidth (bytes/time). Optional helpers for callers that model PCIe
+            staging; the core cost fns do not require them.
+    """
+
+    tiers: Mapping[Tier, Tuple[float, float]]
+
+    ram_bandwidth: float
+    ram_latency: float = 0.0
+
+    storage_read_bw: float = 0.0
+    storage_write_bw: float = 0.0
+    storage_latency: float = 0.0
+
+    gpu_flops: Mapping[str, float] = field(default_factory=dict)
+    gpu_flops_default: float = 0.0
+    gpu_mem_bandwidth: float = 0.0
+
+    cpu_flops: float = 0.0
+
+    h2d_bandwidth: float = 0.0
+    d2h_bandwidth: float = 0.0
+
+
+# Illustrative demo profile -- plausible *relative* magnitudes only, NOT measured
+# from real hardware. Reuses the per-tier network constants convention from
+# ``realsim/seams/transport.py``. Callers building real scenarios should supply
+# their own profile instead of leaning on these numbers.
+DEFAULT_PROFILE = MachineProfile(
+    tiers={
+        Tier.SHM: (0.0001, 150000.0),
+        Tier.NVLINK: (0.0002, 60000.0),
+        Tier.RDMA: (0.0010, 10000.0),
+    },
+    ram_bandwidth=200000.0,
+    ram_latency=0.00005,
+    storage_read_bw=20000.0,
+    storage_write_bw=10000.0,
+    storage_latency=0.001,
+    gpu_flops={
+        "float32": 1.0e9,
+        "float16": 2.0e9,
+        "bfloat16": 2.0e9,
+    },
+    gpu_flops_default=1.0e9,
+    gpu_mem_bandwidth=800000.0,
+    cpu_flops=5.0e7,
+    h2d_bandwidth=25000.0,
+    d2h_bandwidth=25000.0,
+)
+
+
+def _is_gpu(device: str) -> bool:
+    """True if ``device`` names a compute accelerator (vs. the host CPU)."""
+    return device.lower() in _GPU_DEVICES
+
+
+def _effective_flops(flops_dtype: str, device: str, profile: MachineProfile) -> float:
+    """Resolve the peak flop rate for ``(dtype, device)`` from the profile.
+
+    GPU devices use the per-dtype :attr:`MachineProfile.gpu_flops` map (falling
+    back to :attr:`gpu_flops_default`); the host uses the scalar
+    :attr:`cpu_flops`.
+    """
+    if _is_gpu(device):
+        return profile.gpu_flops.get(flops_dtype, profile.gpu_flops_default)
+    return profile.cpu_flops
+
+
+def _mem_bandwidth(device: str, profile: MachineProfile) -> float:
+    """Memory bandwidth backing the roofline's memory term for ``device``."""
+    return profile.gpu_mem_bandwidth if _is_gpu(device) else profile.ram_bandwidth
+
+
+def network_time(src, dst, nbytes: int, profile: MachineProfile) -> float:
+    """Time to move ``nbytes`` from ``src`` to ``dst`` over the network.
+
+    Thin wrapper over :func:`sim_common.topology.transfer_time` using the
+    profile's per-tier ``(latency, bandwidth)`` map. A same-endpoint or zero-byte
+    transfer is free (delegated to ``transfer_time``). ``src``/``dst`` are
+    duck-typed on ``.id``/``.host``/``.node`` (see
+    :class:`sim_common.topology.Endpoint`).
+    """
+    return transfer_time(src, dst, nbytes, profile.tiers)
+
+
+def mem_copy_time(nbytes: int, profile: MachineProfile) -> float:
+    """Time to copy ``nbytes`` through host RAM (latency + bytes/bandwidth).
+
+    Returns ``0.0`` for a zero-byte copy.
+    """
+    if nbytes <= 0:
+        return 0.0
+    return profile.ram_latency + nbytes / profile.ram_bandwidth
+
+
+def storage_time(nbytes: int, kind: str, profile: MachineProfile) -> float:
+    """Time to read or write ``nbytes`` to persistent storage.
+
+    ``kind`` is ``"read"`` or ``"write"`` (selecting the matching bandwidth);
+    the fixed :attr:`MachineProfile.storage_latency` is added to both. Returns
+    ``0.0`` for a zero-byte op. Raises :class:`ValueError` for an unknown kind.
+    """
+    if kind not in _STORAGE_KINDS:
+        raise ValueError(f"storage kind must be one of {sorted(_STORAGE_KINDS)}, got {kind!r}")
+    if nbytes <= 0:
+        return 0.0
+    bw = profile.storage_read_bw if kind == "read" else profile.storage_write_bw
+    return profile.storage_latency + nbytes / bw
+
+
+def compute_time(
+    flops: float,
+    dtype: str,
+    device: str,
+    profile: MachineProfile,
+    nbytes: int = 0,
+) -> float:
+    """Roofline compute time: ``max(flops / effective_flops, nbytes / mem_bw)``.
+
+    A kernel is bounded by whichever is slower: doing the arithmetic at the
+    device's peak flop rate for ``dtype``, or streaming ``nbytes`` through its
+    memory. Pass ``nbytes`` (the bytes the kernel touches) to model the
+    memory-bound side; omit it (``0``) for a pure-compute estimate.
+
+    ``device`` selects the flop rate and memory bandwidth: a GPU-family device
+    (``"cuda"``/``"gpu"``/...) uses :attr:`MachineProfile.gpu_flops` +
+    :attr:`gpu_mem_bandwidth`; anything else uses :attr:`cpu_flops` +
+    :attr:`ram_bandwidth`. Returns ``0.0`` when both quantities are zero.
+    """
+    compute_term = 0.0
+    if flops > 0:
+        eff = _effective_flops(dtype, device, profile)
+        compute_term = flops / eff
+
+    mem_term = 0.0
+    if nbytes > 0:
+        mem_term = nbytes / _mem_bandwidth(device, profile)
+
+    return max(compute_term, mem_term)

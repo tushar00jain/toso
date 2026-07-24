@@ -2,38 +2,41 @@
 
 Both share an interface so scenarios/tests can swap them:
 
-    schedule(request, now) -> Plan | None      # None == rejected (SLO/overload)
-    on_complete(plan) -> list[evicted]         # publish blocks, admit, evict
+    await schedule(request, now) -> Plan | None    # None == rejected (SLO/overload)
+    await on_complete(plan) -> list[evicted]        # publish blocks, evict
 
-``schedule`` models the cache-aware coordinator's serialized mailbox: in the DES it
-runs to completion before the next event, so routing sees a consistent directory
-snapshot. Prefill cost is deterministic, so the *predicted* TTFT used for routing
-equals the *actual* completion time (prefill time is highly predictable).
+``schedule`` models the cache-aware coordinator's serialized mailbox: the real
+directory read (``locate_volumes``) completes without suspending the loop, so the
+whole routing decision runs atomically before the next event -- routing sees a
+consistent directory snapshot. Prefill cost is deterministic, so the *predicted*
+TTFT used for routing equals the *actual* completion time.
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM): route to the least-loaded instance;
-  reuse only that instance's **local** cache; never pull a remote prefix. This is
-  "balance by load, cache is local-only."
-* ``CacheAwareScheduler`` (cache-aware coordinator): route to minimize predicted TTFT
-  using the **global** prefix-match directory, optionally pulling a remote prefix
-  (which read-through-populates -> hot-block replication) under a balance threshold.
+  reuse only that instance's **local** cache; never pull a remote prefix.
+* ``CacheAwareScheduler`` (cache-aware coordinator): route to minimize predicted
+  TTFT using the **global** prefix-match directory (the real ``locate_volumes``),
+  optionally pulling a remote prefix (a real ``client.get`` that read-through-
+  populates the destination -> hot-block replication) under a balance threshold.
+
+Only the directory (real ``Controller``), the data-plane ops (real
+``client.put``/``get``) and the costs (real ``cost_model``) are real; the routing
+*algorithm* is unchanged from the model.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+from sim_common.cost_model import MachineProfile
+from sim_common.topology import Endpoint
 
 from . import cost
 from .cache import LRUCache
-from .cost import (
-    locality,
-    prefill_time,
-    transfer_time,
-)
+from .cluster import Cluster
+from .cost import block_bytes, fetch_time, prefill_time, PROFILE
 from .decode import DecodeEngine
-from sim_common.engine import Sim
-from .index import BlockIndex
-from .model import block_bytes, Instance, longest_prefix_run, Request
+from .model import longest_prefix_run, Request
 
 
 @dataclass
@@ -52,6 +55,9 @@ class Plan:
     ttft: float                  # time-to-first-token (queue + transfer + prefill)
     done_time: float             # absolute sim time prefill completes
     decode_done: float
+    prefill_t: float = 0.0       # prefill compute duration
+    transfer_t: float = 0.0      # predicted remote-pull fetch duration
+    pull_keys: List[str] = field(default_factory=list)  # gap blocks to fetch
     pred_tbt: float = 0.0        # predicted time-between-tokens at admission
     pred_batch: int = 0          # predicted decode batch size at admission
 
@@ -59,51 +65,53 @@ class Plan:
 class _Base:
     """Shared state + prediction/commit helpers for both schedulers."""
 
-    def __init__(self, sim: Sim, index: BlockIndex, instances: List[Instance],
-                 block_tokens: int, bytes_per_token: int,
-                 capacity: Optional[int] = None,
-                 decode_pool: Optional[List[str]] = None,
-                 prefill_pool: Optional[List[str]] = None,
-                 slo_ttft: float = float("inf"),
-                 slo_tbt: float = float("inf"),
-                 simulate_decode: bool = False, max_batch: int = 8,
-                 coupled: bool = False, early_rejection: str = "off") -> None:
-        self.sim = sim
-        self.index = index
-        self.topo: Dict[str, Instance] = {i.id: i for i in instances}
+    def __init__(
+        self,
+        loop,
+        cluster: Cluster,
+        *,
+        block_tokens: int,
+        capacity: Optional[int] = None,
+        profile: MachineProfile = PROFILE,
+        decode_pool: Optional[List[str]] = None,
+        prefill_pool: Optional[List[str]] = None,
+        slo_ttft: float = float("inf"),
+        slo_tbt: float = float("inf"),
+        simulate_decode: bool = False,
+        max_batch: int = 8,
+        coupled: bool = False,
+        early_rejection: str = "off",
+    ) -> None:
+        self.loop = loop
+        self.cluster = cluster
+        self.topo: Dict[str, Endpoint] = cluster.topology
         self.ids: List[str] = sorted(self.topo)
         self.B = block_tokens
-        self.bpt = bytes_per_token
-        self.caches: Dict[str, LRUCache] = {
-            i: LRUCache(capacity) for i in self.ids
-        }
-        # Prefill queue tail over ALL instances (the disaggregated-prefill pool
-        # may be a subset; decode may be a disjoint or overlapping subset).
+        self.profile = profile
+        self.caches: Dict[str, LRUCache] = {i: LRUCache(capacity) for i in self.ids}
+        # Prefill queue tail over ALL instances (the disaggregated-prefill pool may
+        # be a subset; decode may be a disjoint or overlapping subset).
         self.busy_until: Dict[str, float] = {i: 0.0 for i in self.ids}
-        self.prefill_ids: List[str] = sorted(prefill_pool) if prefill_pool else self.ids
+        self.prefill_ids: List[str] = (
+            sorted(prefill_pool) if prefill_pool else self.ids
+        )
         self.decode_ids: List[str] = sorted(decode_pool) if decode_pool else self.ids
         self.slo_ttft = slo_ttft
         self.slo_tbt = slo_tbt
-        # ``off``  -> no TBT gate at routing; late-reject at decode admission.
-        # ``early``-> reject at routing on predicted current occupancy.
-        # ``predict`` -> reject at routing on occupancy predicted at prefill done,
-        #             including in-flight prefills that will land on that pool.
         self.early_rejection = early_rejection
         self.max_batch = max_batch
         self.coupled = coupled
         self.tbt_enabled = simulate_decode
-        # The client installs this to be notified when a request emits its last
-        # decode token (carrying that request's worst observed inter-token gap).
         self.on_decode_finish = None
-        # Prefills reserved but not yet admitted to decode, used only by the
-        # ``predict`` mode: (prefill_done_time, decode_id, output_tokens).
         self._inflight: List[Tuple[float, str, int]] = []
         if simulate_decode:
-            # A COUPLED instance shares its compute timeline with prefill (a long
-            # prefill stalls the next decode step). A DISAGGREGATED pool gets its
-            # own private timeline (engine makes one), so prefill never blocks it.
+            # COUPLED shares its compute timeline with prefill (a long prefill
+            # stalls the next decode step); a DISAGGREGATED pool gets its own.
             self.engine: Optional[DecodeEngine] = DecodeEngine(
-                sim, self.decode_ids, max_batch=max_batch,
+                loop,
+                self.decode_ids,
+                max_batch=max_batch,
+                profile=profile,
                 compute_busy=(self.busy_until if coupled else None),
                 on_finish=self._decode_finished,
             )
@@ -111,8 +119,7 @@ class _Base:
             self.engine = None
 
     # -- prediction (no mutation) ---------------------------------------- #
-    def _predict(self, inst: str, now: float, transfer_t: float,
-                 prefill_t: float):
+    def _predict(self, inst: str, now: float, transfer_t: float, prefill_t: float):
         """Return ``(queue_wait, ttft, done_time)`` without reserving the server."""
         avail = max(now, self.busy_until[inst])
         queue_wait = avail - now
@@ -121,52 +128,45 @@ class _Base:
 
     # -- decode-side TBT prediction / admission -------------------------- #
     def _decode_finished(self, request: Request, tbt: float) -> None:
-        """Bridge the engine's completion callback to the client (if installed)."""
         if self.on_decode_finish is not None:
             self.on_decode_finish(request, tbt)
 
     def _predicted_batch(self, d: str, done_time: float) -> int:
         """Predicted decode batch size on ``d`` seen by a request admitted at
-        ``done_time`` (its prefill completion). Drives TBT prediction.
-
-        ``off``/``early`` use the live occupancy now (a cheap snapshot); ``predict``
-        estimates the occupancy at ``done_time`` -- how many current occupants are
-        still decoding then, plus any *in-flight* prefills that will have landed on
-        ``d`` and not yet drained. This is the Mooncake decode-load prediction that
-        lets the scheduler reject before wasting prefill.
-        """
+        ``done_time`` (its prefill completion). Drives TBT prediction."""
         if self.engine is None:
             return 0
         if self.early_rejection == "predict":
             n = self.engine.predict_occupancy(d, done_time)
             for pd_done, dec_id, out in self._inflight:
-                if (dec_id == d and pd_done <= done_time
-                        and pd_done + max(0, out - 1) * cost.TBT_BASE > done_time):
+                if (
+                    dec_id == d
+                    and pd_done <= done_time
+                    and pd_done + max(0, out - 1) * cost.decode_step_time(1, self.profile)
+                    > done_time
+                ):
                     n += 1
             return n
         return self.engine.occupancy(d)
 
     def _select_decode(self, done_time: float) -> Tuple[str, int]:
-        """Pick the decode instance with the smallest predicted batch (id tie-break)
-        and return ``(decode_id, predicted_batch)``."""
+        """Pick the decode instance with the smallest predicted batch (id tie-break)."""
         if self.engine is None:
             return (min(self.decode_ids), 0)
-        d = min(self.decode_ids,
-                key=lambda d: (self._predicted_batch(d, done_time), d))
+        d = min(
+            self.decode_ids, key=lambda d: (self._predicted_batch(d, done_time), d)
+        )
         return (d, self._predicted_batch(d, done_time))
 
     def _finalize_admission(self, plan: Plan) -> Optional[Plan]:
-        """Apply the SLO gates, then commit. ``None`` == rejected.
-
-        TTFT is always gated. TBT is gated here only in the ``early``/``predict``
-        modes (reject *before* prefill on a predicted violation); ``off`` defers the
-        TBT decision to :meth:`admit_decode` at prefill completion (a late reject
-        that wastes the prefill).
-        """
+        """Apply the SLO gates, then commit. ``None`` == rejected."""
         if plan.ttft > self.slo_ttft:
             return None
-        if (self.tbt_enabled and self.early_rejection in ("early", "predict")
-                and plan.pred_tbt > self.slo_tbt):
+        if (
+            self.tbt_enabled
+            and self.early_rejection in ("early", "predict")
+            and plan.pred_tbt > self.slo_tbt
+        ):
             return None
         return self._commit(plan)
 
@@ -174,67 +174,73 @@ class _Base:
         """Enter an accepted request into its decode batch at prefill completion.
 
         Returns ``False`` when decode cannot honour the TBT SLO. In ``off`` mode
-        this is the only TBT gate, so a rejection here means the prefill was already
-        spent -- a *wasted* prefill (the cost of not predicting decode load).
+        this is the only TBT gate, so a rejection here means the prefill was
+        already spent -- a *wasted* prefill.
         """
         if self.engine is None:
             return True
         if self.early_rejection == "off":
-            pred = cost.decode_step_time(self.engine.occupancy(plan.decode) + 1)
+            pred = cost.decode_step_time(self.engine.occupancy(plan.decode) + 1, self.profile)
             if pred > self.slo_tbt:
                 return False  # late reject -> wasted prefill
         self.engine.admit(plan.request, plan.decode)
         return True
 
     # -- commit / completion --------------------------------------------- #
-    def on_complete(self, plan: Plan) -> List[str]:
-        """Publish the request's blocks on its prefill instance (read-through, K4).
+    async def on_complete(self, plan: Plan) -> List[str]:
+        """Publish the request's newly-materialized blocks on its prefill instance.
 
         After prefill the instance holds KV for the whole prompt, so we admit every
         block key into its cache (evicting the coldest past capacity) and register
-        the presence in the directory. Returns the evicted keys.
+        the *new* blocks' presence in the REAL directory via a metadata-only put
+        (the blocks already cached locally are not re-put). Returns evicted keys.
         """
         keys = list(plan.request.block_keys)
         cache = self.caches[plan.prefill]
+        already = cache.held()
+        new_keys = [k for k in keys if k not in already]
         evicted = cache.admit(keys)
-        for k in keys:
-            self.index.notify_put(k, plan.prefill)
-        for k in evicted:
-            self.index.notify_delete(k, plan.prefill)
+        await self.cluster.publish(plan.prefill, new_keys)
+        if evicted:
+            await self.cluster.evict(plan.prefill, evicted)
         return evicted
 
     def _commit(self, plan: Plan) -> Plan:
-        """Reserve the prefill server for an accepted plan (decode is admitted later,
-        at prefill completion, via :meth:`admit_decode`)."""
+        """Reserve the prefill server for an accepted plan (decode admitted later)."""
         self.busy_until[plan.prefill] = plan.done_time
-        # A cache hit on the matched prefix counts as an access (LRU recency).
         matched = list(plan.request.block_keys[: plan.match_blocks])
         self.caches[plan.prefill].touch(matched)
-        # ``predict`` mode tracks reserved-but-not-yet-decoding prefills so a later
-        # request can foresee the decode load they will add. Prune stale entries
-        # (their prefill has already completed) before recording this one.
         if self.early_rejection == "predict" and self.engine is not None:
-            self._inflight = [e for e in self._inflight if e[0] >= self.sim.now]
+            self._inflight = [e for e in self._inflight if e[0] >= self.loop.time()]
             self._inflight.append(
-                (plan.done_time, plan.decode, plan.request.output_tokens))
+                (plan.done_time, plan.decode, plan.request.output_tokens)
+            )
         return plan
 
 
 class LoadBalanceScheduler(_Base):
     """Baseline: route to the least-loaded instance; local-only cache reuse."""
 
-    def schedule(self, request: Request, now: float) -> Optional[Plan]:
+    async def schedule(self, request: Request, now: float) -> Optional[Plan]:
         keys = list(request.block_keys)
         prompt = request.prompt_tokens
+        # Consult the real directory for per-instance prefix presence; the
+        # baseline only reuses the instance it routes to (local-only cache).
+        counts = await self.cluster.prefix_lengths(keys)
         pick = min(self.prefill_ids, key=lambda i: (self.busy_until[i], i))
-        match = longest_prefix_run(keys, self.caches[pick].held())
+        match = counts.get(pick, 0)
         cached = min(match * self.B, prompt)
         uncached = prompt - cached
-        qw, ttft, done = self._predict(pick, now, 0.0, prefill_time(uncached))
+        pt = prefill_time(uncached, self.profile)
+        qw, ttft, done = self._predict(pick, now, 0.0, pt)
         d, pred_batch = self._select_decode(done)
-        pred_tbt = cost.decode_step_time(pred_batch + 1) if self.engine else 0.0
-        plan = Plan(request, pick, d, match, cached, uncached, None, 0,
-                    qw, ttft, done, 0.0)
+        pred_tbt = (
+            cost.decode_step_time(pred_batch + 1, self.profile) if self.engine else 0.0
+        )
+        plan = Plan(
+            request, pick, d, match, cached, uncached, None, 0, qw, ttft, done, 0.0
+        )
+        plan.prefill_t = pt
         plan.pred_tbt = pred_tbt
         plan.pred_batch = pred_batch
         return self._finalize_admission(plan)
@@ -243,11 +249,11 @@ class LoadBalanceScheduler(_Base):
 class CacheAwareScheduler(_Base):
     """Cache-aware coordinator: global prefix-match routing under a balance threshold."""
 
-    def __init__(self, *args, balance_threshold: float = 1.5,
-                 replicate: bool = True, **kwargs) -> None:
+    def __init__(self, *args, balance_threshold: float = 1.5, replicate: bool = True,
+                 **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Pull a remote prefix only when it is > threshold x the candidate's local
-        # match; otherwise prefer recompute (the kvcache balancing threshold).
+        # match; otherwise prefer recompute (the balancing threshold).
         self.balance_threshold = balance_threshold
         # When False, never pull a remote prefix (always recompute a missing
         # prefix locally). Used to isolate replication's contribution in the demo.
@@ -261,10 +267,11 @@ class CacheAwareScheduler(_Base):
         best_inst = min(i for i, n in prefix_counts.items() if n == best_len)
         return best_len, best_inst
 
-    def schedule(self, request: Request, now: float) -> Optional[Plan]:
+    async def schedule(self, request: Request, now: float) -> Optional[Plan]:
         keys = list(request.block_keys)
         prompt = request.prompt_tokens
-        prefix_counts = self.index.instances_with_prefix(keys)
+        # The cache-aware coordinator's core query, from the REAL directory.
+        prefix_counts = await self.cluster.prefix_lengths(keys)
         best_len, best_inst = self._best_remote(prefix_counts)
 
         best: Optional[Plan] = None
@@ -278,24 +285,39 @@ class CacheAwareScheduler(_Base):
             )
             if use_remote:
                 gap_blocks = best_len - local_len
-                xbytes = block_bytes(gap_blocks, self.B, self.bpt)
-                xt = transfer_time(self.topo[best_inst], self.topo[inst], xbytes)
+                pull_keys = keys[local_len:best_len]
+                xbytes = block_bytes(gap_blocks, self.B)
+                xt = fetch_time(
+                    self.topo[best_inst], self.topo[inst], xbytes, self.profile
+                )
                 cached = min(best_len * self.B, prompt)
                 uncached = prompt - cached
-                qw, ttft, done = self._predict(inst, now, xt, prefill_time(uncached))
+                pt = prefill_time(uncached, self.profile)
+                qw, ttft, done = self._predict(inst, now, xt, pt)
                 src, match, xb = best_inst, best_len, xbytes
             else:
+                pull_keys = []
                 cached = min(local_len * self.B, prompt)
                 uncached = prompt - cached
-                qw, ttft, done = self._predict(inst, now, 0.0, prefill_time(uncached))
+                pt = prefill_time(uncached, self.profile)
+                xt = 0.0
+                qw, ttft, done = self._predict(inst, now, 0.0, pt)
                 src, match, xb = None, local_len, 0
-            cand = Plan(request, inst, "", match, cached, uncached, src, xb,
-                        qw, ttft, done, 0.0)
+            cand = Plan(
+                request, inst, "", match, cached, uncached, src, xb, qw, ttft,
+                done, 0.0,
+            )
+            cand.prefill_t = pt
+            cand.transfer_t = xt
+            cand.pull_keys = list(pull_keys)
             if best is None or (cand.ttft, cand.prefill) < (best.ttft, best.prefill):
                 best = cand
 
         assert best is not None
         best.decode, best.pred_batch = self._select_decode(best.done_time)
         best.pred_tbt = (
-            cost.decode_step_time(best.pred_batch + 1) if self.engine else 0.0)
+            cost.decode_step_time(best.pred_batch + 1, self.profile)
+            if self.engine
+            else 0.0
+        )
         return self._finalize_admission(best)

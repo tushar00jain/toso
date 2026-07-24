@@ -1,37 +1,40 @@
-"""Batched decode engine (K6) -- the piece that makes TBT real.
+"""Batched decode engine -- the piece that makes time-between-tokens (TBT) real.
 
-The prefill path answers "how fast is the first token" (TTFT); this module answers
-"how fast is every *subsequent* token" (TBT, time-between-tokens). A serving
-instance decodes a **batch** of requests together: each decode *step* emits one
-token for every request in the batch, and the step's wall time is the TBT every
-batched request sees for that token. Step time rises with batch size
-(:func:`sim.cost.decode_step_time`), so TBT degrades as an instance fills up --
-exactly the tension a TBT SLO bounds (Mooncake §4.2).
+Prefill answers "how fast is the first token" (TTFT); this module answers "how fast
+is every *subsequent* token" (TBT). A serving instance decodes a **batch** of
+requests together: each decode *step* emits one token for every request in the
+batch, and the step's wall time is the TBT every batched request sees for that
+token. Step time rises with batch size (:func:`~kvcache_sim.sim.cost.decode_step_time`,
+charged on the GPU roofline), so TBT degrades as an instance fills up -- exactly
+the tension a TBT SLO bounds.
 
 Two levers the design cares about are modelled here:
 
-* **VRAM cap** (``max_batch``): aggregated KVCache is bounded, so a batch can only
-  grow so far. Requests over the cap queue (``pending``) and their wait counts
-  against their TBT -- i.e. VRAM pressure shows up as TBT violations, which is why
-  the scheduler must admit against a *predicted* batch, not just accept blindly.
+* **VRAM cap** (``max_batch``): a batch grows only to the cap; requests over it
+  queue (``pending``) and their wait counts against their TBT.
 * **Prefill/decode coupling**: when prefill and decode share an instance's compute
-  (``compute_busy`` aliased to the scheduler's prefill timeline), a long prefill
-  delays the next decode step, spiking that token's TBT. Disaggregation gives the
-  decode engine its own ``compute_busy`` so prefill can never stall decode -- the
-  central Mooncake result.
+  timeline (``compute_busy`` aliased to the scheduler's prefill ``busy_until``), a
+  long prefill delays the next decode step, spiking that token's TBT.
+  Disaggregation gives decode its own ``compute_busy`` so prefill never stalls it.
 
-Single-threaded and deterministic: steps are ``Sim`` events ordered by
-``(time, seq)``; recency/clocks are integer counters. No wall-clock, no randomness.
+Async & deterministic: each instance's decode runs as a coroutine on the shared
+:class:`~sim_common.async_engine.AsyncEngine` virtual clock -- one step per
+``await asyncio.sleep(step_time)``. Recency/clocks are the loop's virtual time; no
+wall-clock, no randomness.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from sim_common.engine import Sim
-from .cost import decode_step_time, TBT_BASE
+from .cost import decode_step_time, PROFILE
 from .model import Request
+
+# Batch=1 baseline step time, used by the decode-load prediction (each remaining
+# token is assumed to cost ~one uncontended step).
+_BASE_STEP = decode_step_time(1, PROFILE)
 
 
 @dataclass
@@ -53,25 +56,40 @@ class DecodeEngine:
     decode); pass a private dict for a **disaggregated** decode pool (no
     interference). ``on_finish(request, tbt_max)`` is called when a request emits
     its last token.
+
+    Args:
+        loop: the :class:`~sim_common.async_engine.AsyncEngine` (for the virtual
+            clock and task creation).
+        decode_ids: the decode instance ids.
+        max_batch: VRAM cap on a decode batch.
+        profile: target-machine profile driving :func:`decode_step_time`.
     """
 
-    def __init__(self, sim: Sim, decode_ids: List[str], *, max_batch: int,
-                 compute_busy: Optional[Dict[str, float]] = None,
-                 on_finish: Optional[Callable[[Request, float], None]] = None
-                 ) -> None:
-        self.sim = sim
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        decode_ids: List[str],
+        *,
+        max_batch: int,
+        profile=PROFILE,
+        compute_busy: Optional[Dict[str, float]] = None,
+        on_finish: Optional[Callable[[Request, float], None]] = None,
+    ) -> None:
+        self.loop = loop
         self.ids = sorted(decode_ids)
         self.max_batch = max_batch
+        self.profile = profile
         self.compute_busy: Dict[str, float] = (
-            compute_busy if compute_busy is not None
-            else {i: 0.0 for i in self.ids}
+            compute_busy if compute_busy is not None else {i: 0.0 for i in self.ids}
         )
         for i in self.ids:
             self.compute_busy.setdefault(i, 0.0)
         self.on_finish = on_finish
         self.batch: Dict[str, List[_Active]] = {i: [] for i in self.ids}
         self.pending: Dict[str, List[_Active]] = {i: [] for i in self.ids}
-        self._stepping: Dict[str, bool] = {i: False for i in self.ids}
+        self._step_task: Dict[str, Optional["asyncio.Task"]] = {
+            i: None for i in self.ids
+        }
 
     # -- queries used by the scheduler for TBT admission ------------------- #
     def occupancy(self, inst: str) -> int:
@@ -81,13 +99,13 @@ class DecodeEngine:
     def predict_occupancy(self, inst: str, at_t: float) -> int:
         """Estimate how many current occupants are *still* decoding at ``at_t``.
 
-        Uses the uniform per-token assumption (each remaining token ~ ``TBT_BASE``),
-        matching Mooncake's decode-load prediction: a request is still resident at
-        ``at_t`` if its estimated finish time is past ``at_t``.
+        Uses the uniform per-token assumption (each remaining token ~ one
+        uncontended step), matching the decode-load prediction: a request is still
+        resident at ``at_t`` if its estimated finish time is past ``at_t``.
         """
         n = 0
         for a in self.batch[inst] + self.pending[inst]:
-            finish = a.last_token_time + a.remaining * TBT_BASE
+            finish = a.last_token_time + a.remaining * _BASE_STEP
             if finish > at_t:
                 n += 1
         return n
@@ -105,34 +123,52 @@ class DecodeEngine:
             if self.on_finish is not None:
                 self.on_finish(request, 0.0)
             return
-        a = _Active(request=request, remaining=remaining,
-                    last_token_time=self.sim.now)
+        a = _Active(
+            request=request, remaining=remaining, last_token_time=self.loop.time()
+        )
         if len(self.batch[inst]) < self.max_batch:
             self.batch[inst].append(a)
         else:
             self.pending[inst].append(a)  # VRAM full: wait counts against TBT
-        self._schedule_step(inst)
+        self._ensure_stepping(inst)
 
-    def _schedule_step(self, inst: str) -> None:
-        """Schedule the next decode step on ``inst`` unless one is already pending."""
-        if self._stepping[inst] or not self.batch[inst]:
+    def _ensure_stepping(self, inst: str) -> None:
+        """Start ``inst``'s decode-step loop unless one is already running."""
+        task = self._step_task[inst]
+        if (task is not None and not task.done()) or not self.batch[inst]:
             return
-        members = list(self.batch[inst])          # frozen for this step
-        dt = decode_step_time(len(members))
-        start = max(self.sim.now, self.compute_busy[inst])
-        step_end = start + dt
-        self.compute_busy[inst] = step_end
-        self._stepping[inst] = True
-        self.sim.schedule(
-            step_end - self.sim.now,
-            lambda: self._step_complete(inst, members, step_end),
-            label=f"decode_step:{inst}",
-        )
+        self._step_task[inst] = self.loop.create_task(self._run_steps(inst))
 
-    def _step_complete(self, inst: str, members: List[_Active],
-                       step_end: float) -> None:
+    async def _run_steps(self, inst: str) -> None:
+        """Emit tokens one step at a time until ``inst``'s batch drains."""
+        while self.batch[inst]:
+            members = list(self.batch[inst])       # frozen for this step
+            dt = decode_step_time(len(members), self.profile)
+            start = max(self.loop.time(), self.compute_busy[inst])
+            step_end = start + dt
+            self.compute_busy[inst] = step_end
+            await asyncio.sleep(step_end - self.loop.time())
+            self._step_complete(inst, members, step_end)
+
+    async def drain(self) -> None:
+        """Await all in-flight decode steps so every request finalizes.
+
+        The request coroutines finish at prefill completion, but decode continues
+        afterwards on its own step tasks; the driver calls this so the loop keeps
+        running until the last token of the last request is emitted.
+        """
+        while True:
+            tasks = [
+                t for t in self._step_task.values() if t is not None and not t.done()
+            ]
+            if not tasks:
+                return
+            await asyncio.gather(*tasks)
+
+    def _step_complete(
+        self, inst: str, members: List[_Active], step_end: float
+    ) -> None:
         """Emit one token for each member; retire finished; promote pending."""
-        self._stepping[inst] = False
         for a in members:
             if a not in self.batch[inst]:
                 continue  # defensive; members never leave mid-step in this model
@@ -148,4 +184,3 @@ class DecodeEngine:
         # A freed VRAM slot admits the next queued request (still counting its wait).
         while self.pending[inst] and len(self.batch[inst]) < self.max_batch:
             self.batch[inst].append(self.pending[inst].pop(0))
-        self._schedule_step(inst)

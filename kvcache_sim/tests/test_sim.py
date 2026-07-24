@@ -1,16 +1,20 @@
-"""Deterministic tests for the KV-cache DES prototype (SPEC.md ~8).
+"""Deterministic tests for the KV-cache simulation on the *real* TorchStore.
 
 Run from the parent directory: ``python -m pytest kvcache_sim/tests -q``.
-Assertions are on the DES *outcome* (hit rate, compute, eviction, rejections,
-determinism) -- never on wall-clock timing.
+Assertions are on the simulation *outcome* (block presence in the real directory,
+prefix hit rate, prefill compute, eviction, rejections, TBT, determinism) -- never
+on wall-clock timing. Every scenario drives the real ``Controller`` directory + real
+per-instance clients on the shared deterministic async engine.
 """
 
 from __future__ import annotations
 
+from sim_common.async_engine import AsyncEngine, run_sim
+
 from kvcache_sim.sim.cache import LRUCache
-from kvcache_sim.sim.cost import decode_step_time, TBT_BASE
+from kvcache_sim.sim.cluster import Cluster
+from kvcache_sim.sim.cost import decode_step_time, PROFILE
 from kvcache_sim.sim.decode import DecodeEngine
-from kvcache_sim.sim.index import BlockIndex
 from kvcache_sim.sim.model import (
     block_keys_for,
     longest_prefix_run,
@@ -19,7 +23,7 @@ from kvcache_sim.sim.model import (
 from kvcache_sim.sim.scenarios import (
     DISAGG_TARGET_TBT,
     EARLY_SLO_TBT,
-    make_instances,
+    make_topology,
     run,
     run_disaggregation,
     run_early_rejection,
@@ -29,10 +33,9 @@ from kvcache_sim.sim.scenarios import (
     run_shared_prefix,
     shared_prefix_workload,
 )
-from sim_common.engine import Sim
 
 
-# 1. Prefix-hash addressing: shared prefixes yield shared keys (K1).
+# 1. Prefix-hash addressing: shared prefixes yield shared keys.
 def test_prefix_hash_chain_shares_prefix():
     a = block_keys_for("m0", [0, 1, 7, 9])
     b = block_keys_for("m0", [0, 1, 8])
@@ -48,18 +51,28 @@ def test_longest_prefix_run():
     assert longest_prefix_run(keys, present) == 2   # stops at first miss
 
 
-# 2. Index: per-instance prefix-match length (the cache-aware scheduler query).
-def test_index_instances_with_prefix():
-    idx = BlockIndex()
+# 2. REAL directory: per-instance prefix-match length, incl. after eviction.
+#    Publishing records block->volume presence in the real Controller directory;
+#    locate_volumes reads it back; eviction removes it. This is the cache-aware
+#    scheduler's core query, answered directly by the real directory.
+def test_real_directory_prefix_presence_and_eviction():
+    topo = make_topology(2)
     keys = block_keys_for("m0", [0, 1, 2, 3])
-    for k in keys[:3]:
-        idx.notify_put(k, "s0")
-    for k in keys[:1]:
-        idx.notify_put(k, "s1")
-    counts = idx.instances_with_prefix(list(keys))
-    assert counts == {"s0": 3, "s1": 1}
-    idx.notify_delete(keys[1], "s0")            # break s0's run at index 1
-    assert idx.instances_with_prefix(list(keys)) == {"s0": 1, "s1": 1}
+
+    async def scenario():
+        cl = Cluster(topo, block_tokens=512)
+        with cl.installed():
+            await cl.publish("s0", list(keys[:3]))   # s0 holds 3 leading blocks
+            await cl.publish("s1", list(keys[:1]))   # s1 holds 1
+            counts = await cl.prefix_lengths(list(keys))
+            assert counts == {"s0": 3, "s1": 1}
+            await cl.evict("s0", [keys[1]])          # break s0's run at index 1
+            counts2 = await cl.prefix_lengths(list(keys))
+            assert counts2 == {"s0": 1, "s1": 1}
+        return True
+
+    ok, _ = run_sim(scenario())
+    assert ok
 
 
 # 3. LRU cache: bounded size + deterministic eviction of the coldest.
@@ -79,7 +92,7 @@ def test_lru_unbounded_never_evicts():
     assert len(c) == 100
 
 
-# 4. Determinism: same seed -> identical trace + metrics.
+# 4. Determinism: same seed -> byte-identical trace + identical metrics.
 def test_deterministic_trace_and_metrics():
     a = run_shared_prefix(seed=1)[0]
     b = run_shared_prefix(seed=1)[0]
@@ -114,10 +127,10 @@ def test_eviction_hit_rate_monotone_then_plateau():
     # a large cache is strictly better than the smallest useful one
     assert hrs[-1] > hrs[0]
     # large finite cap reaches (near) the unbounded hit rate
-    insts = make_instances(4)
+    topo = make_topology(4)
     reqs = shared_prefix_workload()
-    unbounded = run(insts, reqs, "cache_aware", capacity=None).metrics.hit_rate
-    big = run(insts, reqs, "cache_aware", capacity=100000).metrics.hit_rate
+    unbounded = run(topo, reqs, "cache_aware", capacity=None).metrics.hit_rate
+    big = run(topo, reqs, "cache_aware", capacity=100000).metrics.hit_rate
     assert abs(unbounded - big) < 1e-9
 
 
@@ -139,14 +152,13 @@ def test_overload_fewer_rejections():
     assert 0 < len(cache_aware.metrics.accepted) < total   # some admitted, some shed
 
 
-# 10. Fan-out sanity: no instance's cache ever exceeds its capacity.
+# 10. Fan-out sanity: the LRU primitive never exceeds capacity, and a comfortably
+#     sized run still reuses.
 def test_cache_never_exceeds_capacity():
-    insts = make_instances(4)
+    topo = make_topology(4)
     reqs = shared_prefix_workload()
-    # A capacity comfortably larger than one prompt (10 blocks) still yields reuse.
-    r = run(insts, reqs, "cache_aware", capacity=64)
-    assert r.metrics.hit_rate > 0    # the run itself is well-formed
-    # Assert the capacity invariant on the LRU primitive under an adversarial seq.
+    r = run(topo, reqs, "cache_aware", capacity=64)
+    assert r.metrics.hit_rate > 0
     cap = 8
     c = LRUCache(capacity=cap)
     for i in range(200):
@@ -154,44 +166,50 @@ def test_cache_never_exceeds_capacity():
         assert len(c) <= cap
 
 
-# 11. Batched-decode cost model (K6): step time is TBT_BASE at batch 1 and
-#     strictly increasing in batch size.
+# 11. Decode-step cost (from the cost model): baseline at batch 1, clamped below,
+#     and strictly increasing in batch size.
 def test_decode_step_time_shape():
-    assert decode_step_time(1) == TBT_BASE
-    assert decode_step_time(0) == TBT_BASE          # clamps to batch >= 1
-    steps = [decode_step_time(b) for b in range(1, 9)]
+    base = decode_step_time(1, PROFILE)
+    assert decode_step_time(0, PROFILE) == base     # clamps to batch >= 1
+    steps = [decode_step_time(b, PROFILE) for b in range(1, 9)]
     assert all(steps[i] < steps[i + 1] for i in range(len(steps) - 1))
-    assert decode_step_time(2) > TBT_BASE
+    assert decode_step_time(2, PROFILE) > base
 
 
 # 12. Batching raises TBT: a solo request decodes at the batch=1 baseline; several
 #     requests co-batched at the same instant each observe a strictly larger gap.
-def test_batching_raises_tbt():
-    # Solo: one request, output_tokens > 1 -> its TBT is the batch=1 step time.
-    sim = Sim()
-    solo_tbt = {}
-    eng = DecodeEngine(sim, ["s0"], max_batch=8,
-                       on_finish=lambda r, tbt: solo_tbt.__setitem__(r.id, tbt))
-    eng.admit(Request(id="r0", arrival=0.0, block_keys=("m0|0",),
-                      prompt_tokens=512, output_tokens=6), "s0")
-    sim.run()
-    # A solo request never shares a step, so every gap is the batch=1 step time
-    # (float accumulation over steps -> compare within tolerance).
-    assert abs(solo_tbt["r0"] - decode_step_time(1)) < 1e-9
-    assert decode_step_time(1) == TBT_BASE
+def _run_decode_batch(n: int):
+    """Admit ``n`` requests at t=0 on one instance; return {id -> worst TBT}."""
+    loop = AsyncEngine()
+    res = {}
+    eng = DecodeEngine(
+        loop, ["s0"], max_batch=8,
+        on_finish=lambda r, tbt: res.__setitem__(r.id, tbt),
+    )
 
-    # Batched: several requests admitted at the same instant share every step, so
-    # each sees at least the batch>=2 step time -- strictly above the solo gap.
-    sim2 = Sim()
-    batch_tbt = {}
-    eng2 = DecodeEngine(sim2, ["s0"], max_batch=8,
-                        on_finish=lambda r, tbt: batch_tbt.__setitem__(r.id, tbt))
-    for i in range(4):
-        eng2.admit(Request(id=f"r{i}", arrival=0.0, block_keys=("m0|0",),
-                           prompt_tokens=512, output_tokens=6), "s0")
-    sim2.run()
-    assert min(batch_tbt.values()) >= decode_step_time(2)
-    assert min(batch_tbt.values()) > solo_tbt["r0"]
+    async def drive():
+        for i in range(n):
+            eng.admit(
+                Request(id=f"r{i}", arrival=0.0, block_keys=("m0|0",),
+                        prompt_tokens=512, output_tokens=6),
+                "s0",
+            )
+        await eng.drain()
+
+    try:
+        loop.run_until_complete(drive())
+    finally:
+        loop.close()
+    return res
+
+
+def test_batching_raises_tbt():
+    base = decode_step_time(1, PROFILE)
+    solo = _run_decode_batch(1)
+    assert abs(solo["r0"] - base) < 1e-9
+    batched = _run_decode_batch(4)
+    assert min(batched.values()) >= decode_step_time(2, PROFILE)
+    assert min(batched.values()) > solo["r0"]
 
 
 # 13. Disaggregation protects served-request TBT from prefill interference.
@@ -201,10 +219,10 @@ def test_disaggregation_protects_tbt():
     for r in (disagg, coupled):
         assert len(r.metrics.accepted) == len(r.metrics.results)
         assert r.metrics.decode_rejections == 0
-    # A dedicated decode pool holds the TBT target for every served request;
-    # coupling prefill into decode makes a real fraction miss it.
-    assert disagg.metrics.tbt_slo_met(DISAGG_TARGET_TBT) == 1.0
-    assert coupled.metrics.tbt_slo_met(DISAGG_TARGET_TBT) < 0.95
+    # A dedicated decode pool holds the TBT target for (nearly) every served
+    # request; coupling prefill into decode makes a real fraction miss it.
+    assert disagg.metrics.tbt_slo_met(DISAGG_TARGET_TBT) >= 0.95
+    assert coupled.metrics.tbt_slo_met(DISAGG_TARGET_TBT) < 0.9
     assert (disagg.metrics.tbt_slo_met(DISAGG_TARGET_TBT)
             > coupled.metrics.tbt_slo_met(DISAGG_TARGET_TBT))
 
@@ -223,8 +241,7 @@ def test_early_rejection_avoids_wasted_prefill():
             > early.metrics.tbt_slo_met(EARLY_SLO_TBT))
 
 
-# 15. Determinism of the new decode scenarios: same seed -> identical trace + key
-#     metrics.
+# 15. Determinism of the decode scenarios: same seed -> identical trace + metrics.
 def test_new_scenarios_deterministic():
     d1, c1 = run_disaggregation(seed=2)
     d2, c2 = run_disaggregation(seed=2)

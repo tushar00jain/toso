@@ -13,8 +13,7 @@ is **weight sync between a trainer/learner and a generator in RL**, including
 
 ## What's here
 
-The repo has three independent workstreams; the first two are pure-Python and
-need no build.
+The repo has three independent workstreams.
 
 **1. Design docs** (`docs/`) — how TorchStore works and two proposed capabilities
 layered on it.
@@ -29,13 +28,33 @@ layered on it.
   cache-aware coordinator, prefix-hash addressing, and eviction.
 
 **2. Discrete-event simulations** — each design has a companion deterministic DES
-that exercises the *algorithm* (not performance) on a simulated clock. Pure stdlib,
-no torch/threads/randomness in timekeeping; same input ⇒ byte-identical trace.
+that exercises the *algorithm* (not performance) on a simulated clock: no
+wall-clock, no threads, no randomness in timekeeping; same input ⇒ byte-identical
+trace. All three run the **real** TorchStore code (real
+client/controller/transport), so they depend on the from-source
+`torchstore`/`torch`/`monarch` build — not stdlib-only.
 
-- [`dedup_sim/`](dedup_sim/) — the dedup coordinator.
-- [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache coordinator.
-- [`sim_common/`](sim_common/) — the shared engine (`Sim`/`Promise`), locality
-  cost model, trace recorder, and reporting both sims build on.
+- [`realsim/`](realsim/) — the **real-code** cooperative DES foundation: it drives
+  the **real** TorchStore client planning core, controller directory, and
+  in-memory transport/store off-actor on a deterministic virtual clock, modeling
+  only the new read coordinator (with a pluggable `ReadPolicy` seam). It runs
+  **allocation-free** (zero-storage meta tensors / metadata-only descriptors, so a
+  modeled payload of any size costs no memory) and charges **every** resource —
+  network, storage, RAM, CPU, and GPU/compute — as analytic functions of a
+  *target-machine* `MachineProfile`, never measured on the box running the sim.
+- [`dedup_sim/`](dedup_sim/) — the dedup capability **on the real directory**:
+  `import realsim` and implement dedup routing as a real `ReadPolicy` (a 1× peer
+  read-through against the real `Controller`), plus the dedup scenario + metrics
+  (fabric bytes 1× vs naive *m×*).
+- [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
+  real directory**: the scheduler/decode/cache logic consults real KV-block
+  presence per instance (real `Controller`) and drives real fetches via
+  `realsim`'s client/engine/cost model.
+- [`sim_common/`](sim_common/) — the shared building blocks all three sims use:
+  the deterministic virtual-clock `AsyncEngine` (the sim path) plus the original
+  callback engine (`engine.py`: `Sim`/`Promise`), the locality/topology skeleton,
+  an analytic resource cost model (`cost_model.py`: `MachineProfile` +
+  network/RAM/storage/CPU/GPU functions), a trace recorder, and reporting helpers.
 - [`docs/des_explained.md`](docs/des_explained.md) — how the shared core works and
   how the two sims differ.
 
@@ -48,20 +67,28 @@ no torch/threads/randomness in timekeeping; same input ⇒ byte-identical trace.
   endpoints into that protocol's JSON.
 - [`tui/`](tui/) — a read-only [`ratatui`](https://ratatui.rs) terminal UI that
   reads the same protocol, live over TCP or from bundled JSON fixtures. See
-  [`tui/README.md`](tui/README.md).
+  [`tui/README.md`](tui/README.md) to run it and
+  [`docs/tui_design.md`](docs/tui_design.md) for its design.
 
-## Running the simulations (no build)
+## Running the simulations
 
-Pure stdlib, so all you need is the `.venv` at the repo root. Run from the repo
-directory:
+All three sims drive the **real** TorchStore code, so they need the from-source
+build below (`torchstore`/`torch`/`monarch` in the repo-root `.venv`). Once built,
+run from the repo directory with the venv interpreter and the repo on
+`PYTHONPATH`:
 
 ```bash
-uv run --no-sync python -m dedup_sim
-uv run --no-sync python -m kvcache_sim
+PYTHONPATH=. .venv/bin/python -m dedup_sim
+PYTHONPATH=. .venv/bin/python -m kvcache_sim
+PYTHONPATH=. .venv/bin/python -m realsim.run_realsim
 ```
 
-`--no-sync` reuses the existing venv instead of re-resolving the (heavier) live
-deps. See each sim's `README.md` for flags and `SPEC.md` for the harness contract.
+See each capability sim's `README.md` for flags, [`realsim/README.md`](realsim/README.md)
+for the real-code foundation, and the `docs/` design docs for how each capability
+works ([`realsim_design.md`](docs/realsim_design.md),
+[`torchstore_dedup_design.md`](docs/torchstore_dedup_design.md),
+[`torchstore_kvcache_design.md`](docs/torchstore_kvcache_design.md), and
+[`des_explained.md`](docs/des_explained.md)).
 
 ## Building the live example from source
 
