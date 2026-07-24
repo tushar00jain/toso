@@ -84,6 +84,14 @@ def main(argv=None) -> None:
         "default.",
     )
     parser.add_argument(
+        "--contention", choices=("none", "serialize", "progressive"), default=None,
+        help="network/storage contention model (default: none -- independent, "
+        "full-bandwidth transfers, the historical behavior). 'serialize' serves a "
+        "resource one transfer at a time; 'progressive' shares a resource's "
+        "bandwidth max-min fairly among concurrent transfers. Non-default modes "
+        "change timing (they are a fidelity model, not byte-identical to none).",
+    )
+    parser.add_argument(
         "-v", "--verbose", "--debug", action="store_true", dest="verbose",
         help="show the full per-event trace (log level DEBUG)",
     )
@@ -95,6 +103,7 @@ def main(argv=None) -> None:
     config.configure(
         fingerprint=args.fingerprint or None,
         real_directory=False if args.shim_directory else None,
+        contention=args.contention,
     )
 
     # Keep the ROOT logger at INFO so the real torchstore code's own DEBUG

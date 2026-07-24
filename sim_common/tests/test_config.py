@@ -96,6 +96,63 @@ def test_explicit_override_beats_env():
 
 
 # --------------------------------------------------------------------------
+# Contention flag: default, env sourcing, override precedence.
+# --------------------------------------------------------------------------
+
+_CONTENTION_ENV = "TOSO_CONTENTION"
+
+
+def _reset_contention() -> None:
+    os.environ.pop(_CONTENTION_ENV, None)
+    config.configure()
+
+
+def test_contention_default_is_none():
+    _reset_contention()
+    try:
+        assert config.current().contention == "none"
+    finally:
+        _reset_contention()
+
+
+def test_contention_env_is_parsed_and_lowercased():
+    _reset_contention()
+    try:
+        for raw, want in (("serialize", "serialize"), ("PROGRESSIVE", "progressive"),
+                          (" none ", "none")):
+            os.environ[_CONTENTION_ENV] = raw
+            config.configure()
+            assert config.current().contention == want, raw
+    finally:
+        _reset_contention()
+
+
+def test_contention_explicit_override_beats_env():
+    _reset_contention()
+    try:
+        os.environ[_CONTENTION_ENV] = "serialize"
+        # An explicit CLI value wins over the env.
+        config.configure(contention="progressive")
+        assert config.current().contention == "progressive"
+        # An unset (None) CLI flag defers to the env.
+        config.configure(contention=None)
+        assert config.current().contention == "serialize"
+    finally:
+        _reset_contention()
+
+
+def test_contention_overrides_scopes_and_restores():
+    _reset_contention()
+    try:
+        assert config.current().contention == "none"
+        with config.overrides(contention="progressive"):
+            assert config.current().contention == "progressive"
+        assert config.current().contention == "none"
+    finally:
+        _reset_contention()
+
+
+# --------------------------------------------------------------------------
 # Script fallback (no pytest required).
 # --------------------------------------------------------------------------
 

@@ -10,14 +10,22 @@ from a CLI flag) > ``TOSO_*`` environment variables > dataclass defaults. There
 is deliberately no config *file* yet; add a loader in :func:`configure` when a
 second or third knob makes it worthwhile.
 
-Scope discipline -- only cross-cutting *debug/output* flags belong here (whether
+Scope discipline -- mostly cross-cutting *debug/output* flags belong here (whether
 to maintain the trace hash chain, etc.). Anything that changes the *simulated
-result* -- a seed, a :class:`~sim_common.cost_model.MachineProfile` -- stays an
-explicit function argument, so a run is always reproducible from its call args and
-never from hidden global state. The flags here never affect event content or any
-measured metric, which is what makes an ambient read safe under the determinism
-contract: config is loaded once at startup (the environment is read there), so
-:func:`current` on the sim path is a plain in-memory attribute read.
+result* -- a seed, a :class:`~sim_common.cost_model.MachineProfile` -- normally
+stays an explicit function argument, so a run is always reproducible from its call
+args and never from hidden global state. Most flags here never affect event
+content or any measured metric, which is what makes an ambient read safe under the
+determinism contract: config is loaded once at startup (the environment is read
+there), so :func:`current` on the sim path is a plain in-memory attribute read.
+
+The one deliberate exception is :attr:`SimConfig.contention` (the network/storage
+contention model): it is a run-wide *fidelity* knob that DOES change measured
+timing. It is placed here so a run selects one model once, at startup, and every
+transport reads it ambiently -- there is no longer a per-scenario ``contention``
+override argument; the mode is read from this config everywhere. It remains
+deterministic under the contract: the mode is fixed for the whole run, not read
+per event, and re-rating is ordered by a monotonic transfer sequence.
 """
 
 from __future__ import annotations
@@ -56,6 +64,16 @@ class SimConfig:
     # tests). See realsim.adapters.real_controller.make_controller_adapter.
     real_directory: bool = True
 
+    # Network/storage contention model for the transport seam: one of
+    # ``"none"`` (default), ``"serialize"``, or ``"progressive"`` (see
+    # sim_common.resources). Unlike the flags above this DOES change measured
+    # timing -- it is a deliberate fidelity model, not a debug/output toggle. It
+    # is read ambiently everywhere (there is no per-scenario override argument):
+    # a run selects one mode once at startup, so a non-default mode is
+    # intentionally not byte-identical to ``"none"``. ``"none"`` reproduces the
+    # historical independent-sleep behavior exactly.
+    contention: str = "none"
+
 
 _current = SimConfig()
 
@@ -85,6 +103,9 @@ def _from_env() -> dict:
     real_directory = _bool_env("TOSO_REAL_DIRECTORY")
     if real_directory is not None:
         out["real_directory"] = real_directory
+    contention = os.environ.get("TOSO_CONTENTION")
+    if contention is not None:
+        out["contention"] = contention.strip().lower()
     return out
 
 

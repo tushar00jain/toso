@@ -116,13 +116,22 @@ def main(argv=None) -> None:
         "runs). Metrics are byte-identical either way; the real directory is the "
         "default.",
     )
+    parser.add_argument(
+        "--contention", choices=("none", "serialize", "progressive"), default=None,
+        help="network/storage contention model (default: none -- independent, "
+        "full-bandwidth transfers). 'serialize' serves a resource one transfer at "
+        "a time; 'progressive' shares a resource's bandwidth max-min fairly. "
+        "Non-default modes change wallclock (fabric bytes stay 1x for dedup).",
+    )
     args = parser.parse_args(argv)
 
     # Set the process config once from the CLI flags (unset -> env / default);
-    # the scenarios' Traces + controller adapters read it ambiently.
+    # the scenarios' Traces + controller adapters + resource registry read it
+    # ambiently.
     config.configure(
         fingerprint=args.fingerprint or None,
         real_directory=False if args.shim_directory else None,
+        contention=args.contention,
     )
 
     configure_logging(logging.DEBUG if args.verbose else logging.INFO)

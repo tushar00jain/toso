@@ -48,6 +48,7 @@ from realsim.adapters.real_controller import make_controller_adapter
 from realsim.seams.transport import Endpoint, InMemoryTransport, TensorDescriptor
 from realsim.seams.volume_handle import FakeVolumeHandle
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
+from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
 from .cost import BYTES_PER_TOKEN
@@ -75,6 +76,13 @@ class Cluster:
         real_directory: controller directory backing (``None`` -> the ambient
             :data:`sim_common.config.SimConfig.real_directory`, default real
             ``Trie``; ``False`` -> the lightweight dict shim). Changes no metric.
+
+    The network/storage contention model is read ambiently from
+    :data:`sim_common.config.SimConfig.contention` (default ``"none"``). One shared
+    :class:`~sim_common.resources.ResourceRegistry` is built here and injected into
+    every instance's transport, so concurrent cross-instance pulls share a hot
+    peer's egress / a volume's read channel. Unlike ``real_directory`` a
+    non-``"none"`` mode DOES change timing.
     """
 
     def __init__(
@@ -93,6 +101,8 @@ class Cluster:
         self.trace = trace if trace is not None else Trace()
         # Structured fabric-byte accounting filled by the transport factory.
         self.fabric_bytes: int = 0
+        # One shared resource layer for the whole run (default "none" -> inert).
+        self.registry = ResourceRegistry.from_config()
 
         self.controller = make_controller_adapter(real_directory)
         self.handle = self.controller.handle
@@ -106,6 +116,7 @@ class Cluster:
                 topology=topology,
                 profile=profile,
                 trace=self.trace,
+                registry=self.registry,
             )
             for vid in self.ids
         }
@@ -128,6 +139,7 @@ class Cluster:
         profile = self.profile
         trace = self.trace
         on_transfer = self._on_transfer
+        registry = self.registry
 
         def factory(storage_volume_ref) -> InMemoryTransport:
             return InMemoryTransport(
@@ -137,6 +149,7 @@ class Cluster:
                 profile=profile,
                 trace=trace,
                 on_transfer=on_transfer,
+                registry=registry,
             )
 
         original = _CLIENT_MODULE.create_transport_buffer

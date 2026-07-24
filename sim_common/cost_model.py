@@ -28,14 +28,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Mapping, Tuple
 
-from sim_common.topology import Tier, transfer_time
+from sim_common.topology import locality, Tier, transfer_time
 
 __all__ = [
     "MachineProfile",
     "DEFAULT_PROFILE",
     "network_time",
+    "network_rate",
     "mem_copy_time",
     "storage_time",
+    "storage_rate",
     "compute_time",
 ]
 
@@ -168,6 +170,21 @@ def network_time(src, dst, nbytes: int, profile: MachineProfile) -> float:
     return transfer_time(src, dst, nbytes, profile.tiers)
 
 
+def network_rate(src, dst, profile: MachineProfile) -> Tuple[float, float]:
+    """Return the ``(latency, bandwidth)`` of the fabric tier between two endpoints.
+
+    The contention-model decomposition of :func:`network_time`: for a non-trivial
+    transfer, ``network_time(...) == latency + nbytes / bandwidth`` with exactly
+    this ``(latency, bandwidth)``. The bandwidth is the shared quantity when
+    several transfers compete for one link (see :mod:`sim_common.resources`).
+
+    Callers must guard the free cases first: :func:`network_time` returns ``0.0``
+    for a same-endpoint or zero-byte transfer *without* consulting a tier, so this
+    helper is only meaningful for a real cross-endpoint transfer.
+    """
+    return profile.tiers[locality(src, dst)]
+
+
 def mem_copy_time(nbytes: int, profile: MachineProfile) -> float:
     """Time to copy ``nbytes`` through host RAM (latency + bytes/bandwidth).
 
@@ -191,6 +208,21 @@ def storage_time(nbytes: int, kind: str, profile: MachineProfile) -> float:
         return 0.0
     bw = profile.storage_read_bw if kind == "read" else profile.storage_write_bw
     return profile.storage_latency + nbytes / bw
+
+
+def storage_rate(kind: str, profile: MachineProfile) -> Tuple[float, float]:
+    """Return the ``(latency, bandwidth)`` of a storage read/write channel.
+
+    The contention-model decomposition of :func:`storage_time`: for a non-empty
+    op, ``storage_time(nbytes, kind, profile) == latency + nbytes / bandwidth``
+    with exactly this pair. The bandwidth is the shared quantity when several
+    ops hit one volume's read (or write) channel (see
+    :mod:`sim_common.resources`). Raises :class:`ValueError` for an unknown kind.
+    """
+    if kind not in _STORAGE_KINDS:
+        raise ValueError(f"storage kind must be one of {sorted(_STORAGE_KINDS)}, got {kind!r}")
+    bw = profile.storage_read_bw if kind == "read" else profile.storage_write_bw
+    return profile.storage_latency, bw
 
 
 def compute_time(

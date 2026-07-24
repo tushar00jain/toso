@@ -24,6 +24,13 @@ host RAM) + ``network`` (volume->client fabric). The producer-side ``compute``
 cost of generating the payload is charged by the scenario (see
 :mod:`realsim.scenarios.burst_get`), which knows the flop model.
 
+By default each charge is an independent virtual-clock sleep, so two concurrent
+transfers over the same fabric each assume the full bandwidth (no contention).
+Passing a shared :class:`~sim_common.resources.ResourceRegistry` opts into a
+contention model: the network and storage charges then register on a shared
+resource (the source's egress link; a volume's read/write channel) and concurrent
+transfers competing for it share its bandwidth. See :mod:`sim_common.resources`.
+
 We deliberately reuse ``MonarchRPCTransportBuffer`` (not RDMA/gloo/shm) because
 it is the transport that already round-trips data as plain in-process Python
 references, which is exactly what an in-memory sim needs. No parallel transport
@@ -47,9 +54,12 @@ from sim_common.cost_model import (
     DEFAULT_PROFILE,
     MachineProfile,
     mem_copy_time,
+    network_rate,
     network_time,
+    storage_rate,
     storage_time,
 )
+from sim_common.resources import ResourceRegistry
 from sim_common.topology import Endpoint
 from sim_common.trace import Trace
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
@@ -148,6 +158,13 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
             ``(kind, src_id, dst_id, nbytes, cost)`` after each charged *network*
             transfer, for structured fabric-byte accounting (see
             :class:`realsim.coordinator.model` metrics) without parsing the trace.
+        registry: optional shared :class:`~sim_common.resources.ResourceRegistry`
+            modeling network/storage contention. ``None`` (or a registry in
+            ``"none"`` mode) means each charge is an independent sleep -- the
+            historical, byte-identical behavior. Under ``"serialize"`` /
+            ``"progressive"`` the network and storage charges register on the
+            shared resource (source egress / per-volume read-write channel) so
+            concurrent transfers competing for one resource share its bandwidth.
     """
 
     def __init__(
@@ -159,6 +176,7 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         profile: MachineProfile | None = None,
         trace: Trace | None = None,
         on_transfer: Optional[Any] = None,
+        registry: ResourceRegistry | None = None,
     ) -> None:
         super().__init__(storage_volume_ref)
         self._src = src
@@ -166,6 +184,7 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         self._profile = profile if profile is not None else DEFAULT_PROFILE
         self._trace = trace
         self._on_transfer = on_transfer
+        self._registry = registry
 
     async def put_to_storage_volume(self, requests) -> None:
         # Real base-class put lifecycle runs first (data actually lands in the
@@ -197,12 +216,35 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         await asyncio.sleep(dt)
         return asyncio.get_running_loop().time()
 
+    def _contended(self, dt: float) -> bool:
+        """True when this charge should route through the shared resource layer.
+
+        A charge contends only when a registry is present, its mode is not
+        ``"none"``, and the analytic cost is non-trivial. A free transfer
+        (same-endpoint or zero-byte, ``dt <= 0``) never occupies a resource, so it
+        keeps the plain zero sleep -- identical to the ``"none"`` path (and to the
+        historical behavior).
+        """
+        return self._registry is not None and self._registry.mode != "none" and dt > 0
+
     async def _charge_network(
         self, src: Endpoint, dst: Endpoint, nbytes: int, kind: str
     ) -> None:
-        """Charge (and trace) the fabric cost of moving ``nbytes`` src->dst."""
+        """Charge (and trace) the fabric cost of moving ``nbytes`` src->dst.
+
+        Under a contention model the transfer registers on the *source's egress*
+        channel (``("net", src.id)``) and shares that link's bandwidth with any
+        concurrent transfers leaving the same source (the hot-source case).
+        """
         dt = network_time(src, dst, nbytes, self._profile)
-        now = await self._sleep(dt)
+        if self._contended(dt):
+            latency, bandwidth = network_rate(src, dst, self._profile)
+            await self._registry.transfer(
+                ("net", src.id), capacity=bandwidth, latency=latency, nbytes=nbytes
+            )
+            now = asyncio.get_running_loop().time()
+        else:
+            now = await self._sleep(dt)
         if self._trace is not None:
             self._trace.record(
                 now, "xfer", f"{kind} {src.id}->{dst.id} {nbytes}B cost={dt:.4f}"
@@ -211,16 +253,35 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
             self._on_transfer(kind, src.id, dst.id, nbytes, dt)
 
     async def _charge_storage(self, nbytes: int, kind: str) -> None:
-        """Charge (and trace) a persistent-storage read/write of ``nbytes``."""
+        """Charge (and trace) a persistent-storage read/write of ``nbytes``.
+
+        Under a contention model the op registers on the volume's per-direction
+        channel (``("store", volume_id, kind)``) so concurrent reads (or writes)
+        of one volume share its ``storage_read_bw`` (or ``storage_write_bw``).
+        """
         dt = storage_time(nbytes, kind, self._profile)
-        now = await self._sleep(dt)
+        if self._contended(dt):
+            latency, bandwidth = storage_rate(kind, self._profile)
+            await self._registry.transfer(
+                ("store", self._dst.id, kind),
+                capacity=bandwidth, latency=latency, nbytes=nbytes,
+            )
+            now = asyncio.get_running_loop().time()
+        else:
+            now = await self._sleep(dt)
         if self._trace is not None and dt > 0:
             self._trace.record(
                 now, "store", f"{kind} {self._dst.id} {nbytes}B cost={dt:.4f}"
             )
 
     async def _charge_mem(self, nbytes: int) -> None:
-        """Charge (and trace) a host-RAM staging copy of ``nbytes``."""
+        """Charge (and trace) a host-RAM staging copy of ``nbytes``.
+
+        Left as a plain sleep for now: RAM staging is not yet modeled as a shared
+        resource. It uses the very same mechanism as network/storage and could be
+        given a resource key (e.g. per host) later; contention is currently scoped
+        to network + storage per the fidelity design.
+        """
         dt = mem_copy_time(nbytes, self._profile)
         now = await self._sleep(dt)
         if self._trace is not None and dt > 0:

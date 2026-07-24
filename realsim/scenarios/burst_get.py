@@ -37,6 +37,7 @@ from realsim.seams.volume_handle import FakeVolumeHandle
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile, compute_time
 from sim_common.report import render_tree
+from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
 KEY = "W"
@@ -133,6 +134,13 @@ def build_burst(
     ambient :data:`sim_common.config.SimConfig.real_directory`, default real
     ``Trie``; ``False`` -> the lightweight dict shim). It changes no metric.
 
+    The network/storage contention model is read ambiently from
+    :data:`sim_common.config.SimConfig.contention` (default ``"none"``). One shared
+    :class:`~sim_common.resources.ResourceRegistry` is built here and injected into
+    the producer, every reader adapter, and the coordinator's shared transport
+    factory, so all transfers in the burst see the same links/stores. Unlike
+    ``real_directory`` a non-``"none"`` mode DOES change timing.
+
     The full resource model exercised by one run:
 
     * **compute/GPU** -- the producer's generate step (charged here, before the
@@ -161,6 +169,8 @@ def build_burst(
     metrics = metrics if metrics is not None else BurstMetrics()
     policy = policy if policy is not None else NaivePolicy()
     profile = profile if profile is not None else DEFAULT_PROFILE
+    # One shared resource layer for the whole run (default "none" -> inert).
+    registry = ResourceRegistry.from_config()
 
     topology = _topology(num_readers)
     volumes = {vid: FakeVolumeHandle() for vid in topology}
@@ -179,6 +189,7 @@ def build_burst(
         topology=topology,
         profile=profile,
         trace=trace,
+        registry=registry,
     )
 
     # Reader adapters (one per reader volume). Their .client is what the
@@ -195,6 +206,7 @@ def build_burst(
             topology=topology,
             profile=profile,
             trace=trace,
+            registry=registry,
         )
         reader_adapters.append(adapter)
         readers.append(
@@ -209,6 +221,7 @@ def build_burst(
         profile=profile,
         trace=trace,
         metrics=metrics,
+        registry=registry,
     )
 
     # W is the value we seed on the origin. Both carriers are allocation-free.

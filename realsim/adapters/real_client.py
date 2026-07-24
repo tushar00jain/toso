@@ -30,6 +30,7 @@ from typing import Iterator
 from realsim.seams.transport import Endpoint, InMemoryTransport
 from realsim.seams.volume_handle import FakeVolumeHandle
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
+from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 from torchstore.client import LocalClient
 from torchstore.strategy import StorageVolumeRef
@@ -85,6 +86,9 @@ class RealClientAdapter:
             supplying the cost constants (defaults to
             :data:`~sim_common.cost_model.DEFAULT_PROFILE`).
         trace: optional :class:`sim_common.trace.Trace` for transfer events.
+        registry: optional shared :class:`~sim_common.resources.ResourceRegistry`
+            for network/storage contention (``None`` -> independent sleeps, the
+            historical behavior). Passed to every transport this adapter builds.
     """
 
     def __init__(
@@ -96,6 +100,7 @@ class RealClientAdapter:
         topology: dict[str, Endpoint],
         profile: MachineProfile | None = None,
         trace: Trace | None = None,
+        registry: ResourceRegistry | None = None,
     ) -> None:
         self.strategy = FakeStrategy(client_volume_id, volume_handles)
         self.client = LocalClient(controller_handle, self.strategy)
@@ -105,6 +110,7 @@ class RealClientAdapter:
         self._client_endpoint = topology[client_volume_id]
         self._profile = profile if profile is not None else DEFAULT_PROFILE
         self._trace = trace
+        self._registry = registry
 
     def _transport_factory(self):
         def factory(storage_volume_ref: StorageVolumeRef) -> InMemoryTransport:
@@ -114,6 +120,7 @@ class RealClientAdapter:
                 dst=self._topology[storage_volume_ref.volume_id],
                 profile=self._profile,
                 trace=self._trace,
+                registry=self._registry,
             )
 
         return factory

@@ -30,6 +30,7 @@ from dedup_sim.scenario import (
     run_naive_burst,
 )
 from realsim.seams.transport import TensorDescriptor
+from sim_common import config
 
 MODES = (MODE_META, MODE_METADATA)
 PAYLOAD_BYTES = DEFAULT_N * 4  # DEFAULT_N float32 elements
@@ -141,6 +142,29 @@ def test_shim_directory_matches_real(mode):
     assert shim.metrics.total_get_bytes == real.metrics.total_get_bytes
     assert shim.metrics.wallclock == real.metrics.wallclock
     assert sorted(shim.metrics.edges) == sorted(real.metrics.edges)
+
+
+# 7c. Contention gate (Task D): the payoff metric -- 1x fabric -- is invariant to
+#     the network/storage contention model, which only changes *timing*. The
+#     dedup burst still crosses the fabric exactly once under none/serialize/
+#     progressive, and each mode is deterministic run-to-run.
+CONTENTION = ("none", "serialize", "progressive")
+
+
+@pytest.mark.parametrize("contention", CONTENTION)
+def test_dedup_stays_1x_under_every_contention_mode(contention):
+    with config.overrides(contention=contention):
+        dedup = run_dedup_burst(num_readers=4, fanout_cap=1)
+    assert dedup.metrics.fabric_bytes == PAYLOAD_BYTES  # 1x union, any mode
+    assert dedup.metrics.readers_done == dedup.metrics.readers_total == 4
+
+
+@pytest.mark.parametrize("contention", CONTENTION)
+def test_dedup_trace_is_byte_identical_per_contention_mode(contention):
+    with config.overrides(contention=contention):
+        a = run_dedup_burst(num_readers=3, fanout_cap=1)
+        b = run_dedup_burst(num_readers=3, fanout_cap=1)
+    assert a.trace.render() == b.trace.render()
 
 
 # 8. Allocation-free carriers survive the dedup path.

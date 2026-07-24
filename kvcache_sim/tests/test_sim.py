@@ -9,6 +9,8 @@ per-instance clients on the shared deterministic async engine.
 
 from __future__ import annotations
 
+import pytest
+
 from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
@@ -265,6 +267,22 @@ def test_shim_overload_rejections_match_real():
         shim = run_overload()[0]
     assert shim.metrics.rejections == real.metrics.rejections
     assert shim.trace.render() == real.trace.render()
+
+
+# 14c. Contention smoke (Task D): the shared-prefix scenario runs under each
+#      network/storage contention model and stays deterministic per mode. The
+#      registry is read ambiently by the Cluster (config.contention), mirroring
+#      how the dict-shim directory flag is wired.
+@pytest.mark.parametrize("contention", ("none", "serialize", "progressive"))
+def test_shared_prefix_runs_under_each_contention_mode(contention):
+    with config.overrides(contention=contention):
+        a = run_shared_prefix(seed=1)[0]
+        b = run_shared_prefix(seed=1)[0]
+    # Runs to completion, produces a sane reuse metric, and is deterministic.
+    assert 0.0 < a.metrics.hit_rate < 1.0
+    assert a.trace.render() == b.trace.render()
+    assert a.metrics.hit_rate == b.metrics.hit_rate
+    assert a.metrics.compute_tokens == b.metrics.compute_tokens
 
 
 # 15. Determinism of the decode scenarios: same seed -> identical trace + metrics.

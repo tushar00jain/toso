@@ -49,6 +49,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from realsim.seams.transport import Endpoint, InMemoryTransport
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
+from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
 # The real torchstore.client submodule (shadowed on the package by a `client`
@@ -165,6 +166,9 @@ class ReadCoordinator:
             :data:`~sim_common.cost_model.DEFAULT_PROFILE`).
         trace: shared :class:`~sim_common.trace.Trace`.
         metrics: shared :class:`BurstMetrics` (created if omitted).
+        registry: optional shared :class:`~sim_common.resources.ResourceRegistry`
+            for network/storage contention, installed into the shared transport
+            factory the burst uses (``None`` -> independent sleeps).
     """
 
     def __init__(
@@ -177,6 +181,7 @@ class ReadCoordinator:
         profile: Optional[MachineProfile] = None,
         trace: Optional[Trace] = None,
         metrics: Optional[BurstMetrics] = None,
+        registry: Optional[ResourceRegistry] = None,
     ) -> None:
         self.controller_handle = controller_handle
         self.topology = topology
@@ -185,6 +190,7 @@ class ReadCoordinator:
         self.profile = profile if profile is not None else DEFAULT_PROFILE
         self.trace = trace if trace is not None else Trace()
         self.metrics = metrics if metrics is not None else BurstMetrics()
+        self.registry = registry
 
     # -- the shared, contextvar-aware transport factory -------------------- #
     def _on_transfer(self, kind, src_id, dst_id, nbytes, cost) -> None:
@@ -204,6 +210,7 @@ class ReadCoordinator:
         profile = self.profile
         trace = self.trace
         on_transfer = self._on_transfer
+        registry = self.registry
 
         def factory(storage_volume_ref) -> InMemoryTransport:
             return InMemoryTransport(
@@ -213,6 +220,7 @@ class ReadCoordinator:
                 profile=profile,
                 trace=trace,
                 on_transfer=on_transfer,
+                registry=registry,
             )
 
         original = _CLIENT_MODULE.create_transport_buffer
