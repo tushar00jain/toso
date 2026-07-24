@@ -123,15 +123,24 @@ def main(argv=None) -> None:
         "a time; 'progressive' shares a resource's bandwidth max-min fairly. "
         "Non-default modes change wallclock (fabric bytes stay 1x for dedup).",
     )
+    parser.add_argument(
+        "--collapse-charges", action="store_true",
+        help="coalesce each transport op's per-component charges (a get's "
+        "storage+mem+network; a put's network+storage) into one virtual-clock "
+        "sleep, cutting the per-op event-loop bounces on the non-contended path. "
+        "Same total time in isolation and fabric stays 1x; not byte-identical "
+        "(the sub-charge instants collapse). Inert when --contention is not none.",
+    )
     args = parser.parse_args(argv)
 
     # Set the process config once from the CLI flags (unset -> env / default);
-    # the scenarios' Traces + controller adapters + resource registry read it
-    # ambiently.
+    # the scenarios' Traces + controller adapters + resource registry + the
+    # transport's collapse decision read it ambiently.
     config.configure(
         fingerprint=args.fingerprint or None,
         real_directory=False if args.shim_directory else None,
         contention=args.contention,
+        collapse_charges=args.collapse_charges or None,
     )
 
     configure_logging(logging.DEBUG if args.verbose else logging.INFO)

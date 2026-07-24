@@ -153,6 +153,67 @@ def test_contention_overrides_scopes_and_restores():
 
 
 # --------------------------------------------------------------------------
+# Collapse-charges flag: default, env sourcing, override precedence, scoping.
+# --------------------------------------------------------------------------
+
+_COLLAPSE_ENV = "TOSO_COLLAPSE_CHARGES"
+
+
+def _reset_collapse() -> None:
+    os.environ.pop(_COLLAPSE_ENV, None)
+    config.configure()
+
+
+def test_collapse_default_is_off():
+    _reset_collapse()
+    try:
+        assert config.current().collapse_charges is False
+    finally:
+        _reset_collapse()
+
+
+def test_collapse_env_is_parsed():
+    _reset_collapse()
+    try:
+        for raw in ("1", "true", "YES", "On"):
+            os.environ[_COLLAPSE_ENV] = raw
+            config.configure()
+            assert config.current().collapse_charges is True, raw
+        for raw in ("0", "false", "no", "off", ""):
+            os.environ[_COLLAPSE_ENV] = raw
+            config.configure()
+            assert config.current().collapse_charges is False, raw
+    finally:
+        _reset_collapse()
+
+
+def test_collapse_explicit_override_beats_env():
+    _reset_collapse()
+    try:
+        os.environ[_COLLAPSE_ENV] = "0"
+        # An explicit True wins over the env's false.
+        config.configure(collapse_charges=True)
+        assert config.current().collapse_charges is True
+        # An unset (None) CLI flag defers to the env's true.
+        os.environ[_COLLAPSE_ENV] = "1"
+        config.configure(collapse_charges=None)
+        assert config.current().collapse_charges is True
+    finally:
+        _reset_collapse()
+
+
+def test_collapse_overrides_scopes_and_restores():
+    _reset_collapse()
+    try:
+        assert config.current().collapse_charges is False
+        with config.overrides(collapse_charges=True):
+            assert config.current().collapse_charges is True
+        assert config.current().collapse_charges is False
+    finally:
+        _reset_collapse()
+
+
+# --------------------------------------------------------------------------
 # Script fallback (no pytest required).
 # --------------------------------------------------------------------------
 

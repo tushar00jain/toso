@@ -92,6 +92,15 @@ def main(argv=None) -> None:
         "change timing (they are a fidelity model, not byte-identical to none).",
     )
     parser.add_argument(
+        "--collapse-charges", action="store_true",
+        help="coalesce each transport op's per-component charges (a get's "
+        "storage+mem+network; a put's network+storage) into one virtual-clock "
+        "sleep, cutting the per-op event-loop bounces on the non-contended path. "
+        "Same total time in isolation and fabric bytes are unchanged; not "
+        "byte-identical (the sub-charge instants collapse). Inert when "
+        "--contention is not none.",
+    )
+    parser.add_argument(
         "-v", "--verbose", "--debug", action="store_true", dest="verbose",
         help="show the full per-event trace (log level DEBUG)",
     )
@@ -104,6 +113,7 @@ def main(argv=None) -> None:
         fingerprint=args.fingerprint or None,
         real_directory=False if args.shim_directory else None,
         contention=args.contention,
+        collapse_charges=args.collapse_charges or None,
     )
 
     # Keep the ROOT logger at INFO so the real torchstore code's own DEBUG

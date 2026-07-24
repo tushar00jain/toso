@@ -285,6 +285,30 @@ def test_shared_prefix_runs_under_each_contention_mode(contention):
     assert a.metrics.compute_tokens == b.metrics.compute_tokens
 
 
+# 14d. Collapse-charges gate: coalescing each transport op's per-component sleeps
+#      into one (a get's storage+mem+network) is a timing coarsening on the
+#      non-contended path -- the cache-aware payoff metrics (hit rate, compute
+#      saved) do not depend on the vanished sub-charge instants, so they are
+#      unchanged vs collapse-off, and the run stays deterministic. The flag is
+#      read ambiently by the Cluster's transports, like the contention flag.
+def test_shared_prefix_metrics_invariant_to_collapse():
+    off = run_shared_prefix(seed=1)[0]
+    with config.overrides(collapse_charges=True):
+        on = run_shared_prefix(seed=1)[0]
+    assert on.metrics.hit_rate == off.metrics.hit_rate
+    assert on.metrics.saved_tokens == off.metrics.saved_tokens
+    assert on.metrics.compute_tokens == off.metrics.compute_tokens
+    assert on.metrics.fabric_bytes == off.metrics.fabric_bytes
+
+
+def test_shared_prefix_collapse_is_deterministic():
+    with config.overrides(collapse_charges=True):
+        a = run_shared_prefix(seed=1)[0]
+        b = run_shared_prefix(seed=1)[0]
+    assert a.trace.render() == b.trace.render()
+    assert a.metrics.hit_rate == b.metrics.hit_rate
+
+
 # 15. Determinism of the decode scenarios: same seed -> identical trace + metrics.
 def test_new_scenarios_deterministic():
     d1, c1 = run_disaggregation(seed=2)

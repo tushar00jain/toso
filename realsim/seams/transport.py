@@ -31,6 +31,25 @@ contention model: the network and storage charges then register on a shared
 resource (the source's egress link; a volume's read/write channel) and concurrent
 transfers competing for it share its bandwidth. See :mod:`sim_common.resources`.
 
+Charging each component as its own ``asyncio.sleep`` means one op suspends the
+coroutine several times (a get three times, a put twice), and each suspend/resume
+is event-loop and timer-heap churn. The opt-in ``collapse_charges`` flag (ambient
+:data:`sim_common.config.SimConfig.collapse_charges`, or an explicit constructor
+arg) coalesces an op's component sleeps into a **single** combined sleep equal to
+the SUM of the component costs -- a get suspends once instead of three times, a
+put once instead of twice. The clock still advances by the exact same total, so a
+request's completion time in isolation is unchanged; it is *not* byte-identical to
+the per-component path because the intermediate sub-charge instants (after
+storage, after mem) vanish, so a concurrent coroutine may interleave differently.
+The trace still emits the same per-component rows (network/storage/RAM) and the
+``on_transfer`` fabric-byte callback still fires with the exact same byte counts;
+only the sub-charge *timestamps* collapse onto the op's single completion instant.
+Collapse is inert whenever a contention model is active (``contention != "none"``):
+there each component occupies a *different* shared resource and must be tracked
+separately, so the per-component awaits are intrinsic and cannot be merged. Thus
+collapse only trims bounces on the non-contended default path (the cheap/large-run
+case). Default OFF keeps today's exact per-component behavior.
+
 We deliberately reuse ``MonarchRPCTransportBuffer`` (not RDMA/gloo/shm) because
 it is the transport that already round-trips data as plain in-process Python
 references, which is exactly what an in-memory sim needs. No parallel transport
@@ -59,6 +78,7 @@ from sim_common.cost_model import (
     storage_rate,
     storage_time,
 )
+from sim_common import config
 from sim_common.resources import ResourceRegistry
 from sim_common.topology import Endpoint
 from sim_common.trace import Trace
@@ -165,6 +185,13 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
             ``"progressive"`` the network and storage charges register on the
             shared resource (source egress / per-volume read-write channel) so
             concurrent transfers competing for one resource share its bandwidth.
+        collapse_charges: coalesce an op's per-component sleeps into a single
+            combined virtual-clock sleep (``None`` -> the ambient
+            :data:`sim_common.config.SimConfig.collapse_charges`, default off; an
+            explicit ``bool`` wins). Only takes effect when no contention model is
+            active (``registry`` is ``None`` or in ``"none"`` mode) -- see the
+            module docstring; otherwise it is inert (the per-component awaits are
+            intrinsic to the multi-resource contention model).
     """
 
     def __init__(
@@ -177,6 +204,7 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         trace: Trace | None = None,
         on_transfer: Optional[Any] = None,
         registry: ResourceRegistry | None = None,
+        collapse_charges: bool | None = None,
     ) -> None:
         super().__init__(storage_volume_ref)
         self._src = src
@@ -185,6 +213,19 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         self._trace = trace
         self._on_transfer = on_transfer
         self._registry = registry
+        # Resolve the collapse flag like the other ambient knobs: an explicit
+        # arg wins, else the process-wide config (which itself came from the env /
+        # CLI / default). Collapse is *inert* under an active contention model --
+        # there each component occupies a different shared resource, so its awaits
+        # cannot be merged -- so bake that in once here: ``_collapse`` is True only
+        # on the non-contended default path.
+        flag = (
+            config.current().collapse_charges
+            if collapse_charges is None
+            else collapse_charges
+        )
+        contended = registry is not None and registry.mode != "none"
+        self._collapse = bool(flag) and not contended
 
     async def put_to_storage_volume(self, requests) -> None:
         # Real base-class put lifecycle runs first (data actually lands in the
@@ -193,8 +234,19 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         # volume's persistent store.
         nbytes = sum(_request_nbytes(r) for r in requests)
         await super().put_to_storage_volume(requests)
-        await self._charge_network(self._src, self._dst, nbytes, "put")
-        await self._charge_storage(nbytes, "write")
+        if self._collapse:
+            # One combined sleep for the whole put: network + storage-write. The
+            # clock advances by the exact same total; only the sub-charge instants
+            # collapse onto the single completion time. Trace rows + fabric-byte
+            # callback are still emitted per component, stamped at that instant.
+            dt_net = network_time(self._src, self._dst, nbytes, self._profile)
+            dt_store = storage_time(nbytes, "write", self._profile)
+            now = await self._sleep(dt_net + dt_store)
+            self._emit_network(self._src, self._dst, nbytes, "put", dt_net, now)
+            self._emit_storage(nbytes, "write", dt_store, now)
+        else:
+            await self._charge_network(self._src, self._dst, nbytes, "put")
+            await self._charge_storage(nbytes, "write")
 
     async def get_from_storage_volume(self, requests) -> list[Any]:
         # Real base-class get lifecycle runs first, then charge the resource
@@ -202,9 +254,22 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         # store and stages it through host RAM, then ships it over the fabric.
         results = await super().get_from_storage_volume(requests)
         nbytes = sum(_nbytes(r) for r in results)
-        await self._charge_storage(nbytes, "read")
-        await self._charge_mem(nbytes)
-        await self._charge_network(self._dst, self._src, nbytes, "get")
+        if self._collapse:
+            # One combined sleep for the whole get: storage-read + mem + network,
+            # instead of three. Same total clock advance; per-component trace rows
+            # + the network fabric-byte callback are emitted at the completion
+            # instant so accounting/metrics are unchanged.
+            dt_store = storage_time(nbytes, "read", self._profile)
+            dt_mem = mem_copy_time(nbytes, self._profile)
+            dt_net = network_time(self._dst, self._src, nbytes, self._profile)
+            now = await self._sleep(dt_store + dt_mem + dt_net)
+            self._emit_storage(nbytes, "read", dt_store, now)
+            self._emit_mem(nbytes, dt_mem, now)
+            self._emit_network(self._dst, self._src, nbytes, "get", dt_net, now)
+        else:
+            await self._charge_storage(nbytes, "read")
+            await self._charge_mem(nbytes)
+            await self._charge_network(self._dst, self._src, nbytes, "get")
         return results
 
     async def _sleep(self, dt: float) -> float:
@@ -227,6 +292,33 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         """
         return self._registry is not None and self._registry.mode != "none" and dt > 0
 
+    # -- trace/callback emitters (shared by the per-component and collapsed
+    #    paths so both record identical rows; only the timestamp differs) ---- #
+    def _emit_network(
+        self, src: Endpoint, dst: Endpoint, nbytes: int, kind: str, dt: float, now: float
+    ) -> None:
+        """Record the fabric row + fire the fabric-byte callback for a transfer."""
+        if self._trace is not None:
+            self._trace.record(
+                now, "xfer", f"{kind} {src.id}->{dst.id} {nbytes}B cost={dt:.4f}"
+            )
+        if self._on_transfer is not None:
+            self._on_transfer(kind, src.id, dst.id, nbytes, dt)
+
+    def _emit_storage(self, nbytes: int, kind: str, dt: float, now: float) -> None:
+        """Record a persistent-storage read/write row (skipped for a free op)."""
+        if self._trace is not None and dt > 0:
+            self._trace.record(
+                now, "store", f"{kind} {self._dst.id} {nbytes}B cost={dt:.4f}"
+            )
+
+    def _emit_mem(self, nbytes: int, dt: float, now: float) -> None:
+        """Record a host-RAM staging-copy row (skipped for a free op)."""
+        if self._trace is not None and dt > 0:
+            self._trace.record(
+                now, "mem", f"copy {self._dst.id} {nbytes}B cost={dt:.4f}"
+            )
+
     async def _charge_network(
         self, src: Endpoint, dst: Endpoint, nbytes: int, kind: str
     ) -> None:
@@ -245,12 +337,7 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
             now = asyncio.get_running_loop().time()
         else:
             now = await self._sleep(dt)
-        if self._trace is not None:
-            self._trace.record(
-                now, "xfer", f"{kind} {src.id}->{dst.id} {nbytes}B cost={dt:.4f}"
-            )
-        if self._on_transfer is not None:
-            self._on_transfer(kind, src.id, dst.id, nbytes, dt)
+        self._emit_network(src, dst, nbytes, kind, dt, now)
 
     async def _charge_storage(self, nbytes: int, kind: str) -> None:
         """Charge (and trace) a persistent-storage read/write of ``nbytes``.
@@ -269,10 +356,7 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
             now = asyncio.get_running_loop().time()
         else:
             now = await self._sleep(dt)
-        if self._trace is not None and dt > 0:
-            self._trace.record(
-                now, "store", f"{kind} {self._dst.id} {nbytes}B cost={dt:.4f}"
-            )
+        self._emit_storage(nbytes, kind, dt, now)
 
     async def _charge_mem(self, nbytes: int) -> None:
         """Charge (and trace) a host-RAM staging copy of ``nbytes``.
@@ -284,7 +368,4 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
         """
         dt = mem_copy_time(nbytes, self._profile)
         now = await self._sleep(dt)
-        if self._trace is not None and dt > 0:
-            self._trace.record(
-                now, "mem", f"copy {self._dst.id} {nbytes}B cost={dt:.4f}"
-            )
+        self._emit_mem(nbytes, dt, now)

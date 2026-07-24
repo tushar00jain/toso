@@ -167,6 +167,29 @@ def test_dedup_trace_is_byte_identical_per_contention_mode(contention):
     assert a.trace.render() == b.trace.render()
 
 
+# 7d. Collapse-charges gate: coalescing an op's per-component sleeps (a get's
+#     storage+mem+network into one) is a timing coarsening on the non-contended
+#     path -- it does not depend on sub-charge interleaving, so the dedup payoff
+#     metric (1x fabric, delivered bytes) is unchanged vs collapse-off, and it
+#     stays deterministic run-to-run.
+@pytest.mark.parametrize("mode", MODES)
+def test_dedup_1x_fabric_invariant_to_collapse(mode):
+    with config.overrides(collapse_charges=False):
+        off = run_dedup_burst(num_readers=4, fanout_cap=1, mode=mode)
+    with config.overrides(collapse_charges=True):
+        on = run_dedup_burst(num_readers=4, fanout_cap=1, mode=mode)
+    assert on.metrics.fabric_bytes == off.metrics.fabric_bytes == PAYLOAD_BYTES
+    assert on.metrics.total_get_bytes == off.metrics.total_get_bytes
+    assert sorted(on.metrics.edges) == sorted(off.metrics.edges)
+
+
+def test_dedup_collapse_is_deterministic():
+    with config.overrides(collapse_charges=True):
+        a = run_dedup_burst(num_readers=3, fanout_cap=1)
+        b = run_dedup_burst(num_readers=3, fanout_cap=1)
+    assert a.trace.render() == b.trace.render()
+
+
 # 8. Allocation-free carriers survive the dedup path.
 def test_meta_mode_allocates_no_storage():
     res = run_dedup_burst(num_readers=3, fanout_cap=1, mode=MODE_META)

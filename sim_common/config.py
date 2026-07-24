@@ -74,6 +74,21 @@ class SimConfig:
     # historical independent-sleep behavior exactly.
     contention: str = "none"
 
+    # Collapse each transport op's per-component resource charges into a single
+    # virtual-clock sleep (see sim_common.resources / realsim.seams.transport).
+    # Off by default -- today's exact per-component behavior. When ON *and*
+    # ``contention == "none"``, a get charges one combined sleep of
+    # ``storage+mem+network`` instead of three, and a put one of
+    # ``network+storage`` instead of two, cutting the event-loop bounces per op
+    # (the cheap large-run path). The combined sleep advances the clock by the
+    # exact same total, so a request's completion time in isolation is unchanged;
+    # it is NOT byte-identical because the intermediate sub-charge instants vanish
+    # (a documented coarsening -- a concurrent coroutine may interleave
+    # differently). It is inert when ``contention != "none"`` (there the
+    # per-component awaits are intrinsic to the multi-resource contention model),
+    # so this only reduces bounces on the non-contended default path.
+    collapse_charges: bool = False
+
 
 _current = SimConfig()
 
@@ -106,6 +121,9 @@ def _from_env() -> dict:
     contention = os.environ.get("TOSO_CONTENTION")
     if contention is not None:
         out["contention"] = contention.strip().lower()
+    collapse_charges = _bool_env("TOSO_COLLAPSE_CHARGES")
+    if collapse_charges is not None:
+        out["collapse_charges"] = collapse_charges
     return out
 
 
