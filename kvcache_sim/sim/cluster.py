@@ -39,12 +39,12 @@ from __future__ import annotations
 import contextvars
 import sys
 from contextlib import contextmanager
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional
 
 import torch
 
 from realsim.adapters.real_client import RealClientAdapter
-from realsim.adapters.real_controller import RealControllerAdapter
+from realsim.adapters.real_controller import make_controller_adapter
 from realsim.seams.transport import Endpoint, InMemoryTransport, TensorDescriptor
 from realsim.seams.volume_handle import FakeVolumeHandle
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
@@ -72,6 +72,9 @@ class Cluster:
             ``block_tokens * BYTES_PER_TOKEN``).
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`.
         trace: shared :class:`~sim_common.trace.Trace` for transfer events.
+        real_directory: controller directory backing (``None`` -> the ambient
+            :data:`sim_common.config.SimConfig.real_directory`, default real
+            ``Trie``; ``False`` -> the lightweight dict shim). Changes no metric.
     """
 
     def __init__(
@@ -81,6 +84,7 @@ class Cluster:
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         trace: Trace | None = None,
+        real_directory: Optional[bool] = None,
     ) -> None:
         self.topology = topology
         self.ids: List[str] = sorted(topology)
@@ -90,7 +94,7 @@ class Cluster:
         # Structured fabric-byte accounting filled by the transport factory.
         self.fabric_bytes: int = 0
 
-        self.controller = RealControllerAdapter()
+        self.controller = make_controller_adapter(real_directory)
         self.handle = self.controller.handle
         self._volumes = {vid: FakeVolumeHandle() for vid in self.ids}
         # One real LocalClient per instance (co-located with its own volume).

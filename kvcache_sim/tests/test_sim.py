@@ -9,6 +9,7 @@ per-instance clients on the shared deterministic async engine.
 
 from __future__ import annotations
 
+from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
 from kvcache_sim.sim.cache import LRUCache
@@ -239,6 +240,31 @@ def test_early_rejection_avoids_wasted_prefill():
     # 'early' (stale current-occupancy snapshot) cannot.
     assert (predict.metrics.tbt_slo_met(EARLY_SLO_TBT)
             > early.metrics.tbt_slo_met(EARLY_SLO_TBT))
+
+
+# 14b. Divergence gate: the opt-in dict-shim directory yields byte-identical
+#      trace + payoff metrics vs the real Trie directory (Task B). Same real
+#      Controller decision logic over a plain dict -> hit rate, TTFT, fabric
+#      bytes, rejections, and compute must all match exactly.
+def test_shim_directory_matches_real():
+    real = run_shared_prefix(seed=1)[0]
+    with config.overrides(real_directory=False):
+        shim = run_shared_prefix(seed=1)[0]
+    assert shim.trace.render() == real.trace.render()
+    assert shim.metrics.hit_rate == real.metrics.hit_rate
+    assert shim.metrics.mean_ttft == real.metrics.mean_ttft
+    assert shim.metrics.pct_ttft(90) == real.metrics.pct_ttft(90)
+    assert shim.metrics.compute_tokens == real.metrics.compute_tokens
+    assert shim.metrics.fabric_bytes == real.metrics.fabric_bytes
+    assert shim.metrics.rejections == real.metrics.rejections
+
+
+def test_shim_overload_rejections_match_real():
+    real = run_overload()[0]
+    with config.overrides(real_directory=False):
+        shim = run_overload()[0]
+    assert shim.metrics.rejections == real.metrics.rejections
+    assert shim.trace.render() == real.trace.render()
 
 
 # 15. Determinism of the decode scenarios: same seed -> identical trace + metrics.

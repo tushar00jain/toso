@@ -109,11 +109,21 @@ def main(argv=None) -> None:
         "folded from the trace on demand; off by default -- it is not part of the "
         "performance measurement)",
     )
+    parser.add_argument(
+        "--shim-directory", action="store_true",
+        help="back the controller directory with a lightweight dict shim instead "
+        "of the real torchstore Trie (opt-in; skips the per-key trie tax on scale "
+        "runs). Metrics are byte-identical either way; the real directory is the "
+        "default.",
+    )
     args = parser.parse_args(argv)
 
-    # Set the process config once from the CLI flag (unset -> env / default);
-    # the scenarios' Traces read it ambiently.
-    config.configure(fingerprint=args.fingerprint or None)
+    # Set the process config once from the CLI flags (unset -> env / default);
+    # the scenarios' Traces + controller adapters read it ambiently.
+    config.configure(
+        fingerprint=args.fingerprint or None,
+        real_directory=False if args.shim_directory else None,
+    )
 
     configure_logging(logging.DEBUG if args.verbose else logging.INFO)
     _demo()

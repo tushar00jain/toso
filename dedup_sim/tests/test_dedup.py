@@ -128,6 +128,21 @@ def test_all_readers_complete(mode):
         assert res.metrics.readers_done == res.metrics.readers_total == 5
 
 
+# 7b. Divergence gate: the opt-in dict-shim directory yields byte-identical
+#     trace + payoff metrics vs the real Trie directory (Task B). The shim runs
+#     the same real Controller decision logic over a plain dict, so the dedup 1x
+#     routing, fabric bytes, and delivered bytes must match exactly.
+@pytest.mark.parametrize("mode", MODES)
+def test_shim_directory_matches_real(mode):
+    real = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode, real_directory=True)
+    shim = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode, real_directory=False)
+    assert shim.trace.render() == real.trace.render()
+    assert shim.metrics.fabric_bytes == real.metrics.fabric_bytes
+    assert shim.metrics.total_get_bytes == real.metrics.total_get_bytes
+    assert shim.metrics.wallclock == real.metrics.wallclock
+    assert sorted(shim.metrics.edges) == sorted(real.metrics.edges)
+
+
 # 8. Allocation-free carriers survive the dedup path.
 def test_meta_mode_allocates_no_storage():
     res = run_dedup_burst(num_readers=3, fanout_cap=1, mode=MODE_META)

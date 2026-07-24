@@ -45,6 +45,17 @@ class SimConfig:
     # metric are byte-identical either way. See sim_common.trace.Trace.
     trace: bool = True
 
+    # Back the controller directory with the real torchstore Trie (True, default)
+    # or a lightweight dict shim (False). The shim runs every bit of the real
+    # Controller decision logic over a plain dict instead of a pygtrie Trie, so a
+    # scale run skips the per-key trie tax; it is opt-in because the faithful real
+    # directory is the default fidelity story. Like the flags above it never
+    # changes a measured metric -- only the container behind the same Mapping
+    # surface, and directory iteration order is never consumed by a metric -- so
+    # real and shim runs are byte-identical (asserted by the divergence-gate
+    # tests). See realsim.adapters.real_controller.make_controller_adapter.
+    real_directory: bool = True
+
 
 _current = SimConfig()
 
@@ -71,6 +82,9 @@ def _from_env() -> dict:
     trace = _bool_env("TOSO_TRACE")
     if trace is not None:
         out["trace"] = trace
+    real_directory = _bool_env("TOSO_REAL_DIRECTORY")
+    if real_directory is not None:
+        out["real_directory"] = real_directory
     return out
 
 

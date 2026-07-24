@@ -12,4 +12,8 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
 - ``controller_handle.FakeControllerHandle`` -- mimics the controller actor
   surface (``locate_volumes`` / ``notify_put_batch`` / ``keys``), dispatching to
   a real ``Controller`` instance's sync logic.
+- ``dict_directory.DictDirectory`` -- a plain-``dict`` stand-in for the
+  controller's ``Trie`` directory, presenting the same ``Mapping`` +
+  ``keys().filter_by_prefix`` surface so the opt-in shim adapter can skip the
+  per-key trie tax while the real ``Controller`` decision logic runs unchanged.
 """

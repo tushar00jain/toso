@@ -59,6 +59,7 @@ def run_dedup_burst(
     profile: Optional[MachineProfile] = None,
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
     random_seed: Optional[int] = None,
+    real_directory: Optional[bool] = None,
 ) -> BurstResult:
     """Run one dedup burst end-to-end on a fresh deterministic engine.
 
@@ -84,6 +85,7 @@ def run_dedup_burst(
         compute_device=compute_device,
         policy=policy,
         trace=trace,
+        real_directory=real_directory,
     )
     metrics = ctx["metrics"]
     policy._put_value = ctx["expected"]

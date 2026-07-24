@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from realsim.adapters.real_client import RealClientAdapter
-from realsim.adapters.real_controller import RealControllerAdapter
+from realsim.adapters.real_controller import make_controller_adapter
 from realsim.coordinator.model import (
     BurstMetrics,
     NaivePolicy,
@@ -111,6 +111,7 @@ def build_burst(
     policy: Optional[ReadPolicy] = None,
     trace: Optional[Trace] = None,
     metrics: Optional[BurstMetrics] = None,
+    real_directory: Optional[bool] = None,
 ):
     """Wire the real objects for a burst; return ``(scenario_coro, ctx)``.
 
@@ -127,6 +128,10 @@ def build_burst(
     so network + storage + RAM + compute are all charged from one story.
     ``compute_device`` selects the roofline device for the producer's generate
     step (default ``"cuda"`` -- the accelerator that produces W).
+
+    ``real_directory`` selects the controller directory backing (``None`` -> the
+    ambient :data:`sim_common.config.SimConfig.real_directory`, default real
+    ``Trie``; ``False`` -> the lightweight dict shim). It changes no metric.
 
     The full resource model exercised by one run:
 
@@ -160,7 +165,10 @@ def build_burst(
     topology = _topology(num_readers)
     volumes = {vid: FakeVolumeHandle() for vid in topology}
 
-    controller = RealControllerAdapter()
+    # Real Trie directory by default; the opt-in shim (real_directory=False, or
+    # the ambient config flag) swaps only the directory container -- see
+    # realsim.adapters.real_controller.make_controller_adapter.
+    controller = make_controller_adapter(real_directory)
     origin_id = topology["p"].id  # the volume that holds W before the burst
 
     # Producer adapter (writes W to its co-located origin volume "p").
@@ -278,6 +286,7 @@ def run_burst(
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
     policy: Optional[ReadPolicy] = None,
     random_seed: Optional[int] = None,
+    real_directory: Optional[bool] = None,
 ) -> BurstResult:
     """Run one burst end-to-end on a fresh deterministic engine."""
     trace = Trace()
@@ -293,6 +302,7 @@ def run_burst(
         policy=policy,
         trace=trace,
         metrics=metrics,
+        real_directory=real_directory,
     )
     results, trace = run_sim(scenario_coro(), random_seed=random_seed, trace=trace)
     return BurstResult(

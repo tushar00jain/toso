@@ -77,6 +77,13 @@ def main(argv=None) -> None:
         "performance measurement)",
     )
     parser.add_argument(
+        "--shim-directory", action="store_true",
+        help="back the controller directory with a lightweight dict shim instead "
+        "of the real torchstore Trie (opt-in; skips the per-key trie tax on scale "
+        "runs). Metrics are byte-identical either way; the real directory is the "
+        "default.",
+    )
+    parser.add_argument(
         "-v", "--verbose", "--debug", action="store_true", dest="verbose",
         help="show the full per-event trace (log level DEBUG)",
     )
@@ -85,7 +92,10 @@ def main(argv=None) -> None:
     # Set the process config once, up front, from the CLI flag (an unset flag
     # defers to the TOSO_* env / default). Every Trace built below reads it
     # ambiently -- no need to thread it through run_burst.
-    config.configure(fingerprint=args.fingerprint or None)
+    config.configure(
+        fingerprint=args.fingerprint or None,
+        real_directory=False if args.shim_directory else None,
+    )
 
     # Keep the ROOT logger at INFO so the real torchstore code's own DEBUG
     # latency logs (emitted via ``logging.log`` on root) stay quiet; then let the
