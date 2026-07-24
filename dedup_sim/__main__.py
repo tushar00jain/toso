@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from sim_common import config
 from sim_common.report import configure_logging, section
 
 from dedup_sim.scenario import (
@@ -46,8 +47,11 @@ def _log_trace(trace, note: str = "") -> None:
 
 
 def _demo() -> None:
+    fingerprint = config.current().fingerprint
     naive = run_naive_burst(num_readers=NUM_READERS)
     payload = naive.expected.numel() * naive.expected.element_size()
+    if fingerprint:
+        logger.info("naive run fingerprint: %s", naive.trace.fingerprint())
 
     section(logger, f"DEDUP on the REAL directory  --  {NUM_READERS} readers get W")
     logger.info("directory: real torchstore.controller.Controller (real Trie state)")
@@ -61,6 +65,8 @@ def _demo() -> None:
         _log_trace(dedup.trace)
         logger.info("(b) summary")
         logger.info(render_dedup_summary(dedup, naive, cap))
+        if fingerprint:
+            logger.info("dedup(cap=%d) run fingerprint: %s", cap, dedup.trace.fingerprint())
         # 1x proven live on the real directory.
         assert dedup.metrics.fabric_bytes == payload
         assert naive.metrics.fabric_bytes == NUM_READERS * payload
@@ -97,7 +103,17 @@ def main(argv=None) -> None:
         "-v", "--verbose", "--debug", action="store_true", dest="verbose",
         help="show the full per-event virtual-time trace (log level DEBUG)",
     )
+    parser.add_argument(
+        "--fingerprint", action="store_true",
+        help="print each run's trace fingerprint (a determinism-debugging digest, "
+        "folded from the trace on demand; off by default -- it is not part of the "
+        "performance measurement)",
+    )
     args = parser.parse_args(argv)
+
+    # Set the process config once from the CLI flag (unset -> env / default);
+    # the scenarios' Traces read it ambiently.
+    config.configure(fingerprint=args.fingerprint or None)
 
     configure_logging(logging.DEBUG if args.verbose else logging.INFO)
     _demo()

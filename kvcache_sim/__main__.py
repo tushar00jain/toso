@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from sim_common import config
 from sim_common.report import configure_logging, section
 
 from .sim.scenarios import (
@@ -51,7 +52,12 @@ def _section(title: str) -> None:
 
 
 def _log_trace(trace, limit: int = 60) -> None:
-    """Emit the event trace at DEBUG (shown only under -v); cap very long traces."""
+    """Emit the event trace at DEBUG (shown only under -v); cap very long traces.
+
+    When the ``fingerprint`` config flag is set (``--fingerprint``), also print the
+    trace's run fingerprint at INFO (a determinism-debugging digest -- see
+    :meth:`sim_common.trace.Trace.fingerprint`).
+    """
     lines = trace.render_lines()
     logger.debug("(a) event trace (%d events%s)", len(lines),
                  f", first {limit} shown" if len(lines) > limit else "")
@@ -60,6 +66,8 @@ def _log_trace(trace, limit: int = 60) -> None:
     if len(lines) > limit:
         logger.debug("... (%d more)", len(lines) - limit)
     logger.debug("")
+    if config.current().fingerprint:
+        logger.info("run fingerprint: %s", trace.fingerprint())
 
 
 def _shared_prefix() -> None:
@@ -211,7 +219,17 @@ def main(argv=None) -> None:
         "-v", "--verbose", "--debug", action="store_true", dest="verbose",
         help="show the per-event trace (log level DEBUG)",
     )
+    parser.add_argument(
+        "--fingerprint", action="store_true",
+        help="print each shown trace's fingerprint (a determinism-debugging "
+        "digest, folded from the trace on demand; off by default -- it is not "
+        "part of the performance measurement)",
+    )
     args = parser.parse_args(argv)
+
+    # Set the process config once from the CLI flag (unset -> env / default);
+    # _log_trace reads it ambiently to decide whether to print fingerprints.
+    config.configure(fingerprint=args.fingerprint or None)
 
     configure_logging(logging.DEBUG if args.verbose else logging.INFO)
 

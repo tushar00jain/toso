@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from sim_common import config
 from sim_common.cost_model import DEFAULT_PROFILE
 from sim_common.report import configure_logging, section
 
@@ -70,10 +71,21 @@ def main(argv=None) -> None:
         "(default: None -> FIFO, reproducible)",
     )
     parser.add_argument(
+        "--fingerprint", action="store_true",
+        help="print the run's trace fingerprint (a determinism-debugging digest, "
+        "folded from the trace on demand; off by default -- it is not part of the "
+        "performance measurement)",
+    )
+    parser.add_argument(
         "-v", "--verbose", "--debug", action="store_true", dest="verbose",
         help="show the full per-event trace (log level DEBUG)",
     )
     args = parser.parse_args(argv)
+
+    # Set the process config once, up front, from the CLI flag (an unset flag
+    # defers to the TOSO_* env / default). Every Trace built below reads it
+    # ambiently -- no need to thread it through run_burst.
+    config.configure(fingerprint=args.fingerprint or None)
 
     # Keep the ROOT logger at INFO so the real torchstore code's own DEBUG
     # latency logs (emitted via ``logging.log`` on root) stay quiet; then let the
@@ -102,6 +114,8 @@ def main(argv=None) -> None:
         random_seed=args.seed,
     )
     _log_trace(res.trace)
+    if config.current().fingerprint:
+        logger.info("run fingerprint: %s", res.trace.fingerprint())
     logger.info("(b) summary")
     logger.info(render_burst_summary(res))
     logger.info(

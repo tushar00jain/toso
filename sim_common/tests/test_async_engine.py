@@ -130,6 +130,55 @@ def test_gather_completion_order_is_by_virtual_time():
     assert [ln.split()[-2] for ln in ends] == ["b", "c", "a"]
 
 
+def test_simultaneous_timers_fire_in_scheduling_order():
+    # Timers due at the same virtual instant must fire strictly FIFO by
+    # scheduling order (the `_SeqTimerHandle` (time, seq) tiebreak), not in
+    # heapq-structural order. Mixing two fire times with interleaved insertion
+    # exercises the heap reordering the tiebreak fixes: c5/b5/d5 are all due at
+    # t=5 but inserted with a1/e1 (t=1) between them.
+    fired: list[str] = []
+
+    async def _drain(loop):
+        await asyncio.sleep(6.0)  # keep the loop alive past every timer
+
+    loop = AsyncEngine()
+    try:
+        loop.call_at(5.0, lambda: fired.append("c5"))  # seq 0
+        loop.call_at(1.0, lambda: fired.append("a1"))  # seq 1
+        loop.call_at(5.0, lambda: fired.append("b5"))  # seq 2
+        loop.call_at(5.0, lambda: fired.append("d5"))  # seq 3
+        loop.call_at(1.0, lambda: fired.append("e1"))  # seq 4
+        loop.run_until_complete(_drain(loop))
+    finally:
+        loop.close()
+
+    # t=1 group first (FIFO: a1 before e1), then the t=5 group (FIFO: c5, b5, d5).
+    assert fired == ["a1", "e1", "c5", "b5", "d5"]
+
+
+def test_simultaneous_sleepers_resume_in_creation_order():
+    # The same guarantee, one level up: coroutines that sleep to the same wake
+    # time resume in the order their sleeps were scheduled.
+    async def scenario(loop):
+        order: list[str] = []
+
+        async def sleeper(name: str):
+            await asyncio.sleep(4.0)
+            order.append(name)
+
+        # gather starts the coroutines in argument order; each schedules its
+        # timer for t=4 in that order, so they must resume a, b, c, d, e.
+        await asyncio.gather(*(sleeper(n) for n in ["a", "b", "c", "d", "e"]))
+        return order
+
+    loop = AsyncEngine()
+    try:
+        order = loop.run_until_complete(scenario(loop))
+    finally:
+        loop.close()
+    assert order == ["a", "b", "c", "d", "e"]
+
+
 def test_gather_over_in_memory_futures_completes_deterministically():
     # Fan-out over plain loop futures resolved in a fixed order -> defined
     # gather result order.

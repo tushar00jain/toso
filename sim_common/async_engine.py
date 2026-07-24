@@ -37,11 +37,14 @@ Ordering & determinism (mirrors ``engine.py`` conventions)
   breaks ties by a monotonic ``seq``. All coroutine wakeups (``Task.__step``,
   future done-callbacks) flow through ``call_soon`` -> ``self._ready``, so the
   interleaving of concurrently-runnable coroutines is deterministic.
-* Timers live on a ``heapq`` keyed by fire time; ``heapq`` is a pure algorithm,
-  so an identical sequence of scheduling operations replays identically. (Among
-  timers with the *same* fire time the order is heap-deterministic rather than
-  strictly FIFO; if a scenario needs strict FIFO among simultaneous timers,
-  stagger them by an epsilon. Flagged for the architect.)
+* Timers live on a ``heapq`` keyed by ``(fire time, seq)`` where ``seq`` is a
+  monotonic per-loop insertion counter (see :class:`_SeqTimerHandle`). asyncio's
+  own ``TimerHandle`` orders by fire time alone, so timers due at the *same*
+  virtual instant would pop in heap-structural order; the ``seq`` tiebreak makes
+  them **strictly FIFO** instead -- the same ``(time, seq)`` total order the
+  callback engine (:mod:`sim_common.engine`) uses. So an identical sequence of
+  scheduling operations replays identically *and* simultaneous timers fire in
+  scheduling order (this is what ``realsim_design.md`` §5 already describes).
 * Task names are assigned by *this loop* (``task-1``, ``task-2``, ...) instead of
   asyncio's process-global counter, so names -- and therefore the trace -- are
   byte-identical across runs and independent of other loops in the process.
@@ -69,6 +72,61 @@ from sim_common.trace import Trace
 _T = TypeVar("_T")
 
 
+class _SeqTimerHandle(asyncio.TimerHandle):
+    """A :class:`asyncio.TimerHandle` with a FIFO tiebreak among equal fire times.
+
+    asyncio orders timers by ``_when`` alone (its ``TimerHandle.__lt__``), so two
+    timers scheduled for the *same* virtual instant pop from the ``heapq`` in
+    heap-structural order -- not the order they were scheduled. Carrying a
+    monotonic per-loop ``_seq`` and comparing on ``(_when, _seq)`` restores strict
+    FIFO among simultaneous timers, matching the ``(time, seq)`` total order the
+    callback engine (:mod:`sim_common.engine`) already guarantees. The run is
+    deterministic either way; this only removes the counter-intuitive
+    "same-time timers reorder" behavior.
+
+    The plain-``TimerHandle`` comparison branches are defensive only: the loop's
+    schedule holds nothing but ``_SeqTimerHandle`` instances (every timer is built
+    by :meth:`AsyncEngine.call_at`).
+    """
+
+    __slots__ = ("_seq",)
+
+    def __init__(self, when, callback, args, loop, context=None, *, seq: int = 0):
+        super().__init__(when, callback, args, loop, context)
+        self._seq = seq
+
+    def _sort_key(self) -> Tuple[float, int]:
+        return (self._when, self._seq)
+
+    def __lt__(self, other: Any) -> Any:
+        if isinstance(other, _SeqTimerHandle):
+            return self._sort_key() < other._sort_key()
+        if isinstance(other, asyncio.TimerHandle):
+            return self._when < other._when
+        return NotImplemented
+
+    def __le__(self, other: Any) -> Any:
+        if isinstance(other, _SeqTimerHandle):
+            return self._sort_key() <= other._sort_key()
+        if isinstance(other, asyncio.TimerHandle):
+            return self._when <= other._when
+        return NotImplemented
+
+    def __gt__(self, other: Any) -> Any:
+        if isinstance(other, _SeqTimerHandle):
+            return self._sort_key() > other._sort_key()
+        if isinstance(other, asyncio.TimerHandle):
+            return self._when > other._when
+        return NotImplemented
+
+    def __ge__(self, other: Any) -> Any:
+        if isinstance(other, _SeqTimerHandle):
+            return self._sort_key() >= other._sort_key()
+        if isinstance(other, asyncio.TimerHandle):
+            return self._when >= other._when
+        return NotImplemented
+
+
 class AsyncEngine(asyncio.BaseEventLoop):
     """A single-threaded, deterministic ``asyncio`` loop on a virtual clock.
 
@@ -91,6 +149,9 @@ class AsyncEngine(asyncio.BaseEventLoop):
         self.trace: Trace = trace if trace is not None else Trace()
         # Deterministic, per-loop task naming (not asyncio's global counter).
         self._task_seq: int = 0
+        # Monotonic per-loop timer counter -> the FIFO tiebreak among timers due
+        # at the same virtual instant (see `_SeqTimerHandle` / `call_at`).
+        self._timer_seq: int = 0
         # Optional seeded-random ready-queue selection for interleaving sweeps.
         self.random_seed: Optional[int] = random_seed
         self._rng: Optional[random.Random] = (
@@ -102,6 +163,35 @@ class AsyncEngine(asyncio.BaseEventLoop):
     def time(self) -> float:
         """Return the current *simulated* time (seconds). Never reads a wall clock."""
         return self._clock
+
+    # -- timer scheduling (with a FIFO tiebreak among simultaneous timers) -
+
+    def call_at(  # type: ignore[override]
+        self,
+        when: float,
+        callback: Any,
+        *args: Any,
+        context: Any = None,
+    ) -> "asyncio.TimerHandle":
+        """Schedule ``callback`` at virtual time ``when`` with a FIFO tiebreak.
+
+        Mirrors :meth:`asyncio.BaseEventLoop.call_at` but builds a
+        :class:`_SeqTimerHandle` carrying a monotonic ``seq``, so timers due at the
+        same virtual instant fire in scheduling order rather than heap-structural
+        order. ``call_later`` and ``asyncio.sleep`` both route through here, so
+        every virtual-clock sleep inherits the tiebreak.
+        """
+        self._check_closed()
+        if self._debug:
+            self._check_thread()
+            self._check_callback(callback, "call_at")
+        timer = _SeqTimerHandle(when, callback, args, self, context, seq=self._timer_seq)
+        self._timer_seq += 1
+        if timer._source_traceback:
+            del timer._source_traceback[-1]
+        heapq.heappush(self._scheduled, timer)
+        timer._scheduled = True
+        return timer
 
     # -- tracing ----------------------------------------------------------
 
