@@ -96,6 +96,14 @@ class Trace:
     :data:`~sim_common.config.SimConfig.fingerprint` flag, read at construction --
     so ``--fingerprint`` turns it on everywhere without threading a param down to
     each ``Trace``. Pass it explicitly to override (e.g. in tests).
+
+    ``enabled`` decides whether :meth:`record` does anything at all. When it is
+    ``False`` ("quiet mode") every ``record`` early-returns -- no append, no
+    hash-chain update -- so a large run pays none of the per-event string-format /
+    list-growth bookkeeping. It defaults to the process config's
+    :data:`~sim_common.config.SimConfig.trace` flag, read at construction (same
+    ambient pattern as ``hash_chain``). Disabling only removes trace side effects;
+    :meth:`render` / :meth:`fingerprint` still work (on an empty event list).
     """
 
     events: List[Tuple[float, str, str]] = field(default_factory=list)
@@ -104,6 +112,9 @@ class Trace:
     # Ambient default: the process config's fingerprint flag at construction time
     # (config.configure(...) / config.overrides(...)). Explicit value still wins.
     hash_chain: bool = field(default_factory=lambda: config.current().fingerprint)
+    # Ambient default: the process config's trace flag at construction time. When
+    # False, `record` is a no-op (see the class docstring). Explicit value wins.
+    enabled: bool = field(default_factory=lambda: config.current().trace)
     # Running hash chain over `events`, maintained only when `hash_chain` is True;
     # derived state, excluded from equality.
     _chain: bytes = field(default=_CHAIN_SEED, init=False, repr=False, compare=False)
@@ -116,7 +127,13 @@ class Trace:
                 self._chain = _fold(self._chain, e)
 
     def record(self, now: float, kind: str, msg: str) -> None:
-        """Append an event at ``now`` (and extend the hash chain if enabled)."""
+        """Append an event at ``now`` (and extend the hash chain if enabled).
+
+        A no-op when ``enabled`` is ``False`` (quiet mode): no append and no
+        hash-chain update, so all call sites become free through this one object.
+        """
+        if not self.enabled:
+            return
         event = (now, kind, msg)
         self.events.append(event)
         if self.hash_chain:

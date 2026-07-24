@@ -37,6 +37,14 @@ class SimConfig:
     # no per-event hashing. See sim_common.trace.Trace / sim_common.diverge.
     fingerprint: bool = False
 
+    # Record the chronological event trace at all. On by default (the trace is the
+    # human-readable output and the fingerprint's input). Turning it off ("quiet
+    # mode") makes every sim_common.trace.Trace.record call a no-op, so a large run
+    # pays none of the per-event string-formatting / list-growth bookkeeping. It
+    # only removes trace side effects -- virtual time, ordering and every measured
+    # metric are byte-identical either way. See sim_common.trace.Trace.
+    trace: bool = True
+
 
 _current = SimConfig()
 
@@ -60,6 +68,9 @@ def _from_env() -> dict:
     fingerprint = _bool_env("TOSO_FINGERPRINT")
     if fingerprint is not None:
         out["fingerprint"] = fingerprint
+    trace = _bool_env("TOSO_TRACE")
+    if trace is not None:
+        out["trace"] = trace
     return out
 
 

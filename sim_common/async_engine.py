@@ -67,6 +67,7 @@ import heapq
 import random
 from typing import Any, Coroutine, Optional, Tuple, TypeVar
 
+from sim_common import config
 from sim_common.trace import Trace
 
 _T = TypeVar("_T")
@@ -139,14 +140,25 @@ class AsyncEngine(asyncio.BaseEventLoop):
         self,
         *,
         trace: Optional[Trace] = None,
+        quiet: Optional[bool] = None,
         random_seed: Optional[int] = None,
     ) -> None:
         super().__init__()
         # Virtual clock: simulated seconds. `time()` returns this; it only ever
         # advances in `_run_once`, and only when nothing is ready to run.
         self._clock: float = 0.0
-        # Shared trace recorder (reused across both engines for one format).
-        self.trace: Trace = trace if trace is not None else Trace()
+        # Quiet mode ("no tracing at all"): removes every per-event trace side
+        # effect -- clock-advance / task create+finish rows and the per-task
+        # done-callback -- so a large run pays none of that bookkeeping. It only
+        # removes side effects; virtual time, ordering and every metric are
+        # byte-identical either way. Ambient default from the config `trace` flag
+        # (same pattern as Trace.hash_chain); an explicit `quiet` arg overrides.
+        if quiet is None:
+            quiet = not config.current().trace
+        # Shared trace recorder (reused across both engines for one format). When
+        # a trace is supplied its own `enabled` governs; the default one is built
+        # disabled in quiet mode so all `record` call sites become no-ops.
+        self.trace: Trace = trace if trace is not None else Trace(enabled=not quiet)
         # Deterministic, per-loop task naming (not asyncio's global counter).
         self._task_seq: int = 0
         # Monotonic per-loop timer counter -> the FIFO tiebreak among timers due
@@ -219,7 +231,11 @@ class AsyncEngine(asyncio.BaseEventLoop):
             name = f"task-{self._task_seq}"
         task = super().create_task(coro, name=name, context=context)
         self.trace.record(self._clock, "task", f"create {name}")
-        task.add_done_callback(self._on_task_done)
+        # Skip the finish-row callback entirely when tracing is off: it exists
+        # only to emit the "{status} {name}" row and schedules nothing, so its
+        # absence cannot change clock, ordering, naming or any metric.
+        if self.trace.enabled:
+            task.add_done_callback(self._on_task_done)
         return task
 
     def _on_task_done(self, task: "asyncio.Task[Any]") -> None:
@@ -308,14 +324,19 @@ def run_sim(
     *,
     random_seed: Optional[int] = None,
     trace: Optional[Trace] = None,
+    quiet: Optional[bool] = None,
 ) -> Tuple[_T, Trace]:
     """Run ``coro`` to completion on a fresh :class:`AsyncEngine`.
 
     Returns ``(result, trace)`` and closes the loop. Convenience for tests and
     one-shot scenarios; construct :class:`AsyncEngine` directly if you need the
     loop object (e.g. to schedule external timers before running).
+
+    ``quiet`` opts out of all per-event tracing (see :class:`AsyncEngine`); the
+    returned trace is then empty. ``None`` (the default) defers to the config's
+    ``trace`` flag.
     """
-    loop = AsyncEngine(trace=trace, random_seed=random_seed)
+    loop = AsyncEngine(trace=trace, quiet=quiet, random_seed=random_seed)
     try:
         result = loop.run_until_complete(coro)
     finally:
