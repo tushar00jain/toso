@@ -47,11 +47,19 @@ pub trait Provider: Send + Sync {
 /// - `search`         -> `search/<pattern>.json`
 /// - `peek`           -> `peek/<key>.json`, falling back to `peek.json`
 ///
-/// Params are used verbatim as filenames (keys like `model.layers.0.attn.wq`
-/// and groups like `rack:A12` are valid on unix), so fixtures round-trip with
-/// no escaping.
+/// Params map to filenames near-verbatim: keys like `model.layers.0.attn.wq`
+/// are used as-is, but `:` is rewritten to `-` for the on-disk name (a colon is
+/// awkward in filenames and illegal on some filesystems). So group `rack:A12`
+/// reads `list_volumes/rack-A12.json` while the group label keeps its colon.
 pub struct FileProvider {
     dir: PathBuf,
+}
+
+/// Map a request param to its on-disk filename component. `:` is the one
+/// character we rewrite (illegal in filenames on Windows/exFAT, awkward
+/// elsewhere); every other char a param can hold is filename-safe on unix.
+fn fixture_component(param: &str) -> String {
+    param.replace(':', "-")
 }
 
 impl FileProvider {
@@ -81,7 +89,7 @@ impl Provider for FileProvider {
         // than re-serving page one forever.
         match &req.cursor {
             Some(cursor) => {
-                let rel = format!("expand_prefix/{cursor}.json");
+                let rel = format!("expand_prefix/{}.json", fixture_component(cursor));
                 if self.dir.join(&rel).exists() {
                     self.read_fixture(rel).await
                 } else {
@@ -92,7 +100,7 @@ impl Provider for FileProvider {
                 }
             }
             None => {
-                self.read_fixture(format!("expand_prefix/{}.json", req.prefix))
+                self.read_fixture(format!("expand_prefix/{}.json", fixture_component(&req.prefix)))
                     .await
             }
         }
@@ -101,7 +109,7 @@ impl Provider for FileProvider {
     async fn list_volumes(&self, req: ListVolumesRequest) -> Result<ListVolumesResponse> {
         match &req.cursor {
             Some(cursor) => {
-                let rel = format!("list_volumes/{cursor}.json");
+                let rel = format!("list_volumes/{}.json", fixture_component(cursor));
                 if self.dir.join(&rel).exists() {
                     self.read_fixture(rel).await
                 } else {
@@ -112,20 +120,21 @@ impl Provider for FileProvider {
                 }
             }
             None => {
-                self.read_fixture(format!("list_volumes/{}.json", req.group))
+                self.read_fixture(format!("list_volumes/{}.json", fixture_component(&req.group)))
                     .await
             }
         }
     }
 
     async fn key(&self, req: KeyRequest) -> Result<KeyEntry> {
-        self.read_fixture(format!("key/{}.json", req.key)).await
+        self.read_fixture(format!("key/{}.json", fixture_component(&req.key)))
+            .await
     }
 
     async fn search(&self, req: SearchRequest) -> Result<SearchResponse> {
         match &req.cursor {
             Some(cursor) => {
-                let rel = format!("search/{cursor}.json");
+                let rel = format!("search/{}.json", fixture_component(cursor));
                 if self.dir.join(&rel).exists() {
                     self.read_fixture(rel).await
                 } else {
@@ -136,16 +145,16 @@ impl Provider for FileProvider {
                 }
             }
             None => {
-                self.read_fixture(format!("search/{}.json", req.pattern))
+                self.read_fixture(format!("search/{}.json", fixture_component(&req.pattern)))
                     .await
             }
         }
     }
 
     async fn peek(&self, req: PeekRequest) -> Result<PeekResult> {
-        let keyed = self.dir.join(format!("peek/{}.json", req.key));
-        if keyed.exists() {
-            return self.read_fixture(format!("peek/{}.json", req.key)).await;
+        let rel = format!("peek/{}.json", fixture_component(&req.key));
+        if self.dir.join(&rel).exists() {
+            return self.read_fixture(rel).await;
         }
         self.read_fixture("peek.json").await
     }
