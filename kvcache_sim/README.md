@@ -113,19 +113,30 @@ to the coordinator, layered over the existing `put`/`get` plumbing.
 
 ```
 kvcache_sim/
-  sim/model.py        # inference Request + prefix-hash chain (plain str keys)
-  sim/cost.py         # cost layer over sim_common.cost_model (prefill/decode/fetch)
-  sim/cluster.py      # the four KV directory verbs over a realsim.mesh.Mesh
-  sim/cache.py        # per-instance LRU eviction bookkeeping
-  sim/decode.py       # async DecodeEngine: batched, stepped decode -> TBT
-  sim/scheduler.py    # LoadBalance (baseline) + CacheAware coordinator (async)
-  sim/client.py       # async request-lifecycle driver
-  sim/workload.py     # seeded synthetic request generator (Zipf prefixes)
-  sim/trace.py        # RequestResult, Metrics + summary rendering
-  sim/scenarios.py    # scenario builders + the async run harness
-  __main__.py         # `python -m kvcache_sim [scenario] [-v]`
-  tests/test_sim.py   # deterministic tests (real-directory + outcome assertions)
+  utils.py                # prefill / decode-step GPU times. Root, not in a role
+                          #   folder, because BOTH planes use them: control
+                          #   predicts with them, data charges them.
+  policy/                 # CONTROL PLANE -- decides, moves nothing
+    scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator;
+                          #   owns the analytical prefill-queue model
+    cache.py              #   per-instance LRU eviction bookkeeping (metadata)
+  workload/               # WHAT IS SIMULATED
+    request.py            #   inference Request + prefix-hash chain (str keys)
+    generator.py          #   seeded synthetic request stream (Zipf + Poisson)
+    scenarios.py          #   scenario builders + the async run harness
+  runtime/                # DATA PLANE -- moves bytes, burns compute
+    cluster.py            #   the four KV directory verbs over a realsim.mesh.Mesh
+    driver.py             #   the serving engine's request loop (turns a Plan into
+                          #   clock advances + real ops; decides nothing)
+    decode.py             #   async DecodeEngine: batched, stepped decode -> TBT
+  report/                 # OUTCOME METRICS
+    metrics.py            #   RequestResult, Metrics + summary rendering
+  __main__.py             # `python -m kvcache_sim [scenario] [-v]`
+  tests/test_sim.py       # deterministic tests (real-directory + outcome assertions)
 ```
+
+`dedup_sim/` uses the same role folders, so the two capabilities can be compared
+folder by folder — see [Comparison with `dedup_sim`](../dedup_sim/README.md#comparison-with-kvcache_sim).
 
 The async engine, the cost model, the topology/`Endpoint` skeleton, the `Trace`
 recorder and the report helpers live in the repo-root `sim_common/`; the real

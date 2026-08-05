@@ -460,3 +460,22 @@ for. Only the *policy* is new.
 - **Consistency across model versions:** a weight update (new policy in RL) invalidates
   the KV cache. Tie KV `block_key`s to the weight `version` (MAPPING marker) so a sync
   bump auto-invalidates stale KV.
+- **A read cannot target a volume.** §5.6 assumes a prefix is pulled from the *chosen*
+  peer, but `client.get` takes no source argument and the client serves from whichever
+  holder comes first in the directory map — so the peer the coordinator picks (and prices
+  its TTFT against) is not the peer that serves. With a replicated hot block the two
+  differ, at a different locality tier, so routing is decided against a cost that is
+  never paid. Measured in `kvcache_sim`: ~1 pulled block in 4.
+  - Add a source argument (or locality-aware selection) to `client.get` — upstream change.
+  - Narrow the caller's directory view to the chosen volume — works today, no API change
+    (`dedup_sim` does this), but every caller reimplements it.
+  - Accept whatever serves and price the plan on the *closest* holder — cheapest, loses
+    the guarantee.
+- **A routing decision goes stale before it executes.** Between routing and the pull,
+  read-through replication (§5.6, the design's own mechanism) changes who holds what: the
+  prefix may have landed on the prefill instance itself, or the planned source may have
+  evicted it. The design does not say what to do about it.
+  - Re-plan at execution time — correct, costs a second directory round trip.
+  - Pull only the blocks still missing *locally*, recompute the rest — cheap, and strictly
+    better than today (`kvcache_sim` currently re-pulls blocks it already holds).
+  - Pin the plan and fail the pull if the source moved — simplest, wastes the prefill.

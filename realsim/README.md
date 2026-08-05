@@ -123,6 +123,9 @@ realsim/
   mesh.py         Mesh -- the multi-client wiring a capability builds on: per-node
                   volumes + real clients, one directory, one resource registry,
                   one shared transport factory
+  model.py        Model -- a transformer reduced to what a sim charges against
+                  (flops/token, KV bytes/token). Shared: kvcache_sim prices
+                  compute from it; dedup_sim will size synced weights from it
   coordinator/    the NEW read coordinator -- a burst-shaped consumer of a Mesh,
                   a model with a pluggable policy
   scenarios/      burst_get.py: a synchronized read burst; meta/metadata data

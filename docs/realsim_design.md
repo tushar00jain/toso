@@ -140,6 +140,8 @@ realsim/
     real_client.py            # RealClientAdapter + FakeStrategy (single-client transport install)
   mesh.py                     # Mesh — multi-client wiring: per-node volumes + real clients,
                               #   one directory + registry, one shared transport factory
+  model.py                    # Model — a transformer's per-token flops / KV bytes; shared by
+                              #   both capability sims (see the TODO for the weight-side use)
   coordinator/                # the NEW component under design — a model
     model.py                  # Reader, ReadPolicy/NaivePolicy, ReadCoordinator, BurstMetrics
   scenarios/                  # runnable scenarios

@@ -19,7 +19,7 @@ bandwidth. Three modes are selectable (via the ``contention`` config flag / the
   (FIFO by a monotonic transfer sequence) and run at full bandwidth afterwards.
   Total time for N contending transfers is ~the sum of their solo costs. Mirrors
   the per-instance compute ``busy_until`` pattern in
-  :mod:`kvcache_sim.sim.scheduler`.
+  :mod:`kvcache_sim.policy.scheduler`.
 * ``"progressive"`` -- max-min fair sharing. Every in-flight transfer on a
   resource gets an equal share of its bandwidth; when a transfer *enters* or
   *leaves* the resource, every other in-flight transfer is re-rated (remaining

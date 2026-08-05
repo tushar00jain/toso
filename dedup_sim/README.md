@@ -4,7 +4,7 @@
 types** (via [`realsim`](../realsim/)): a synchronized read burst is routed so
 that each unique byte crosses the fabric **exactly once (1x)**, versus **`m x`**
 for the naive baseline. The routing is a real
-`realsim.coordinator.model.ReadPolicy` (`dedup_sim.policy.DedupPolicy`) driving
+`realsim.coordinator.model.ReadPolicy` (`dedup_sim.policy.routing.DedupPolicy`) driving
 the real `Controller` directory, the real `LocalClient` planning core, and the
 real in-memory transport, all on `realsim`'s deterministic virtual-clock async
 engine.
@@ -103,16 +103,40 @@ reassembly guarantee of the real client is covered separately in
 
 ```
 dedup_sim/
-  __init__.py     package doc
-  policy.py       DedupPolicy (a real realsim ReadPolicy) + the routing handle
-  scenario.py     build/run the dedup burst (reuses realsim wiring) + naive baseline
-  __main__.py     `python -m dedup_sim` demo (fabric summary + ASCII + trace)
-  tests/          the dedup-outcome assertions (pytest, deterministic)
+  policy/                 # THE ALGORITHM UNDER TEST
+    routing.py            #   DedupPolicy (a real realsim ReadPolicy)
+                          #   + the per-reader routing directory view
+  workload/               # WHAT IS SIMULATED
+    scenarios.py          #   build/run the dedup burst (reuses realsim wiring)
+                          #   + realsim's own burst as the naive baseline
+  report/                 # OUTCOME METRICS
+    summary.py            #   dedup-vs-naive fabric summary + source->dest tree
+  __main__.py             # `python -m dedup_sim` demo (summary + ASCII + trace)
+  tests/                  # the dedup-outcome assertions (pytest, deterministic)
 ```
 
 All the real-object plumbing -- adapters, seams, coordinator, cost model, async
 engine, meta/metadata carriers -- is imported from `realsim` / `sim_common`;
 `dedup_sim` adds only the dedup policy and its scenario.
+
+## Comparison with `kvcache_sim`
+
+Both capability packages use the same role folders, so what each one *needs* is
+visible from which folders exist and how thick they are:
+
+| role | `dedup_sim` | `kvcache_sim` |
+|---|---|---|
+| `policy/` — the algorithm under test | `routing.py`: one `ReadPolicy` override | `scheduler.py` + `cache.py` + `decode.py`: routing, eviction and a batched decode engine |
+| `workload/` — what is simulated | `scenarios.py` only; the workload is **one fixed synchronized burst**, parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
+| `report/` — outcome metrics | `summary.py`: rendering only; the metrics are realsim's `BurstMetrics` | `metrics.py`: its **own** per-request outcome model (TTFT/TBT percentiles, hit rate, rejections) |
+| `runtime/` — running on the real objects | **absent** — realsim's `ReadCoordinator` already drives a burst, so the `ReadPolicy` seam is the only hook needed | `cluster.py` (four KV directory verbs on a `Mesh`) + `driver.py` (per-request lifecycle on the virtual clock) |
+| domain model + cost layer | **absent** — no served model to describe; charges realsim's cost model directly through the transport seam | `realsim.model.Model` (shared — the LLM's flop terms and KV block byte size) plus `utils.py` (`prefill_time` / `decode_step_time`, used by both planes) |
+
+The short version: dedup is a *routing decision inside an existing burst*, so it
+fits realsim's policy seam and needs no runtime or cost layer of its own.
+KV-cache serving is a *continuous arrival stream with per-instance state*, so it
+brings its own driver, its own directory verbs, its own cost layer and its own
+metrics.
 
 ## Honesty note
 

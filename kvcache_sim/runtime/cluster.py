@@ -43,16 +43,22 @@ from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
+from realsim.model import DEFAULT_MODEL, Model
+
 
 class Cluster:
     """Serving instances over the real directory + real per-instance clients.
 
     Args:
         topology: ``instance_id -> Endpoint`` (instance id == its volume id).
-        block_tokens: tokens per KV block (the modeled byte size of one block is
-            ``block_tokens * BYTES_PER_TOKEN``).
+        block_tokens: tokens per KV block.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`.
             Also supplies each volume's byte capacity.
+        model: served-model :class:`~realsim.model.Model`, which sets
+            how many bytes one KV block occupies. The block carrier is sized from
+            it (see :attr:`block_nbytes`) so the bytes the transport charges are
+            always the bytes :meth:`~realsim.model.Model.block_bytes`
+            predicts.
         trace: shared :class:`~sim_common.trace.Trace` for transfer events.
         real_directory: controller directory backing (``None`` -> the ambient
             :data:`sim_common.config.SimConfig.real_directory`, default real
@@ -72,6 +78,7 @@ class Cluster:
         *,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
+        model: Model = DEFAULT_MODEL,
         trace: Trace | None = None,
         real_directory: Optional[bool] = None,
     ) -> None:
@@ -82,10 +89,13 @@ class Cluster:
             real_directory=real_directory,
         )
         self.block_tokens = block_tokens
-        # A metadata-only carrier for one KV block (uint8 -> 1 byte/token). Zero
-        # real storage; the transport seam reads its nbytes for the cost model.
+        self.model = model
+        # A metadata-only carrier for one KV block: a uint8 descriptor whose
+        # length IS the block's modeled byte size, derived from the model profile
+        # so the charged bytes cannot drift from the predicted ones. Zero real
+        # storage; the transport seam reads its nbytes for the cost model.
         self._block_carrier = TensorDescriptor(
-            shape=(block_tokens,), dtype=torch.uint8
+            shape=(model.block_bytes(1, block_tokens),), dtype=torch.uint8
         )
 
     # -- the mesh's shared pieces, surfaced for the scheduler/driver -------- #
@@ -118,6 +128,18 @@ class Cluster:
     def registry(self) -> ResourceRegistry:
         """The run's shared :class:`~sim_common.resources.ResourceRegistry`."""
         return self.mesh.registry
+
+    @property
+    def block_nbytes(self) -> int:
+        """Bytes the data plane actually moves for one KV block.
+
+        The authoritative byte count: this is the carrier's size, i.e. what the
+        transport seam charges. It must equal
+        ``model.block_bytes(1, block_tokens)`` -- the value the scheduler
+        predicts a fetch against -- which
+        ``kvcache_sim/tests/test_cost_premises.py`` asserts.
+        """
+        return self._block_carrier.nbytes
 
     @contextmanager
     def installed(self) -> Iterator["Cluster"]:

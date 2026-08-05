@@ -54,6 +54,13 @@ client/controller/transport), so they depend on the from-source
   presence per instance (real `Controller`) and drives real fetches via
   `realsim`'s `Mesh`/client/engine/cost model, expressed as four directory verbs
   (`prefix_lengths` / `publish` / `fetch` / `evict`).
+
+  Both capability packages use the same **role folders** — `policy/` (the
+  algorithm under test), `workload/` (what is simulated), `report/` (outcome
+  metrics), plus `runtime/` and `cost.py` where needed — so they can be read
+  folder by folder, and the folders a capability *lacks* show what it does not
+  need. The comparison is tabulated in
+  [`dedup_sim/README.md`](dedup_sim/README.md#comparison-with-kvcache_sim).
 - [`sim_common/`](sim_common/) — the shared building blocks all three sims use:
   the deterministic virtual-clock `AsyncEngine` (the sim path) plus the original
   callback engine (`engine.py`: `Sim`/`Promise`), the locality/topology skeleton,

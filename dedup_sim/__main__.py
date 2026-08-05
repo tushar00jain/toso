@@ -9,7 +9,7 @@ directory + **real** client/transport (via ``realsim``) under two policies:
 
   * the naive baseline (realsim's ``NaivePolicy``): every reader pulls from the
     origin -- ``m x`` fabric; and
-  * the dedup policy (:class:`dedup_sim.policy.DedupPolicy`): the burst is staged
+  * the dedup policy (:class:`dedup_sim.policy.routing.DedupPolicy`): the burst is staged
     into a chain (``fanout_cap=1``) or tree (``fanout_cap=2``) of read-through
     peers so each unique byte crosses the fabric once -- 1x fabric.
 
@@ -27,11 +27,8 @@ import logging
 from sim_common import config
 from sim_common.report import configure_logging, section
 
-from dedup_sim.scenario import (
-    render_dedup_summary,
-    run_dedup_burst,
-    run_naive_burst,
-)
+from dedup_sim.report.summary import render_dedup_summary
+from dedup_sim.workload.scenarios import run_dedup_burst, run_naive_burst
 
 logger = logging.getLogger("dedup_sim")
 

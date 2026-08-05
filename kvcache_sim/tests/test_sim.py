@@ -14,16 +14,17 @@ import pytest
 from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
-from kvcache_sim.sim.cache import LRUCache
-from kvcache_sim.sim.cluster import Cluster
-from kvcache_sim.sim.cost import decode_step_time, PROFILE
-from kvcache_sim.sim.decode import DecodeEngine
-from kvcache_sim.sim.model import (
+from kvcache_sim.policy.cache import LRUCache
+from kvcache_sim.runtime.cluster import Cluster
+from sim_common.cost_model import DEFAULT_PROFILE
+from kvcache_sim.utils import decode_step_time
+from kvcache_sim.runtime.decode import DecodeEngine
+from kvcache_sim.workload.request import (
     block_keys_for,
     longest_prefix_run,
     Request,
 )
-from kvcache_sim.sim.scenarios import (
+from kvcache_sim.workload.scenarios import (
     DISAGG_TARGET_TBT,
     EARLY_SLO_TBT,
     make_topology,
@@ -172,11 +173,11 @@ def test_cache_never_exceeds_capacity():
 # 11. Decode-step cost (from the cost model): baseline at batch 1, clamped below,
 #     and strictly increasing in batch size.
 def test_decode_step_time_shape():
-    base = decode_step_time(1, PROFILE)
-    assert decode_step_time(0, PROFILE) == base     # clamps to batch >= 1
-    steps = [decode_step_time(b, PROFILE) for b in range(1, 9)]
+    base = decode_step_time(1, DEFAULT_PROFILE)
+    assert decode_step_time(0, DEFAULT_PROFILE) == base     # clamps to batch >= 1
+    steps = [decode_step_time(b, DEFAULT_PROFILE) for b in range(1, 9)]
     assert all(steps[i] < steps[i + 1] for i in range(len(steps) - 1))
-    assert decode_step_time(2, PROFILE) > base
+    assert decode_step_time(2, DEFAULT_PROFILE) > base
 
 
 # 12. Batching raises TBT: a solo request decodes at the batch=1 baseline; several
@@ -207,11 +208,11 @@ def _run_decode_batch(n: int):
 
 
 def test_batching_raises_tbt():
-    base = decode_step_time(1, PROFILE)
+    base = decode_step_time(1, DEFAULT_PROFILE)
     solo = _run_decode_batch(1)
     assert abs(solo["r0"] - base) < 1e-9
     batched = _run_decode_batch(4)
-    assert min(batched.values()) >= decode_step_time(2, PROFILE)
+    assert min(batched.values()) >= decode_step_time(2, DEFAULT_PROFILE)
     assert min(batched.values()) > solo["r0"]
 
 

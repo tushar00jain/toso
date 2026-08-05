@@ -25,7 +25,7 @@ from __future__ import annotations
 import random
 from typing import List
 
-from .model import block_keys_for, Request
+from .request import block_keys_for, Request
 
 
 def _zipf_weights(n: int, s: float) -> List[float]:

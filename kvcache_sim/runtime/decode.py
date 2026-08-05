@@ -4,7 +4,7 @@ Prefill answers "how fast is the first token" (TTFT); this module answers "how f
 is every *subsequent* token" (TBT). A serving instance decodes a **batch** of
 requests together: each decode *step* emits one token for every request in the
 batch, and the step's wall time is the TBT every batched request sees for that
-token. Step time rises with batch size (:func:`~kvcache_sim.sim.cost.decode_step_time`,
+token. Step time rises with batch size (:func:`~kvcache_sim.utils.decode_step_time`,
 charged on the GPU roofline), so TBT degrades as an instance fills up -- exactly
 the tension a TBT SLO bounds.
 
@@ -29,12 +29,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from .cost import decode_step_time, PROFILE
-from .model import Request
+from realsim.model import DEFAULT_MODEL, Model
+from sim_common.cost_model import DEFAULT_PROFILE
 
-# Batch=1 baseline step time, used by the decode-load prediction (each remaining
-# token is assumed to cost ~one uncontended step).
-_BASE_STEP = decode_step_time(1, PROFILE)
+from ..utils import decode_step_time
+from ..workload.request import Request
 
 
 @dataclass
@@ -63,6 +62,7 @@ class DecodeEngine:
         decode_ids: the decode instance ids.
         max_batch: VRAM cap on a decode batch.
         profile: target-machine profile driving :func:`decode_step_time`.
+        model: served-model profile supplying the decode flop term.
     """
 
     def __init__(
@@ -71,7 +71,8 @@ class DecodeEngine:
         decode_ids: List[str],
         *,
         max_batch: int,
-        profile=PROFILE,
+        profile=DEFAULT_PROFILE,
+        model: Model = DEFAULT_MODEL,
         compute_busy: Optional[Dict[str, float]] = None,
         on_finish: Optional[Callable[[Request, float], None]] = None,
     ) -> None:
@@ -79,6 +80,11 @@ class DecodeEngine:
         self.ids = sorted(decode_ids)
         self.max_batch = max_batch
         self.profile = profile
+        self.model = model
+        # Batch=1 baseline step time for the decode-load prediction (each remaining
+        # token is assumed to cost ~one uncontended step). Derived per engine from
+        # this run's profiles, not once at import from the defaults.
+        self._base_step = decode_step_time(1, profile, model)
         self.compute_busy: Dict[str, float] = (
             compute_busy if compute_busy is not None else {i: 0.0 for i in self.ids}
         )
@@ -105,7 +111,7 @@ class DecodeEngine:
         """
         n = 0
         for a in self.batch[inst] + self.pending[inst]:
-            finish = a.last_token_time + a.remaining * _BASE_STEP
+            finish = a.last_token_time + a.remaining * self._base_step
             if finish > at_t:
                 n += 1
         return n
@@ -143,7 +149,7 @@ class DecodeEngine:
         """Emit tokens one step at a time until ``inst``'s batch drains."""
         while self.batch[inst]:
             members = list(self.batch[inst])       # frozen for this step
-            dt = decode_step_time(len(members), self.profile)
+            dt = decode_step_time(len(members), self.profile, self.model)
             start = max(self.loop.time(), self.compute_busy[inst])
             step_end = start + dt
             self.compute_busy[inst] = step_end

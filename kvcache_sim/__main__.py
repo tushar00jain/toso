@@ -28,7 +28,7 @@ import logging
 from sim_common import config
 from sim_common.report import configure_logging, section
 
-from .sim.scenarios import (
+from .workload.scenarios import (
     DISAGG_TARGET_TBT,
     EARLY_SLO_TBT,
     run_disaggregation,
@@ -38,7 +38,7 @@ from .sim.scenarios import (
     run_overload,
     run_shared_prefix,
 )
-from .sim.trace import (
+from .report.metrics import (
     render_disaggregation,
     render_early_rejection,
     render_summary,

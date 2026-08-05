@@ -15,13 +15,13 @@ from typing import Dict, List, Optional, Tuple
 from sim_common.async_engine import AsyncEngine
 from sim_common.topology import Endpoint
 
-from . import cost
-from .client import Driver
-from .cluster import Cluster
-from .cost import PROFILE
-from .scheduler import CacheAwareScheduler, LoadBalanceScheduler
-from .trace import Metrics, Trace
-from .workload import make_workload
+from ..runtime.driver import Driver
+from ..runtime.cluster import Cluster
+from sim_common.cost_model import DEFAULT_PROFILE
+from ..utils import decode_step_time
+from ..policy.scheduler import CacheAwareScheduler, LoadBalanceScheduler
+from ..report.metrics import Metrics, Trace
+from .generator import make_workload
 
 BLOCK_TOKENS = 512
 
@@ -81,12 +81,12 @@ def run(
     loop = AsyncEngine(trace=trace)
     try:
         cluster = Cluster(
-            topology, block_tokens=BLOCK_TOKENS, profile=PROFILE, trace=trace
+            topology, block_tokens=BLOCK_TOKENS, profile=DEFAULT_PROFILE, trace=trace
         )
         common = dict(
             block_tokens=BLOCK_TOKENS,
             capacity=capacity,
-            profile=PROFILE,
+            profile=DEFAULT_PROFILE,
             slo_ttft=slo_ttft,
             slo_tbt=slo_tbt,
             simulate_decode=simulate_decode,
@@ -188,7 +188,7 @@ def run_overload(seed: int = 0) -> Tuple[Run, Run]:
 # --------------------------------------------------------------------------- #
 
 # Target TBT for the disaggregation scenario: 5 x the batch=1 baseline step time.
-DISAGG_TARGET_TBT = 5 * cost.decode_step_time(1, PROFILE)
+DISAGG_TARGET_TBT = 5 * decode_step_time(1, DEFAULT_PROFILE)
 DISAGG_MAX_BATCH = 8
 
 
@@ -222,7 +222,7 @@ def run_disaggregation(seed: int = 0) -> Tuple[Run, Run]:
 
 
 # TBT SLO for the early-rejection scenario: 3 x baseline step time.
-EARLY_SLO_TBT = 3 * cost.decode_step_time(1, PROFILE)
+EARLY_SLO_TBT = 3 * decode_step_time(1, DEFAULT_PROFILE)
 EARLY_MAX_BATCH = 8
 
 

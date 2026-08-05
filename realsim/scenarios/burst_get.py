@@ -40,6 +40,9 @@ from sim_common.trace import Trace
 KEY = "W"
 DEFAULT_N = 16  # elements in W (float32 -> 4 bytes each)
 
+# TODO(next diff): derive this payload from a ``realsim.model.Model`` instead of a
+# bare element count -- see the TODO in ``realsim/model.py`` for the full plan.
+
 # Producer compute model. We assume "generating" W costs a small, constant number
 # of flops per element (a stand-in for e.g. a fused multiply-add per element in
 # the kernel that materializes the tensor) and touches the whole payload's bytes.

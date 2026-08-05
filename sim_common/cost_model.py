@@ -39,6 +39,7 @@ __all__ = [
     "mem_copy_time",
     "storage_time",
     "storage_rate",
+    "get_time",
     "compute_time",
 ]
 
@@ -220,6 +221,37 @@ def storage_time(nbytes: int, kind: str, profile: MachineProfile) -> float:
         return 0.0
     bw = profile.storage_read_bw if kind == "read" else profile.storage_write_bw
     return profile.storage_latency + nbytes / bw
+
+
+def get_time(src, dst, nbytes: int, profile: MachineProfile) -> float:
+    """Total time to serve one ``get`` of ``nbytes`` from ``src`` to ``dst``.
+
+    The **canonical composition** of a read: the serving side reads the payload
+    back from persistent storage, stages it through host RAM, and ships it over
+    the fabric -- ``storage_time(read) + mem_copy_time + network_time``.
+
+    This exists so the component that *charges* a get and any component that
+    *predicts* one share a single definition. ``realsim``'s transport seam charges
+    exactly these three terms (as three virtual-clock sleeps, or one combined
+    sleep under ``collapse_charges``), and a scheduler that predicts a fetch cost
+    to route on must agree with them to the last float -- otherwise routing
+    decisions are made against a stale model and nothing fails loudly.
+    ``realsim/tests/test_cost_parity.py`` pins the two together.
+
+    ``network_time`` is symmetric in its endpoints (it prices the locality
+    :class:`~sim_common.topology.Tier` between them), so the argument order here
+    is "who serves" / "who receives" and does not affect the result.
+
+    Note this does **not** special-case a same-endpoint get: reading from a
+    co-located volume still costs storage + RAM, only the fabric term is zero.
+    """
+    if nbytes <= 0:
+        return 0.0
+    return (
+        storage_time(nbytes, "read", profile)
+        + mem_copy_time(nbytes, profile)
+        + network_time(src, dst, nbytes, profile)
+    )
 
 
 def storage_rate(kind: str, profile: MachineProfile) -> Tuple[float, float]:

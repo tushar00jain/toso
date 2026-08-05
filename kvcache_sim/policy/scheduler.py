@@ -28,15 +28,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from sim_common.cost_model import MachineProfile
+from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
 from sim_common.topology import Endpoint
 
-from . import cost
 from .cache import LRUCache
-from .cluster import Cluster
-from .cost import block_bytes, fetch_time, prefill_time, PROFILE
-from .decode import DecodeEngine
-from .model import longest_prefix_run, Request
+from ..runtime.cluster import Cluster
+from realsim.model import DEFAULT_MODEL, Model
+from ..utils import decode_step_time, prefill_time
+from ..runtime.decode import DecodeEngine
+from ..workload.request import longest_prefix_run, Request
 
 
 @dataclass
@@ -72,7 +72,8 @@ class _Base:
         *,
         block_tokens: int,
         capacity: Optional[int] = None,
-        profile: MachineProfile = PROFILE,
+        profile: MachineProfile = DEFAULT_PROFILE,
+        model: Model = DEFAULT_MODEL,
         decode_pool: Optional[List[str]] = None,
         prefill_pool: Optional[List[str]] = None,
         slo_ttft: float = float("inf"),
@@ -88,6 +89,7 @@ class _Base:
         self.ids: List[str] = sorted(self.topo)
         self.B = block_tokens
         self.profile = profile
+        self.model = model
         self.caches: Dict[str, LRUCache] = {i: LRUCache(capacity) for i in self.ids}
         # Prefill queue tail over ALL instances (the disaggregated-prefill pool may
         # be a subset; decode may be a disjoint or overlapping subset).
@@ -142,7 +144,7 @@ class _Base:
                 if (
                     dec_id == d
                     and pd_done <= done_time
-                    and pd_done + max(0, out - 1) * cost.decode_step_time(1, self.profile)
+                    and pd_done + max(0, out - 1) * decode_step_time(1, self.profile, self.model)
                     > done_time
                 ):
                     n += 1
@@ -180,7 +182,9 @@ class _Base:
         if self.engine is None:
             return True
         if self.early_rejection == "off":
-            pred = cost.decode_step_time(self.engine.occupancy(plan.decode) + 1, self.profile)
+            pred = decode_step_time(
+                self.engine.occupancy(plan.decode) + 1, self.profile, self.model
+            )
             if pred > self.slo_tbt:
                 return False  # late reject -> wasted prefill
         self.engine.admit(plan.request, plan.decode)
@@ -203,6 +207,16 @@ class _Base:
         await self.cluster.publish(plan.prefill, new_keys)
         if evicted:
             await self.cluster.evict(plan.prefill, evicted)
+        # Reconcile the analytical prefill queue with the clock the real ops
+        # actually reached. ``schedule`` reserved this instance until the
+        # *predicted* done_time; the executed cost can differ (the pull may find
+        # fewer blocks still resident, may be served by a different peer than the
+        # one priced, or may be slowed by contention), and only now is the true
+        # completion time known. Owned here rather than written by the caller so
+        # the queue model stays this object's invariant.
+        now = self.loop.time()
+        if now > self.busy_until[plan.prefill]:
+            self.busy_until[plan.prefill] = now
         return evicted
 
     def _commit(self, plan: Plan) -> Plan:
@@ -231,11 +245,11 @@ class LoadBalanceScheduler(_Base):
         match = counts.get(pick, 0)
         cached = min(match * self.B, prompt)
         uncached = prompt - cached
-        pt = prefill_time(uncached, self.profile)
+        pt = prefill_time(uncached, self.profile, self.model)
         qw, ttft, done = self._predict(pick, now, 0.0, pt)
         d, pred_batch = self._select_decode(done)
         pred_tbt = (
-            cost.decode_step_time(pred_batch + 1, self.profile) if self.engine else 0.0
+            decode_step_time(pred_batch + 1, self.profile, self.model) if self.engine else 0.0
         )
         plan = Plan(
             request, pick, d, match, cached, uncached, None, 0, qw, ttft, done, 0.0
@@ -286,20 +300,22 @@ class CacheAwareScheduler(_Base):
             if use_remote:
                 gap_blocks = best_len - local_len
                 pull_keys = keys[local_len:best_len]
-                xbytes = block_bytes(gap_blocks, self.B)
-                xt = fetch_time(
+                xbytes = self.model.block_bytes(gap_blocks, self.B)
+                # The one definition the transport also charges, so this
+                # prediction equals the time the real pull will cost.
+                xt = get_time(
                     self.topo[best_inst], self.topo[inst], xbytes, self.profile
                 )
                 cached = min(best_len * self.B, prompt)
                 uncached = prompt - cached
-                pt = prefill_time(uncached, self.profile)
+                pt = prefill_time(uncached, self.profile, self.model)
                 qw, ttft, done = self._predict(inst, now, xt, pt)
                 src, match, xb = best_inst, best_len, xbytes
             else:
                 pull_keys = []
                 cached = min(local_len * self.B, prompt)
                 uncached = prompt - cached
-                pt = prefill_time(uncached, self.profile)
+                pt = prefill_time(uncached, self.profile, self.model)
                 xt = 0.0
                 qw, ttft, done = self._predict(inst, now, 0.0, pt)
                 src, match, xb = None, local_len, 0
@@ -316,7 +332,7 @@ class CacheAwareScheduler(_Base):
         assert best is not None
         best.decode, best.pred_batch = self._select_decode(best.done_time)
         best.pred_tbt = (
-            cost.decode_step_time(best.pred_batch + 1, self.profile)
+            decode_step_time(best.pred_batch + 1, self.profile, self.model)
             if self.engine
             else 0.0
         )

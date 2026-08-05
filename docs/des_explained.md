@@ -54,9 +54,16 @@ as aligned text. A deterministic sim ⟹ an identical trace across runs.
 renderer (`render_tree`) the demo entrypoints share.
 
 The real-object plumbing the sims drive — the real client/controller/transport
-**seams + adapters**, the `ReadCoordinator` and its pluggable `ReadPolicy`, and
-the meta / metadata-only payload carriers — lives in [`realsim`](../realsim/).
-Both sims `import realsim` and add only their own policy + scenario code.
+**seams + adapters**, the `Mesh` that wires per-node volumes + real clients onto
+one directory, the `ReadCoordinator` and its pluggable `ReadPolicy`, and the meta /
+metadata-only payload carriers — lives in [`realsim`](../realsim/). Both sims
+`import realsim` and add only their own policy + scenario code.
+
+`realsim/model.py` is also shared: a `Model` reduces a transformer to what a sim
+charges against (flops per prefilled token, flops per decode step, KV bytes per
+token via `block_bytes()`). `kvcache_sim` prices prefill/decode compute and KV
+block sizes from it; `dedup_sim` will size the weights it syncs from it (a TODO in
+that file records the plan).
 
 Because the sims execute real torchstore code, they depend on the **real
 `torchstore` / `torch` / `monarch` install** (the from-source build), not
@@ -71,7 +78,7 @@ overlapping shards) that lives on a trainer, can we move each unique byte across
 the slow cross-node fabric **exactly once** (1×) instead of *m* times?
 
 `dedup_sim` implements this as a real `realsim.coordinator.model.ReadPolicy`
-(`dedup_sim.policy.DedupPolicy`) plugged into `realsim`'s `ReadCoordinator`. It
+(`dedup_sim.policy.routing.DedupPolicy`) plugged into `realsim`'s `ReadCoordinator`. It
 consults the **real** `Controller` directory and drives the real `LocalClient`
 and in-memory transport, on real types throughout.
 
@@ -79,9 +86,9 @@ and in-memory transport, on real types throughout.
 
 | Component | File | Role |
 |---|---|---|
-| `DedupPolicy` | `policy.py` | A real `ReadPolicy`. Overrides `run_burst` to stage the read-through chain/tree over the real directory, and `after_fetch` for the read-through `put`. Reuses the coordinator's real primitives (`_locate`, `_fetch_one`, shared transport, metrics, trace). |
-| `_RoutingControllerHandle` | `policy.py` | Expresses each routing choice: answers `locate_volumes` from the **real** directory, then narrows the result to the policy-chosen volume (returning the real `StorageInfo` unchanged). Every other endpoint — notably `notify_put_batch` — passes straight through, so the real directory stays the single source of truth. |
-| dedup scenario + metrics | `scenario.py` | Builds the burst (reusing `realsim`'s wiring), runs it under dedup + naive, and computes fabric bytes (1× vs *m×*) + the source→dest tree. |
+| `DedupPolicy` | `policy/routing.py` | A real `ReadPolicy`. Overrides `run_burst` to stage the read-through chain/tree over the real directory, and `after_fetch` for the read-through `put`. Reuses the coordinator's real primitives (`_locate`, `_fetch_one`, shared transport, metrics, trace). |
+| `_RoutingControllerHandle` | `policy/routing.py` | Expresses each routing choice: answers `locate_volumes` from the **real** directory, then narrows the result to the policy-chosen volume (returning the real `StorageInfo` unchanged). Every other endpoint — notably `notify_put_batch` — passes straight through, so the real directory stays the single source of truth. |
+| dedup scenario | `workload/scenarios.py` | Builds the burst (reusing `realsim`'s wiring), runs it under dedup + naive, and computes fabric bytes (1× vs *m×*) + the source→dest tree. |
 | demo entrypoint | `__main__.py` | `python -m dedup_sim` — fabric summary + ASCII diagram (INFO), full per-event trace (DEBUG, `-v`). |
 
 ### How it reaches 1× on the real directory
@@ -134,21 +141,21 @@ through `realsim`'s transport seam, and eviction is the real `notify_delete_batc
 
 | Component | File | Role |
 |---|---|---|
-| `Instance`, `Request`, prefix-hash | `sim/model.py` | An `Instance` owns one KV pool. A prompt is chunked into fixed `B`-token blocks, each **content-addressed by a prefix-hash chain** so shared leading blocks get identical keys (dedup/prefix-reuse falls out for free). `longest_prefix_run` counts leading matched blocks. |
-| `Cluster` | `sim/cluster.py` | The four KV directory verbs (`prefix_lengths` / `publish` / `fetch` / `evict`) over a `realsim.mesh.Mesh`, which supplies the **real** `Controller` directory plus a real per-instance `LocalClient`. `prefix_lengths(block_keys)` — `{instance → leading blocks held}` — is the scheduler's core query, computed from the real `locate_volumes`. |
-| `LRUCache` | `sim/cache.py` | Per-instance bounded cache with **LRU eviction**, the local bookkeeping kept in sync with directory presence. Recency is a monotonic counter (deterministic). |
-| cost layer | `sim/cost.py` | Over `sim_common.cost_model`: `prefill_time` (per-uncached-token compute), `decode_step_time(batch)` (per-step **TBT**, strictly increasing in batch size), and `fetch_time` (a remote KV fetch, matching what the transport seam charges). |
-| `DecodeEngine` | `sim/decode.py` | Batched, stepped decode on the async engine (makes **TBT real**). Emits one token per step per batched request; step time = `decode_step_time(batch)`. Models the VRAM `max_batch` cap (over-cap requests queue, their wait counting against TBT) and prefill/decode coupling (shared vs private compute timeline). |
-| `LoadBalanceScheduler` / `CacheAwareScheduler` | `sim/scheduler.py` | The two policies (async). Load-balance: least-loaded instance, local-only cache. Cache-aware: route to minimize predicted TTFT using the **global** prefix directory; optionally pull a remote prefix under a balance threshold (which read-through-replicates the destination); LRU-evict on completion; SLO-reject. With `simulate_decode`, also picks a decode instance by *predicted* batch and applies the `early_rejection` admission mode. |
-| `Client` | `sim/client.py` | Drives the request lifecycle: arrival → `schedule` → prefill-done publish (read-through), and (when decode is simulated) decode admission → decode-done, recording TBT. |
-| `make_workload` | `sim/workload.py` | Seeded synthetic generator: shared system prompt + per-conversation context + unique query suffix, conversations chosen by a **Zipf** popularity law, **Poisson** arrivals. |
-| `Metrics` | `sim/trace.py` | Hit rate, compute/saved tokens, mean/p90 TTFT, fabric bytes, rejections, and decode-side TBT (`mean_tbt`, `pct_tbt`, `tbt_slo_met`, `wasted_prefills`, `decode_rejections`). |
-| scenarios + harness | `sim/scenarios.py` | The six scenarios + the async run harness. |
+| `Instance`, `Request`, prefix-hash | `workload/request.py` | An `Instance` owns one KV pool. A prompt is chunked into fixed `B`-token blocks, each **content-addressed by a prefix-hash chain** so shared leading blocks get identical keys (dedup/prefix-reuse falls out for free). `longest_prefix_run` counts leading matched blocks. |
+| `Cluster` | `runtime/cluster.py` | The four KV directory verbs (`prefix_lengths` / `publish` / `fetch` / `evict`) over a `realsim.mesh.Mesh`, which supplies the **real** `Controller` directory plus a real per-instance `LocalClient`. `prefix_lengths(block_keys)` — `{instance → leading blocks held}` — is the scheduler's core query, computed from the real `locate_volumes`. |
+| `LRUCache` | `policy/cache.py` | Per-instance bounded cache with **LRU eviction**, the local bookkeeping kept in sync with directory presence. Recency is a monotonic counter (deterministic). |
+| compute times | `utils.py` | Over `sim_common.cost_model`: `prefill_time` (per-uncached-token compute) and `decode_step_time(batch)` (per-step **TBT**, strictly increasing in batch size). The cost of the *transfer* is `sim_common.cost_model.get_time`, shared with the transport seam. |
+| `DecodeEngine` | `runtime/decode.py` | Batched, stepped decode on the async engine (makes **TBT real**). Emits one token per step per batched request; step time = `decode_step_time(batch)`. Models the VRAM `max_batch` cap (over-cap requests queue, their wait counting against TBT) and prefill/decode coupling (shared vs private compute timeline). |
+| `LoadBalanceScheduler` / `CacheAwareScheduler` | `policy/scheduler.py` | The two policies (async). Load-balance: least-loaded instance, local-only cache. Cache-aware: route to minimize predicted TTFT using the **global** prefix directory; optionally pull a remote prefix under a balance threshold (which read-through-replicates the destination); LRU-evict on completion; SLO-reject. With `simulate_decode`, also picks a decode instance by *predicted* batch and applies the `early_rejection` admission mode. |
+| `Driver` | `runtime/driver.py` | Drives the request lifecycle: arrival → `schedule` → prefill-done publish (read-through), and (when decode is simulated) decode admission → decode-done, recording TBT. |
+| `make_workload` | `workload/generator.py` | Seeded synthetic generator: shared system prompt + per-conversation context + unique query suffix, conversations chosen by a **Zipf** popularity law, **Poisson** arrivals. |
+| `Metrics` | `report/metrics.py` | Hit rate, compute/saved tokens, mean/p90 TTFT, fabric bytes, rejections, and decode-side TBT (`mean_tbt`, `pct_tbt`, `tbt_slo_met`, `wasted_prefills`, `decode_rejections`). |
+| scenarios + harness | `workload/scenarios.py` | The six scenarios + the async run harness. |
 
 ### The event flow
 
 1. **`make_workload`** produces a deterministic, arrival-sorted list of `Request`s.
-2. **`Client.submit`** schedules each request's arrival; on arrival
+2. **`Driver.run`** schedules each request's arrival; on arrival
    **`scheduler.schedule(request, now)`** runs (serialized like the Monarch actor
    mailbox — consistent directory snapshot): query `prefix_lengths` for the best
    match, predict TTFT per instance (`queue + transfer + prefill(uncached)`), route
@@ -178,6 +185,13 @@ and [`torchstore_kvcache_design.md`](torchstore_kvcache_design.md).
 ---
 
 ## 4. How the two compare
+
+Both packages are laid out in the same **role folders** — `policy/` (the algorithm
+under test), `workload/` (what is simulated), `report/` (outcome metrics), plus
+`runtime/` and `cost.py` where a capability needs them — so the two can be read
+folder by folder. Which folders are *absent* is itself informative; the
+folder-level comparison is tabulated in
+[`../dedup_sim/README.md`](../dedup_sim/README.md#comparison-with-kvcache_sim).
 
 | Aspect | `dedup_sim` | `kvcache_sim` |
 |---|---|---|

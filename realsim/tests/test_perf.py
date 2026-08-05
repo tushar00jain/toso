@@ -110,7 +110,7 @@ _REALSIM_SNIPPET = (
 )
 _DEDUP_SNIPPET = (
     "import resource;"
-    "from dedup_sim.scenario import run_dedup_burst, run_naive_burst;"
+    "from dedup_sim.workload.scenarios import run_dedup_burst, run_naive_burst;"
     "run_naive_burst(num_readers=3, n=1024);"
     "run_dedup_burst(num_readers=3, fanout_cap=1, n=1024);"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"

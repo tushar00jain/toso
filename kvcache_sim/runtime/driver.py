@@ -27,9 +27,9 @@ import asyncio
 from typing import Dict, List
 
 from .cluster import Cluster
-from .model import Request
-from .scheduler import Plan
-from .trace import Metrics, RequestResult, Trace
+from ..workload.request import Request
+from ..policy.scheduler import Plan
+from ..report.metrics import Metrics, RequestResult, Trace
 
 
 class Driver:
@@ -107,11 +107,9 @@ class Driver:
             await asyncio.sleep(plan.prefill_t)
 
         # (4) publish the computed KV blocks into the real directory; evict.
+        # ``on_complete`` also reconciles its own prefill-queue model against the
+        # clock the real ops reached -- the driver does not reach into it.
         evicted = await self.scheduler.on_complete(plan)
-        # Keep the analytical queue tail consistent with the real ops' clock.
-        self.scheduler.busy_until[plan.prefill] = max(
-            self.scheduler.busy_until[plan.prefill], self._now()
-        )
         self._prefill_done(plan, evicted)
 
     # -- outcome bookkeeping ---------------------------------------------- #

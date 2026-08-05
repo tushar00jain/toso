@@ -22,7 +22,7 @@ from collections import Counter
 import pytest
 import torch
 
-from dedup_sim.scenario import (
+from dedup_sim.workload.scenarios import (
     DEFAULT_N,
     MODE_META,
     MODE_METADATA,
