@@ -37,7 +37,10 @@ client/controller/transport), so they depend on the from-source
 - [`realsim/`](realsim/) — the **real-code** cooperative DES foundation: it drives
   the **real** TorchStore client planning core, controller directory, and
   in-memory transport/store off-actor on a deterministic virtual clock, modeling
-  only the new read coordinator (with a pluggable `ReadPolicy` seam). It runs
+  only the new read coordinator (with a pluggable `ReadPolicy` seam). `Mesh` is the
+  multi-client wiring the capability sims build on — per-node volumes + real
+  clients, one directory, one resource registry, and the single shared transport
+  factory — so a capability package holds only capability code. It runs
   **allocation-free** (zero-storage meta tensors / metadata-only descriptors, so a
   modeled payload of any size costs no memory) and charges **every** resource —
   network, storage, RAM, CPU, and GPU/compute — as analytic functions of a
@@ -49,7 +52,8 @@ client/controller/transport), so they depend on the from-source
 - [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
   real directory**: the scheduler/decode/cache logic consults real KV-block
   presence per instance (real `Controller`) and drives real fetches via
-  `realsim`'s client/engine/cost model.
+  `realsim`'s `Mesh`/client/engine/cost model, expressed as four directory verbs
+  (`prefix_lengths` / `publish` / `fetch` / `evict`).
 - [`sim_common/`](sim_common/) — the shared building blocks all three sims use:
   the deterministic virtual-clock `AsyncEngine` (the sim path) plus the original
   callback engine (`engine.py`: `Sim`/`Promise`), the locality/topology skeleton,

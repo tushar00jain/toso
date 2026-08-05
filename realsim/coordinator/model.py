@@ -29,38 +29,26 @@ The routing lives entirely in the pluggable :class:`ReadPolicy`, built on the
 
 Multi-client transport seam
 ---------------------------
-``torchstore.client.create_transport_buffer`` is a process-wide module global (see
-``docs/realsim_design.md`` recommendation 2), so concurrent readers cannot each
-install their own factory. This module installs **one** shared factory for the
-whole burst that resolves the calling reader's source endpoint from a
-:class:`contextvars.ContextVar` set per reader task. ``asyncio`` copies the context
-into each task created by ``gather``, so the lookup is task-local and
-deterministic.
+The wiring a burst runs on -- real volumes, one real ``LocalClient`` per node, the
+shared resource registry, and the single ``create_transport_buffer`` substitution
+that resolves the calling reader's source endpoint -- is not burst-specific, so it
+lives in :class:`realsim.mesh.Mesh`. The coordinator is a burst-shaped *consumer*
+of a mesh: it adds the read path, the policy seam, and the fabric accounting, and
+nothing else.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextvars
-import sys
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from realsim.seams.transport import Endpoint, InMemoryTransport
-from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
+from realsim.mesh import Mesh
+from realsim.seams import factory
+from realsim.seams.transport import Endpoint
+from sim_common.cost_model import MachineProfile
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
-
-# The real torchstore.client submodule (shadowed on the package by a `client`
-# function, so it must be fetched from sys.modules -- see realsim_design.md #4).
-_CLIENT_MODULE = sys.modules["torchstore.client"]
-
-# Per-reader source endpoint, read by the shared transport factory. Set inside
-# each reader's task so concurrent readers each charge the right locality.
-_current_src: "contextvars.ContextVar[Endpoint]" = contextvars.ContextVar(
-    "realsim_current_src_endpoint"
-)
 
 
 @dataclass
@@ -154,45 +142,70 @@ class NaivePolicy(ReadPolicy):
 class ReadCoordinator:
     """Coordinates a synchronized read burst over the real directory/client.
 
+    The real objects the burst runs on come from ``mesh``; this class adds only
+    the burst-specific parts -- the read path, the :class:`ReadPolicy` seam, and
+    the fabric accounting in :class:`BurstMetrics`. It claims the mesh's
+    :attr:`~realsim.mesh.Mesh.on_transfer` hook for that accounting, so one mesh
+    backs at most one coordinator.
+
     Args:
-        controller_handle: a :class:`~realsim.seams.controller_handle.FakeControllerHandle`
-            (the real ``Controller`` directory behind the actor surface).
-        topology: ``volume_id -> Endpoint`` for transfer-cost locality.
+        mesh: the :class:`realsim.mesh.Mesh` holding the real controller
+            directory, per-node volumes/clients, resource registry, and the
+            shared transport factory.
         origin_ids: endpoint ids that held data before the burst; transfers whose
             source is one of these count as fabric bytes.
         policy: a :class:`ReadPolicy` (defaults to :class:`NaivePolicy`).
-        profile: the target-machine :class:`~sim_common.cost_model.MachineProfile`
-            supplying every cost constant (defaults to
-            :data:`~sim_common.cost_model.DEFAULT_PROFILE`).
-        trace: shared :class:`~sim_common.trace.Trace`.
         metrics: shared :class:`BurstMetrics` (created if omitted).
-        registry: optional shared :class:`~sim_common.resources.ResourceRegistry`
-            for network/storage contention, installed into the shared transport
-            factory the burst uses (``None`` -> independent sleeps).
     """
 
     def __init__(
         self,
-        controller_handle: Any,
-        topology: Dict[str, Endpoint],
+        mesh: Mesh,
         *,
         origin_ids: Optional[set] = None,
         policy: Optional[ReadPolicy] = None,
-        profile: Optional[MachineProfile] = None,
-        trace: Optional[Trace] = None,
         metrics: Optional[BurstMetrics] = None,
-        registry: Optional[ResourceRegistry] = None,
     ) -> None:
-        self.controller_handle = controller_handle
-        self.topology = topology
+        self.mesh = mesh
         self.origin_ids = set(origin_ids) if origin_ids is not None else set()
         self.policy = policy if policy is not None else NaivePolicy()
-        self.profile = profile if profile is not None else DEFAULT_PROFILE
-        self.trace = trace if trace is not None else Trace()
         self.metrics = metrics if metrics is not None else BurstMetrics()
-        self.registry = registry
+        mesh.on_transfer = self._on_transfer
 
-    # -- the shared, contextvar-aware transport factory -------------------- #
+    # -- the mesh's shared pieces, surfaced for policies ------------------- #
+    @property
+    def controller_handle(self) -> Any:
+        """The real ``Controller`` directory behind the actor surface."""
+        return self.mesh.handle
+
+    @property
+    def topology(self) -> Dict[str, Endpoint]:
+        """``volume_id -> Endpoint`` for transfer-cost locality."""
+        return self.mesh.topology
+
+    @property
+    def trace(self) -> Trace:
+        """The run's shared :class:`~sim_common.trace.Trace`."""
+        return self.mesh.trace
+
+    @property
+    def profile(self) -> MachineProfile:
+        """The target-machine :class:`~sim_common.cost_model.MachineProfile`."""
+        return self.mesh.profile
+
+    @property
+    def registry(self) -> ResourceRegistry:
+        """The run's shared :class:`~sim_common.resources.ResourceRegistry`."""
+        return self.mesh.registry
+
+    def installed(self) -> Iterator[Mesh]:
+        """Install the mesh's shared transport factory for the burst.
+
+        A :class:`ReadPolicy` that overrides :meth:`ReadPolicy.run_burst` must
+        wrap its execution in this, exactly as :meth:`_naive_burst` does.
+        """
+        return self.mesh.installed()
+
     def _on_transfer(self, kind, src_id, dst_id, nbytes, cost) -> None:
         """Structured fabric-byte accounting (see :class:`BurstMetrics`)."""
         if kind != "get":
@@ -202,33 +215,6 @@ class ReadCoordinator:
             self.metrics.fabric_bytes += nbytes
         if nbytes > 0:
             self.metrics.edges.append((src_id, dst_id, dst_id))
-
-    @contextmanager
-    def _shared_transport(self) -> Iterator[None]:
-        """Install one contextvar-aware ``create_transport_buffer`` for the burst."""
-        topo = self.topology
-        profile = self.profile
-        trace = self.trace
-        on_transfer = self._on_transfer
-        registry = self.registry
-
-        def factory(storage_volume_ref) -> InMemoryTransport:
-            return InMemoryTransport(
-                storage_volume_ref,
-                src=_current_src.get(),
-                dst=topo[storage_volume_ref.volume_id],
-                profile=profile,
-                trace=trace,
-                on_transfer=on_transfer,
-                registry=registry,
-            )
-
-        original = _CLIENT_MODULE.create_transport_buffer
-        _CLIENT_MODULE.create_transport_buffer = factory
-        try:
-            yield
-        finally:
-            _CLIENT_MODULE.create_transport_buffer = original
 
     # -- the read path ----------------------------------------------------- #
     async def _locate(self, key: str) -> Dict[str, Dict[str, Any]]:
@@ -241,7 +227,7 @@ class ReadCoordinator:
 
     async def _fetch_one(self, reader: Reader, key: str) -> Any:
         """Run one reader's real ``client.get`` with its source endpoint bound."""
-        _current_src.set(reader.endpoint)
+        factory.bind_source(reader.endpoint)
         result = await reader.client.get(key, tensor_slice_spec=reader.tensor_slice_spec)
         await self.policy.after_fetch(self.controller_handle, reader, key)
         self.metrics.readers_done += 1
@@ -270,7 +256,7 @@ class ReadCoordinator:
         baseline. Records the directory lookup, a per-reader completion, and (via
         the transport) every transfer into the shared trace.
         """
-        with self._shared_transport():
+        with self.installed():
             await self._locate(key)
             loop = asyncio.get_running_loop()
             self.trace.record(loop.time(), "coord", f"burst: {len(readers)} readers get {key!r}")

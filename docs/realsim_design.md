@@ -134,9 +134,12 @@ realsim/
                               #   TensorDescriptor (metadata-only carrier)
     volume_handle.py          # FakeVolumeHandle (mirrors StorageVolume endpoints; real InMemoryStore)
     controller_handle.py      # FakeControllerHandle (dispatches to a real Controller)
+    factory.py                # THE create_transport_buffer substitution point + source contextvar
   adapters/                   # thin wiring that constructs the real objects off-actor
     real_controller.py        # RealControllerAdapter (constructs a real Controller off-actor)
-    real_client.py            # RealClientAdapter + FakeStrategy + create_transport_buffer seam
+    real_client.py            # RealClientAdapter + FakeStrategy (single-client transport install)
+  mesh.py                     # Mesh — multi-client wiring: per-node volumes + real clients,
+                              #   one directory + registry, one shared transport factory
   coordinator/                # the NEW component under design — a model
     model.py                  # Reader, ReadPolicy/NaivePolicy, ReadCoordinator, BurstMetrics
   scenarios/                  # runnable scenarios
@@ -152,6 +155,7 @@ realsim/
     test_correctness.py       # off-sim byte-equality on tiny REAL CPU tensors
     test_perf.py              # no-real-allocation-at-scale + parity vs. a capability sim
     test_composability.py     # import the real-directory backend + swap proof
+    test_mesh.py              # Mesh wiring, per-operation source locality, one-owner install
 
 sim_common/                   # shared DES library (repo root)
   async_engine.py             # deterministic asyncio loop + virtual clock
@@ -173,7 +177,8 @@ the entire `InMemoryStore`; and the real `Request` / `TensorSlice` / `StorageInf
 component being designed); the `.call` / `.call_one` awaitable wrappers standing in
 for Monarch RPC; the ~5-line verbatim mirrors of the `locate_volumes` / `keys`
 read endpoints (see §4); the transport's resource-cost charges; the minimal
-`FakeStrategy`; and the `create_transport_buffer` substitution.
+`FakeStrategy`; the `Mesh`/`Cluster` wiring that constructs the real objects; and
+the `create_transport_buffer` substitution.
 
 ---
 
@@ -218,12 +223,18 @@ modifying any torchstore source**.
   callers that ignore a real `.call`'s `ValueMesh` return are unaffected.
 - **Transport seam (the one substitution).** The client resolves the transport via
   the module global `create_transport_buffer`, imported at module load. The only
-  substitution point is that bound name on the client module object.
-  `RealClientAdapter.installed()` patches
+  substitution point is that bound name on the client module object, and
+  `seams/factory.py` is the only place in the repo that touches it: it patches
   `sys.modules["torchstore.client"].create_transport_buffer` for the scope of a
   block and restores it in `finally`. (The submodule must be fetched via
   `sys.modules["torchstore.client"]` because the package namespace shadows the
-  `client` submodule with a `client` function — §10.)
+  `client` submodule with a `client` function — §10.) Because the binding is
+  process-wide, `factory.installed()` permits **one owner at a time** and raises on
+  an overlapping install; a second install would otherwise silently win while the
+  first owner kept recording metrics, charging transfers the wrong source
+  locality. `RealClientAdapter.installed()` is the single-client form (source
+  pinned to that adapter's node); `Mesh.installed()` is the multi-client form
+  (source resolved per operation from the factory's contextvar).
 - **Strategy seam.** `FakeStrategy` supplies only what the client uses —
   `select_storage_volume()`, `get_storage_volume(volume_id)` (both returning real
   `StorageVolumeRef` objects), and `transport_context`. A real
@@ -350,13 +361,44 @@ So a **put** charges `network` (client→volume) + `storage write`; a **get** ch
 
 ---
 
-## 8. Coordinator and scenario
+## 8. Mesh, coordinator and scenario
+
+### `mesh.py` — the shared multi-client wiring
+
+Before a scenario can express any capability it needs the same set of real
+objects: a controller adapter, a `FakeVolumeHandle` per node, a
+`RealClientAdapter` (hence a real `LocalClient`) per node, one shared
+`ResourceRegistry`, and — because `create_transport_buffer` is a process-wide
+global — *one* transport factory shared across clients that resolves the caller's
+source endpoint dynamically. `Mesh` is that assembly:
+
+```python
+mesh = Mesh(topology, profile=profile, trace=trace)
+with mesh.installed():
+    mesh.bind_source("s0")
+    await mesh.client("s0").put_batch(...)
+```
+
+`Mesh.on_transfer` is an optional `(kind, src_id, dst_id, nbytes, cost)` hook read
+at call time, so a consumer built *after* the mesh can claim it for accounting.
+
+This wiring is independent of the capability under test, so it does not belong to
+any one of them. It originally lived inside `ReadCoordinator`, whose shape is a
+single synchronized burst (`run_burst(readers, key)`); a capability that is not a
+burst — `kvcache_sim`'s continuous arrival stream — could not reuse the
+coordinator and re-derived the wiring underneath it, duplicating the factory, the
+contextvar, and the per-node adapter construction. With `Mesh` extracted, the
+coordinator is a burst-shaped consumer of a mesh and `kvcache_sim`'s `Cluster` is a
+KV-shaped one (four directory verbs), so each capability package holds only
+capability code.
 
 ### `coordinator/model.py` — the new component
 
 - `ReadCoordinator.run_burst(readers, key)` consults the **real** controller
   directory (`locate_volumes`) then fans each reader's **real** `client.get` out on
-  the engine via `asyncio.gather`. It installs one shared, contextvar-aware
+  the engine via `asyncio.gather`. The real objects it drives come from a
+  `Mesh` (§8a); the coordinator adds only the read path, the policy seam, and the
+  fabric accounting. It installs the mesh's shared, contextvar-aware
   `create_transport_buffer` for the burst so concurrent readers each charge the
   right locality: the process-wide transport global is replaced by one factory that
   reads the calling reader's source endpoint from a `ContextVar` set per reader
@@ -437,7 +479,9 @@ upstream changes that would each remove a piece of glue:
    global `create_transport_buffer` — e.g. accept an optional factory on
    `LocalClient`, or hang it off the strategy. This removes the process-wide
    substitution and is the clean form of driving many clients with different
-   transports in one process.
+   transports in one process. It would also let `Mesh` drop its contextvar
+   (each client would simply hold its own factory) and remove the one-owner
+   restriction in `seams/factory.py` entirely.
 3. **Add a non-actor `Controller` construction/init path** — a plain constructor
    plus an init that does not require a Monarch storage-volume mesh (or split
    directory init from mesh setup). Today the adapter sets `is_initialized`

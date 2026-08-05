@@ -12,9 +12,11 @@ Wiring:
   off it.
 - ``create_transport_buffer`` is substituted so the client's planning core drives
   :class:`~realsim.seams.transport.InMemoryTransport`. The real client imports the
-  factory as a module global (``from torchstore.transport import
-  create_transport_buffer``), so the only substitution point is the bound name on
-  the ``torchstore.client`` module object -- patched via ``installed()`` below.
+  factory as a module global, so the substitution is process-wide; it goes through
+  :mod:`realsim.seams.factory`, which owns the patch and permits only one owner at
+  a time. ``installed()`` below is therefore the **single-client** drive: it pins
+  the source endpoint to this adapter's own node. A multi-client drive needs one
+  factory shared across clients -- use :class:`realsim.mesh.Mesh`.
 
 The real ``LocalClient`` planning core (``_build_volume_requests``,
 ``_expand_tensor_slices``, ``_fetch``, ``_assemble_results``, ``_apply_inplace``)
@@ -23,10 +25,10 @@ is exactly what executes.
 
 from __future__ import annotations
 
-import sys
 from contextlib import contextmanager
 from typing import Iterator
 
+from realsim.seams import factory
 from realsim.seams.transport import Endpoint, InMemoryTransport
 from realsim.seams.volume_handle import FakeVolumeHandle
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
@@ -36,11 +38,6 @@ from torchstore.client import LocalClient
 from torchstore.strategy import StorageVolumeRef
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
-
-# The real torchstore.client submodule object (shadowed on the package by a
-# `client` function, so it must be fetched from sys.modules, not attribute
-# access on the `torchstore` package).
-_CLIENT_MODULE = sys.modules["torchstore.client"]
 
 
 class FakeStrategy:
@@ -129,14 +126,13 @@ class RealClientAdapter:
     def installed(self) -> Iterator["RealClientAdapter"]:
         """Substitute ``create_transport_buffer`` for the duration of the block.
 
-        The substitution is a process-wide monkeypatch on the ``torchstore.client``
-        module, so multi-client drives must scope each client's operations in its
-        own ``installed()`` block (see ``docs/realsim_design.md`` s10 for the
-        recommended upstream fix).
+        The substitution is a process-wide monkeypatch (see
+        :mod:`realsim.seams.factory`), and this one pins the source endpoint to
+        *this* adapter's node -- so it drives a single client. Multi-client drives
+        must either scope each client's operations in its own ``installed()``
+        block or, better, share one :class:`realsim.mesh.Mesh` factory that
+        resolves the source per operation. Overlapping installs raise (see
+        ``docs/realsim_design.md`` s10 for the recommended upstream fix).
         """
-        original = _CLIENT_MODULE.create_transport_buffer
-        _CLIENT_MODULE.create_transport_buffer = self._transport_factory()
-        try:
+        with factory.installed(self._transport_factory(), owner=self):
             yield self
-        finally:
-            _CLIENT_MODULE.create_transport_buffer = original

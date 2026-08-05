@@ -115,7 +115,7 @@ to the coordinator, layered over the existing `put`/`get` plumbing.
 kvcache_sim/
   sim/model.py        # inference Request + prefix-hash chain (plain str keys)
   sim/cost.py         # cost layer over sim_common.cost_model (prefill/decode/fetch)
-  sim/cluster.py      # real Controller directory + per-instance real clients + seam
+  sim/cluster.py      # the four KV directory verbs over a realsim.mesh.Mesh
   sim/cache.py        # per-instance LRU eviction bookkeeping
   sim/decode.py       # async DecodeEngine: batched, stepped decode -> TBT
   sim/scheduler.py    # LoadBalance (baseline) + CacheAware coordinator (async)
@@ -129,8 +129,13 @@ kvcache_sim/
 
 The async engine, the cost model, the topology/`Endpoint` skeleton, the `Trace`
 recorder and the report helpers live in the repo-root `sim_common/`; the real
-client/controller/transport seams + adapters live in `realsim/`. This package holds
-only the KV-cache policy (scheduler, cache, decode, workload, scenarios).
+client/controller/transport seams + adapters live in `realsim/`, and the
+multi-instance wiring they add up to — per-instance volumes + real clients, one
+directory, one resource registry, one shared transport factory — is
+`realsim.mesh.Mesh`. This package holds only the KV-cache policy (scheduler,
+cache, decode, workload, scenarios) plus the four directory verbs
+(`prefix_lengths` / `publish` / `fetch` / `evict`) that express KV caching on a
+mesh.
 
 ## Honesty notes
 

@@ -23,8 +23,6 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from realsim.adapters.real_client import RealClientAdapter
-from realsim.adapters.real_controller import make_controller_adapter
 from realsim.coordinator.model import (
     BurstMetrics,
     NaivePolicy,
@@ -32,12 +30,11 @@ from realsim.coordinator.model import (
     ReadCoordinator,
     ReadPolicy,
 )
+from realsim.mesh import Mesh
 from realsim.seams.transport import Endpoint, TensorDescriptor
-from realsim.seams.volume_handle import FakeVolumeHandle
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile, compute_time
 from sim_common.report import render_tree
-from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
 KEY = "W"
@@ -135,11 +132,12 @@ def build_burst(
     ``Trie``; ``False`` -> the lightweight dict shim). It changes no metric.
 
     The network/storage contention model is read ambiently from
-    :data:`sim_common.config.SimConfig.contention` (default ``"none"``). One shared
-    :class:`~sim_common.resources.ResourceRegistry` is built here and injected into
-    the producer, every reader adapter, and the coordinator's shared transport
-    factory, so all transfers in the burst see the same links/stores. Unlike
-    ``real_directory`` a non-``"none"`` mode DOES change timing.
+    :data:`sim_common.config.SimConfig.contention` (default ``"none"``). The
+    :class:`~realsim.mesh.Mesh` builds one shared
+    :class:`~sim_common.resources.ResourceRegistry` and injects it into the
+    producer, every reader adapter, and its shared transport factory, so all
+    transfers in the burst see the same links/stores. Unlike ``real_directory`` a
+    non-``"none"`` mode DOES change timing.
 
     The full resource model exercised by one run:
 
@@ -169,65 +167,37 @@ def build_burst(
     metrics = metrics if metrics is not None else BurstMetrics()
     policy = policy if policy is not None else NaivePolicy()
     profile = profile if profile is not None else DEFAULT_PROFILE
-    # One shared resource layer for the whole run (default "none" -> inert).
-    registry = ResourceRegistry.from_config()
 
     topology = _topology(num_readers)
-    # Each volume's byte capacity comes from the run's profile
-    # (``storage_capacity_bytes``, default unbounded); the seam enforces it
-    # against the aggregate resident working set.
-    volumes = {
-        vid: FakeVolumeHandle(volume_id=ep.id, profile=profile)
-        for vid, ep in topology.items()
-    }
-
-    # Real Trie directory by default; the opt-in shim (real_directory=False, or
-    # the ambient config flag) swaps only the directory container -- see
-    # realsim.adapters.real_controller.make_controller_adapter.
-    controller = make_controller_adapter(real_directory)
+    # The mesh builds every real object the burst runs on: the controller adapter
+    # (real Trie by default; the opt-in shim swaps only the directory container),
+    # a real volume + co-located real LocalClient per node, the shared resource
+    # registry, and the shared transport factory.
+    mesh = Mesh(
+        topology, profile=profile, trace=trace, real_directory=real_directory
+    )
     origin_id = topology["p"].id  # the volume that holds W before the burst
 
-    # Producer adapter (writes W to its co-located origin volume "p").
-    producer = RealClientAdapter(
-        controller.handle,
-        volume_handles=volumes,
-        client_volume_id="p",
-        topology=topology,
-        profile=profile,
-        trace=trace,
-        registry=registry,
-    )
+    # The producer writes W to its co-located origin volume "p". This is a
+    # single-client drive (before the burst), so it uses the adapter's own
+    # factory rather than the mesh's shared one.
+    producer = mesh.adapter("p")
 
-    # Reader adapters (one per reader volume). Their .client is what the
-    # coordinator fans out; the coordinator installs the shared transport factory
-    # for the burst, so the readers' own factories are unused during the burst.
-    readers: List[Reader] = []
-    reader_adapters = []
-    for i in range(num_readers):
-        vid = f"r{i}"
-        adapter = RealClientAdapter(
-            controller.handle,
-            volume_handles=volumes,
-            client_volume_id=vid,
-            topology=topology,
-            profile=profile,
-            trace=trace,
-            registry=registry,
-        )
-        reader_adapters.append(adapter)
-        readers.append(
-            Reader(id=vid, client=adapter.client, endpoint=topology[vid])
-        )
+    # Reader clients are what the coordinator fans out; the coordinator installs
+    # the mesh's shared transport factory for the burst, so the readers' own
+    # adapter factories are unused during the burst.
+    reader_ids = [f"r{i}" for i in range(num_readers)]
+    reader_adapters = [mesh.adapter(vid) for vid in reader_ids]
+    readers: List[Reader] = [
+        Reader(id=vid, client=mesh.client(vid), endpoint=topology[vid])
+        for vid in reader_ids
+    ]
 
     coordinator = ReadCoordinator(
-        controller.handle,
-        topology,
+        mesh,
         origin_ids={origin_id},
         policy=policy,
-        profile=profile,
-        trace=trace,
         metrics=metrics,
-        registry=registry,
     )
 
     # W is the value we seed on the origin. Both carriers are allocation-free.
@@ -278,13 +248,14 @@ def build_burst(
         return await coordinator.run_burst(readers, KEY)
 
     ctx = {
-        "controller": controller,
+        "mesh": mesh,
+        "controller": mesh.controller,
         "producer": producer,
         "reader_adapters": reader_adapters,
         "readers": readers,
         "coordinator": coordinator,
         "topology": topology,
-        "volumes": volumes,
+        "volumes": mesh.volumes,
         "expected": expected,
         "descriptor": descriptor,
         "mode": mode,

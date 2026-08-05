@@ -194,7 +194,7 @@ class DedupPolicy(ReadPolicy):
         the root touches an origin, so ``fabric_bytes`` is the 1x union.
         """
         results: Dict[str, Any] = {}
-        with coordinator._shared_transport():
+        with coordinator.installed():
             located = await coordinator._locate(key)
             # Volumes that already hold the key are the fabric origins; every
             # read-through peer registered during the burst is not an origin.

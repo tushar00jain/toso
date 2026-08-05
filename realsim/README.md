@@ -117,15 +117,20 @@ PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_contr
 ```
 realsim/
   seams/          in-process adapters onto real torchstore surfaces;
-                  transport charges the cost model per put/get
+                  transport charges the cost model per put/get; factory.py is the
+                  one place create_transport_buffer is substituted
   adapters/       thin wiring that constructs the real objects off-actor
-  coordinator/    the NEW read coordinator -- a model with a pluggable policy
+  mesh.py         Mesh -- the multi-client wiring a capability builds on: per-node
+                  volumes + real clients, one directory, one resource registry,
+                  one shared transport factory
+  coordinator/    the NEW read coordinator -- a burst-shaped consumer of a Mesh,
+                  a model with a pluggable policy
   scenarios/      burst_get.py: a synchronized read burst; meta/metadata data
                   plane + full resource-cost exercise
   run_realsim.py  the demo entrypoint
   tools/          check_contract.py: the concurrency-contract lint
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
-                  perf guard, composability
+                  perf guard, composability, mesh wiring
 sim_common/
   async_engine.py deterministic asyncio loop + virtual clock
   cost_model.py   MachineProfile + analytic network/RAM/storage/CPU/GPU costs

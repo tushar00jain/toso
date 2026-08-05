@@ -16,4 +16,8 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
   controller's ``Trie`` directory, presenting the same ``Mapping`` +
   ``keys().filter_by_prefix`` surface so the opt-in shim adapter can skip the
   per-key trie tax while the real ``Controller`` decision logic runs unchanged.
+- ``factory`` -- the single substitution point for the process-wide
+  ``create_transport_buffer`` global, plus the contextvar holding the calling
+  client's source endpoint. Every install in the repo goes through it, and only
+  one owner may hold the patch at a time.
 """
