@@ -37,7 +37,7 @@ import asyncio
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Optional, Sequence, Set, Tuple
 
-from proposed.policy import DecisionLog, Policy, Selection
+from proposed import DecisionLog, Policy, Selection
 
 __all__ = ["DedupPolicy"]
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence
 
-from proposed.view import View
+from proposed import View
 
 __all__ = ["KVView", "PinnedKVView"]
 

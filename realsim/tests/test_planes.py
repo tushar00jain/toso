@@ -30,11 +30,11 @@ import asyncio
 import torch
 
 from realsim.mesh import Mesh
-from proposed.plane import DataPlane
-from proposed.policy import NaivePolicy, Policy, Selection
+from proposed import DataPlane
+from proposed import NaivePolicy, Policy, Selection
 from realsim.runner import Runner, WorkItem
 from realsim.seams.transport import Endpoint
-from proposed.view import View
+from proposed import View
 from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier

@@ -34,7 +34,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from domain.llm import (
+from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, Model,
 )
 

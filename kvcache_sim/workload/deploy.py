@@ -15,8 +15,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from domain.llm import DEFAULT_MODEL, DEFAULT_PROFILE, MachineProfile, Model
-from proposed.topology import Endpoint
+from domain import DEFAULT_MODEL, DEFAULT_PROFILE, MachineProfile, Model
+from proposed import Endpoint
 from realsim.mesh import Mesh
 from realsim.seams.transport import TensorDescriptor
 from sim_common.trace import Trace

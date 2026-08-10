@@ -53,7 +53,7 @@ from realsim.adapters.real_controller import make_controller_adapter
 from realsim.seams import factory
 from realsim.seams.transport import Endpoint, InMemoryTransport
 from realsim.seams.volume_handle import FakeVolumeHandle
-from proposed.view import View
+from proposed import View
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace

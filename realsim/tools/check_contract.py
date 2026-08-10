@@ -131,6 +131,14 @@ DATA_FORBIDDEN: Dict[str, str] = {
     "sim_common": "simulation internals (machine facts come from domain)",
 }
 
+# Re-exports mean a module-path ban is not enough: ``proposed`` deliberately
+# surfaces its whole contract at package level, so ``from proposed import X`` has
+# to be judged on X. Names control may not pull out of it, whatever the path.
+CONTROL_FORBIDDEN_NAMES: Dict[str, str] = {
+    "DataPlane": "the DataPlane interface (that is the executing half)",
+    "Deployment": "a Deployment (control never reaches the store)",
+}
+
 # Any resolved module with this path segment is a capability's data plane.
 DATA_SEGMENT = "data"
 # ...and this one marks the importing module as control.
@@ -244,9 +252,15 @@ class _ContractVisitor(ast.NodeVisitor):
             self._add(node.lineno, f"{top}-import",
                       f"imports from {module!r} (threads/processes are banned on "
                       f"the deterministic sim path)")
-        self._check_plane_import(
-            resolve_module(self.rel_path, node.level, module), node.lineno
-        )
+        resolved = resolve_module(self.rel_path, node.level, module)
+        self._check_plane_import(resolved, node.lineno)
+        if self.is_control:
+            for alias in node.names:
+                why = CONTROL_FORBIDDEN_NAMES.get(alias.name)
+                if why is not None:
+                    self._add(node.lineno, "control-imports-execution",
+                              f"control imports {alias.name!r} from {resolved!r}: "
+                              f"that is {why}")
         for alias in node.names:
             bound = alias.asname or alias.name
             self._callable_alias[bound] = f"{module}.{alias.name}"

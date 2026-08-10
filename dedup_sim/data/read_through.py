@@ -15,8 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from proposed.deployment import Deployment
-from proposed.plane import DataPlane
+from proposed import DataPlane, Deployment
 
 __all__ = ["ReadThroughPlane", "make_plane"]
 

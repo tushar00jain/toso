@@ -15,11 +15,38 @@ simulator, ``proposed`` is the design being argued for.
   a controller hands a policy: who holds a key, where volumes are, what time it is.
 
 Import rule, enforced by ``realsim/tools/check_contract.py``: **this package may
-not import** ``realsim`` **or the capability packages.** That is what keeps the
-proposal honest -- if it needed the simulator, it could not be implemented inside
-torchstore. It may use ``sim_common.topology`` for the locality types, which are
-themselves part of the ask (gap 4).
+not import anything at all** -- not ``realsim``, not a capability, not even
+``sim_common``. That is what keeps it honest: a contract that needed the simulator
+underneath it could not survive outside the harness. The locality types live here
+rather than in ``sim_common`` for the same reason; only the *cost* of a tier is
+simulation.
 
 The gaps each piece answers are listed in the design doc's "What torchstore is
 missing" section.
 """
+
+# Re-export the contract surface so callers import from the package directly.
+from .cost import TransferCost
+from .deployment import Deployment
+from .plane import DataPlane
+from .policy import DecisionLog, NaivePolicy, Policy, Selection
+from .topology import Endpoint, locality, Tier, TIER_LABEL
+from .view import Directory, View
+
+__all__ = [
+    # the torchstore ask
+    "Policy",
+    "NaivePolicy",
+    "Selection",
+    "DecisionLog",
+    "View",
+    "Directory",
+    "Endpoint",
+    "Tier",
+    "TIER_LABEL",
+    "locality",
+    # ports the application depends on
+    "Deployment",
+    "DataPlane",
+    "TransferCost",
+]

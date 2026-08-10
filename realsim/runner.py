@@ -24,7 +24,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
-from proposed.plane import DataPlane
+from proposed import DataPlane
 from sim_common.report import Ledger, Outcome
 
 __all__ = ["WorkItem", "Runner"]

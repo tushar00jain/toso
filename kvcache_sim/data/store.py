@@ -37,9 +37,9 @@ from __future__ import annotations
 
 from typing import List
 
-from proposed.deployment import Deployment
+from proposed import Deployment
 
-from domain.llm import DEFAULT_MODEL, Model
+from domain import DEFAULT_MODEL, Model
 
 
 class KVStore:

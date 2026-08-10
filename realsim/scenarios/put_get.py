@@ -34,8 +34,8 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 from realsim.mesh import Mesh
-from proposed.plane import DataPlane
-from proposed.policy import Policy
+from proposed import DataPlane
+from proposed import Policy
 from realsim.runner import Runner, WorkItem
 from realsim.seams.transport import Endpoint, TensorDescriptor
 from sim_common.async_engine import run_sim

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from proposed.policy import Policy, Selection
+from proposed import Policy, Selection
 
 __all__ = ["LongestPrefixPolicy"]
 

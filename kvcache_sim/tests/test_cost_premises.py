@@ -32,7 +32,7 @@ from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
 from sim_common.topology import Tier
 
-from domain.llm import DEFAULT_MODEL, Model, prefill_time
+from domain import DEFAULT_MODEL, Model, prefill_time
 from kvcache_sim.workload.deploy import make_store
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, make_topology
 

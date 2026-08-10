@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 from typing import Dict, List, Optional
 
-from proposed.plane import DataPlane
+from proposed import DataPlane
 
 from ..control.scheduler import Plan
 from ..report.metrics import Metrics, RequestResult

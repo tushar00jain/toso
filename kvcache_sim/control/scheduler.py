@@ -44,13 +44,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
-from proposed.topology import Endpoint
+from proposed import Endpoint
 
-from domain.llm import (
+from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
     prefill_time,
 )
-from proposed.cost import TransferCost
+from proposed import TransferCost
 
 from .cache import LRUCache
 from .source import LongestPrefixPolicy

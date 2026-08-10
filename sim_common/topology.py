@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
-from proposed.topology import Endpoint, locality, Tier, TIER_LABEL
+from proposed import Endpoint, locality, Tier, TIER_LABEL
 
 __all__ = ["Endpoint", "Tier", "TIER_LABEL", "locality", "transfer_time"]
 

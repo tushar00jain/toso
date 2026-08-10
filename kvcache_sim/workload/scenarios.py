@@ -23,7 +23,7 @@ from sim_common.async_engine import AsyncEngine
 from sim_common.topology import Endpoint
 
 from sim_common.cost_model import DEFAULT_PROFILE, ProfileTransferCost
-from domain.llm import decode_step_time
+from domain import decode_step_time
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ..control.view import KVView
 from ..data.serving import ServingPlane

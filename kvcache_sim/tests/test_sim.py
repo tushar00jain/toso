@@ -18,7 +18,7 @@ from kvcache_sim.control.cache import LRUCache
 from kvcache_sim.control.view import KVView
 from kvcache_sim.workload.deploy import make_store
 from sim_common.cost_model import DEFAULT_PROFILE
-from domain.llm import decode_step_time
+from domain import decode_step_time
 from kvcache_sim.data.decode import DecodeEngine
 from kvcache_sim.workload.request import (
     block_keys_for,

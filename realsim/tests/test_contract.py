@@ -115,10 +115,10 @@ def test_lint_flags_control_importing_the_mesh_or_a_client():
 
 def test_lint_allows_what_control_is_supposed_to_use():
     allowed = (
-        "from proposed.policy import Policy, Selection\n"
-        "from proposed.view import View\n"
-        "from proposed.cost import TransferCost\n"
-        "from domain.llm import prefill_time, MachineProfile\n"
+        "from proposed import Policy, Selection\n"
+        "from proposed import View\n"
+        "from proposed import TransferCost\n"
+        "from domain import prefill_time, MachineProfile\n"
         "from .cache import LRUCache\n"
         "from ..workload.request import Request\n"
     )
@@ -130,17 +130,22 @@ def test_lint_keeps_control_out_of_the_simulator():
     assert "control-imports-execution" in _codes(
         "from sim_common.cost_model import get_time\n", path=CONTROL
     )
-    assert "control-imports-execution" in _codes(
-        "from proposed.plane import DataPlane\n", path=CONTROL
-    )
+    # Both the module path and the package re-export, since proposed surfaces
+    # its whole contract at package level.
+    for line in (
+        "from proposed.plane import DataPlane\n",
+        "from proposed import DataPlane\n",
+        "from proposed import Deployment\n",
+    ):
+        assert "control-imports-execution" in _codes(line, path=CONTROL), line
 
 
 def test_data_may_hold_decisions_but_not_the_simulator():
     """data/ executes decisions, but it is application code: no harness in it."""
     allowed = (
-        "from proposed.deployment import Deployment\n"
-        "from proposed.plane import DataPlane\n"
-        "from domain.llm import Model\n"
+        "from proposed import Deployment\n"
+        "from proposed import DataPlane\n"
+        "from domain import Model\n"
         "from ..control.scheduler import Plan\n"
         "from .store import KVStore\n"
     )
@@ -169,7 +174,7 @@ def test_lint_flags_the_proposal_leaning_on_the_simulator():
 def test_the_proposal_stands_on_its_own():
     """It may use itself and the stdlib -- nothing else, not even sim_common."""
     assert _codes(
-        "from proposed.topology import Endpoint, locality, Tier\n"
+        "from proposed import Endpoint, locality, Tier\n"
         "from .view import View\n"
         "import asyncio\n",
         path=PROPOSED,
