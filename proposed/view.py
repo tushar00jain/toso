@@ -1,6 +1,6 @@
 """The read-only observation a policy is handed: :class:`View`.
 
-A :class:`~realsim.policy.Policy` never touches a client, a volume or the
+A :class:`~proposed.policy.Policy` never touches a client, a volume or the
 mesh -- it is given a ``View`` and returns a decision. The ``View`` is the sensor
 half of that contract: awaited *reads* of state that already exists, and no
 mutation of any kind.
@@ -9,7 +9,7 @@ What the base view offers, and why that is all it offers
 --------------------------------------------------------
 * :meth:`locate` -- the real directory answer for a set of keys, read straight
   from the real ``Controller`` body. It deliberately bypasses the controller's
-  routing hook (see :mod:`realsim.policy`): a sensor must report the directory
+  routing hook (see :mod:`proposed.policy`): a sensor must report the directory
   as it *is*, and a policy reading its own answer back would recurse.
 * :meth:`holders` / :meth:`topology` / :meth:`endpoint` / :meth:`locality` --
   who holds a key and how far away they are, the two inputs every source

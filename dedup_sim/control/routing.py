@@ -1,4 +1,4 @@
-"""1x-fabric dedup routing, as a :class:`realsim.policy.Policy`.
+"""1x-fabric dedup routing, as a :class:`proposed.policy.Policy`.
 
 The question a synchronized read burst asks the store is exactly the one the
 policy interface answers: *given this key and this requester, which volume serves
@@ -37,7 +37,7 @@ import asyncio
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Optional, Sequence, Set, Tuple
 
-from realsim.policy import Policy, Selection
+from proposed.policy import Policy, Selection
 
 __all__ = ["DedupPolicy"]
 

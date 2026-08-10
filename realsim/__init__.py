@@ -16,9 +16,9 @@ is here:
   shared ``create_transport_buffer`` substitution. Build capabilities on this
   rather than re-deriving the wiring;
 * the four types every capability plugs into:
-  :class:`realsim.policy.Policy` (which volume serves these keys for this
+  :class:`proposed.policy.Policy` (which volume serves these keys for this
   requester, and when -- naive by default, and consulted inside the real
-  controller's ``locate_volumes``), :class:`realsim.view.View` (the read-only
+  controller's ``locate_volumes``), :class:`proposed.view.View` (the read-only
   observation a policy is handed), :class:`realsim.plane.DataPlane` (the work
   around and after a transfer, both methods defaulting to real no-op behaviour)
   and :class:`realsim.runner.Runner` (release work items on the virtual clock,

@@ -1,6 +1,6 @@
 """The four shared types every capability plugs into.
 
-:class:`~realsim.view.View` (sense), :class:`~realsim.policy.Policy` (decide),
+:class:`~proposed.view.View` (sense), :class:`~proposed.policy.Policy` (decide),
 :class:`~realsim.plane.DataPlane` (execute) and :class:`~realsim.runner.Runner`
 (release on the clock) are the generic half of both capabilities. These tests
 pin the contract each one owes its callers:
@@ -31,10 +31,10 @@ import torch
 
 from realsim.mesh import Mesh
 from realsim.plane import DataPlane
-from realsim.policy import NaivePolicy, Policy, Selection
+from proposed.policy import NaivePolicy, Policy, Selection
 from realsim.runner import Runner, WorkItem
 from realsim.seams.transport import Endpoint
-from realsim.view import View
+from proposed.view import View
 from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier

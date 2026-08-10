@@ -8,7 +8,7 @@ for the unrouted baseline.
 Laid out by plane, like ``kvcache_sim``:
 
 * :mod:`dedup_sim.control` -- the routing decision, a real
-  :class:`realsim.policy.Policy` consulted inside the controller's
+  :class:`proposed.policy.Policy` consulted inside the controller's
   ``locate_volumes``. It holds no client, no volume and no mesh;
 * :mod:`dedup_sim.data` -- the read-through put that turns a finished reader into
   a real directory source, a :class:`realsim.plane.DataPlane` overriding one

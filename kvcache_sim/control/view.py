@@ -1,6 +1,6 @@
 """The one derived directory read the KV-cache scheduler needs.
 
-:class:`~realsim.view.View` stops at "who holds this key". A KV-cache scheduler
+:class:`~proposed.view.View` stops at "who holds this key". A KV-cache scheduler
 asks something one step further on: *how many leading blocks of this prompt does
 each instance hold contiguously?* -- because a cache is only useful as a
 contiguous prefix. That is a KV-cache notion (a block-key chain), not a store
@@ -9,7 +9,7 @@ notion, so it is a subclass here rather than a field on the base view.
 :class:`PinnedKVView` is the second half of the same idea. A routing decision
 reads the prefix runs several times -- once for the candidate loop's local
 matches and once per candidate when it asks the source
-:class:`~realsim.policy.Policy` which peer would serve the gap -- and every one of
+:class:`~proposed.policy.Policy` which peer would serve the gap -- and every one of
 those reads must see the *same* directory state or the decision is incoherent.
 Pinning the snapshot for the duration of one decision makes that explicit
 (and means the directory is walked once per request, not once per read).
@@ -19,13 +19,13 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence
 
-from realsim.view import View
+from proposed.view import View
 
 __all__ = ["KVView", "PinnedKVView"]
 
 
 class KVView(View):
-    """A :class:`~realsim.view.View` plus per-instance prefix-run lengths."""
+    """A :class:`~proposed.view.View` plus per-instance prefix-run lengths."""
 
     async def prefix_lengths(self, block_keys: Sequence[str]) -> Dict[str, int]:
         """``instance -> leading blocks of ``block_keys`` it holds contiguously``.

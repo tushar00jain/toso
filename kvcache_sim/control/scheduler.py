@@ -120,7 +120,7 @@ class _Base:
         max_batch: VRAM cap the data plane's decode batch will use; control needs
             it only to reason about admission.
         early_rejection: ``"off"`` | ``"early"`` | ``"predict"``.
-        source_policy: the :class:`~realsim.policy.Policy` that ranks peers for a
+        source_policy: the :class:`~proposed.policy.Policy` that ranks peers for a
             prefix pull (default :class:`~kvcache_sim.control.source.LongestPrefixPolicy`).
     """
 

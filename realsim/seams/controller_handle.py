@@ -19,7 +19,7 @@ touched (``controller.keys_to_storage_volumes``, ``_is_dtensor_fully_committed``
 The routing hook
 ----------------
 :meth:`FakeControllerHandle.locate_volumes` is also the one place a
-:class:`~realsim.policy.Policy` is consulted on the request path: the mirrored
+:class:`~proposed.policy.Policy` is consulted on the request path: the mirrored
 real body runs first (:meth:`FakeControllerHandle.locate_raw`), then, if a policy
 is installed, the controller asks it which of the directory's volumes should
 serve this requester and *withholds the answer* until the chosen source is
@@ -70,8 +70,8 @@ class FakeControllerHandle:
         """Consult ``policy`` inside ``locate_volumes``, handing it ``view``.
 
         Args:
-            policy: a :class:`realsim.policy.Policy`.
-            view: the :class:`realsim.view.View` the policy senses through. It
+            policy: a :class:`proposed.policy.Policy`.
+            view: the :class:`proposed.view.View` the policy senses through. It
                 reads :meth:`locate_raw`, so a policy reading the directory back
                 does not re-enter this hook.
         """

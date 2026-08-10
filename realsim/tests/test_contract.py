@@ -28,6 +28,7 @@ def _codes(source: str, *, is_test: bool = False, path: str = "snippet.py"):
 
 CONTROL = "kvcache_sim/control/scheduler.py"
 DATA = "kvcache_sim/data/serving.py"
+PROPOSED = "proposed/policy.py"
 
 
 def test_sim_paths_obey_the_concurrency_contract():
@@ -114,8 +115,8 @@ def test_lint_flags_control_importing_the_mesh_or_a_client():
 
 def test_lint_allows_what_control_is_supposed_to_use():
     allowed = (
-        "from realsim.policy import Policy, Selection\n"
-        "from realsim.view import View\n"
+        "from proposed.policy import Policy, Selection\n"
+        "from proposed.view import View\n"
         "from domain.llm import prefill_time\n"
         "from sim_common.cost_model import get_time\n"
         "from .cache import LRUCache\n"
@@ -132,3 +133,23 @@ def test_the_rule_only_applies_to_control():
         "from .store import KVStore\n"
     )
     assert _codes(src, path=DATA) == set()
+
+
+def test_lint_flags_the_proposal_leaning_on_the_simulator():
+    """``proposed/`` has to be implementable inside torchstore with nothing under it."""
+    for line in (
+        "from realsim.mesh import Mesh\n",
+        "from realsim.seams.controller_handle import FakeControllerHandle\n",
+        "import torchstore\n",
+        "from kvcache_sim.control.source import LongestPrefixPolicy\n",
+    ):
+        assert "proposed-imports-simulator" in _codes(line, path=PROPOSED), line
+
+
+def test_lint_allows_what_the_proposal_may_use():
+    """Locality types are part of the ask, so the proposal may name them."""
+    allowed = (
+        "from sim_common.topology import Endpoint, locality, Tier\n"
+        "from .view import View\n"
+    )
+    assert _codes(allowed, path=PROPOSED) == set()

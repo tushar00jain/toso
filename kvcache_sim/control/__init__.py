@@ -5,7 +5,7 @@
   These are *compute* decisions the store knows nothing about, which is why they
   are app code and not part of the shared policy interface;
 * :mod:`~kvcache_sim.control.source` -- the one part that *is* a store question,
-  "which peer serves this prefix gap", as a :class:`realsim.policy.Policy`;
+  "which peer serves this prefix gap", as a :class:`proposed.policy.Policy`;
 * :mod:`~kvcache_sim.control.view` -- the single derived directory read the
   scheduler needs (per-instance prefix-run lengths), plus the pinned snapshot one
   decision reads it through;

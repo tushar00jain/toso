@@ -15,7 +15,7 @@ payload.
 
 The scenario is ordinary user code, top to bottom: a ``client.put`` and a gather
 of ``client.get``. There is no policy, no coordinator and no execution loop in
-it. Handing it a :class:`~realsim.policy.Policy` (and, if the capability needs
+it. Handing it a :class:`~proposed.policy.Policy` (and, if the capability needs
 one, a :class:`~realsim.plane.DataPlane`) is the *only* change needed to make it
 a routed run -- which is exactly how ``dedup_sim`` turns the same ``m x`` burst
 into a 1x one.
@@ -35,7 +35,7 @@ import torch
 
 from realsim.mesh import Mesh
 from realsim.plane import DataPlane
-from realsim.policy import Policy
+from proposed.policy import Policy
 from realsim.runner import Runner, WorkItem
 from realsim.seams.transport import Endpoint, TensorDescriptor
 from sim_common.async_engine import run_sim

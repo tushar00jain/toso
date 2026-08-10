@@ -5,7 +5,7 @@ be compared folder by folder:
 
 * :mod:`kvcache_sim.control` -- what is **decided**: the serving scheduler
   (prefill placement, pull-vs-recompute, TTFT/TBT gates, decode placement), the
-  source :class:`realsim.policy.Policy` it delegates "which peer" to, the
+  source :class:`proposed.policy.Policy` it delegates "which peer" to, the
   prefix-run view it senses through, and LRU eviction bookkeeping. Moves nothing,
   and imports nothing from ``data``;
 * :mod:`kvcache_sim.data` -- what **executes** those decisions on ``realsim``'s

@@ -1,4 +1,4 @@
-"""Which peer serves a prefix gap: the KV-cache source :class:`~realsim.policy.Policy`.
+"""Which peer serves a prefix gap: the KV-cache source :class:`~proposed.policy.Policy`.
 
 This is the *only* part of KV-cache routing that is a store question, so it is
 the only part that goes through the shared policy interface. Everything else the
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from realsim.policy import Policy, Selection
+from proposed.policy import Policy, Selection
 
 __all__ = ["LongestPrefixPolicy"]
 

@@ -40,7 +40,7 @@ drove them. The rule that makes the leak impossible is an import-direction one:
 
     ``*/control/`` may not import ``*/data/``, the mesh, or a store client.
 
-Control receives a :class:`~realsim.view.View` and returns a decision; anything
+Control receives a :class:`~proposed.view.View` and returns a decision; anything
 that moves bytes reaches it as an *observation*, never as a handle. That is
 mechanically checkable, so it is checked here rather than left to review.
 Importing in the other direction is fine and expected: the data plane is handed
@@ -73,7 +73,9 @@ from typing import Dict, Iterable, List, NamedTuple
 
 # Repo root is two levels up from this file (realsim/tools/check_contract.py).
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCAN_DIRS = ("dedup_sim", "domain", "kvcache_sim", "realsim", "sim_common")
+SCAN_DIRS = (
+    "dedup_sim", "domain", "kvcache_sim", "proposed", "realsim", "sim_common",
+)
 
 # --------------------------------------------------------------------------- #
 # Banned canonical references.
@@ -124,6 +126,17 @@ DATA_SEGMENT = "data"
 # ...and this one marks the importing module as control.
 CONTROL_SEGMENT = "control"
 
+# The ``proposed`` package is the surface argued for upstream, so it must be
+# implementable inside torchstore with no simulator underneath it. Anything it
+# imported from here could not be shipped, which would make the ask a fiction.
+PROPOSED_PKG = "proposed"
+PROPOSED_FORBIDDEN: Dict[str, str] = {
+    "realsim": "simulator scaffolding (the proposal has to stand without it)",
+    "dedup_sim": "a capability (the proposal must not know its consumers)",
+    "kvcache_sim": "a capability (the proposal must not know its consumers)",
+    "torchstore": "the store itself (this package is what torchstore would gain)",
+}
+
 
 class Violation(NamedTuple):
     """One contract breach: where it is, a short code, and why it matters."""
@@ -146,6 +159,12 @@ def is_control_module(rel_path: str) -> bool:
     """True for a capability's control-plane module (``<pkg>/control/...``)."""
     parts = Path(rel_path).parts
     return CONTROL_SEGMENT in parts[:-1]
+
+
+def is_proposed_module(rel_path: str) -> bool:
+    """True for a module in the upstream-proposal package (``proposed/...``)."""
+    parts = Path(rel_path).parts
+    return bool(parts) and parts[0] == PROPOSED_PKG
 
 
 def resolve_module(rel_path: str, level: int, module: str) -> str:
@@ -172,11 +191,13 @@ class _ContractVisitor(ast.NodeVisitor):
         rel_path: str,
         allow_wallclock_reads: bool,
         is_control: bool = False,
+        is_proposed: bool = False,
     ) -> None:
         self.rel_path = rel_path
         self.allow_wallclock_reads = allow_wallclock_reads
         # Control-plane modules additionally may not import the executing half.
         self.is_control = is_control
+        self.is_proposed = is_proposed
         self.violations: List[Violation] = []
         # name-in-this-module -> canonical module ("t" -> "time")
         self._module_alias: Dict[str, str] = {}
@@ -215,8 +236,21 @@ class _ContractVisitor(ast.NodeVisitor):
     # -- plane separation ---------------------------------------------------- #
 
     def _check_plane_import(self, module: str, lineno: int) -> None:
-        """Flag a ``control/`` module importing the executing half."""
-        if not self.is_control or not module:
+        """Flag a ``control/`` module importing the executing half.
+
+        Also flags a ``proposed/`` module reaching for anything the proposal
+        could not be shipped with.
+        """
+        if not module:
+            return
+        if self.is_proposed:
+            for banned, why in PROPOSED_FORBIDDEN.items():
+                if module == banned or module.startswith(banned + "."):
+                    self._add(lineno, "proposed-imports-simulator",
+                              f"proposed imports {module!r}: that is {why}")
+                    return
+            return
+        if not self.is_control:
             return
         parts = module.split(".")
         if DATA_SEGMENT in parts:
@@ -296,6 +330,7 @@ def scan_source(source: str, rel_path: str, *, is_test: bool) -> List[Violation]
         rel_path,
         allow_wallclock_reads=is_test,
         is_control=is_control_module(rel_path),
+        is_proposed=is_proposed_module(rel_path),
     )
     visitor.visit(tree)
     # Dedupe (a Name can be visited twice) and sort deterministically.
