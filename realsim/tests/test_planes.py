@@ -30,6 +30,7 @@ import asyncio
 import torch
 
 from realsim.mesh import Mesh
+from realsim.simulation import Simulation
 from proposed import DataPlane
 from proposed import Policy, Selection
 from proposed.policy import NaivePolicy  # not exported: the base Policy is naive
@@ -40,6 +41,14 @@ from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier
 from sim_common.trace import Trace
+
+
+def _drive(sim, coro):
+    """Run one coroutine on an assembled stack's clock (no workload involved)."""
+    try:
+        return sim.loop.run_until_complete(coro)
+    finally:
+        sim.loop.close()
 
 
 def _topology() -> dict[str, Endpoint]:
@@ -61,18 +70,18 @@ def _payload():
 
 
 def test_view_reads_the_real_directory_topology_and_clock():
-    mesh = Mesh(_topology())
-    view = mesh.view
+    sim = Simulation(_topology())
+    view = sim.view
 
     async def scenario():
-        with mesh.installed():
-            mesh.bind_source("a")
-            await mesh.client("a").put("W", _payload())
+        with sim.mesh.installed():
+            sim.mesh.bind_source("a")
+            await sim.mesh.client("a").put("W", _payload())
             await asyncio.sleep(2.0)
             located = await view.locate(["W", "absent"])
             return located, view.now()
 
-    (located, now), _ = run_sim(scenario())
+    (located, now) = _drive(sim, scenario())
     assert View.holders(located, "W") == ["a"]
     # Absent keys are simply missing -- a sensor reports, it does not raise.
     assert View.holders(located, "absent") == []
@@ -96,16 +105,16 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
             await view.locate(keys)
             return Selection()
 
-    mesh = Mesh(_topology(), policy=_Counting())
+    sim = Simulation(_topology(), policy=_Counting())
 
     async def scenario():
-        with mesh.installed():
-            mesh.bind_source("a")
-            await mesh.client("a").put("W", _payload())
-            mesh.bind_source("c")
-            return await mesh.client("c").get("W")
+        with sim.mesh.installed():
+            sim.mesh.bind_source("a")
+            await sim.mesh.client("a").put("W", _payload())
+            sim.mesh.bind_source("c")
+            return await sim.mesh.client("c").get("W")
 
-    got, _ = run_sim(scenario())
+    got = _drive(sim, scenario())
     assert got is not None
     # Exactly one consultation: c's get. The put never locates, and the view read
     # inside select bypasses the hook.
@@ -120,19 +129,19 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
 def _burst_trace(policy) -> str:
     """Run the same two-reader burst with/without a policy; return its trace."""
     trace = Trace()
-    mesh = Mesh(_topology(), trace=trace, policy=policy)
+    sim = Simulation(_topology(), trace=trace, policy=policy)
 
     async def scenario():
-        with mesh.installed():
-            mesh.bind_source("a")
-            await mesh.client("a").put("W", _payload())
-            mesh.bind_source("b")
-            await mesh.client("b").get("W")
-            mesh.bind_source("c")
-            await mesh.client("c").get("W")
+        with sim.mesh.installed():
+            sim.mesh.bind_source("a")
+            await sim.mesh.client("a").put("W", _payload())
+            sim.mesh.bind_source("b")
+            await sim.mesh.client("b").get("W")
+            sim.mesh.bind_source("c")
+            await sim.mesh.client("c").get("W")
         return True
 
-    _ok, trace = run_sim(scenario(), trace=trace)
+    _drive(sim, scenario())
     return trace.render()
 
 

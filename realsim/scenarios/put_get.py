@@ -33,10 +33,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from realsim.mesh import Mesh
-from proposed import DataPlane
-from proposed import Policy
-from realsim.runner import Runner, WorkItem
+from proposed import DataPlane, Deployment, Policy
+from realsim.runner import WorkItem
+from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint, TensorDescriptor
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile, compute_time
@@ -66,7 +65,7 @@ DEFAULT_COMPUTE_DEVICE = "cuda"
 
 # A factory for the capability's data plane, called with the wired mesh plus the
 # key/payload the readers move: ``(mesh, key, value) -> DataPlane``.
-MakePlane = Callable[[Mesh, str, Any], DataPlane]
+MakePlane = Callable[[Deployment, str, Any], DataPlane]
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -126,6 +125,7 @@ def build_burst(
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
     policy: Optional[Policy] = None,
     make_plane: Optional[MakePlane] = None,
+    random_seed: Optional[int] = None,
     trace: Optional[Trace] = None,
     ledger: Optional[Ledger] = None,
     real_directory: Optional[bool] = None,
@@ -189,28 +189,25 @@ def build_burst(
     if mode not in (MODE_META, MODE_METADATA):
         raise ValueError(f"unknown data-plane mode {mode!r}")
 
-    trace = trace if trace is not None else Trace()
-    ledger = ledger if ledger is not None else Ledger()
-    profile = profile if profile is not None else DEFAULT_PROFILE
-
     topology = _topology(num_readers)
-    # The mesh builds every real object the burst runs on: the controller adapter
-    # (real Trie by default; the opt-in shim swaps only the directory container),
-    # a real volume + co-located real LocalClient per node, the shared resource
-    # registry, and the shared transport factory. A policy, if given, is consulted
-    # inside the real locate_volumes body.
-    mesh = Mesh(
+    # One assembled stack: clock, mesh (with the policy installed in the real
+    # locate_volumes body), view, ledger, transfer-cost estimate. Nothing about
+    # the burst is wired by hand.
+    sim = Simulation(
         topology,
+        policy=policy,
         profile=profile,
         trace=trace,
+        ledger=ledger,
         real_directory=real_directory,
-        policy=policy,
+        random_seed=random_seed,
     )
+    mesh, trace, ledger = sim.mesh, sim.trace, sim.ledger
+    profile = sim.profile
     origin_id = topology["p"].id  # the volume that holds W before the burst
     # Bytes served by the origin are the fabric cost a routing policy exists to
     # cut; everything else is a peer-to-peer hop.
-    ledger.origins.add(origin_id)
-    mesh.on_transfer = ledger.record_transfer
+    sim.origins(origin_id)
 
     # The producer writes W to its co-located origin volume "p". This is a
     # single-client drive (before the burst), so it uses the adapter's own
@@ -255,12 +252,12 @@ def build_burst(
         return call
 
     plane = make_plane(mesh, KEY, put_value) if make_plane is not None else None
-    runner = Runner(mesh, plane=plane, ledger=ledger)
     items: List[WorkItem] = [
         WorkItem(id=rid, release_time=0.0, run=_get(rid)) for rid in reader_ids
     ]
 
-    async def scenario_coro() -> Dict[str, Any]:
+    async def seed() -> None:
+        """Everything that happens before the burst, on the same clock."""
         # (1) COMPUTE/GPU: the producer "generates" W on its accelerator. Modeled
         # as FLOPS_PER_ELEMENT per element, streaming the whole payload's bytes;
         # the roofline picks the binding term on ``compute_device``. Charged on
@@ -281,21 +278,22 @@ def build_burst(
         # put path charges network + storage-write in the transport seam.
         with producer.installed():
             await producer.client.put(KEY, put_value)
-        # (3) Every reader gets W. Each get charges storage-read + RAM staging +
-        # network in the transport seam.
+        # (3) Every reader then gets W. Each get charges storage-read + RAM
+        # staging + network in the transport seam.
         trace.record(
             asyncio.get_running_loop().time(),
             "burst",
             f"{num_readers} readers get {KEY!r}",
         )
-        return await runner.run(items)
 
     ctx = {
+        "sim": sim,
         "mesh": mesh,
         "controller": mesh.controller,
         "producer": producer,
         "reader_ids": reader_ids,
-        "runner": runner,
+        "items": items,
+        "seed": seed,
         "plane": plane,
         "policy": policy,
         "topology": topology,
@@ -307,7 +305,7 @@ def build_burst(
         "trace": trace,
         "ledger": ledger,
     }
-    return scenario_coro, ctx
+    return sim, ctx
 
 
 def run_burst(
@@ -325,9 +323,7 @@ def run_burst(
     real_directory: Optional[bool] = None,
 ) -> BurstResult:
     """Run one burst end-to-end on a fresh deterministic engine."""
-    trace = Trace()
-    ledger = Ledger()
-    scenario_coro, ctx = build_burst(
+    sim, ctx = build_burst(
         num_readers,
         n=n,
         dtype=dtype,
@@ -337,14 +333,13 @@ def run_burst(
         compute_device=compute_device,
         policy=policy,
         make_plane=make_plane,
-        trace=trace,
-        ledger=ledger,
+        random_seed=random_seed,
         real_directory=real_directory,
     )
-    results, trace = run_sim(scenario_coro(), random_seed=random_seed, trace=trace)
+    results = sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
     return BurstResult(
-        trace=trace,
-        ledger=ledger,
+        trace=sim.trace,
+        ledger=sim.ledger,
         results=results,
         expected=ctx["expected"],
         origin_id=ctx["origin_id"],

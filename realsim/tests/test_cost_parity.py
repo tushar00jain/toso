@@ -24,7 +24,7 @@ import math
 
 import torch
 
-from realsim.mesh import Mesh
+from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint
 from sim_common import config
 from sim_common.async_engine import run_sim
@@ -48,7 +48,8 @@ def _measure_get_advance(collapse: bool) -> tuple[float, int]:
     served: list[int] = []
 
     with config.overrides(collapse_charges=collapse):
-        mesh = Mesh(topo, profile=DEFAULT_PROFILE)
+        sim = Simulation(topo, profile=DEFAULT_PROFILE)
+        mesh = sim.mesh
         mesh.on_transfer = lambda kind, s, d, nbytes, cost: (
             served.append(nbytes) if kind == "get" else None
         )
@@ -67,7 +68,10 @@ def _measure_get_advance(collapse: bool) -> tuple[float, int]:
                 await mesh.client("cli").get(KEY)
                 return loop.time() - before
 
-        advance, _ = run_sim(scenario())
+        try:
+            advance = sim.loop.run_until_complete(scenario())
+        finally:
+            sim.loop.close()
 
     assert served, "no get transfer was reported"
     return advance, served[0]
@@ -76,9 +80,10 @@ def _measure_get_advance(collapse: bool) -> tuple[float, int]:
 def test_transport_get_charge_equals_get_time():
     """A real get advances the clock by exactly ``get_time`` for its bytes."""
     advance, nbytes = _measure_get_advance(collapse=False)
-    expected = get_time(
-        _topology()["srv"], _topology()["cli"], nbytes, DEFAULT_PROFILE
-    )
+    # Through the stack's own estimator -- the value a scheduler would be handed.
+    expected = Simulation(
+        _topology(), profile=DEFAULT_PROFILE
+    ).transfer_cost.get_time("srv", "cli", nbytes)
     assert nbytes == N * 4  # float32
     # Compared with a tolerance, not bit-exactly: the advance is a difference of
     # two absolute clock readings, so its last bit depends on what the clock had
@@ -113,7 +118,8 @@ def test_a_colocated_get_is_not_free():
     """
     topo = {"solo": Endpoint(id="volsolo", host="hostA", node="node0")}
     ep = topo["solo"]
-    mesh = Mesh(topo, profile=DEFAULT_PROFILE)
+    sim = Simulation(topo, profile=DEFAULT_PROFILE)
+    mesh = sim.mesh
 
     async def scenario() -> tuple[float, int]:
         loop = asyncio.get_running_loop()
@@ -126,8 +132,13 @@ def test_a_colocated_get_is_not_free():
             await mesh.client("solo").get(KEY)
             return loop.time() - before, N * 4
 
-    (advance, nbytes), _ = run_sim(scenario())
-    expected = get_time(ep, ep, nbytes, DEFAULT_PROFILE)
+    try:
+        advance, nbytes = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+    # Priced through the stack's own estimator, not a parallel call to get_time:
+    # the point is that what a scheduler is handed matches what it is charged.
+    expected = sim.transfer_cost.get_time("solo", "solo", nbytes)
     assert expected > 0.0, "a co-located get must still cost storage + RAM"
     assert network_time(ep, ep, nbytes, DEFAULT_PROFILE) == 0.0  # only fabric is free
     assert math.isclose(advance, expected, rel_tol=1e-12), (

@@ -11,15 +11,11 @@ the KV tensors.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
-
 import torch
 
-from domain import DEFAULT_MODEL, DEFAULT_PROFILE, MachineProfile, Model
-from proposed import Endpoint
-from realsim.mesh import Mesh
+from domain import DEFAULT_MODEL, Model
 from realsim.seams.transport import TensorDescriptor
-from sim_common.trace import Trace
+from realsim.simulation import Simulation
 
 from ..data.store import KVStore
 
@@ -27,25 +23,23 @@ __all__ = ["make_store"]
 
 
 def make_store(
-    topology: Dict[str, Endpoint],
+    sim: Simulation,
     *,
     block_tokens: int,
-    profile: MachineProfile = DEFAULT_PROFILE,
     model: Model = DEFAULT_MODEL,
-    trace: Optional[Trace] = None,
-    real_directory: Optional[bool] = None,
-) -> Tuple[Mesh, KVStore]:
-    """Build the simulated deployment and the KV store over it."""
-    mesh = Mesh(
-        topology, profile=profile, trace=trace, real_directory=real_directory
-    )
+) -> KVStore:
+    """Build the KV store over an assembled :class:`~realsim.simulation.Simulation`.
+
+    The simulation *is* the deployment: it vends the client for an instance and
+    holds the directory. All this adds is the block carrier, which is the one
+    piece a real run would choose differently.
+    """
     # A metadata-only carrier for one KV block: a uint8 descriptor whose length IS
     # the block's modeled byte size, so the bytes the transport charges cannot
     # drift from the bytes the scheduler predicted. Zero real storage.
     carrier = TensorDescriptor(
         shape=(model.block_bytes(1, block_tokens),), dtype=torch.uint8
     )
-    store = KVStore(
-        mesh, block_tokens=block_tokens, carrier=carrier, model=model
+    return KVStore(
+        sim.mesh, block_tokens=block_tokens, carrier=carrier, model=model
     )
-    return mesh, store

@@ -219,16 +219,15 @@ def test_metadata_mode_carries_only_a_descriptor():
 #    the change -- the 1x number alone would still pass with the monkeypatch.
 def test_readers_run_an_untouched_real_client():
     from realsim.scenarios.put_get import build_burst
-    from sim_common.async_engine import run_sim
 
     from dedup_sim.control.routing import DedupPolicy
     from dedup_sim.data.read_through import make_plane
 
-    scenario_coro, ctx = build_burst(
+    sim, ctx = build_burst(
         3, policy=DedupPolicy(fanout_cap=1), make_plane=make_plane
     )
     mesh = ctx["mesh"]
-    run_sim(scenario_coro())
+    sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
 
     for reader_id in ctx["reader_ids"]:
         # The one controller handle the mesh built, not a per-reader view of it.

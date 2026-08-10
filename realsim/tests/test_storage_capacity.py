@@ -51,9 +51,9 @@ def _run_build(profile=None, *, num_readers: int = 3):
     ``ctx["volumes"]`` handles for resident/peak bytes. Any
     :class:`StorageCapacityExceeded` raised during the run propagates out.
     """
-    scenario_coro, ctx = build_burst(num_readers, profile=profile)
-    results, trace = run_sim(scenario_coro())
-    return results, trace, ctx
+    sim, ctx = build_burst(num_readers, profile=profile)
+    results = sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
+    return results, sim.trace, ctx
 
 
 # --------------------------------------------------------------------------

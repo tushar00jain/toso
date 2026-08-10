@@ -17,6 +17,7 @@ from sim_common.async_engine import AsyncEngine, run_sim
 from kvcache_sim.control.cache import LRUCache
 from kvcache_sim.control.view import KVView
 from kvcache_sim.workload.deploy import make_store
+from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from kvcache_sim.data.decode import DecodeEngine
@@ -64,11 +65,13 @@ def test_real_directory_prefix_presence_and_eviction():
     topo = make_topology(2)
     keys = block_keys_for("m0", [0, 1, 2, 3])
 
+    sim = Simulation(topo)
+    store = make_store(sim, block_tokens=512)
+    view = KVView(sim.view.directory, sim.topology)
+
     async def scenario():
         # The data plane publishes/evicts; the control-plane view reads back.
-        mesh, store = make_store(topo, block_tokens=512)
-        view = KVView(mesh.handle, mesh.topology)
-        with mesh.installed():
+        with sim.mesh.installed():
             await store.publish("s0", list(keys[:3]))  # s0 holds 3 leading blocks
             await store.publish("s1", list(keys[:1]))  # s1 holds 1
             counts = await view.prefix_lengths(list(keys))
@@ -78,7 +81,10 @@ def test_real_directory_prefix_presence_and_eviction():
             assert counts2 == {"s0": 1, "s1": 1}
         return True
 
-    ok, _ = run_sim(scenario())
+    try:
+        ok = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
     assert ok
 
 
@@ -186,7 +192,12 @@ def test_decode_step_time_shape():
 # 12. Batching raises TBT: a solo request decodes at the batch=1 baseline; several
 #     requests co-batched at the same instant each observe a strictly larger gap.
 def _run_decode_batch(n: int):
-    """Admit ``n`` requests at t=0 on one instance; return {id -> worst TBT}."""
+    """Admit ``n`` requests at t=0 on one instance; return {id -> worst TBT}.
+
+    Drives the decode engine against a bare clock: it needs no store, no
+    directory and no topology, so assembling a Simulation would build a mesh for
+    nothing.
+    """
     loop = AsyncEngine()
     res = {}
     eng = DecodeEngine(

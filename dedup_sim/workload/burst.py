@@ -63,8 +63,7 @@ def run_dedup_burst(
     once), versus ``m x`` for :func:`run_naive_burst`.
     """
     trace = Trace()
-    ledger = Ledger()
-    scenario_coro, _ctx = build_burst(
+    sim, ctx = build_burst(
         num_readers,
         n=n,
         dtype=dtype,
@@ -75,15 +74,15 @@ def run_dedup_burst(
         policy=DedupPolicy(fanout_cap=fanout_cap, trace=trace),
         make_plane=make_plane,
         trace=trace,
-        ledger=ledger,
+        random_seed=random_seed,
         real_directory=real_directory,
     )
-    results, trace = run_sim(scenario_coro(), random_seed=random_seed, trace=trace)
+    results = sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
     return BurstResult(
-        trace=trace,
-        ledger=ledger,
+        trace=sim.trace,
+        ledger=sim.ledger,
         results=results,
-        expected=_ctx["expected"],
-        origin_id=_ctx["origin_id"],
+        expected=ctx["expected"],
+        origin_id=ctx["origin_id"],
         num_readers=num_readers,
     )

@@ -18,11 +18,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from realsim.runner import Runner, WorkItem
-from sim_common.async_engine import AsyncEngine
+from realsim.runner import WorkItem
+from realsim.simulation import Simulation
 from sim_common.topology import Endpoint
 
-from sim_common.cost_model import DEFAULT_PROFILE, ProfileTransferCost
+from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ..control.view import KVView
@@ -86,53 +86,53 @@ def run(
     the decode instances' compute, which is a data-plane fact and so is handed to
     the serving plane, not to the scheduler.
     """
-    trace = Trace(time_width=8, kind_width=7)
-    metrics = Metrics()
-    loop = AsyncEngine(trace=trace)
-    try:
-        mesh, store = make_store(
-            topology, block_tokens=BLOCK_TOKENS, profile=DEFAULT_PROFILE, trace=trace
+    # One assembled stack: clock, mesh, view, ledger, transfer-cost estimate.
+    sim = Simulation(
+        topology,
+        profile=DEFAULT_PROFILE,
+        trace=Trace(time_width=8, kind_width=7),
+        ledger=Metrics(),
+    )
+    metrics = sim.ledger
+    store = make_store(sim, block_tokens=BLOCK_TOKENS)
+    # Control senses the same real directory the data plane writes, but only
+    # ever reads it.
+    view = KVView(sim.view.directory, sim.topology)
+    common = dict(
+        transfer_cost=sim.transfer_cost,
+        block_tokens=BLOCK_TOKENS,
+        capacity=capacity,
+        profile=DEFAULT_PROFILE,
+        slo_ttft=slo_ttft,
+        slo_tbt=slo_tbt,
+        simulate_decode=simulate_decode,
+        max_batch=max_batch,
+        prefill_pool=prefill_pool,
+        decode_pool=decode_pool,
+        early_rejection=early_rejection,
+    )
+    if kind == "cache_aware":
+        sched = CacheAwareScheduler(
+            view, balance_threshold=balance_threshold,
+            replicate=replicate, **common,
         )
-        # Control senses the same real directory the data plane writes, but only
-        # ever reads it.
-        view = KVView(mesh.handle, mesh.topology)
-        common = dict(
-            transfer_cost=ProfileTransferCost(topology, DEFAULT_PROFILE),
-            block_tokens=BLOCK_TOKENS,
-            capacity=capacity,
-            profile=DEFAULT_PROFILE,
-            slo_ttft=slo_ttft,
-            slo_tbt=slo_tbt,
-            simulate_decode=simulate_decode,
-            max_batch=max_batch,
-            prefill_pool=prefill_pool,
-            decode_pool=decode_pool,
-            early_rejection=early_rejection,
-        )
-        if kind == "cache_aware":
-            sched = CacheAwareScheduler(
-                view, balance_threshold=balance_threshold,
-                replicate=replicate, **common,
-            )
-        elif kind == "load_balance":
-            sched = LoadBalanceScheduler(view, **common)
-        else:  # pragma: no cover - guard
-            raise ValueError(f"unknown scheduler kind {kind!r}")
+    elif kind == "load_balance":
+        sched = LoadBalanceScheduler(view, **common)
+    else:  # pragma: no cover - guard
+        raise ValueError(f"unknown scheduler kind {kind!r}")
 
-        plane = ServingPlane(
-            loop, store, sched, trace=trace, metrics=metrics,
-            coupled=coupled, max_batch=max_batch,
-        )
-        # Request coroutines end at prefill completion; decode continues on its
-        # own step tasks, so the runner drains them before it returns.
-        runner = Runner(mesh, plane=plane, drain=plane.drain)
-        items = [
-            WorkItem(id=r.id, release_time=r.arrival, payload=r) for r in requests
-        ]
-        loop.run_until_complete(runner.run(items))
-    finally:
-        loop.close()
-    return Run(metrics=metrics, trace=trace)
+    plane = ServingPlane(
+        sim.loop, store, sched, trace=sim.trace, metrics=metrics,
+        coupled=coupled, max_batch=max_batch,
+    )
+    items = [
+        WorkItem(id=r.id, release_time=r.arrival, payload=r) for r in requests
+    ]
+    # Request coroutines end at prefill completion; decode continues on its own
+    # step tasks, so the run drains them before returning. The rows are published
+    # by the serving plane at three different lifecycle points, not per item.
+    sim.run(items, plane=plane, drain=plane.drain, record_rows=False)
+    return Run(metrics=metrics, trace=sim.trace)
 
 
 # --------------------------------------------------------------------------- #

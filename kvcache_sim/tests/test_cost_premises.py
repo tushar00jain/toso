@@ -34,6 +34,7 @@ from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
 from kvcache_sim.workload.deploy import make_store
+from realsim.simulation import Simulation
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, make_topology
 
 # Bounds on how much cheaper fetching a block is than recomputing it, under the
@@ -197,8 +198,8 @@ def test_predicted_block_bytes_equal_the_bytes_the_data_plane_moves():
     this pins them together for the default and for a much larger model.
     """
     for model in (DEFAULT_MODEL, REAL_MODEL):
-        _, cl = make_store(
-            make_topology(2), block_tokens=BLOCK_TOKENS, model=model
+        cl = make_store(
+            Simulation(make_topology(2)), block_tokens=BLOCK_TOKENS, model=model
         )
         assert cl.block_nbytes == model.block_bytes(1, BLOCK_TOKENS), (
             "the KV block carrier and Model.block_bytes() disagree, so every "
@@ -219,18 +220,25 @@ def test_a_real_pull_costs_what_get_time_predicted():
     holder, puller = ids[0], next(i for i in ids[1:] if topo[i].node != topo[ids[0]].node)
     keys = ["blk0"]
 
+    sim = Simulation(topo)
+    cl = make_store(sim, block_tokens=BLOCK_TOKENS)
+
     async def scenario():
         import asyncio
 
-        mesh, cl = make_store(topo, block_tokens=BLOCK_TOKENS)
-        with mesh.installed():
+        with sim.mesh.installed():
             await cl.publish(holder, list(keys))
             loop = asyncio.get_running_loop()
             before = loop.time()
             await cl.fetch(puller, list(keys))
             return loop.time() - before, cl.block_nbytes
 
-    (advance, nbytes), _ = run_sim(scenario())
+    # Drives one op rather than a workload, so it uses the stack's clock directly
+    # instead of Simulation.run.
+    try:
+        advance, nbytes = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
     predicted = get_time(topo[holder], topo[puller], nbytes, DEFAULT_PROFILE)
     assert advance > 0.0
     assert math.isclose(advance, predicted, rel_tol=1e-12), (
