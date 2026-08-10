@@ -61,7 +61,7 @@ def _payload():
 
 def test_view_reads_the_real_directory_topology_and_clock():
     mesh = Mesh(_topology())
-    view = View.of(mesh)
+    view = mesh.view
 
     async def scenario():
         with mesh.installed():

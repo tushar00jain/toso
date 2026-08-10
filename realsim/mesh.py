@@ -113,7 +113,7 @@ class Mesh:
         # unrouted mesh pays nothing for the hook.
         self.policy = policy
         if policy is not None:
-            self.handle.install_policy(policy, View.of(self))
+            self.handle.install_policy(policy, self.view)
         # Each volume's byte capacity comes from the run's profile
         # (``storage_capacity_bytes``, default unbounded); the seam enforces it
         # against the aggregate resident working set.
@@ -136,6 +136,15 @@ class Mesh:
         }
 
     # -- accessors ---------------------------------------------------------- #
+    @property
+    def view(self) -> View:
+        """A :class:`~proposed.view.View` over this mesh's directory + topology.
+
+        Built here rather than in ``proposed`` so the proposal never has to know
+        what a :class:`Mesh` is.
+        """
+        return View(self.handle, self.topology)
+
     def adapter(self, node_id: str) -> RealClientAdapter:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""
         return self.adapters[node_id]

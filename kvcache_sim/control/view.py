@@ -62,7 +62,7 @@ class PinnedKVView(KVView):
     """
 
     def __init__(self, base: KVView, block_keys: Sequence[str]) -> None:
-        super().__init__(base._handle, base.topology)
+        super().__init__(base.directory, base.topology)
         self._base = base
         self._keys: List[str] = list(block_keys)
         self._counts: Optional[Dict[str, int]] = None

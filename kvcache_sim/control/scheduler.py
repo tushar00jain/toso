@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
-from sim_common.topology import Endpoint
+from proposed.topology import Endpoint
 
 from domain.llm import DEFAULT_MODEL, decode_step_time, Model, prefill_time
 

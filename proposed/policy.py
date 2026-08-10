@@ -37,6 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Sequence, Tuple
 
+from proposed.view import View
+
 __all__ = ["Selection", "Policy", "NaivePolicy"]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -100,7 +102,7 @@ class Policy:
     name = "naive"
 
     async def select(
-        self, view: Any, keys: Sequence[str], requester: str
+        self, view: View, keys: Sequence[str], requester: str
     ) -> Selection:
         """Rank the volumes that should serve ``keys`` for ``requester``.
 
