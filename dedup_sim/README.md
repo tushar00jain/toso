@@ -3,7 +3,7 @@
 `dedup_sim` runs the **dedup algorithm on the real TorchStore directory and real
 types** (via [`realsim`](../realsim/)): a synchronized read burst is routed so
 that each unique byte crosses the fabric **exactly once (1x)**, versus **`m x`**
-for the unrouted baseline. The routing is a real `realsim.policy.Policy`
+for the unrouted baseline. The routing is a real `proposed.policy.Policy`
 (`dedup_sim.control.routing.DedupPolicy`) consulted *inside* the real
 `Controller`'s `locate_volumes`, over the real `LocalClient` planning core and the
 real in-memory transport, all on `realsim`'s deterministic virtual-clock async
@@ -24,7 +24,7 @@ With no policy installed, every reader `locate_volumes` the origin before anyone
 finishes, so each pulls from the origin volume -- `m x` fabric.
 
 `DedupPolicy` answers that same `locate_volumes` differently. It is a
-`realsim.policy.Policy`, consulted inside the real controller endpoint body:
+`proposed.policy.Policy`, consulted inside the real controller endpoint body:
 
 1. Readers reach the controller in order. The **first** is routed to a volume
    that already holds the key -- the single fabric hop.
@@ -98,18 +98,18 @@ reassembly guarantee of the real client is covered separately in
 
 ## Module layout
 
-Split by plane: `control/` decides, `data/` executes, and `control/` imports
-neither the data plane, the mesh, nor a client (enforced by
-`realsim/tools/check_contract.py`).
+Split by plane: `control/` decides, `data/` executes, and neither imports the
+simulator — `control/` takes a read-only `View`, `data/` calls torchstore APIs
+against a `Deployment` (enforced by `realsim/tools/check_contract.py`).
 
 ```
 dedup_sim/
   control/                # DECIDES
-    routing.py            #   DedupPolicy: a realsim Policy -- ranked source
+    routing.py            #   DedupPolicy: a proposed.Policy -- ranked source
                           #   + a readiness gate, from a read-only View
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- the
-                          #   reader's put that makes it a directory source
+                          #   reader's put, via the Deployment's client for it
   workload/               # WHAT IS SIMULATED
     burst.py              #   realsim's put/get fixture, with the policy
                           #   installed; and unwrapped, as the baseline

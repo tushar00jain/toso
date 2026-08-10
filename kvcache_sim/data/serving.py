@@ -1,7 +1,7 @@
 """The serving loop: turning one routing decision into real store calls.
 
 :class:`ServingPlane` is ``kvcache_sim``'s :class:`~proposed.plane.DataPlane`. The
-:class:`~realsim.runner.Runner` releases one work item per request at its arrival
+The run harness releases one work item per request at its arrival
 time; everything from there is here:
 
 1. ask the scheduler to route the request (control), and record a rejection if it

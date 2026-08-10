@@ -33,8 +33,7 @@ multi-client scenario and independent of the capability under test. It used to
 live inside a burst-shaped read coordinator, so capabilities that are not bursts
 -- ``kvcache_sim``'s continuous arrival stream -- could not reuse it and had to
 re-derive the wiring underneath. Extracting it here lets a capability package
-hold only capability code; :class:`MeshView` is the base every consumer of a mesh
-shares.
+hold only capability code.
 
 Accounting hook
 ---------------
@@ -214,61 +213,4 @@ class Mesh:
         :func:`realsim.seams.factory.installed`.
         """
         with factory.installed(self._build, owner=self):
-            yield self
-
-
-class MeshView:
-    """Base for a capability-shaped consumer of a :class:`Mesh`.
-
-    Every consumer of a mesh (a KV-cache instance set, a burst's store, a
-    :class:`~proposed.view.View`) needs the same handful of pass-throughs to the
-    real objects the mesh owns -- the directory handle, the topology, the trace,
-    the machine profile, the resource registry -- plus the install context. They
-    were re-declared property-for-property in each consumer; declaring them once
-    here keeps a consumer to the part that is actually capability-specific.
-
-    This adds no behaviour of its own: every member forwards to :attr:`mesh`.
-
-    Args:
-        mesh: the :class:`Mesh` holding the real controller directory, per-node
-            volumes/clients, resource registry, and the shared transport factory.
-    """
-
-    def __init__(self, mesh: Mesh) -> None:
-        self.mesh = mesh
-
-    @property
-    def topology(self) -> Dict[str, Endpoint]:
-        """``node_id -> Endpoint`` for transfer-cost locality."""
-        return self.mesh.topology
-
-    @property
-    def ids(self) -> List[str]:
-        """Node ids, sorted."""
-        return self.mesh.ids
-
-    @property
-    def handle(self) -> Any:
-        """The real ``Controller`` directory behind the actor surface."""
-        return self.mesh.handle
-
-    @property
-    def trace(self) -> Trace:
-        """The run's shared :class:`~sim_common.trace.Trace`."""
-        return self.mesh.trace
-
-    @property
-    def profile(self) -> MachineProfile:
-        """The target-machine :class:`~sim_common.cost_model.MachineProfile`."""
-        return self.mesh.profile
-
-    @property
-    def registry(self) -> ResourceRegistry:
-        """The run's shared :class:`~sim_common.resources.ResourceRegistry`."""
-        return self.mesh.registry
-
-    @contextmanager
-    def installed(self) -> Iterator["MeshView"]:
-        """Install the mesh's shared transport factory for the duration of the block."""
-        with self.mesh.installed():
             yield self

@@ -23,7 +23,7 @@ Two levers the design cares about are modelled here:
   simply never makes either call, so decode is never disturbed by prefill.
 
 Async & deterministic: each instance's decode runs as a coroutine on the shared
-:class:`~sim_common.async_engine.AsyncEngine` virtual clock -- one step per
+run's event loop -- one step per
 ``await asyncio.sleep(step_time)``. Recency/clocks are the loop's virtual time; no
 wall-clock, no randomness.
 """
@@ -56,8 +56,8 @@ class DecodeEngine:
     """Drives batched, stepped decode for a set of decode instances.
 
     Args:
-        loop: the :class:`~sim_common.async_engine.AsyncEngine` (for the virtual
-            clock and task creation).
+        loop: the run's event loop (for the clock and task creation). Under
+            simulation its clock is virtual, so a step costs no wall time.
         decode_ids: the decode instance ids.
         max_batch: VRAM cap on a decode batch.
         profile: target-machine profile driving :func:`decode_step_time`.

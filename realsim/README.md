@@ -127,16 +127,8 @@ realsim/
   adapters/       thin wiring that constructs the real objects off-actor
   mesh.py         Mesh -- the multi-client wiring a capability builds on: per-node
                   volumes + real clients, one directory, one resource registry,
-                  one shared transport factory
-                  one shared transport factory. MeshView is the base every
-                  consumer of a mesh shares
-  policy.py       Policy.select(view, keys, requester) -> ranked sources +
-                  readiness. Naive (all holders, directory order) is the default;
-                  the controller consults it inside locate_volumes
-  view.py         View -- awaited, read-only observation: locate, topology and
-                  locality, the clock. No mutation
-  plane.py        DataPlane -- execute(item) / after(item, result), both
-                  defaulting to real no-op behaviour
+                  one shared transport factory. It is also the Deployment a
+                  capability's data plane runs against (client_for resolves a node)
   runner.py       Runner -- release work items on the virtual clock in
                   (release_time, id) order, install the mesh once, gather, drain
   scenarios/      put_get.py: seed a key, then m clients get it; meta/metadata data
@@ -145,6 +137,18 @@ realsim/
   tools/          check_contract.py: the concurrency + plane-separation lint
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
                   perf guard, composability, mesh wiring, the shared plane types
+proposed/       every contract that outlives the simulator; imports nothing
+  policy.py       Policy.select(view, keys, requester) -> ranked sources +
+                  readiness, plus notice() to open a readiness gate. Naive (all
+                  holders, directory order) is the default; the controller
+                  consults it inside locate_volumes
+  view.py         View -- awaited, read-only observation: locate, topology and
+                  locality, the clock. Built over a Directory protocol
+  deployment.py   Deployment -- how data-plane code reaches its store
+  plane.py        DataPlane -- execute(item) / after(item, result), both
+                  defaulting to no-op
+  cost.py         TransferCost -- what a fetch is predicted to cost
+  topology.py     Endpoint / Tier / locality -- where a volume is
 domain/
   llm.py          Model -- a transformer reduced to what a sim charges against
                   (flops/token, KV bytes/token) -- plus prefill/decode-step times.

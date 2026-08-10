@@ -24,7 +24,7 @@ for routing equals the *actual* completion time.
 
 Control plane only
 ------------------
-Nothing here executes: this module holds no client, no volume, no mesh and no
+Nothing here executes: this module holds no client, no volume, no deployment and no
 decode engine. It senses through a :class:`~kvcache_sim.control.view.KVView`,
 returns decisions, and learns what actually happened through two ``observe_*``
 calls the data plane makes.
@@ -152,7 +152,8 @@ class _Base:
         self.profile = profile
         # Priced through the protocol, never a simulator function: the scheduler
         # is written against an estimate, not against one cost model. The caller
-        # supplies the implementation (the simulator's comes from sim_common).
+        # supplies the implementation; a simulated run passes one priced off the
+        # same model the transport charges, a deployment its measured numbers.
         self.transfer_cost = transfer_cost
         self.model = model
         self.source_policy = (

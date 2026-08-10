@@ -35,7 +35,9 @@ byte-identical runs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional, Sequence, Tuple
+from typing import (
+    Any, Awaitable, Callable, Dict, Optional, Protocol, Sequence, Tuple,
+)
 
 from proposed.view import View
 
@@ -90,6 +92,18 @@ class Selection:
             }
             scoped[key] = ranked if ranked else volume_map
         return scoped
+
+
+class DecisionLog(Protocol):
+    """Somewhere a policy can explain itself.
+
+    Optional and never load-bearing: a policy must behave identically with none
+    attached. Declared here so a policy can be handed one without naming the
+    simulator's trace -- a deployment would pass its own logger.
+    """
+
+    def record(self, at: float, kind: str, message: str) -> None:
+        ...
 
 
 class Policy:

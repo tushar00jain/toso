@@ -1,14 +1,14 @@
-"""KV directory verbs over the *real* TorchStore clients: :class:`KVStore`.
+"""KV directory verbs over real TorchStore clients: :class:`KVStore`.
 
-A **serving instance** is a real storage volume plus a co-located real
-``LocalClient``. All of that wiring -- the real ``Controller`` directory behind
-:class:`~realsim.seams.controller_handle.FakeControllerHandle`, one
-:class:`~realsim.seams.volume_handle.FakeVolumeHandle` and one
-:class:`~realsim.adapters.real_client.RealClientAdapter` per instance, the shared
-:class:`~sim_common.resources.ResourceRegistry`, and the single shared
-``create_transport_buffer`` substitution -- is generic multi-client machinery, so
-it comes from :class:`realsim.mesh.Mesh` via :class:`realsim.mesh.MeshView`. This
-module holds only the three KV verbs that move bytes or change the directory.
+A **serving instance** is a storage volume plus a co-located ``LocalClient``.
+Obtaining that client is not this module's business: it asks a
+:class:`~proposed.deployment.Deployment` for the one belonging to an instance and
+drives ordinary torchstore APIs on it. Under simulation the deployment resolves an
+instance id to one of many in-process clients; a real one has a single client and
+ignores the id. Either way what follows is the same code -- which is the point:
+nothing here imports the simulator.
+
+This module holds only the three KV verbs that move bytes or change the directory.
 
 Mapping (real directory + real types throughout):
 
@@ -17,13 +17,14 @@ Mapping (real directory + real types throughout):
   ``keys_to_storage_volumes[K][volume_X]`` -- created by a real, metadata-only
   ``put`` from X's client and read back by the real ``locate_volumes``;
 * **publishing** a prefix after prefill (:meth:`KVStore.publish`) is a real
-  ``client.put_batch`` of metadata-only carriers (a ``(shape, dtype)``
-  ``TensorDescriptor`` per block -- zero real tensor storage), which both writes
-  the carrier into X's real store and registers ``K -> volume_X`` via the real
-  ``notify_put_batch``;
-* a **remote prefix pull** (:meth:`KVStore.fetch`) is a real ``client.get_batch``
-  driven through ``realsim``'s transport seam, so the fabric/storage/RAM cost is
-  charged by the real cost model;
+  ``client.put_batch`` of one carrier per block, which both writes the carrier
+  into X's store and registers ``K -> volume_X`` via the real
+  ``notify_put_batch``. *What* a block is stored as is chosen by the run, not
+  here: a simulated run supplies an allocation-free ``(shape, dtype)`` descriptor
+  where a deployment would supply the KV tensors;
+* a **remote prefix pull** (:meth:`KVStore.fetch`) is a real ``client.get_batch``,
+  so a simulated run charges fabric/storage/RAM for it through the same cost model
+  the scheduler predicted against;
 * **eviction** (:meth:`KVStore.evict`) removes ``K -> volume_X`` from the real
   directory via the real ``notify_delete_batch`` endpoint.
 
@@ -45,25 +46,16 @@ class KVStore:
     """The KV data plane's three verbs over real per-instance clients.
 
     Args:
-        topology: ``instance_id -> Endpoint`` (instance id == its volume id).
+        deployment: the :class:`~proposed.deployment.Deployment` these instances
+            run against; it vends the client for an instance id.
         block_tokens: tokens per KV block.
-        profile: target-machine :class:`~sim_common.cost_model.MachineProfile`.
-            Also supplies each volume's byte capacity.
+        carrier: what one block is stored as. Supplied by the run (see
+            ``kvcache_sim/workload/deploy.py``) because it is the piece that
+            differs between a simulated run and a real one.
         model: served-model :class:`~domain.llm.Model`, which sets how many bytes
-            one KV block occupies. The block carrier is sized from it (see
-            :attr:`block_nbytes`) so the bytes the transport charges are always
-            the bytes :meth:`~domain.llm.Model.block_bytes` predicts.
-        trace: shared :class:`~sim_common.trace.Trace` for transfer events.
-        real_directory: controller directory backing (``None`` -> the ambient
-            :data:`sim_common.config.SimConfig.real_directory`, default real
-            ``Trie``; ``False`` -> the lightweight dict shim). Changes no metric.
-
-    The network/storage contention model is read ambiently from
-    :data:`sim_common.config.SimConfig.contention` (default ``"none"``). The mesh
-    builds one shared :class:`~sim_common.resources.ResourceRegistry` and injects
-    it into every instance's transport, so concurrent cross-instance pulls share a
-    hot peer's egress / a volume's read channel. Unlike ``real_directory`` a
-    non-``"none"`` mode DOES change timing.
+            one KV block occupies. The carrier must be sized from it (see
+            :attr:`block_nbytes`) so the bytes moved are the bytes
+            :meth:`~domain.llm.Model.block_bytes` predicts.
     """
 
     def __init__(

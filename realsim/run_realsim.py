@@ -150,7 +150,7 @@ def main(argv=None) -> None:
     logger.info(render_burst_summary(res))
     logger.info(
         "no routing policy => %dx fabric (every reader pulls the origin). Installing "
-        "a realsim Policy (policy.py) in the controller's locate_volumes -- as "
+        "a Policy (proposed/policy.py) in the controller's locate_volumes -- as "
         "dedup_sim does -- routes later readers to read-through peers and cuts this "
         "toward 1x, with the scenario code above unchanged.",
         res.num_readers,

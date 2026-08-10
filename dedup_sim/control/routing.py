@@ -37,7 +37,7 @@ import asyncio
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Optional, Sequence, Set, Tuple
 
-from proposed.policy import Policy, Selection
+from proposed.policy import DecisionLog, Policy, Selection
 
 __all__ = ["DedupPolicy"]
 
@@ -49,14 +49,17 @@ class DedupPolicy(Policy):
         fanout_cap: how many peers one source may be planned to feed (1 = a
             chain, >= 2 = a shallow tree). The fabric stays 1x for any cap; the
             cap only trades wallclock against tree depth.
-        trace: optional :class:`~sim_common.trace.Trace` to record each routing
-            decision into. Control recording its own decisions costs nothing and
-            makes the demo readable; it changes no metric.
+        trace: optional :class:`~proposed.policy.DecisionLog` to record each
+            routing decision into. Control explaining itself costs nothing and
+            makes the demo readable; it changes no metric, and the policy behaves
+            identically with none attached.
     """
 
     name = "dedup"
 
-    def __init__(self, *, fanout_cap: int = 1, trace: Optional[Any] = None) -> None:
+    def __init__(
+        self, *, fanout_cap: int = 1, trace: Optional[DecisionLog] = None
+    ) -> None:
         self.cap = fanout_cap
         self.trace = trace
         # requester -> the source it was routed to (decided once, then reused).

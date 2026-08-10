@@ -12,7 +12,7 @@
 * :mod:`~kvcache_sim.control.cache` -- per-instance LRU. It picks victims; it
   does not delete anything.
 
-Nothing here imports :mod:`kvcache_sim.data`, the mesh, or a client -- checked by
-``realsim/tools/check_contract.py``. Control senses through a view and returns
+Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and
+nothing here reaches into the simulator -- all checked by the repo's contract lint. Control senses through a view and returns
 decisions; what actually happened comes back as an observation.
 """

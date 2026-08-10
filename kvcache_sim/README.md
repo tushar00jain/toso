@@ -115,9 +115,10 @@ The scheduler only ever *decides*: it reads the real directory through a view
 
 ## Layout
 
-Split by plane: `control/` decides, `data/` executes, and `control/` imports
-neither the data plane, the mesh, nor a client (enforced by
-`realsim/tools/check_contract.py`). The test for which folder something belongs
+Split by plane: `control/` decides, `data/` executes, and neither imports the
+simulator — `control/` takes a `View`, a `TransferCost` and machine facts from
+`domain`; `data/` calls torchstore APIs against a `Deployment`. Both are enforced
+by `realsim/tools/check_contract.py`. The test for which folder something belongs
 in is **does it advance the clock or move bytes?** — the decode engine sleeps and
 emits tokens, so it is data; the LRU only picks victims, so it is control; a
 directory read is control even though it awaits.
@@ -129,20 +130,22 @@ kvcache_sim/
                           #   prefill placement, pull-vs-recompute, SLO gates,
                           #   decode placement; owns the PREDICTED prefill queue
     source.py             #   LongestPrefixPolicy: the one store question
-                          #   ("which peer serves this gap"), a realsim Policy
+                          #   ("which peer serves this gap"), a proposed.Policy
     view.py               #   KVView: per-instance prefix-run lengths, plus the
                           #   pinned snapshot one routing decision reads through
     cache.py              #   per-instance LRU eviction bookkeeping (metadata)
   data/                   # EXECUTES -- advances the clock, moves bytes
-    serving.py            #   the per-request serving loop (a realsim DataPlane):
+    serving.py            #   the per-request serving loop (a DataPlane):
                           #   queue wait, real pull, prefill charge, publish/evict,
                           #   decode admission, outcome rows. Owns prefill/decode
                           #   coupling, which is a deployment fact, not a policy
     decode.py             #   async DecodeEngine: batched, stepped decode -> TBT
-    store.py              #   publish / fetch / evict over a realsim.mesh.Mesh
+    store.py              #   publish / fetch / evict over a Deployment's clients
   workload/               # WHAT IS SIMULATED
     request.py            #   inference Request + prefix-hash chain (str keys)
     generator.py          #   seeded synthetic request stream (Zipf + Poisson)
+    deploy.py             #   builds the simulated Deployment (a Mesh) and picks
+                          #   the block carrier -- the run wiring data/ must not see
     scenarios.py          #   scenario builders + the run harness that wires the
                           #   two planes and hands the requests to realsim.Runner
   report/                 # OUTCOME METRICS

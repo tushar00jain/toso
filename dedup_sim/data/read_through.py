@@ -26,11 +26,11 @@ class ReadThroughPlane(DataPlane):
 
     Args:
         deployment: the :class:`~proposed.deployment.Deployment` the readers run
-            against; under simulation the mesh, which resolves the reader's node.
+            against; it vends the client co-located with a reader.
         key: the key the burst moves.
         value: the payload carrier to re-``put`` (a ``device="meta"`` tensor or a
-            :class:`~realsim.seams.transport.TensorDescriptor`) -- allocation-free
-            either way, exactly as the producer's put was.
+            allocation-free descriptor) -- whatever the producer put, put back
+            unchanged, so the read-through stores exactly what was read.
     """
 
     def __init__(self, deployment: Deployment, key: str, value: Any) -> None:
@@ -44,5 +44,5 @@ class ReadThroughPlane(DataPlane):
 
 
 def make_plane(deployment: Deployment, key: str, value: Any) -> ReadThroughPlane:
-    """Factory matching ``realsim.scenarios.put_get.MakePlane``."""
+    """Build the plane for a run; matches the factory shape a scenario expects."""
     return ReadThroughPlane(deployment, key, value)
