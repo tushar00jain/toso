@@ -7,7 +7,3 @@ also registers the reader in the real directory. That registration is what
 releases the next reader's withheld answer, so the chain/tree is a consequence of
 this one call rather than a loop anywhere in the control plane.
 """
-
-from .read_through import make_plane, ReadThroughPlane
-
-__all__ = ["ReadThroughPlane", "make_plane"]

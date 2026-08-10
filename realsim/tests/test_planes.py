@@ -31,7 +31,8 @@ import torch
 
 from realsim.mesh import Mesh
 from proposed import DataPlane
-from proposed import NaivePolicy, Policy, Selection
+from proposed import Policy, Selection
+from proposed.policy import NaivePolicy  # not exported: the base Policy is naive
 from realsim.runner import Runner, WorkItem
 from realsim.seams.transport import Endpoint
 from proposed import View

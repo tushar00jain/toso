@@ -29,14 +29,13 @@ missing" section.
 from .cost import TransferCost
 from .deployment import Deployment
 from .plane import DataPlane
-from .policy import DecisionLog, NaivePolicy, Policy, Selection
+from .policy import DecisionLog, Policy, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL
 from .view import Directory, View
 
 __all__ = [
     # the torchstore ask
     "Policy",
-    "NaivePolicy",
     "Selection",
     "DecisionLog",
     "View",

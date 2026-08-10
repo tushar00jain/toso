@@ -7,7 +7,3 @@ holds no client, no volume and no deployment, and it never executes anything -- 
 read-through write that makes its answer come true lives in
 :mod:`dedup_sim.data`.
 """
-
-from .routing import DedupPolicy
-
-__all__ = ["DedupPolicy"]
