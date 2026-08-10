@@ -117,22 +117,42 @@ def test_lint_allows_what_control_is_supposed_to_use():
     allowed = (
         "from proposed.policy import Policy, Selection\n"
         "from proposed.view import View\n"
-        "from domain.llm import prefill_time\n"
-        "from sim_common.cost_model import get_time\n"
+        "from proposed.cost import TransferCost\n"
+        "from domain.llm import prefill_time, MachineProfile\n"
         "from .cache import LRUCache\n"
         "from ..workload.request import Request\n"
     )
     assert _codes(allowed, path=CONTROL) == set()
 
 
-def test_the_rule_only_applies_to_control():
-    """The data plane is *supposed* to hold the mesh and the decisions."""
-    src = (
-        "from realsim.mesh import Mesh\n"
+def test_lint_keeps_control_out_of_the_simulator():
+    """Estimates come through a protocol; machine facts come from domain."""
+    assert "control-imports-execution" in _codes(
+        "from sim_common.cost_model import get_time\n", path=CONTROL
+    )
+    assert "control-imports-execution" in _codes(
+        "from proposed.plane import DataPlane\n", path=CONTROL
+    )
+
+
+def test_data_may_hold_decisions_but_not_the_simulator():
+    """data/ executes decisions, but it is application code: no harness in it."""
+    allowed = (
+        "from proposed.deployment import Deployment\n"
+        "from proposed.plane import DataPlane\n"
+        "from domain.llm import Model\n"
         "from ..control.scheduler import Plan\n"
         "from .store import KVStore\n"
     )
-    assert _codes(src, path=DATA) == set()
+    assert _codes(allowed, path=DATA) == set()
+    for line in ("from realsim.mesh import Mesh\n", "from sim_common.trace import Trace\n"):
+        assert "data-imports-simulator" in _codes(line, path=DATA), line
+
+
+def test_the_simulator_rules_do_not_apply_to_workload():
+    """workload/ is where the harness is wired up, so it may name it."""
+    src = "from realsim.mesh import Mesh\nfrom sim_common.trace import Trace\n"
+    assert _codes(src, path="kvcache_sim/workload/deploy.py") == set()
 
 
 def test_lint_flags_the_proposal_leaning_on_the_simulator():

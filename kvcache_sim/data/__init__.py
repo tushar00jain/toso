@@ -1,7 +1,7 @@
 """The KV-cache data plane: everything that advances the clock or moves bytes.
 
 * :mod:`~kvcache_sim.data.serving` -- the per-request serving loop, a
-  :class:`realsim.plane.DataPlane`: queue wait, the real prefix pull, the prefill
+  :class:`proposed.plane.DataPlane`: queue wait, the real prefix pull, the prefill
   charge, the real publish/evict, decode admission, and the outcome rows;
 * :mod:`~kvcache_sim.data.decode` -- the batched decode engine. It sleeps and
   emits tokens, so it is data even though the scheduler *reads* its occupancy;

@@ -149,6 +149,21 @@ class Mesh:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""
         return self.adapters[node_id]
 
+    def client_for(self, node_id: str) -> Any:
+        """:class:`proposed.deployment.Deployment` -- the client for ``node_id``.
+
+        Binds the calling coroutine to ``node_id`` first, so a capability's data
+        plane never has to know that many clients share this process. A real
+        deployment has one client and no binding to do.
+        """
+        self.bind_source(node_id)
+        return self.client(node_id)
+
+    @property
+    def controller_handle(self) -> Any:
+        """:class:`proposed.deployment.Deployment` -- the directory endpoints."""
+        return self.handle
+
     def client(self, node_id: str) -> Any:
         """The real ``LocalClient`` co-located with ``node_id``."""
         return self.adapters[node_id].client

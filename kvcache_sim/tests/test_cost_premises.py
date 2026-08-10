@@ -33,7 +33,7 @@ from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
 from sim_common.topology import Tier
 
 from domain.llm import DEFAULT_MODEL, Model, prefill_time
-from kvcache_sim.data.store import KVStore
+from kvcache_sim.workload.deploy import make_store
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, make_topology
 
 # Bounds on how much cheaper fetching a block is than recomputing it, under the
@@ -197,7 +197,7 @@ def test_predicted_block_bytes_equal_the_bytes_the_data_plane_moves():
     this pins them together for the default and for a much larger model.
     """
     for model in (DEFAULT_MODEL, REAL_MODEL):
-        cl = KVStore(
+        _, cl = make_store(
             make_topology(2), block_tokens=BLOCK_TOKENS, model=model
         )
         assert cl.block_nbytes == model.block_bytes(1, BLOCK_TOKENS), (
@@ -222,8 +222,8 @@ def test_a_real_pull_costs_what_get_time_predicted():
     async def scenario():
         import asyncio
 
-        cl = KVStore(topo, block_tokens=BLOCK_TOKENS)
-        with cl.installed():
+        mesh, cl = make_store(topo, block_tokens=BLOCK_TOKENS)
+        with mesh.installed():
             await cl.publish(holder, list(keys))
             loop = asyncio.get_running_loop()
             before = loop.time()

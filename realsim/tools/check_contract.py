@@ -117,8 +117,18 @@ CONTROL_FORBIDDEN: Dict[str, str] = {
     "realsim.mesh": "the mesh (control gets a View, not the objects behind it)",
     "realsim.adapters": "a real client/controller adapter",
     "realsim.seams": "the store seams (transport, volumes, controller handle)",
-    "realsim.plane": "the DataPlane interface (that is the executing half)",
+    "proposed.plane": "the DataPlane interface (that is the executing half)",
     "realsim.runner": "the Runner (releasing work is execution, not decision)",
+    "sim_common": "simulation internals -- take estimates through a protocol "
+                  "(proposed.cost) and machine facts from domain",
+}
+
+# What a capability's ``data/`` may not import. It is application code: it calls
+# ordinary torchstore APIs against a proposed.deployment.Deployment, and the
+# harness that *is* that deployment under simulation is wired up in workload/.
+DATA_FORBIDDEN: Dict[str, str] = {
+    "realsim": "the simulator (data/ is real code -- take a Deployment instead)",
+    "sim_common": "simulation internals (machine facts come from domain)",
 }
 
 # Any resolved module with this path segment is a capability's data plane.
@@ -162,6 +172,12 @@ def is_control_module(rel_path: str) -> bool:
     return CONTROL_SEGMENT in parts[:-1]
 
 
+def is_capability_data_module(rel_path: str) -> bool:
+    """True for a capability's data-plane module (``<pkg>/data/...``)."""
+    parts = Path(rel_path).parts
+    return len(parts) > 1 and parts[0].endswith("_sim") and DATA_SEGMENT in parts[:-1]
+
+
 def is_proposed_module(rel_path: str) -> bool:
     """True for a module in the upstream-proposal package (``proposed/...``)."""
     parts = Path(rel_path).parts
@@ -193,12 +209,14 @@ class _ContractVisitor(ast.NodeVisitor):
         allow_wallclock_reads: bool,
         is_control: bool = False,
         is_proposed: bool = False,
+        is_capability_data: bool = False,
     ) -> None:
         self.rel_path = rel_path
         self.allow_wallclock_reads = allow_wallclock_reads
         # Control-plane modules additionally may not import the executing half.
         self.is_control = is_control
         self.is_proposed = is_proposed
+        self.is_capability_data = is_capability_data
         self.violations: List[Violation] = []
         # name-in-this-module -> canonical module ("t" -> "time")
         self._module_alias: Dict[str, str] = {}
@@ -249,6 +267,13 @@ class _ContractVisitor(ast.NodeVisitor):
                 if module == banned or module.startswith(banned + "."):
                     self._add(lineno, "proposed-imports-simulator",
                               f"proposed imports {module!r}: that is {why}")
+                    return
+            return
+        if self.is_capability_data:
+            for banned, why in DATA_FORBIDDEN.items():
+                if module == banned or module.startswith(banned + "."):
+                    self._add(lineno, "data-imports-simulator",
+                              f"data imports {module!r}: that is {why}")
                     return
             return
         if not self.is_control:
@@ -332,6 +357,7 @@ def scan_source(source: str, rel_path: str, *, is_test: bool) -> List[Violation]
         allow_wallclock_reads=is_test,
         is_control=is_control_module(rel_path),
         is_proposed=is_proposed_module(rel_path),
+        is_capability_data=is_capability_data_module(rel_path),
     )
     visitor.visit(tree)
     # Dedupe (a Name can be visited twice) and sort deterministically.

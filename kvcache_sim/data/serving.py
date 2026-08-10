@@ -1,6 +1,6 @@
 """The serving loop: turning one routing decision into real store calls.
 
-:class:`ServingPlane` is ``kvcache_sim``'s :class:`~realsim.plane.DataPlane`. The
+:class:`ServingPlane` is ``kvcache_sim``'s :class:`~proposed.plane.DataPlane`. The
 :class:`~realsim.runner.Runner` releases one work item per request at its arrival
 time; everything from there is here:
 
@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 from typing import Dict, List, Optional
 
-from realsim.plane import DataPlane
+from proposed.plane import DataPlane
 
 from ..control.scheduler import Plan
 from ..report.metrics import Metrics, RequestResult

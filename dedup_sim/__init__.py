@@ -11,7 +11,7 @@ Laid out by plane, like ``kvcache_sim``:
   :class:`proposed.policy.Policy` consulted inside the controller's
   ``locate_volumes``. It holds no client, no volume and no mesh;
 * :mod:`dedup_sim.data` -- the read-through put that turns a finished reader into
-  a real directory source, a :class:`realsim.plane.DataPlane` overriding one
+  a real directory source, a :class:`proposed.plane.DataPlane` overriding one
   method;
 * :mod:`dedup_sim.workload` -- the burst itself, which is ``realsim``'s ordinary
   put/get fixture with the policy installed and nothing else changed;

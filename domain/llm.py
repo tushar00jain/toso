@@ -76,7 +76,13 @@ from dataclasses import dataclass
 from sim_common.cost_model import compute_time, DEFAULT_PROFILE, MachineProfile
 
 
-__all__ = ["Model", "DEFAULT_MODEL", "prefill_time", "decode_step_time"]
+__all__ = [
+    "Model", "DEFAULT_MODEL", "prefill_time", "decode_step_time",
+    # Re-exported: a MachineProfile describes the *target machine*, which is a
+    # domain fact rather than a simulator artifact. Capability code takes it from
+    # here so control/ and data/ need not reach into sim_common.
+    "DEFAULT_PROFILE", "MachineProfile",
+]
 
 @dataclass(frozen=True)
 class Model:

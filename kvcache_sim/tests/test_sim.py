@@ -16,7 +16,7 @@ from sim_common.async_engine import AsyncEngine, run_sim
 
 from kvcache_sim.control.cache import LRUCache
 from kvcache_sim.control.view import KVView
-from kvcache_sim.data.store import KVStore
+from kvcache_sim.workload.deploy import make_store
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain.llm import decode_step_time
 from kvcache_sim.data.decode import DecodeEngine
@@ -66,9 +66,9 @@ def test_real_directory_prefix_presence_and_eviction():
 
     async def scenario():
         # The data plane publishes/evicts; the control-plane view reads back.
-        store = KVStore(topo, block_tokens=512)
-        view = KVView(store.handle, store.topology)
-        with store.installed():
+        mesh, store = make_store(topo, block_tokens=512)
+        view = KVView(mesh.handle, mesh.topology)
+        with mesh.installed():
             await store.publish("s0", list(keys[:3]))  # s0 holds 3 leading blocks
             await store.publish("s1", list(keys[:1]))  # s1 holds 1
             counts = await view.prefix_lengths(list(keys))

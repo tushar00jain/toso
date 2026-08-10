@@ -11,7 +11,7 @@ four things:
 4. record one outcome row per item.
 
 That is this class. Everything capability-specific lives in the
-:class:`~realsim.plane.DataPlane` it is given.
+:class:`~proposed.plane.DataPlane` it is given.
 
 Determinism: the release order is a total order (``release_time`` then ``id``),
 and the engine's ready queue is FIFO, so items released at the same virtual
@@ -24,7 +24,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
-from realsim.plane import DataPlane
+from proposed.plane import DataPlane
 from sim_common.report import Ledger, Outcome
 
 __all__ = ["WorkItem", "Runner"]
@@ -38,7 +38,7 @@ class WorkItem:
         id: stable identity; also the tie-break among items released together.
         release_time: virtual time at which the item starts.
         run: the item's own ordinary store call, awaited by the default
-            :meth:`~realsim.plane.DataPlane.execute`. A capability whose plane
+            :meth:`~proposed.plane.DataPlane.execute`. A capability whose plane
             overrides ``execute`` may leave this unset.
         payload: whatever the capability's plane needs (a request, a key, ...).
     """
@@ -60,7 +60,7 @@ class Runner:
     Args:
         mesh: the :class:`realsim.mesh.Mesh` whose shared transport factory is
             installed for the run (duck-typed: only ``installed()`` is used).
-        plane: the capability's :class:`~realsim.plane.DataPlane` (default: the
+        plane: the capability's :class:`~proposed.plane.DataPlane` (default: the
             plain one -- run the item, nothing around it).
         ledger: optional :class:`~sim_common.report.Ledger`. When given, the
             runner records one :class:`~sim_common.report.Outcome` row per item

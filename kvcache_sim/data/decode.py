@@ -34,8 +34,9 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from domain.llm import DEFAULT_MODEL, decode_step_time, Model
-from sim_common.cost_model import DEFAULT_PROFILE
+from domain.llm import (
+    DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, Model,
+)
 
 from ..workload.request import Request
 

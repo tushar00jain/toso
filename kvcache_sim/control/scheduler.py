@@ -44,10 +44,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
-from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
 from proposed.topology import Endpoint
 
-from domain.llm import DEFAULT_MODEL, decode_step_time, Model, prefill_time
+from domain.llm import (
+    DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
+    prefill_time,
+)
+from proposed.cost import TransferCost
 
 from .cache import LRUCache
 from .source import LongestPrefixPolicy
@@ -131,6 +134,7 @@ class _Base:
         block_tokens: int,
         capacity: Optional[int] = None,
         profile: MachineProfile = DEFAULT_PROFILE,
+        transfer_cost: TransferCost,
         model: Model = DEFAULT_MODEL,
         decode_pool: Optional[List[str]] = None,
         prefill_pool: Optional[List[str]] = None,
@@ -146,6 +150,10 @@ class _Base:
         self.ids: List[str] = sorted(self.topo)
         self.B = block_tokens
         self.profile = profile
+        # Priced through the protocol, never a simulator function: the scheduler
+        # is written against an estimate, not against one cost model. The caller
+        # supplies the implementation (the simulator's comes from sim_common).
+        self.transfer_cost = transfer_cost
         self.model = model
         self.source_policy = (
             source_policy if source_policy is not None else LongestPrefixPolicy()
@@ -365,9 +373,7 @@ class CacheAwareScheduler(_Base):
                 xbytes = self.model.block_bytes(gap_blocks, self.B)
                 # The one definition the transport also charges, so this
                 # prediction equals the time the real pull will cost.
-                xt = get_time(
-                    self.topo[src_inst], self.topo[inst], xbytes, self.profile
-                )
+                xt = self.transfer_cost.get_time(src_inst, inst, xbytes)
                 cached = min(src_len * self.B, prompt)
                 uncached = prompt - cached
                 pt = prefill_time(uncached, self.profile, self.model)

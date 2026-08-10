@@ -22,12 +22,12 @@ from realsim.runner import Runner, WorkItem
 from sim_common.async_engine import AsyncEngine
 from sim_common.topology import Endpoint
 
-from sim_common.cost_model import DEFAULT_PROFILE
+from sim_common.cost_model import DEFAULT_PROFILE, ProfileTransferCost
 from domain.llm import decode_step_time
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ..control.view import KVView
 from ..data.serving import ServingPlane
-from ..data.store import KVStore
+from .deploy import make_store
 from ..report.metrics import Metrics, Trace
 from .generator import make_workload
 
@@ -90,13 +90,14 @@ def run(
     metrics = Metrics()
     loop = AsyncEngine(trace=trace)
     try:
-        store = KVStore(
+        mesh, store = make_store(
             topology, block_tokens=BLOCK_TOKENS, profile=DEFAULT_PROFILE, trace=trace
         )
         # Control senses the same real directory the data plane writes, but only
         # ever reads it.
-        view = KVView(store.handle, store.topology)
+        view = KVView(mesh.handle, mesh.topology)
         common = dict(
+            transfer_cost=ProfileTransferCost(topology, DEFAULT_PROFILE),
             block_tokens=BLOCK_TOKENS,
             capacity=capacity,
             profile=DEFAULT_PROFILE,
@@ -124,7 +125,7 @@ def run(
         )
         # Request coroutines end at prefill completion; decode continues on its
         # own step tasks, so the runner drains them before it returns.
-        runner = Runner(store.mesh, plane=plane, drain=plane.drain)
+        runner = Runner(mesh, plane=plane, drain=plane.drain)
         items = [
             WorkItem(id=r.id, release_time=r.arrival, payload=r) for r in requests
         ]

@@ -34,19 +34,14 @@ nothing, so per-instance prefix presence is a control-plane view
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List
 
-import torch
-
-from realsim.mesh import Mesh, MeshView
-from realsim.seams.transport import Endpoint, TensorDescriptor
-from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
-from sim_common.trace import Trace
+from proposed.deployment import Deployment
 
 from domain.llm import DEFAULT_MODEL, Model
 
 
-class KVStore(MeshView):
+class KVStore:
     """The KV data plane's three verbs over real per-instance clients.
 
     Args:
@@ -73,31 +68,20 @@ class KVStore(MeshView):
 
     def __init__(
         self,
-        topology: Dict[str, Endpoint],
+        deployment: Deployment,
         *,
         block_tokens: int,
-        profile: MachineProfile = DEFAULT_PROFILE,
+        carrier,
         model: Model = DEFAULT_MODEL,
-        trace: Trace | None = None,
-        real_directory: Optional[bool] = None,
     ) -> None:
-        super().__init__(
-            Mesh(
-                topology,
-                profile=profile,
-                trace=trace,
-                real_directory=real_directory,
-            )
-        )
+        self.deployment = deployment
         self.block_tokens = block_tokens
         self.model = model
-        # A metadata-only carrier for one KV block: a uint8 descriptor whose
-        # length IS the block's modeled byte size, derived from the model profile
-        # so the charged bytes cannot drift from the predicted ones. Zero real
-        # storage; the transport seam reads its nbytes for the cost model.
-        self._block_carrier = TensorDescriptor(
-            shape=(model.block_bytes(1, block_tokens),), dtype=torch.uint8
-        )
+        # What one KV block is, as far as the store is concerned. Supplied by the
+        # workload rather than built here: *what* to store is not a data-plane
+        # decision, and it is the piece that differs between a simulated run
+        # (an allocation-free carrier) and a real one (the KV tensors).
+        self._block_carrier = carrier
 
     @property
     def block_nbytes(self) -> int:
@@ -120,9 +104,8 @@ class KVStore(MeshView):
         """
         if not keys:
             return
-        self.mesh.bind_source(inst)
         entries = {k: self._block_carrier for k in keys}
-        await self.mesh.client(inst).put_batch(entries)
+        await self.deployment.client_for(inst).put_batch(entries)
 
     async def fetch(self, inst: str, keys: List[str]) -> None:
         """Pull ``keys`` into ``inst`` via a real ``get_batch`` (charges fabric).
@@ -140,17 +123,18 @@ class KVStore(MeshView):
         """
         if not keys:
             return
-        located = await self.handle.locate_volumes.call_one(
+        located = await self.deployment.controller_handle.locate_volumes.call_one(
             list(keys), missing_ok=True
         )
         present = [k for k in keys if k in located]
         if not present:
             return
-        self.mesh.bind_source(inst)
-        await self.mesh.client(inst).get_batch(present)
+        await self.deployment.client_for(inst).get_batch(present)
 
     async def evict(self, inst: str, keys: List[str]) -> None:
         """Drop ``key -> volume`` for ``inst`` from the REAL directory (eviction)."""
         if not keys:
             return
-        await self.handle.notify_delete_batch.call({inst: list(keys)})
+        await self.deployment.controller_handle.notify_delete_batch.call(
+            {inst: list(keys)}
+        )

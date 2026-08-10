@@ -1,7 +1,7 @@
 """Read-through: a finished reader becomes a real directory source.
 
 :class:`ReadThroughPlane` overrides one method of
-:class:`realsim.plane.DataPlane`. After a reader's ``get`` lands, it drives the
+:class:`proposed.plane.DataPlane`. After a reader's ``get`` lands, it drives the
 real ``client.put`` into that reader's co-located volume: a zero-fabric local
 write plus the real ``notify_put_batch``. The reader is now a genuine source in
 the real directory, which is what
@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from realsim.plane import DataPlane
+from proposed.deployment import Deployment
+from proposed.plane import DataPlane
 
 __all__ = ["ReadThroughPlane", "make_plane"]
 
@@ -24,24 +25,24 @@ class ReadThroughPlane(DataPlane):
     """Publish what a reader just fetched into the reader's own volume.
 
     Args:
-        mesh: the :class:`realsim.mesh.Mesh` holding the per-node real clients.
+        deployment: the :class:`~proposed.deployment.Deployment` the readers run
+            against; under simulation the mesh, which resolves the reader's node.
         key: the key the burst moves.
         value: the payload carrier to re-``put`` (a ``device="meta"`` tensor or a
             :class:`~realsim.seams.transport.TensorDescriptor`) -- allocation-free
             either way, exactly as the producer's put was.
     """
 
-    def __init__(self, mesh: Any, key: str, value: Any) -> None:
-        self.mesh = mesh
+    def __init__(self, deployment: Deployment, key: str, value: Any) -> None:
+        self.deployment = deployment
         self.key = key
         self.value = value
 
     async def after(self, item: Any, result: Any) -> None:
         """Real read-through: the reader stores the key into its own volume."""
-        self.mesh.bind_source(item.id)
-        await self.mesh.client(item.id).put(self.key, self.value)
+        await self.deployment.client_for(item.id).put(self.key, self.value)
 
 
-def make_plane(mesh: Any, key: str, value: Any) -> ReadThroughPlane:
+def make_plane(deployment: Deployment, key: str, value: Any) -> ReadThroughPlane:
     """Factory matching ``realsim.scenarios.put_get.MakePlane``."""
-    return ReadThroughPlane(mesh, key, value)
+    return ReadThroughPlane(deployment, key, value)

@@ -298,3 +298,21 @@ def compute_time(
         mem_term = nbytes / _mem_bandwidth(device, profile)
 
     return max(compute_term, mem_term)
+
+
+class ProfileTransferCost:
+    """:class:`proposed.cost.TransferCost` backed by a profile + topology.
+
+    The simulator's implementation: prices a transfer with the same
+    :func:`get_time` the transport seam charges, so a scheduler's prediction and
+    the clock advance it causes cannot drift apart.
+    """
+
+    def __init__(self, topology, profile: MachineProfile = DEFAULT_PROFILE) -> None:
+        self._topology = dict(topology)
+        self._profile = profile
+
+    def get_time(self, src_id: str, dst_id: str, nbytes: int) -> float:
+        return get_time(
+            self._topology[src_id], self._topology[dst_id], nbytes, self._profile
+        )

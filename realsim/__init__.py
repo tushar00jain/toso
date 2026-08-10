@@ -19,7 +19,7 @@ is here:
   :class:`proposed.policy.Policy` (which volume serves these keys for this
   requester, and when -- naive by default, and consulted inside the real
   controller's ``locate_volumes``), :class:`proposed.view.View` (the read-only
-  observation a policy is handed), :class:`realsim.plane.DataPlane` (the work
+  observation a policy is handed), :class:`proposed.plane.DataPlane` (the work
   around and after a transfer, both methods defaulting to real no-op behaviour)
   and :class:`realsim.runner.Runner` (release work items on the virtual clock,
   install the mesh once, drain);

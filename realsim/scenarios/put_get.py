@@ -16,7 +16,7 @@ payload.
 The scenario is ordinary user code, top to bottom: a ``client.put`` and a gather
 of ``client.get``. There is no policy, no coordinator and no execution loop in
 it. Handing it a :class:`~proposed.policy.Policy` (and, if the capability needs
-one, a :class:`~realsim.plane.DataPlane`) is the *only* change needed to make it
+one, a :class:`~proposed.plane.DataPlane`) is the *only* change needed to make it
 a routed run -- which is exactly how ``dedup_sim`` turns the same ``m x`` burst
 into a 1x one.
 
@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 from realsim.mesh import Mesh
-from realsim.plane import DataPlane
+from proposed.plane import DataPlane
 from proposed.policy import Policy
 from realsim.runner import Runner, WorkItem
 from realsim.seams.transport import Endpoint, TensorDescriptor
@@ -149,7 +149,7 @@ def build_burst(
     ``policy`` is the one knob that changes *routing*: it is installed in the real
     controller's ``locate_volumes`` body, so the reader code below is unchanged
     whether it is set or not. ``make_plane`` supplies the capability's
-    :class:`~realsim.plane.DataPlane` (built once the mesh and payload exist), for
+    :class:`~proposed.plane.DataPlane` (built once the mesh and payload exist), for
     work the capability does around or after each get -- e.g. a read-through put.
     Both default to none, which is the naive ``m x`` burst.
 
