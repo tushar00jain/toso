@@ -146,10 +146,14 @@ def test_lint_flags_the_proposal_leaning_on_the_simulator():
         assert "proposed-imports-simulator" in _codes(line, path=PROPOSED), line
 
 
-def test_lint_allows_what_the_proposal_may_use():
-    """Locality types are part of the ask, so the proposal may name them."""
-    allowed = (
-        "from sim_common.topology import Endpoint, locality, Tier\n"
+def test_the_proposal_stands_on_its_own():
+    """It may use itself and the stdlib -- nothing else, not even sim_common."""
+    assert _codes(
+        "from proposed.topology import Endpoint, locality, Tier\n"
         "from .view import View\n"
+        "import asyncio\n",
+        path=PROPOSED,
+    ) == set()
+    assert "proposed-imports-simulator" in _codes(
+        "from sim_common.topology import Endpoint\n", path=PROPOSED
     )
-    assert _codes(allowed, path=PROPOSED) == set()

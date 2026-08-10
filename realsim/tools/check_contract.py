@@ -132,6 +132,7 @@ CONTROL_SEGMENT = "control"
 PROPOSED_PKG = "proposed"
 PROPOSED_FORBIDDEN: Dict[str, str] = {
     "realsim": "simulator scaffolding (the proposal has to stand without it)",
+    "sim_common": "simulation primitives (the proposal depends on nothing here)",
     "dedup_sim": "a capability (the proposal must not know its consumers)",
     "kvcache_sim": "a capability (the proposal must not know its consumers)",
     "torchstore": "the store itself (this package is what torchstore would gain)",

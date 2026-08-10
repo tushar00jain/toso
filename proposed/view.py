@@ -38,7 +38,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List, Optional, Sequence
 
-from sim_common.topology import Endpoint, locality, Tier
+from proposed.topology import Endpoint, locality, Tier
 
 
 class View:
