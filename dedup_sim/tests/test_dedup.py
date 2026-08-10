@@ -218,18 +218,16 @@ def test_metadata_mode_carries_only_a_descriptor():
 #    the change -- the 1x number alone would still pass with the monkeypatch.
 def test_readers_run_an_untouched_real_client():
     from realsim.entrypoint import run_simulation
-    from realsim.scenarios.put_get import put_get_burst
+    from realsim.scenarios.put_get import PutGetBurst
 
     from dedup_sim.control.routing import DedupPolicy
     from dedup_sim.data.read_through import make_plane
 
-    fixture = put_get_burst(3, make_plane=make_plane)
-    result = run_simulation(
-        fixture.topology, fixture.build, policy=DedupPolicy(fanout_cap=1)
-    )
+    workload = PutGetBurst(3, make_plane=make_plane)
+    result = run_simulation(workload, policy=DedupPolicy(fanout_cap=1))
     mesh = result.sim.mesh
 
-    for reader_id in fixture.reader_ids:
+    for reader_id in workload.reader_ids:
         # The one controller handle the mesh built, not a per-reader view of it.
         assert mesh.client(reader_id)._controller is mesh.handle
 
@@ -252,5 +250,5 @@ def test_the_scenario_holds_no_burst_loop():
         for n in ast.walk(tree)
         if isinstance(n, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor))
     ]
-    # ...and both runs go through realsim's fixture: one call, one policy apart.
-    assert harness.run_burst is put_get.run_burst
+    # ...and both runs are the same realsim workload, one policy apart.
+    assert harness.PutGetBurst is put_get.PutGetBurst

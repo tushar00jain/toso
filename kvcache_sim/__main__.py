@@ -71,7 +71,7 @@ def _shared_prefix() -> None:
     logger.info("load-balance scatters them, recomputing prefixes on every instance.")
     _log_trace(cache_aware.trace)
     logger.info("(b) summary")
-    logger.info(render_summary("shared_prefix", cache_aware.metrics, baseline.metrics))
+    logger.info(render_summary("shared_prefix", cache_aware.ledger, baseline.ledger))
 
 
 def _eviction() -> None:
@@ -94,7 +94,7 @@ def _hotspot() -> None:
     logger.info("to peers (read-through), spreading load and cutting p90 TTFT.")
     _log_trace(repl.trace)
     logger.info("(b) summary")
-    logger.info(render_hotspot(baseline.metrics, no_repl.metrics, repl.metrics))
+    logger.info(render_hotspot(baseline.ledger, no_repl.ledger, repl.ledger))
     logger.info("(replication swaps recompute for cheap KV transfer when spreading a")
     logger.info(" hot prefix to a peer -> fewer prefill tokens, more fabric bytes.)")
 
@@ -106,7 +106,7 @@ def _overload() -> None:
     logger.info("shortens prefill, freeing capacity, so cache-aware admits more")
     logger.info("requests (fewer rejections) than the load-balancing baseline.")
     logger.info("(b) summary")
-    logger.info(render_summary("overload", cache_aware.metrics, baseline.metrics))
+    logger.info(render_summary("overload", cache_aware.ledger, baseline.ledger))
 
 
 def _disaggregation() -> None:
@@ -122,7 +122,7 @@ def _disaggregation() -> None:
     logger.info("can collide with a decode step and spike that request's inter-token gap.")
     _log_trace(disagg.trace)
     logger.info("(b) summary")
-    logger.info(render_disaggregation(disagg.metrics, coupled.metrics,
+    logger.info(render_disaggregation(disagg.ledger, coupled.ledger,
                                       DISAGG_TARGET_TBT))
     logger.info("Attainment is the fraction of served requests whose *worst* inter-token")
     logger.info("gap stayed under the target. Disaggregation isolates decode from prefill,")
@@ -145,7 +145,7 @@ def _early_rejection() -> None:
     logger.info("load foreseen at prefill completion, spreading decode so the SLO holds.")
     _log_trace(predict.trace)
     logger.info("(b) summary")
-    logger.info(render_early_rejection(off.metrics, early.metrics, predict.metrics,
+    logger.info(render_early_rejection(off.ledger, early.ledger, predict.ledger,
                                        EARLY_SLO_TBT))
     logger.info("(Signal: wasted prefill separates 'off' from the rest; TBT attainment")
     logger.info(" separates 'predict' (routes on predicted load) from 'early' (stale).)")

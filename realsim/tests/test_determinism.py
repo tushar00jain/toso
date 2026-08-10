@@ -25,7 +25,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from realsim.scenarios.put_get import DEFAULT_N, MODE_META, MODE_METADATA, run_burst
+from realsim.harness import run_burst
+from realsim.scenarios.put_get import DEFAULT_N, MODE_META, MODE_METADATA
 from realsim.seams.transport import TensorDescriptor
 
 MODES = (MODE_META, MODE_METADATA)

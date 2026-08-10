@@ -12,7 +12,9 @@ from typing import Dict, List, Tuple
 from domain import decode_step_time, DEFAULT_PROFILE
 from proposed import Endpoint
 
-from ..harness import BLOCK_TOKENS, Run, run
+from realsim.entrypoint import Result
+
+from ..harness import BLOCK_TOKENS, run
 from .generator import make_workload
 
 
@@ -44,7 +46,7 @@ def shared_prefix_workload(seed: int = 0):
     )
 
 
-def run_shared_prefix(seed: int = 0) -> Tuple[Run, Run]:
+def run_shared_prefix(seed: int = 0) -> Tuple[Result, Result]:
     """Cache-aware vs load-balance on the shared-prefix workload (ample capacity)."""
     topo = make_topology(4)
     reqs = shared_prefix_workload(seed)
@@ -64,7 +66,7 @@ def run_eviction_sweep(seed: int = 0) -> List[Tuple[int, float, int]]:
     rows: List[Tuple[int, float, int]] = []
     for cap in (2, 4, 8, 16, 32, 64, 256):
         r = run(topo, reqs, "cache_aware", capacity=cap)
-        rows.append((cap, r.metrics.hit_rate, r.metrics.fabric_bytes))
+        rows.append((cap, r.ledger.hit_rate, r.ledger.fabric_bytes))
     return rows
 
 
@@ -77,7 +79,7 @@ def hotspot_workload(seed: int = 0):
     )
 
 
-def run_hotspot(seed: int = 0) -> Tuple[Run, Run, Run]:
+def run_hotspot(seed: int = 0) -> Tuple[Result, Result, Result]:
     """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware."""
     topo = make_topology(4)
     reqs = hotspot_workload(seed)
@@ -87,7 +89,7 @@ def run_hotspot(seed: int = 0) -> Tuple[Run, Run, Run]:
     return baseline, no_repl, repl
 
 
-def run_overload(seed: int = 0) -> Tuple[Run, Run]:
+def run_overload(seed: int = 0) -> Tuple[Result, Result]:
     """High arrival rate + a TTFT SLO -> some requests must be rejected."""
     topo = make_topology(4)
     reqs = make_workload(
@@ -110,7 +112,7 @@ DISAGG_TARGET_TBT = 5 * decode_step_time(1, DEFAULT_PROFILE)
 DISAGG_MAX_BATCH = 8
 
 
-def run_disaggregation(seed: int = 0) -> Tuple[Run, Run]:
+def run_disaggregation(seed: int = 0) -> Tuple[Result, Result]:
     """Disaggregating prefill from decode protects TBT (Mooncake's headline).
 
     Both configs run with admission disabled (``slo_tbt=inf``, ``early_rejection=
@@ -144,7 +146,7 @@ EARLY_SLO_TBT = 3 * decode_step_time(1, DEFAULT_PROFILE)
 EARLY_MAX_BATCH = 8
 
 
-def run_early_rejection(seed: int = 0) -> Tuple[Run, Run, Run]:
+def run_early_rejection(seed: int = 0) -> Tuple[Result, Result, Result]:
     """Predicting decode load avoids wasting prefill (off/early/predict)."""
     topo = make_topology(4)
     reqs = make_workload(

@@ -110,23 +110,23 @@ def test_deterministic_trace_and_metrics():
     a = run_shared_prefix(seed=1)[0]
     b = run_shared_prefix(seed=1)[0]
     assert a.trace.render() == b.trace.render()
-    assert a.metrics.hit_rate == b.metrics.hit_rate
-    assert a.metrics.compute_tokens == b.metrics.compute_tokens
+    assert a.ledger.hit_rate == b.ledger.hit_rate
+    assert a.ledger.compute_tokens == b.ledger.compute_tokens
 
 
 # 5. Cache-aware beats load-balance on reuse + TTFT (shared-prefix workload).
 def test_cache_aware_improves_reuse_and_ttft():
     cache_aware, baseline = run_shared_prefix()
-    assert cache_aware.metrics.hit_rate >= baseline.metrics.hit_rate
-    assert cache_aware.metrics.compute_tokens <= baseline.metrics.compute_tokens
-    assert cache_aware.metrics.mean_ttft <= baseline.metrics.mean_ttft
+    assert cache_aware.ledger.hit_rate >= baseline.ledger.hit_rate
+    assert cache_aware.ledger.compute_tokens <= baseline.ledger.compute_tokens
+    assert cache_aware.ledger.mean_ttft <= baseline.ledger.mean_ttft
 
 
 # 6. Reuse actually happens (some prefix tokens served from cache).
 def test_reuse_is_nonzero():
     cache_aware, _ = run_shared_prefix()
-    assert cache_aware.metrics.saved_tokens > 0
-    assert 0.0 < cache_aware.metrics.hit_rate < 1.0
+    assert cache_aware.ledger.saved_tokens > 0
+    assert 0.0 < cache_aware.ledger.hit_rate < 1.0
 
 
 # 7. Eviction: hit rate rises with capacity, then plateaus at the unbounded value.
@@ -142,8 +142,8 @@ def test_eviction_hit_rate_monotone_then_plateau():
     # large finite cap reaches (near) the unbounded hit rate
     topo = make_topology(4)
     reqs = shared_prefix_workload()
-    unbounded = run(topo, reqs, "cache_aware", capacity=None).metrics.hit_rate
-    big = run(topo, reqs, "cache_aware", capacity=100000).metrics.hit_rate
+    unbounded = run(topo, reqs, "cache_aware", capacity=None).ledger.hit_rate
+    big = run(topo, reqs, "cache_aware", capacity=100000).ledger.hit_rate
     assert abs(unbounded - big) < 1e-9
 
 
@@ -151,18 +151,18 @@ def test_eviction_hit_rate_monotone_then_plateau():
 #    at the cost of KV fabric bytes.
 def test_hotspot_replication_helps():
     baseline, no_repl, repl = run_hotspot()
-    assert repl.metrics.mean_ttft <= no_repl.metrics.mean_ttft <= baseline.metrics.mean_ttft
-    assert repl.metrics.compute_tokens <= no_repl.metrics.compute_tokens
-    assert no_repl.metrics.fabric_bytes == 0     # replicate=False never pulls
-    assert repl.metrics.fabric_bytes > 0         # replication moves KV once per spread
+    assert repl.ledger.mean_ttft <= no_repl.ledger.mean_ttft <= baseline.ledger.mean_ttft
+    assert repl.ledger.compute_tokens <= no_repl.ledger.compute_tokens
+    assert no_repl.ledger.fabric_bytes == 0     # replicate=False never pulls
+    assert repl.ledger.fabric_bytes > 0         # replication moves KV once per spread
 
 
 # 9. Overload: cache-aware rejects no more than the baseline, and admits some.
 def test_overload_fewer_rejections():
     cache_aware, baseline = run_overload()
-    assert cache_aware.metrics.rejections <= baseline.metrics.rejections
-    total = len(cache_aware.metrics.results)
-    assert 0 < len(cache_aware.metrics.accepted) < total   # some admitted, some shed
+    assert cache_aware.ledger.rejections <= baseline.ledger.rejections
+    total = len(cache_aware.ledger.results)
+    assert 0 < len(cache_aware.ledger.accepted) < total   # some admitted, some shed
 
 
 # 10. Fan-out sanity: the LRU primitive never exceeds capacity, and a comfortably
@@ -171,7 +171,7 @@ def test_cache_never_exceeds_capacity():
     topo = make_topology(4)
     reqs = shared_prefix_workload()
     r = run(topo, reqs, "cache_aware", capacity=64)
-    assert r.metrics.hit_rate > 0
+    assert r.ledger.hit_rate > 0
     cap = 8
     c = LRUCache(capacity=cap)
     for i in range(200):
@@ -235,28 +235,28 @@ def test_disaggregation_protects_tbt():
     disagg, coupled = run_disaggregation()
     # Both serve the identical load with no decode rejection (admission disabled).
     for r in (disagg, coupled):
-        assert len(r.metrics.accepted) == len(r.metrics.results)
-        assert r.metrics.decode_rejections == 0
+        assert len(r.ledger.accepted) == len(r.ledger.results)
+        assert r.ledger.decode_rejections == 0
     # A dedicated decode pool holds the TBT target for (nearly) every served
     # request; coupling prefill into decode makes a real fraction miss it.
-    assert disagg.metrics.tbt_slo_met(DISAGG_TARGET_TBT) >= 0.95
-    assert coupled.metrics.tbt_slo_met(DISAGG_TARGET_TBT) < 0.9
-    assert (disagg.metrics.tbt_slo_met(DISAGG_TARGET_TBT)
-            > coupled.metrics.tbt_slo_met(DISAGG_TARGET_TBT))
+    assert disagg.ledger.tbt_slo_met(DISAGG_TARGET_TBT) >= 0.95
+    assert coupled.ledger.tbt_slo_met(DISAGG_TARGET_TBT) < 0.9
+    assert (disagg.ledger.tbt_slo_met(DISAGG_TARGET_TBT)
+            > coupled.ledger.tbt_slo_met(DISAGG_TARGET_TBT))
 
 
 # 14. Early rejection avoids wasted prefill; prediction routes decode better.
 def test_early_rejection_avoids_wasted_prefill():
     off, early, predict = run_early_rejection()
     # 'off' late-checks decode load after prefill -> some prefills are wasted.
-    assert off.metrics.wasted_prefills > 0
+    assert off.ledger.wasted_prefills > 0
     # 'early'/'predict' gate before prefill -> never waste it.
-    assert early.metrics.wasted_prefills == 0
-    assert predict.metrics.wasted_prefills == 0
+    assert early.ledger.wasted_prefills == 0
+    assert predict.ledger.wasted_prefills == 0
     # Only 'predict' routes decode by foreseen load, so it holds the TBT SLO where
     # 'early' (stale current-occupancy snapshot) cannot.
-    assert (predict.metrics.tbt_slo_met(EARLY_SLO_TBT)
-            > early.metrics.tbt_slo_met(EARLY_SLO_TBT))
+    assert (predict.ledger.tbt_slo_met(EARLY_SLO_TBT)
+            > early.ledger.tbt_slo_met(EARLY_SLO_TBT))
 
 
 # 14b. Divergence gate: the opt-in dict-shim directory yields byte-identical
@@ -268,19 +268,19 @@ def test_shim_directory_matches_real():
     with config.overrides(real_directory=False):
         shim = run_shared_prefix(seed=1)[0]
     assert shim.trace.render() == real.trace.render()
-    assert shim.metrics.hit_rate == real.metrics.hit_rate
-    assert shim.metrics.mean_ttft == real.metrics.mean_ttft
-    assert shim.metrics.pct_ttft(90) == real.metrics.pct_ttft(90)
-    assert shim.metrics.compute_tokens == real.metrics.compute_tokens
-    assert shim.metrics.fabric_bytes == real.metrics.fabric_bytes
-    assert shim.metrics.rejections == real.metrics.rejections
+    assert shim.ledger.hit_rate == real.ledger.hit_rate
+    assert shim.ledger.mean_ttft == real.ledger.mean_ttft
+    assert shim.ledger.pct_ttft(90) == real.ledger.pct_ttft(90)
+    assert shim.ledger.compute_tokens == real.ledger.compute_tokens
+    assert shim.ledger.fabric_bytes == real.ledger.fabric_bytes
+    assert shim.ledger.rejections == real.ledger.rejections
 
 
 def test_shim_overload_rejections_match_real():
     real = run_overload()[0]
     with config.overrides(real_directory=False):
         shim = run_overload()[0]
-    assert shim.metrics.rejections == real.metrics.rejections
+    assert shim.ledger.rejections == real.ledger.rejections
     assert shim.trace.render() == real.trace.render()
 
 
@@ -294,10 +294,10 @@ def test_shared_prefix_runs_under_each_contention_mode(contention):
         a = run_shared_prefix(seed=1)[0]
         b = run_shared_prefix(seed=1)[0]
     # Runs to completion, produces a sane reuse metric, and is deterministic.
-    assert 0.0 < a.metrics.hit_rate < 1.0
+    assert 0.0 < a.ledger.hit_rate < 1.0
     assert a.trace.render() == b.trace.render()
-    assert a.metrics.hit_rate == b.metrics.hit_rate
-    assert a.metrics.compute_tokens == b.metrics.compute_tokens
+    assert a.ledger.hit_rate == b.ledger.hit_rate
+    assert a.ledger.compute_tokens == b.ledger.compute_tokens
 
 
 # 14d. Collapse-charges gate: coalescing each transport op's per-component sleeps
@@ -310,10 +310,10 @@ def test_shared_prefix_metrics_invariant_to_collapse():
     off = run_shared_prefix(seed=1)[0]
     with config.overrides(collapse_charges=True):
         on = run_shared_prefix(seed=1)[0]
-    assert on.metrics.hit_rate == off.metrics.hit_rate
-    assert on.metrics.saved_tokens == off.metrics.saved_tokens
-    assert on.metrics.compute_tokens == off.metrics.compute_tokens
-    assert on.metrics.fabric_bytes == off.metrics.fabric_bytes
+    assert on.ledger.hit_rate == off.ledger.hit_rate
+    assert on.ledger.saved_tokens == off.ledger.saved_tokens
+    assert on.ledger.compute_tokens == off.ledger.compute_tokens
+    assert on.ledger.fabric_bytes == off.ledger.fabric_bytes
 
 
 def test_shared_prefix_collapse_is_deterministic():
@@ -321,7 +321,7 @@ def test_shared_prefix_collapse_is_deterministic():
         a = run_shared_prefix(seed=1)[0]
         b = run_shared_prefix(seed=1)[0]
     assert a.trace.render() == b.trace.render()
-    assert a.metrics.hit_rate == b.metrics.hit_rate
+    assert a.ledger.hit_rate == b.ledger.hit_rate
 
 
 # 15. Determinism of the decode scenarios: same seed -> identical trace + metrics.
@@ -330,12 +330,12 @@ def test_new_scenarios_deterministic():
     d2, c2 = run_disaggregation(seed=2)
     assert d1.trace.render() == d2.trace.render()
     assert c1.trace.render() == c2.trace.render()
-    assert d1.metrics.mean_tbt == d2.metrics.mean_tbt
-    assert c1.metrics.mean_tbt == c2.metrics.mean_tbt
+    assert d1.ledger.mean_tbt == d2.ledger.mean_tbt
+    assert c1.ledger.mean_tbt == c2.ledger.mean_tbt
 
     off1, early1, predict1 = run_early_rejection(seed=3)
     off2, early2, predict2 = run_early_rejection(seed=3)
     for a, b in ((off1, off2), (early1, early2), (predict1, predict2)):
         assert a.trace.render() == b.trace.render()
-        assert a.metrics.wasted_prefills == b.metrics.wasted_prefills
-        assert a.metrics.mean_tbt == b.metrics.mean_tbt
+        assert a.ledger.wasted_prefills == b.ledger.wasted_prefills
+        assert a.ledger.mean_tbt == b.ledger.mean_tbt

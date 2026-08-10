@@ -4,14 +4,14 @@ The measurements themselves are a shared
 :class:`sim_common.report.Ledger`, filled by the mesh's transfer accounting --
 this capability defines none of its own (contrast ``kvcache_sim.report.metrics``,
 which owns a whole per-request outcome model). All this module does is turn two
-:class:`~realsim.scenarios.put_get.BurstResult` objects into the side-by-side
+:class:`~realsim.harness.BurstResult` objects into the side-by-side
 story: how many times the payload crossed the fabric under each policy, and who
 served whom.
 """
 
 from __future__ import annotations
 
-from realsim.scenarios.put_get import BurstResult
+from realsim.harness import BurstResult
 from sim_common.report import render_tree
 
 __all__ = ["render_dedup_summary", "render_baseline_summary"]

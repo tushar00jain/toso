@@ -21,12 +21,9 @@ from sim_common.cost_model import DEFAULT_PROFILE
 from realsim.cli import add_run_flags, apply_run_flags, log_trace
 from sim_common.report import section
 
-from realsim.scenarios.put_get import (
-    MODE_META,
-    MODE_METADATA,
-    render_burst_summary,
-    run_burst,
-)
+from realsim.harness import run_burst
+from realsim.report import render_burst_summary
+from realsim.scenarios.put_get import MODE_META, MODE_METADATA
 
 # The cost model is driven by a MachineProfile that describes the *target*
 # machine being simulated -- never the box this demo runs on. Costs are analytic

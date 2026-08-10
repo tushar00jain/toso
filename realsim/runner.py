@@ -27,7 +27,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 from proposed import DataPlane
 from sim_common.report import Ledger, Outcome
 
-__all__ = ["WorkItem", "Workload", "Runner"]
+__all__ = ["WorkItem", "Runner"]
 
 
 @dataclass
@@ -52,19 +52,6 @@ class WorkItem:
     def order(self):
         """The total order the runner releases items in."""
         return (self.release_time, self.id)
-
-
-@dataclass
-class Workload:
-    """What to run: the items, and any setup that precedes them on the clock.
-
-    ``setup`` is for work that is part of the simulated timeline but is not an
-    item -- seeding a key before a read burst. It runs before the first item is
-    released, outside the mesh's shared factory, as a single-client drive would.
-    """
-
-    items: Sequence[WorkItem]
-    setup: Optional[Callable[[], Awaitable[None]]] = None
 
 
 class Runner:

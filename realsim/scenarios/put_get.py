@@ -34,14 +34,11 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 from proposed import DataPlane, Deployment, Policy
-from realsim.runner import WorkItem, Workload
-from realsim.entrypoint import run_simulation
+from realsim.entrypoint import Result, Workload
+from realsim.runner import WorkItem
 from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint, TensorDescriptor
-from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile, compute_time
-from sim_common.report import Ledger, render_tree
-from sim_common.trace import Trace
 
 KEY = "W"
 DEFAULT_N = 16  # elements in W (float32 -> 4 bytes each)
@@ -84,33 +81,24 @@ MODE_META = "meta"
 MODE_METADATA = "metadata"
 
 
-@dataclass
-class _Fixture:
-    """The burst's own facts, plus the callback that builds it onto a stack.
+def _topology(num_readers: int) -> Dict[str, Endpoint]:
+    """Origin volume ``p`` on node P; readers ``r0..`` on distinct hosts of node R."""
+    topo: Dict[str, Endpoint] = {
+        "p": Endpoint(id="volp", host="hP", node="P"),
+    }
+    for i in range(num_readers):
+        topo[f"r{i}"] = Endpoint(id=f"volr{i}", host=f"hR{i}", node="R")
+    return topo
 
-    What a scenario *is* -- a topology, a payload, m readers -- separated from how
-    a run is assembled, which is :func:`~realsim.entrypoint.run_simulation`'s job.
+
+@dataclass
+class BurstResult(Result):
+    """A :class:`~realsim.entrypoint.Result` plus what the burst itself reports.
+
+    ``results``/``trace``/``ledger``/``sim`` come from the base; the rest are facts
+    about the scenario that a summary needs and the ledger does not carry.
     """
 
-    topology: Dict[str, Endpoint]
-    build: Any
-    expected: Any
-    descriptor: Any
-    origin_id: str
-    reader_ids: List[str]
-    mode: str
-    profile: MachineProfile
-
-
-@dataclass
-class BurstResult:
-    """Output of one burst run."""
-
-    trace: Trace
-    ledger: Ledger
-    # reader_id -> fetched payload. In "meta" mode a meta ``torch.Tensor``; in
-    # "metadata" mode a :class:`~realsim.seams.transport.TensorDescriptor`.
-    results: Dict[str, Any]
     # The ground-truth W carrier (meta tensor or descriptor); both expose
     # ``shape``/``dtype``/``numel()``/``element_size()`` so callers can size it.
     expected: Any
@@ -123,129 +111,80 @@ class BurstResult:
         return self.expected.numel() * self.expected.element_size()
 
 
-def _topology(num_readers: int) -> Dict[str, Endpoint]:
-    """Origin volume ``p`` on node P; readers ``r0..`` on distinct hosts of node R."""
-    topo: Dict[str, Endpoint] = {
-        "p": Endpoint(id="volp", host="hP", node="P"),
-    }
-    for i in range(num_readers):
-        topo[f"r{i}"] = Endpoint(id=f"volr{i}", host=f"hR{i}", node="R")
-    return topo
+class PutGetBurst(Workload):
+    """m readers get one key an origin already holds.
 
+    The capability-free fixture: ordinary user code (a put, then a gather of gets)
+    with no routing of its own. Installing a :class:`~proposed.policy.Policy` and a
+    :class:`~proposed.plane.DataPlane` turns it into a routed run without touching
+    a line of it, which is how ``dedup_sim`` compares the two.
 
-def put_get_burst(
-    num_readers: int = 3,
-    *,
-    n: int = DEFAULT_N,
-    dtype: torch.dtype = torch.float32,
-    mode: str = MODE_META,
-    device: str = "meta",
-    profile: Optional[MachineProfile] = None,
-    compute_device: str = DEFAULT_COMPUTE_DEVICE,
-    policy: Optional[Policy] = None,
-    make_plane: Optional[MakePlane] = None,
-    random_seed: Optional[int] = None,
-    trace: Optional[Trace] = None,
-    ledger: Optional[Ledger] = None,
-    real_directory: Optional[bool] = None,
-):
-    """Wire the real objects for a burst; return ``(scenario_coro, ctx)``.
-
-    ``ctx`` carries the pieces a caller/test may want to assert on (the expected
-    payload, origin id, mesh, volumes, trace, ledger). ``scenario_coro`` is an
-    awaitable that seeds ``W`` on the origin then runs the burst; hand it to
-    :func:`sim_common.async_engine.run_sim`.
-
-    ``profile`` is the target-machine
-    :class:`~sim_common.cost_model.MachineProfile` (defaults to
-    :data:`~sim_common.cost_model.DEFAULT_PROFILE`). It supplies **every** cost
-    constant -- it models the *target* hardware being simulated, never the box the
-    test runs on. It is threaded to the producer and every reader so network +
-    storage + RAM + compute are all charged from one story. ``compute_device``
-    selects the roofline device for the producer's generate step (default
-    ``"cuda"`` -- the accelerator that produces W).
-
-    ``policy`` is the one knob that changes *routing*: it is installed in the real
-    controller's ``locate_volumes`` body, so the reader code below is unchanged
-    whether it is set or not. ``make_plane`` supplies the capability's
-    :class:`~proposed.plane.DataPlane` (built once the mesh and payload exist), for
-    work the capability does around or after each get -- e.g. a read-through put.
-    Both default to none, which is the naive ``m x`` burst.
-
-    ``real_directory`` selects the controller directory backing (``None`` -> the
-    ambient :data:`sim_common.config.SimConfig.real_directory`, default real
-    ``Trie``; ``False`` -> the lightweight dict shim). It changes no metric.
-
-    The network/storage contention model is read ambiently from
-    :data:`sim_common.config.SimConfig.contention` (default ``"none"``). The
-    :class:`~realsim.mesh.Mesh` builds one shared
-    :class:`~sim_common.resources.ResourceRegistry` and injects it into the
-    producer, every reader adapter, and its shared transport factory, so all
-    transfers in the burst see the same links/stores. Unlike ``real_directory`` a
-    non-``"none"`` mode DOES change timing.
-
-    The full resource model exercised by one run:
-
-    * **compute/GPU** -- the producer's generate step (charged here, before the
-      put), via :func:`~sim_common.cost_model.compute_time` on ``compute_device``;
-    * **network** -- client<->volume fabric transfers (transport seam);
-    * **storage** -- write on put, read on serve (transport seam);
-    * **RAM** -- host-memory staging copy on serve (transport seam).
-
-    Data plane (allocation-free by default):
-
-    * ``mode="meta"`` (default): ``W`` is a ``torch.empty(n, dtype=dtype,
-      device=device)`` tensor, with ``device="meta"`` -- a real tensor of zero
-      storage. It passes every ``isinstance``/``shape``/``dtype`` check in the
-      real torchstore path and is passed by reference through the fake volume
-      handle, so nothing is serialized or allocated.
-    * ``mode="metadata"``: ``W`` is a :class:`TensorDescriptor` carrying only
-      ``(shape, dtype)`` -- no tensor at all. It is handed to ``client.put`` as an
-      arbitrary object so it flows through the real *object* put/get path; the
-      transport seam reads ``nbytes`` off the descriptor (``tensor_val is None``).
-      See the value-typing note below.
+    Args:
+        num_readers: how many readers contend for the key.
+        n: elements in ``W``; the payload is ``n * itemsize`` bytes.
+        dtype: element type of ``W``.
+        mode: ``"meta"`` (a zero-storage real tensor, the default) or
+            ``"metadata"`` (a ``(shape, dtype)`` descriptor, no tensor at all).
+            Both are allocation-free and drive the real store round-trip.
+        device: device for the ``"meta"`` carrier.
+        profile: target-machine :class:`~sim_common.cost_model.MachineProfile`,
+            used here for the producer's generate step; the stack charges every
+            other cost from the same one.
+        compute_device: roofline device for that generate step.
+        make_plane: builds the capability's data plane once the deployment and the
+            payload exist. ``None`` -> no plane, the unrouted baseline.
     """
-    if mode not in (MODE_META, MODE_METADATA):
-        raise ValueError(f"unknown data-plane mode {mode!r}")
 
-    profile = profile if profile is not None else DEFAULT_PROFILE
-    topology = _topology(num_readers)
-    origin_id = topology["p"].id  # the volume that holds W before the burst
+    def __init__(
+        self,
+        num_readers: int = 3,
+        *,
+        n: int = DEFAULT_N,
+        dtype: torch.dtype = torch.float32,
+        mode: str = MODE_META,
+        device: str = "meta",
+        profile: Optional[MachineProfile] = None,
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        make_plane: Optional[MakePlane] = None,
+    ) -> None:
+        if mode not in (MODE_META, MODE_METADATA):
+            raise ValueError(f"unknown data-plane mode {mode!r}")
+        self.num_readers = num_readers
+        self.dtype = dtype
+        self.mode = mode
+        self.profile = profile if profile is not None else DEFAULT_PROFILE
+        self.compute_device = compute_device
+        self.make_plane = make_plane
 
-    reader_ids = [f"r{i}" for i in range(num_readers)]
+        self.topology = _topology(num_readers)
+        self.origin_id = self.topology["p"].id  # holds W before the burst
+        self.reader_ids = [f"r{i}" for i in range(num_readers)]
 
-    # W is the value we seed on the origin. Both carriers are allocation-free.
-    descriptor = TensorDescriptor(shape=(n,), dtype=dtype)
-    if mode == MODE_META:
-        # Real tensor, zero storage (device="meta").
-        expected: Any = torch.empty(n, dtype=dtype, device=device)
-        put_value: Any = expected
-    else:  # MODE_METADATA
-        # No tensor at all -- the descriptor *is* the payload.
-        #
-        # put_batch value-typing gotcha (torchstore/client.py): put_batch types
-        # the value -- a Tensor/DTensor takes the tensor path, everything else
-        # (including ``None``) takes ``Request.from_objects`` and is stored as an
-        # OBJECT. Rather than fight that, we lean into it: we hand the descriptor
-        # itself (an arbitrary object) to ``client.put``, so it round-trips
-        # through the real object put/get path (kv[key] = {"obj": descriptor}) and
-        # the reader gets the descriptor back. No volume-handle/RPC-hook bypass is
-        # needed; the only seam change is that ``_nbytes`` reads the modeled size
-        # off the descriptor when ``tensor_val is None``. The descriptor thus
-        # carries (shape, dtype) out-of-band for the cost model.
-        expected = descriptor
-        put_value = descriptor
+        # W, as an allocation-free carrier either way.
+        self.descriptor = TensorDescriptor(shape=(n,), dtype=dtype)
+        if mode == MODE_META:
+            # Real tensor, zero storage (device="meta").
+            self.expected: Any = torch.empty(n, dtype=dtype, device=device)
+        else:
+            # No tensor at all -- the descriptor *is* the payload.
+            #
+            # put_batch value-typing gotcha (torchstore/client.py): put_batch types
+            # the value -- a Tensor/DTensor takes the tensor path, everything else
+            # (including ``None``) takes ``Request.from_objects`` and is stored as
+            # an OBJECT. Rather than fight that, we lean into it and hand the
+            # descriptor itself to ``client.put``, so it round-trips through the
+            # real object path and the reader gets the descriptor back. The only
+            # seam change is that ``_nbytes`` reads the modeled size off the
+            # descriptor when ``tensor_val is None``.
+            self.expected = self.descriptor
+        self.put_value = self.expected
 
-    def build(sim: Simulation) -> Tuple[Optional[DataPlane], Workload]:
-        """Build the burst onto an assembled stack (the entry point's callback)."""
+    def build(self, sim: Simulation) -> Tuple[Optional[DataPlane], List[WorkItem]]:
+        """One work item per reader, plus the capability's plane if it has one."""
         mesh, trace = sim.mesh, sim.trace
         # Bytes served by the origin are the fabric cost a routing policy exists
         # to cut; everything else is a peer-to-peer hop.
-        sim.origins(origin_id)
-        # The producer writes W to its co-located origin volume. This is a
-        # single-client drive (before the burst), so it uses the adapter's own
-        # factory rather than the mesh's shared one.
-        producer = mesh.adapter("p")
+        sim.origins(self.origin_id)
 
         def _get(reader_id: str) -> Callable[[], Any]:
             """One reader's ordinary user code: bind who I am, then get the key."""
@@ -262,119 +201,63 @@ def put_get_burst(
 
             return call
 
-        plane = make_plane(mesh, KEY, put_value) if make_plane is not None else None
-        items: List[WorkItem] = [
-            WorkItem(id=rid, release_time=0.0, run=_get(rid)) for rid in reader_ids
+        plane = (
+            self.make_plane(mesh, KEY, self.put_value)
+            if self.make_plane is not None
+            else None
+        )
+        items = [
+            WorkItem(id=rid, release_time=0.0, run=_get(rid))
+            for rid in self.reader_ids
         ]
-        return plane, Workload(items=items, setup=_seed(mesh, producer, trace))
+        return plane, items
 
-    def _seed(mesh, producer, trace) -> Callable[[], Any]:
-        """Everything that happens before the burst, on the same clock."""
+    def result(self, result: Result) -> BurstResult:
+        """Add what a burst summary needs beyond the ledger."""
+        return BurstResult(
+            results=result.results,
+            trace=result.trace,
+            ledger=result.ledger,
+            sim=result.sim,
+            expected=self.expected,
+            origin_id=self.origin_id,
+            num_readers=self.num_readers,
+        )
 
-        async def seed() -> None:
-            # (1) COMPUTE/GPU: the producer "generates" W on its accelerator. Modeled
-            # as FLOPS_PER_ELEMENT per element, streaming the whole payload's bytes;
-            # the roofline picks the binding term on ``compute_device``. Charged on
-            # the virtual clock before the put and recorded in the trace.
-            gen_nbytes = descriptor.nbytes
-            gen_flops = FLOPS_PER_ELEMENT * descriptor.numel()
-            gen_dt = compute_time(
-                gen_flops, _dtype_name(dtype), compute_device, profile, gen_nbytes
-            )
-            await asyncio.sleep(gen_dt)
-            trace.record(
-                asyncio.get_running_loop().time(),
-                "compute",
-                f"generate {KEY} flops={gen_flops:g} {gen_nbytes}B "
-                f"dev={compute_device} cost={gen_dt:.4f}",
-            )
-            # (2) Seed W on the origin volume (also populates the real directory). The
-            # put path charges network + storage-write in the transport seam.
-            with producer.installed():
-                await producer.client.put(KEY, put_value)
-            # (3) Every reader then gets W. Each get charges storage-read + RAM
-            # staging + network in the transport seam.
-            trace.record(
-                asyncio.get_running_loop().time(),
-                "burst",
-                f"{num_readers} readers get {KEY!r}",
-            )
-
-        return seed
-
-    return _Fixture(
-        topology=topology,
-        build=build,
-        expected=expected,
-        descriptor=descriptor,
-        origin_id=origin_id,
-        reader_ids=reader_ids,
-        mode=mode,
-        profile=profile,
-    )
-
-
-def run_burst(
-    num_readers: int = 3,
-    *,
-    n: int = DEFAULT_N,
-    dtype: torch.dtype = torch.float32,
-    mode: str = MODE_META,
-    device: str = "meta",
-    profile: Optional[MachineProfile] = None,
-    compute_device: str = DEFAULT_COMPUTE_DEVICE,
-    policy: Optional[Policy] = None,
-    make_plane: Optional[MakePlane] = None,
-    trace: Optional[Trace] = None,
-    ledger: Optional[Ledger] = None,
-    random_seed: Optional[int] = None,
-    real_directory: Optional[bool] = None,
-) -> BurstResult:
-    """Run one burst end-to-end on a fresh deterministic engine."""
-    fixture = put_get_burst(
-        num_readers,
-        n=n,
-        dtype=dtype,
-        mode=mode,
-        device=device,
-        profile=profile,
-        compute_device=compute_device,
-        make_plane=make_plane,
-    )
-    result = run_simulation(
-        fixture.topology,
-        fixture.build,
-        policy=policy,
-        profile=fixture.profile,
-        trace=trace,
-        ledger=ledger,
-        real_directory=real_directory,
-        random_seed=random_seed,
-    )
-    return BurstResult(
-        trace=result.trace,
-        ledger=result.ledger,
-        results=result.results,
-        expected=fixture.expected,
-        origin_id=fixture.origin_id,
-        num_readers=num_readers,
-    )
-
-
-def render_burst_summary(res: BurstResult) -> str:
-    """Render the fabric/wallclock summary + the source->dest tree."""
-    payload = res.payload_bytes
-    union = payload  # the 1x target: W crosses the fabric once
-    fabric_x = res.ledger.origin_bytes / union if union else 0.0
-    lines = [
-        f"readers: {res.num_readers}   payload(W): {payload}B   "
-        f"1x-union target: {union}B",
-        f"fabric(origin->readers): {res.ledger.origin_bytes}B ({fabric_x:.1f}x)   "
-        f"total delivered: {res.ledger.transfer_bytes}B",
-        f"wallclock: {res.ledger.wallclock:.4f}   "
-        f"readers done: {res.ledger.items_done}/{res.ledger.items_total}",
-        "source->dest (unrouted: every reader pulls the origin):",
-    ]
-    for line in render_tree(res.ledger.edges):
-        lines.append("    " + line)
-    return "\n".join(lines)
+    async def setup(self, sim: Simulation) -> None:
+        """Generate W on the producer's accelerator, then seed it on the origin."""
+        mesh, trace = sim.mesh, sim.trace
+        # The producer writes W to its co-located origin volume. This is a
+        # single-client drive (before the burst), so it uses the adapter's own
+        # factory rather than the mesh's shared one.
+        producer = mesh.adapter("p")
+        # (1) COMPUTE/GPU: modeled as FLOPS_PER_ELEMENT per element, streaming the
+        # whole payload's bytes; the roofline picks the binding term on
+        # ``compute_device``. Charged on the virtual clock before the put.
+        gen_nbytes = self.descriptor.nbytes
+        gen_flops = FLOPS_PER_ELEMENT * self.descriptor.numel()
+        gen_dt = compute_time(
+            gen_flops,
+            _dtype_name(self.dtype),
+            self.compute_device,
+            self.profile,
+            gen_nbytes,
+        )
+        await asyncio.sleep(gen_dt)
+        trace.record(
+            asyncio.get_running_loop().time(),
+            "compute",
+            f"generate {KEY} flops={gen_flops:g} {gen_nbytes}B "
+            f"dev={self.compute_device} cost={gen_dt:.4f}",
+        )
+        # (2) Seed W on the origin volume (also populates the real directory). The
+        # put path charges network + storage-write in the transport seam.
+        with producer.installed():
+            await producer.client.put(KEY, self.put_value)
+        # (3) Every reader then gets W. Each get charges storage-read + RAM
+        # staging + network in the transport seam.
+        trace.record(
+            asyncio.get_running_loop().time(),
+            "burst",
+            f"{self.num_readers} readers get {KEY!r}",
+        )

@@ -44,7 +44,7 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
-from realsim.runner import Runner, Workload
+from realsim.runner import Runner, WorkItem
 
 __all__ = ["Simulation"]
 
@@ -140,14 +140,17 @@ class Simulation:
 
     # -- driving it ---------------------------------------------------------- #
     def run(
-        self, workload: Workload, *, plane: Optional[DataPlane] = None
+        self,
+        items: Sequence[WorkItem],
+        *,
+        plane: Optional[DataPlane] = None,
+        setup: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Run ``workload`` on this stack; return ``item id -> result``.
+        """Run ``items`` on this stack; return ``item id -> result``.
 
-        Everything else the run needs is already assembled or declared: the plane
-        says whether it publishes its own outcome rows and whether it has work
-        outliving the items, and the workload says what runs and what precedes it.
-        A capability supplies those two and nothing more.
+        The plane says whether it publishes its own outcome rows and whether it
+        has work outliving the items, so neither is passed here. ``setup`` is
+        awaited before the first item is released.
 
         Closes the loop when done; a :class:`Simulation` runs once.
         """
@@ -161,9 +164,9 @@ class Simulation:
         )
 
         async def _go() -> Dict[str, Any]:
-            if workload.setup is not None:
-                await workload.setup()
-            return await runner.run(workload.items)
+            if setup is not None:
+                await setup(self)
+            return await runner.run(items)
 
         try:
             return self.loop.run_until_complete(_go())

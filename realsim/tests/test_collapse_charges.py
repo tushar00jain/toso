@@ -35,7 +35,8 @@ from __future__ import annotations
 import pytest
 
 import realsim.seams.transport as transport_mod
-from realsim.scenarios.put_get import MODE_META, MODE_METADATA, run_burst
+from realsim.harness import run_burst
+from realsim.scenarios.put_get import MODE_META, MODE_METADATA
 from sim_common import config
 
 MODES = (MODE_META, MODE_METADATA)

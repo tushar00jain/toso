@@ -21,13 +21,14 @@ from typing import Optional
 
 import torch
 
+from realsim.entrypoint import run_simulation
 from realsim.scenarios.put_get import (
     BurstResult,
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_N,
     MODE_META,
     MODE_METADATA,
-    run_burst,
+    PutGetBurst,
 )
 from sim_common.cost_model import MachineProfile
 from sim_common.trace import Trace
@@ -60,23 +61,25 @@ def run(
     -- the policy is the only difference, which is what makes the comparison mean
     something.
     """
-    common = dict(
+    # A routed run installs the policy in the controller and gives the readers a
+    # read-through plane; the baseline passes neither. Same workload either way.
+    routed = fanout_cap is not None
+    trace = Trace()
+    workload = PutGetBurst(
+        num_readers,
         n=n,
         dtype=dtype,
         mode=mode,
         device=device,
         profile=profile,
         compute_device=compute_device,
-        random_seed=random_seed,
-        real_directory=real_directory,
+        make_plane=make_plane if routed else None,
     )
-    if fanout_cap is None:
-        return run_burst(num_readers, **common)
-    trace = Trace()
-    return run_burst(
-        num_readers,
-        policy=DedupPolicy(fanout_cap=fanout_cap, trace=trace),
-        make_plane=make_plane,
+    return run_simulation(
+        workload,
+        policy=DedupPolicy(fanout_cap=fanout_cap, trace=trace) if routed else None,
+        profile=workload.profile,
         trace=trace,
-        **common,
+        real_directory=real_directory,
+        random_seed=random_seed,
     )

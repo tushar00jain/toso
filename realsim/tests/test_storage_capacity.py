@@ -35,7 +35,7 @@ import torch
 from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import RealControllerAdapter
 from realsim.entrypoint import run_simulation
-from realsim.scenarios.put_get import DEFAULT_N, put_get_burst
+from realsim.scenarios.put_get import DEFAULT_N, PutGetBurst
 from realsim.seams.transport import Endpoint
 from realsim.seams.volume_handle import FakeVolumeHandle, StorageCapacityExceeded
 from sim_common.async_engine import run_sim
@@ -52,12 +52,12 @@ def _run_build(profile=None, *, num_readers: int = 3):
     handles for resident/peak bytes. Any :class:`StorageCapacityExceeded` raised
     during the run propagates out.
     """
-    fixture = put_get_burst(num_readers, profile=profile)
-    result = run_simulation(fixture.topology, fixture.build, profile=fixture.profile)
+    workload = PutGetBurst(num_readers, profile=profile)
+    result = run_simulation(workload, profile=workload.profile)
     ctx = {
         "volumes": result.sim.mesh.volumes,
-        "origin_id": fixture.origin_id,
-        "expected": fixture.expected,
+        "origin_id": workload.origin_id,
+        "expected": workload.expected,
     }
     return result.results, result.trace, ctx
 
