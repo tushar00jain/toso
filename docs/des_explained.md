@@ -68,7 +68,11 @@ one directory, and the meta / metadata-only payload carriers — lives in
 | `DataPlane` | `execute(item)` (work around the transfer) and `after(item, result)` (registration/eviction), both defaulting to real no-op behaviour, so a capability overrides one method rather than filling in a stub. |
 | `Runner` | Releases work items on the virtual clock in `(release_time, id)` order, installs the mesh once, gathers, drains. |
 
-Both sims `import realsim` and add only their own decision + execution code.
+Both sims `import realsim` and add only their own decision + execution code. So
+does [`putget_sim`](../putget_sim/), which is not a capability at all: it is the
+same put/get workload with **no** `Policy` and **no** `DataPlane` installed, and
+therefore the unrouted *m×* baseline dedup measures against. Dedup imports its
+`PutGetBurst` unchanged, which is what makes the two runs comparable.
 
 [`domain/llm.py`](../domain/llm.py) is also shared: a `Model` reduces a
 transformer to what a sim charges against (flops per prefilled token, flops per
@@ -101,7 +105,7 @@ transport, on real types throughout.
 |---|---|---|
 | `DedupPolicy` | `control/routing.py` | A real `Policy`. Assigns each requester, as it asks, a source under a fan-out cap, and returns it with a **readiness gate** when that source has not registered yet. Holds no client, no volume, no mesh — and no burst loop. |
 | `ReadThroughPlane` | `data/read_through.py` | One `DataPlane.after`: the finished reader `put`s the key into its own co-located volume, which through the real `client.put` path also calls the real `notify_put_batch`. That registration is what opens the next reader's gate. |
-| dedup scenario | `workload/burst.py` | Runs `realsim`'s ordinary put/get fixture twice — unrouted (the *m×* baseline) and with the policy + plane installed (1×) — so the comparison is byte-for-byte the same topology, payload and cost model. |
+| dedup scenario | `workload/scenarios.py` | Runs `putget_sim`'s ordinary put/get fixture twice — unrouted (the *m×* baseline) and with the policy + plane installed (1×) — so the comparison is byte-for-byte the same topology, payload and cost model. |
 | demo entrypoint | `__main__.py` | `python -m dedup_sim` — fabric summary + ASCII diagram (INFO), full per-event trace (DEBUG, `-v`). |
 
 ### How it reaches 1× on the real directory

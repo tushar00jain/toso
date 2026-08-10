@@ -1,7 +1,7 @@
 """What every demo's ``__main__`` shares: flags, config, logging, traces.
 
-The three entry points (``python -m dedup_sim``, ``python -m kvcache_sim``,
-``python -m realsim``) all take the same five run flags, all turn them
+The three entry points (``python -m putget_sim``, ``python -m dedup_sim``,
+``python -m kvcache_sim``) all take the same five run flags, all turn them
 into the same ``config.configure`` call, and all dump a trace the same way. That
 was copied three times; it lives here instead, so a new capability's demo is a
 parser, a scenario and a renderer.
@@ -74,7 +74,7 @@ def apply_run_flags(
 
     An unset flag defers to the ``TOSO_*`` env var / default, so this never
     overrides an ambient setting with "off". Pass ``logger`` when the demo's own
-    logger must drop to DEBUG independently of the root (``realsim`` keeps the
+    logger must drop to DEBUG independently of the root (``putget_sim`` keeps the
     root at INFO so torchstore's own debug logging stays quiet).
     """
     config.configure(

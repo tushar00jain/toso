@@ -47,8 +47,9 @@ Importing in the other direction is fine and expected: the data plane is handed
 the decisions.
 
 Scope: the simulation packages -- ``realsim/``, ``sim_common/``, ``domain/``, and
-the capability packages ``dedup_sim/`` / ``kvcache_sim/`` (whose ``control/``
-folders the plane rule applies to). The sibling ``../torchstore`` is out of scope
+the capability packages ``putget_sim/`` / ``dedup_sim/`` / ``kvcache_sim/`` (whose
+``control/`` folders the plane rule applies to; ``putget_sim`` has none, because
+it decides nothing). The sibling ``../torchstore`` is out of scope
 and is *not* scanned -- it owns one benign wall-clock read
 (``torchstore/logging.py::LatencyTracker`` uses ``perf_counter()`` for DEBUG-only
 elapsed display; it never affects control flow or the ``Trace``).
@@ -74,7 +75,8 @@ from typing import Dict, Iterable, List, NamedTuple
 # Repo root is two levels up from this file (realsim/tools/check_contract.py).
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAN_DIRS = (
-    "dedup_sim", "domain", "kvcache_sim", "proposed", "realsim", "sim_common",
+    "dedup_sim", "domain", "kvcache_sim", "proposed", "putget_sim", "realsim",
+    "sim_common",
 )
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +155,7 @@ PROPOSED_FORBIDDEN: Dict[str, str] = {
     "sim_common": "simulation primitives (the proposal depends on nothing here)",
     "dedup_sim": "a capability (the proposal must not know its consumers)",
     "kvcache_sim": "a capability (the proposal must not know its consumers)",
+    "putget_sim": "a capability (the proposal must not know its consumers)",
     "torchstore": "the store itself (this package is what torchstore would gain)",
 }
 

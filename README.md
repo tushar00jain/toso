@@ -49,12 +49,18 @@ client/controller/transport), so they depend on the from-source
   modeled payload of any size costs no memory) and charges **every** resource —
   network, storage, RAM, CPU, and GPU/compute — as analytic functions of a
   *target-machine* `MachineProfile`, never measured on the box running the sim.
+  It is the foundation only: it has no scenario and no demo of its own.
+- [`putget_sim/`](putget_sim/) — the unrouted put/get burst: seed one key, then
+  `m` clients get it, with **no policy and no data plane**, so every reader pulls
+  the origin and fabric is *m×* the payload. The smallest thing that exercises
+  the whole real stack while deciding nothing, and the baseline `dedup_sim`
+  measures against.
 - [`dedup_sim/`](dedup_sim/) — the dedup capability **on the real directory**: a
   real `Policy` that routes each reader to a peer and withholds the controller's
   answer until that peer's read-through put registers, plus the one-method data
-  plane that does the put. The scenario is `realsim`'s ordinary put/get fixture,
-  unchanged — installing the policy is the whole difference between *m×* and 1×
-  fabric.
+  plane that does the put. The scenario is `putget_sim`'s ordinary put/get
+  fixture, unchanged — installing the policy is the whole difference between *m×*
+  and 1× fabric.
 - [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
   real directory**: the scheduler keeps its compute decisions (prefill placement,
   pull-vs-recompute, SLO gates, decode placement) and delegates only "which peer
@@ -62,9 +68,10 @@ client/controller/transport), so they depend on the from-source
   batched decode engine drive real fetches via `realsim`'s `Mesh`/client/engine/
   cost model.
 
-  Both capability packages are split the same way, **by plane** — `control/`
+  All three sim packages are split the same way, **by plane** — `control/`
   decides, `data/` executes, plus `workload/` (what is simulated) and `report/`
-  (outcome metrics). `control/` may not import `data/`, the mesh, or a client,
+  (outcome metrics). `putget_sim` simply has no `control/` or `data/`, which is
+  what makes it the baseline. `control/` may not import `data/`, the mesh, or a client,
   which `realsim/tools/check_contract.py` enforces. The test for which folder
   something belongs in: *does it advance the clock or move bytes?* The comparison
   is tabulated in
@@ -103,12 +110,12 @@ run from the repo directory with the venv interpreter and the repo on
 `PYTHONPATH`:
 
 ```bash
+PYTHONPATH=. .venv/bin/python -m putget_sim
 PYTHONPATH=. .venv/bin/python -m dedup_sim
 PYTHONPATH=. .venv/bin/python -m kvcache_sim
-PYTHONPATH=. .venv/bin/python -m realsim
 ```
 
-See each capability sim's `README.md` for flags, [`realsim/README.md`](realsim/README.md)
+See each sim's `README.md` for flags, [`realsim/README.md`](realsim/README.md)
 for the real-code foundation, and the `docs/` design docs for how each capability
 works ([`realsim_design.md`](docs/realsim_design.md),
 [`torchstore_dedup_design.md`](docs/torchstore_dedup_design.md),

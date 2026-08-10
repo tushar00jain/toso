@@ -4,7 +4,7 @@ Mirrors :mod:`kvcache_sim.harness` -- the one place this capability wires itself
 onto a stack. There is a single run function: with no ``fanout_cap`` it is the
 unrouted baseline, with one it is dedup routing. Same scenario either way.
 
-This is the point of the whole exercise. The scenario is ``realsim``'s own
+This is the point of the whole exercise. The scenario is ``putget_sim``'s
 put/get fixture -- ordinary user code: seed ``W``, then a gather of
 ``client.get(W)``. Running it unchanged gives the ``m x`` baseline. Running it
 with :class:`~dedup_sim.control.routing.DedupPolicy` and the read-through
@@ -22,7 +22,7 @@ from typing import Optional
 import torch
 
 from realsim.entrypoint import run_simulation
-from realsim.scenarios.put_get import (
+from putget_sim.workload.put_get import (
     BurstResult,
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_N,

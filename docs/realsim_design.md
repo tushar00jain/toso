@@ -150,10 +150,10 @@ realsim/
                               #   defaulting to real no-op behaviour
   runner.py                   # Runner — release work on the virtual clock in
                               #   (release_time, id) order, install the mesh once, drain
-  scenarios/                  # runnable scenarios
-    put_get.py                # seed a key, then m clients get it; meta/metadata data plane +
-                              #   compute/network/storage/RAM cost exercise
-  __main__.py                 # `python -m realsim` demo entrypoint (+ --mode)
+  entrypoint.py               # run_simulation(workload, **knobs) — the one way to run
+                              #   anything; Workload + Result live here
+  simulation.py               # Simulation — assembles engine + mesh + directory + registry
+  cli.py                      # the run flags/logging every sim's __main__ shares
   tools/
     check_contract.py         # concurrency-contract lint (AST checker + CLI)
   tests/
@@ -165,6 +165,15 @@ realsim/
     test_composability.py     # import the real-directory backend + swap proof
     test_mesh.py              # Mesh wiring, per-operation source locality, one-owner install
     test_planes.py            # the shared Policy / View / DataPlane / Runner contracts
+
+putget_sim/                   # the unrouted put/get burst (repo root) — no policy, no
+                              #   data plane: the m x baseline, and the fixture the
+                              #   realsim tests above drive
+  workload/put_get.py         # seed a key, then m clients get it; meta/metadata carrier +
+                              #   compute/network/storage/RAM cost exercise
+  report/summary.py           # fabric/wallclock summary + source->dest tree
+  harness.py                  # run_burst — the one place it wires onto a stack
+  __main__.py                 # `python -m putget_sim` demo entrypoint (+ --mode)
 
 sim_common/                   # shared DES library (repo root)
   async_engine.py             # deterministic asyncio loop + virtual clock
@@ -594,7 +603,7 @@ PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_contr
 **The demo:**
 
 ```
-PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim \
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m putget_sim \
   [-m READERS] [-n N] [--mode meta|metadata] [--seed S] [-v]
 ```
 

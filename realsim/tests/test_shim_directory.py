@@ -30,7 +30,7 @@ from realsim.adapters.real_controller import (
     RealControllerAdapter,
     ShimControllerAdapter,
 )
-from realsim.harness import run_burst
+from putget_sim.harness import run_burst
 from realsim.seams.dict_directory import DictDirectory
 from torchstore.transport.types import Request, TensorSlice
 

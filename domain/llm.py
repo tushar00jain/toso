@@ -196,7 +196,7 @@ DEFAULT_MODEL = Model(
 #   * ``weight_bytes`` -- total parameter bytes;
 #   * ``weight_carriers(world_size)`` -- per-rank **allocation-free** carriers (a
 #     ``device="meta"`` tensor or a ``TensorDescriptor``, as
-#     ``realsim.scenarios.put_get`` already builds), so a 60 GiB burst still
+#     ``putget_sim.workload.put_get`` already builds), so a 60 GiB burst still
 #     costs no memory;
 #   * optionally a whole ``state_dict``'s worth of them (~290 keys for an 8B
 #     model), which is what real weight sync moves.

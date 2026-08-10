@@ -1,14 +1,14 @@
-"""``python -m realsim`` -- run the put/get fixture and print it.
+"""``python -m putget_sim`` -- run the unrouted put/get burst and print it.
 
 Mirrors the ``dedup_sim`` demo style (``sim_common.report`` headers, a digest at
 INFO and the full per-event trace at DEBUG under ``-v``), but every layer under
 the scenario is **real** TorchStore code driven off-actor on the deterministic
-virtual-clock engine. The scenario itself (``realsim/scenarios/put_get.py``) is
-ordinary user code and depends on no capability.
+virtual-clock engine. The scenario itself (``putget_sim/workload/put_get.py``) is
+ordinary user code and installs no policy.
 
-Run from the worktree with the venv interpreter::
+Run from the repo root so the package resolves, with the venv interpreter::
 
-    PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim [-m N] [-v]
+    PYTHONPATH=. .venv/bin/python -m putget_sim [-m N] [-v]
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ from sim_common.cost_model import DEFAULT_PROFILE
 from realsim.cli import add_run_flags, apply_run_flags, log_trace
 from sim_common.report import section
 
-from realsim.harness import run_burst
-from realsim.report import render_burst_summary
-from realsim.scenarios.put_get import MODE_META, MODE_METADATA
+from putget_sim.harness import run_burst
+from putget_sim.report.summary import render_burst_summary
+from putget_sim.workload.put_get import MODE_META, MODE_METADATA
 
 # The cost model is driven by a MachineProfile that describes the *target*
 # machine being simulated -- never the box this demo runs on. Costs are analytic
@@ -32,12 +32,12 @@ from realsim.scenarios.put_get import MODE_META, MODE_METADATA
 # swap in a profile measured/spec'd for its target hardware.
 PROFILE = DEFAULT_PROFILE
 
-logger = logging.getLogger("realsim")
+logger = logging.getLogger("putget_sim")
 
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
-        prog="python -m realsim",
+        prog="python -m putget_sim",
         description="Deterministic read-burst simulation over the REAL TorchStore "
         "client/controller/transport. Prints the summary + source->dest tree "
         "(INFO) and, with -v, the full per-event trace (DEBUG).",

@@ -1,9 +1,12 @@
-"""Running realsim's own fixture: :func:`run_burst`.
+"""Running one unrouted burst: :func:`run_burst`.
 
-The same split the capabilities use: :mod:`realsim.scenarios.put_get` says *what*
-is simulated (a topology, a payload, m readers), this says *how* a run of it is
-assembled, and :mod:`realsim.report` renders the outcome. It is the baseline
-``dedup_sim`` measures against, so it lives here rather than in either demo.
+Mirrors :mod:`dedup_sim.harness` and :mod:`kvcache_sim.harness` -- the one place
+this capability wires itself onto a stack. :mod:`putget_sim.workload.put_get`
+says *what* is simulated (a topology, a payload, m readers), this says *how* a
+run of it is assembled, and :mod:`putget_sim.report.summary` renders the outcome.
+
+There is no policy and no data plane unless a caller passes one, so the default
+run is the ``m x`` baseline ``dedup_sim`` measures against.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.entrypoint import run_simulation
-from realsim.scenarios.put_get import (
+from putget_sim.workload.put_get import (
     BurstResult,
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_N,

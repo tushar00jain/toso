@@ -1,10 +1,10 @@
-"""Rendering a burst outcome, like each capability's ``report/``."""
+"""Rendering a burst outcome, like each other capability's ``report/``."""
 
 from __future__ import annotations
 
 from sim_common.report import render_tree
 
-from realsim.harness import BurstResult
+from putget_sim.workload.put_get import BurstResult
 
 __all__ = ["render_burst_summary"]
 

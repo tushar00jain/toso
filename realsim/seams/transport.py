@@ -22,7 +22,7 @@ The put path charges ``network`` (client->volume fabric) + ``storage write``
 read`` + ``mem_copy`` (the serving volume reads the payload and stages it through
 host RAM) + ``network`` (volume->client fabric). The producer-side ``compute``
 cost of generating the payload is charged by the scenario (see
-:mod:`realsim.scenarios.put_get`), which knows the flop model.
+:mod:`putget_sim.workload.put_get`), which knows the flop model.
 
 By default each charge is an independent virtual-clock sleep, so two concurrent
 transfers over the same fabric each assume the full bandwidth (no contention).
@@ -95,7 +95,7 @@ class TensorDescriptor:
     meta tensor. Instead this tiny descriptor stands in for the payload: it is
     passed to ``client.put(key, descriptor)`` as an arbitrary object (so it flows
     through the real object put/get path in ``InMemoryStore`` -- see
-    :mod:`realsim.scenarios.put_get` for why this sidesteps the ``put_batch``
+    :mod:`putget_sim.workload.put_get` for why this sidesteps the ``put_batch``
     value-typing gotcha) and :func:`_nbytes` reads the modeled byte count off it.
 
     It exposes the same size surface as a ``torch.Tensor``

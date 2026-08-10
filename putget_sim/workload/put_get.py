@@ -1,11 +1,11 @@
-"""``realsim``'s own fixture: seed one key, then ``m`` clients get it.
+"""The capability-free fixture: seed one key, then ``m`` clients get it.
 
 The smallest scenario that exercises everything ``realsim`` provides -- the real
 ``LocalClient`` planning core, the real ``Controller`` directory, the real
 ``InMemoryStore`` behind the volume seam, the cost model, and the deterministic
 virtual-clock engine -- and **nothing** a capability owns. It exists so
-``realsim``'s demo and tests have something to run that does not depend on
-``dedup_sim`` or ``kvcache_sim``.
+``realsim``'s tests have something to run that decides nothing, and so
+``dedup_sim`` has a baseline that is the same workload as its routed run.
 
 Layout: one *origin* volume on node ``P`` holds ``W``; ``m`` reader volumes on
 distinct hosts of node ``R`` each want it. Every reader is released at the same
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 

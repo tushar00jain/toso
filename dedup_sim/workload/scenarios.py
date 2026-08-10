@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
-from realsim.harness import BurstResult
+from putget_sim.workload.put_get import BurstResult
 
 from ..harness import run
 

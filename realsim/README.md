@@ -5,9 +5,11 @@ A single-threaded, deterministic discrete-event simulation that drives the
 the **real** in-memory transport/store off-actor, under a virtual clock. It models
 only the pieces a capability plugs in: the routing policy and what it executes.
 
-`realsim` is the real-code foundation that [`dedup_sim/`](../dedup_sim/) and
-[`kvcache_sim/`](../kvcache_sim/) build on: both `import realsim` and run their
-algorithms on the real directory + real types. It deliberately depends on the real
+`realsim` is the real-code foundation that [`putget_sim/`](../putget_sim/),
+[`dedup_sim/`](../dedup_sim/) and [`kvcache_sim/`](../kvcache_sim/) build on: all
+three `import realsim` and run their algorithms on the real directory + real
+types. It is the foundation only — it owns no scenario and no demo; the unrouted
+put/get burst is `putget_sim`. It deliberately depends on the real
 `torchstore` / `torch` / `monarch` install — the client, controller, transport,
 and store types that execute are the real ones; only the components being designed
 (a routing `Policy`, a capability's `DataPlane`) and the actor/RPC boundary are
@@ -61,30 +63,21 @@ Needs the venv that has torchstore/torch/monarch built (see the repo root
 **not** stdlib-only. Run from the repo directory with that interpreter on
 `PYTHONPATH`.
 
-## Running the demo
+## Running a demo
+
+`realsim` has no `__main__` of its own — a run is always some sim's. The one that
+exercises this package and nothing else is
+[`putget_sim`](../putget_sim/README.md):
 
 ```
-PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim
-PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim -m 4 -v
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m putget_sim
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m putget_sim -m 4 -v
 ```
-
-- `-m/--readers N` -- readers in the burst (default 3).
-- `-n/--elements N` -- elements in `W` (float32; payload = `4*N` bytes).
-- `--mode meta|metadata` -- the allocation-free data-plane carrier: `meta`
-  (zero-storage meta tensor, default) or `metadata` (a `(shape, dtype)`
-  descriptor, no tensor at all).
-- `--seed S` -- switch the engine to seeded-random ready-queue mode (default:
-  FIFO, reproducible).
-- `-v` -- also print the full per-event virtual-time trace (DEBUG).
-
-Output: the fabric/wallclock summary + an ASCII source→dest tree at INFO. Under the
-naive policy every reader pulls the origin (`m×` fabric) -- the baseline a
-read-through policy would cut toward the 1× union.
 
 ## Testing
 
 ```
-# whole cross-package suite (realsim + shared engine + both capability sims)
+# whole cross-package suite (realsim + shared engine + the capability sims)
 PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m pytest \
   realsim/tests sim_common/tests dedup_sim/tests kvcache_sim/tests -q
 
@@ -93,13 +86,15 @@ PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m pytest realsim/tests -q
 ```
 
 Tests are deterministic (byte-identical traces across runs; invariants across a
-couple of seeds under random scheduling):
+couple of seeds under random scheduling). They drive `putget_sim`'s
+capability-free fixture, so they exercise the whole stack without depending on a
+capability's decisions:
 
 - **`test_correctness.py`** — off-sim byte-level reassembly on tiny **real** CPU
   tensors put/got through the *same* real client/controller/`InMemoryStore` code.
 - **`test_perf.py`** — the perf guard: a 256 MiB *modeled* payload must not move
-  peak RSS, and a realsim run must stay within a tolerant multiple of a `dedup_sim`
-  run's wall + RSS (measured in fresh subprocesses).
+  peak RSS, and a `putget_sim` run must stay within a tolerant multiple of a
+  `dedup_sim` run's wall + RSS (measured in fresh subprocesses).
 - **`test_composability.py`** — imports realsim's real-directory backend
   (`RealControllerAdapter` / `FakeControllerHandle`) standalone and exercises it.
 
@@ -131,12 +126,20 @@ realsim/
                   capability's data plane runs against (client_for resolves a node)
   runner.py       Runner -- release work items on the virtual clock in
                   (release_time, id) order, install the mesh once, gather, drain
-  scenarios/      put_get.py: seed a key, then m clients get it; meta/metadata data
-                  plane + full resource-cost exercise
-  __main__.py     the demo entrypoint (`python -m realsim`)
+  entrypoint.py   run_simulation(workload, **knobs) -- the one way to run
+                  anything; Workload and Result live here too
+  simulation.py   Simulation -- assembles engine + mesh + directory + registry
+  cli.py          the run flags/logging every sim's __main__ shares
   tools/          check_contract.py: the concurrency + plane-separation lint
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
                   perf guard, composability, mesh wiring, the shared plane types
+putget_sim/     the unrouted put/get burst (no policy, no data plane) -- the m x
+                baseline, and the fixture realsim's own tests drive
+  workload/       put_get.py: seed a key, then m clients get it; meta/metadata
+                  carrier + full resource-cost exercise
+  report/         summary.py: fabric/wallclock summary + source->dest tree
+  harness.py      run_burst: the one place it wires onto a stack
+  __main__.py     the demo entrypoint (`python -m putget_sim`)
 proposed/       every contract that outlives the simulator; imports nothing
   policy.py       Policy.select(view, keys, requester) -> ranked sources +
                   readiness, plus notice() to open a readiness gate. Naive (all

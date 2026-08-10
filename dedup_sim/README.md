@@ -44,8 +44,9 @@ Because exactly one reader ever pulls from a pre-existing holder, the only
 origin-sourced transfer is that first hop: `origin_bytes == 1x` the payload, for
 **any** fan-out cap. The baseline stays `m x`.
 
-There is no burst loop anywhere. `dedup_sim/workload/burst.py` runs `realsim`'s
-ordinary put/get fixture -- a `client.put` and a gather of `client.get` -- and the
+There is no burst loop anywhere. `dedup_sim/workload/scenarios.py` runs
+[`putget_sim`](../putget_sim/)'s ordinary put/get fixture -- a `client.put` and a
+gather of `client.get` -- and the
 chain/tree is an emergent consequence of step 4 changing the directory that step
 1 reads.
 
@@ -111,7 +112,7 @@ dedup_sim/
     read_through.py       #   ReadThroughPlane: one DataPlane method -- the
                           #   reader's put, via the Deployment's client for it
   workload/               # WHAT IS SIMULATED
-    burst.py              #   realsim's put/get fixture, with the policy
+    scenarios.py          #   putget_sim's put/get fixture, with the policy
                           #   installed; and unwrapped, as the baseline
   report/                 # OUTCOME METRICS
     summary.py            #   dedup-vs-baseline fabric summary + source->dest tree
@@ -132,7 +133,7 @@ visible from which folders exist and how thick they are:
 |---|---|---|
 | `control/` — what is decided | `routing.py`: one `Policy.select` — a ranked source plus a readiness gate | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement) + `policy.py` (the source `Policy`) + `cache.py` (LRU) + `view.py` (prefix runs) |
 | `data/` — what executes | `read_through.py`: one `DataPlane.after` — a local put | `serving.py` (the per-request lifecycle) + `decode.py` (the batched decode engine) + `store.py` (the KV directory verbs) |
-| `workload/` — what is simulated | `burst.py`: **one fixed synchronized burst**, parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
+| `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |
 | domain model + cost layer | **absent** — no served model to describe; charges realsim's cost model directly through the transport seam | `domain/llm.py` (shared — the LLM's flop terms, KV block byte size, and token→time) |
 

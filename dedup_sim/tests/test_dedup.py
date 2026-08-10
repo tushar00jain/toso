@@ -218,7 +218,7 @@ def test_metadata_mode_carries_only_a_descriptor():
 #    the change -- the 1x number alone would still pass with the monkeypatch.
 def test_readers_run_an_untouched_real_client():
     from realsim.entrypoint import run_simulation
-    from realsim.scenarios.put_get import PutGetBurst
+    from putget_sim.workload.put_get import PutGetBurst
 
     from dedup_sim.control.routing import DedupPolicy
     from dedup_sim.data.read_through import make_plane
@@ -237,13 +237,13 @@ def test_the_scenario_holds_no_burst_loop():
     import ast
     import inspect
 
-    from realsim.scenarios import put_get
+    from putget_sim.workload import put_get
 
     from dedup_sim import harness
 
     tree = ast.parse(inspect.getsource(harness))
     # The capability contributes a policy and a data plane; the burst itself is
-    # realsim's fixture. So the harness stages nothing of its own: no coroutine,
+    # putget_sim's fixture. So the harness stages nothing of its own: no coroutine,
     # hence no gather, no await, no execution order to get wrong.
     assert not [
         n
