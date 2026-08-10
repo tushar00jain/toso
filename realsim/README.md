@@ -64,8 +64,8 @@ Needs the venv that has torchstore/torch/monarch built (see the repo root
 ## Running the demo
 
 ```
-PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.run_realsim
-PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.run_realsim -m 4 -v
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim -m 4 -v
 ```
 
 - `-m/--readers N` -- readers in the burst (default 3).
@@ -133,7 +133,7 @@ realsim/
                   (release_time, id) order, install the mesh once, gather, drain
   scenarios/      put_get.py: seed a key, then m clients get it; meta/metadata data
                   plane + full resource-cost exercise
-  run_realsim.py  the demo entrypoint
+  __main__.py     the demo entrypoint (`python -m realsim`)
   tools/          check_contract.py: the concurrency + plane-separation lint
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
                   perf guard, composability, mesh wiring, the shared plane types

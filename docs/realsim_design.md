@@ -153,7 +153,7 @@ realsim/
   scenarios/                  # runnable scenarios
     put_get.py                # seed a key, then m clients get it; meta/metadata data plane +
                               #   compute/network/storage/RAM cost exercise
-  run_realsim.py              # `python -m realsim.run_realsim` demo entrypoint (+ --mode)
+  __main__.py                 # `python -m realsim` demo entrypoint (+ --mode)
   tools/
     check_contract.py         # concurrency-contract lint (AST checker + CLI)
   tests/
@@ -594,7 +594,7 @@ PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_contr
 **The demo:**
 
 ```
-PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.run_realsim \
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim \
   [-m READERS] [-n N] [--mode meta|metadata] [--seed S] [-v]
 ```
 

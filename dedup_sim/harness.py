@@ -1,4 +1,8 @@
-"""The dedup burst: the same scenario as the baseline, with a policy installed.
+"""Running one dedup configuration: :func:`run`.
+
+Mirrors :mod:`kvcache_sim.harness` -- the one place this capability wires itself
+onto a stack. There is a single run function: with no ``fanout_cap`` it is the
+unrouted baseline, with one it is dedup routing. Same scenario either way.
 
 This is the point of the whole exercise. The scenario is ``realsim``'s own
 put/get fixture -- ordinary user code: seed ``W``, then a gather of
@@ -18,35 +22,26 @@ from typing import Optional
 import torch
 
 from realsim.scenarios.put_get import (
-    build_burst,
     BurstResult,
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_N,
     MODE_META,
     MODE_METADATA,
-    run_burst as run_naive_burst,
+    run_burst,
 )
-from sim_common.async_engine import run_sim
 from sim_common.cost_model import MachineProfile
-from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from dedup_sim.control.routing import DedupPolicy
 from dedup_sim.data.read_through import make_plane
 
-__all__ = [
-    "DEFAULT_N",
-    "MODE_META",
-    "MODE_METADATA",
-    "run_dedup_burst",
-    "run_naive_burst",
-]
+__all__ = ["DEFAULT_N", "MODE_META", "MODE_METADATA", "run"]
 
 
-def run_dedup_burst(
+def run(
     num_readers: int = 3,
     *,
-    fanout_cap: int = 1,
+    fanout_cap: Optional[int] = None,
     n: int = DEFAULT_N,
     dtype: torch.dtype = torch.float32,
     mode: str = MODE_META,
@@ -56,33 +51,32 @@ def run_dedup_burst(
     random_seed: Optional[int] = None,
     real_directory: Optional[bool] = None,
 ) -> BurstResult:
-    """Run one dedup burst end-to-end on a fresh deterministic engine.
+    """Run one burst end-to-end on a fresh deterministic engine.
 
-    Returns a :class:`~realsim.scenarios.put_get.BurstResult` whose
-    ``ledger.origin_bytes`` is the 1x union (each unique byte crosses the fabric
-    once), versus ``m x`` for :func:`run_naive_burst`.
+    With no ``fanout_cap`` this is the unrouted baseline: every reader locates the
+    origin and pulls from it, ``m x`` fabric. With one, the dedup policy is
+    installed in the controller and each reader is routed to a peer instead, so
+    ``ledger.origin_bytes`` is the 1x union. The scenario is identical either way
+    -- the policy is the only difference, which is what makes the comparison mean
+    something.
     """
-    trace = Trace()
-    sim, ctx = build_burst(
-        num_readers,
+    common = dict(
         n=n,
         dtype=dtype,
         mode=mode,
         device=device,
         profile=profile,
         compute_device=compute_device,
-        policy=DedupPolicy(fanout_cap=fanout_cap, trace=trace),
-        make_plane=make_plane,
-        trace=trace,
         random_seed=random_seed,
         real_directory=real_directory,
     )
-    results = sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
-    return BurstResult(
-        trace=sim.trace,
-        ledger=sim.ledger,
-        results=results,
-        expected=ctx["expected"],
-        origin_id=ctx["origin_id"],
-        num_readers=num_readers,
+    if fanout_cap is None:
+        return run_burst(num_readers, **common)
+    trace = Trace()
+    return run_burst(
+        num_readers,
+        policy=DedupPolicy(fanout_cap=fanout_cap, trace=trace),
+        make_plane=make_plane,
+        trace=trace,
+        **common,
     )

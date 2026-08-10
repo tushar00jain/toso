@@ -105,7 +105,7 @@ run from the repo directory with the venv interpreter and the repo on
 ```bash
 PYTHONPATH=. .venv/bin/python -m dedup_sim
 PYTHONPATH=. .venv/bin/python -m kvcache_sim
-PYTHONPATH=. .venv/bin/python -m realsim.run_realsim
+PYTHONPATH=. .venv/bin/python -m realsim
 ```
 
 See each capability sim's `README.md` for flags, [`realsim/README.md`](realsim/README.md)

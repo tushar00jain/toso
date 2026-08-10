@@ -22,12 +22,11 @@ from collections import Counter
 import pytest
 import torch
 
-from dedup_sim.workload.burst import (
+from dedup_sim.harness import (
     DEFAULT_N,
     MODE_META,
     MODE_METADATA,
-    run_dedup_burst,
-    run_naive_burst,
+    run,
 )
 from realsim.seams.transport import TensorDescriptor
 from sim_common import config
@@ -47,7 +46,7 @@ def _shape_dtype_nbytes(payload):
 # 1. Correctness: every reader receives a payload of the right shape/dtype/nbytes.
 @pytest.mark.parametrize("mode", MODES)
 def test_every_reader_receives_the_payload(mode):
-    res = run_dedup_burst(num_readers=4, fanout_cap=1, mode=mode)
+    res = run(num_readers=4, fanout_cap=1, mode=mode)
     assert set(res.results) == {"r0", "r1", "r2", "r3"}
     for reader_id, payload in res.results.items():
         shape, dtype, nbytes = _shape_dtype_nbytes(payload)
@@ -60,8 +59,8 @@ def test_every_reader_receives_the_payload(mode):
 @pytest.mark.parametrize("mode", MODES)
 def test_fabric_dedup_is_1x_naive_is_mx(mode):
     m = 3
-    dedup = run_dedup_burst(num_readers=m, fanout_cap=1, mode=mode)
-    naive = run_naive_burst(num_readers=m, mode=mode)
+    dedup = run(num_readers=m, fanout_cap=1, mode=mode)
+    naive = run(num_readers=m, mode=mode)
 
     union = PAYLOAD_BYTES  # the key crosses the fabric exactly once
     assert dedup.ledger.origin_bytes == union
@@ -76,14 +75,14 @@ def test_fabric_dedup_is_1x_naive_is_mx(mode):
 @pytest.mark.parametrize("mode", MODES)
 def test_fabric_dedup_1x_independent_of_fanout_cap(mode):
     for cap in (1, 2, 3):
-        dedup = run_dedup_burst(num_readers=4, fanout_cap=cap, mode=mode)
+        dedup = run(num_readers=4, fanout_cap=cap, mode=mode)
         assert dedup.ledger.origin_bytes == PAYLOAD_BYTES, cap
 
 
 # 4. Exactly one reader pulls from the origin; the rest pull from peers.
 @pytest.mark.parametrize("mode", MODES)
 def test_only_one_hop_crosses_from_the_origin(mode):
-    dedup = run_dedup_burst(num_readers=5, fanout_cap=1, mode=mode)
+    dedup = run(num_readers=5, fanout_cap=1, mode=mode)
     origin_edges = [e for e in dedup.ledger.edges if e[0] == dedup.origin_id]
     assert len(origin_edges) == 1  # the single fabric hop
     # Every other transfer's source is a reader-side peer, not the origin.
@@ -94,13 +93,13 @@ def test_only_one_hop_crosses_from_the_origin(mode):
 
 # 5. Fan-out cap shapes the topology: cap 1 = chain, cap 2 = tree.
 def test_fanout_cap1_is_a_chain():
-    dedup = run_dedup_burst(num_readers=4, fanout_cap=1)
+    dedup = run(num_readers=4, fanout_cap=1)
     fanout = Counter(src for (src, _dst, _k) in dedup.ledger.edges)
     assert max(fanout.values()) == 1  # every source serves at most one reader
 
 
 def test_fanout_cap2_builds_a_tree():
-    dedup = run_dedup_burst(num_readers=4, fanout_cap=2)
+    dedup = run(num_readers=4, fanout_cap=2)
     fanout = Counter(src for (src, _dst, _k) in dedup.ledger.edges)
     assert max(fanout.values()) == 2  # a source fans out to two peers
 
@@ -108,16 +107,16 @@ def test_fanout_cap2_builds_a_tree():
 # 6. Determinism: two runs yield byte-identical traces (default + seeded).
 @pytest.mark.parametrize("mode", MODES)
 def test_trace_is_byte_identical_across_runs(mode):
-    a = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode)
-    b = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode)
+    a = run(num_readers=3, fanout_cap=1, mode=mode)
+    b = run(num_readers=3, fanout_cap=1, mode=mode)
     assert a.trace.render() == b.trace.render()
     assert a.trace.events == b.trace.events
 
 
 @pytest.mark.parametrize("mode", MODES)
 def test_trace_is_byte_identical_for_fixed_seed(mode):
-    a = run_dedup_burst(num_readers=4, fanout_cap=2, random_seed=7, mode=mode)
-    b = run_dedup_burst(num_readers=4, fanout_cap=2, random_seed=7, mode=mode)
+    a = run(num_readers=4, fanout_cap=2, random_seed=7, mode=mode)
+    b = run(num_readers=4, fanout_cap=2, random_seed=7, mode=mode)
     assert a.trace.render() == b.trace.render()
 
 
@@ -125,7 +124,7 @@ def test_trace_is_byte_identical_for_fixed_seed(mode):
 @pytest.mark.parametrize("mode", MODES)
 def test_all_readers_complete(mode):
     for cap in (1, 2, 3):
-        res = run_dedup_burst(num_readers=5, fanout_cap=cap, mode=mode)
+        res = run(num_readers=5, fanout_cap=cap, mode=mode)
         assert res.ledger.items_done == res.ledger.items_total == 5
 
 
@@ -135,8 +134,8 @@ def test_all_readers_complete(mode):
 #     routing, fabric bytes, and delivered bytes must match exactly.
 @pytest.mark.parametrize("mode", MODES)
 def test_shim_directory_matches_real(mode):
-    real = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode, real_directory=True)
-    shim = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode, real_directory=False)
+    real = run(num_readers=3, fanout_cap=1, mode=mode, real_directory=True)
+    shim = run(num_readers=3, fanout_cap=1, mode=mode, real_directory=False)
     assert shim.trace.render() == real.trace.render()
     assert shim.ledger.origin_bytes == real.ledger.origin_bytes
     assert shim.ledger.transfer_bytes == real.ledger.transfer_bytes
@@ -154,7 +153,7 @@ CONTENTION = ("none", "serialize", "progressive")
 @pytest.mark.parametrize("contention", CONTENTION)
 def test_dedup_stays_1x_under_every_contention_mode(contention):
     with config.overrides(contention=contention):
-        dedup = run_dedup_burst(num_readers=4, fanout_cap=1)
+        dedup = run(num_readers=4, fanout_cap=1)
     assert dedup.ledger.origin_bytes == PAYLOAD_BYTES  # 1x union, any mode
     assert dedup.ledger.items_done == dedup.ledger.items_total == 4
 
@@ -162,8 +161,8 @@ def test_dedup_stays_1x_under_every_contention_mode(contention):
 @pytest.mark.parametrize("contention", CONTENTION)
 def test_dedup_trace_is_byte_identical_per_contention_mode(contention):
     with config.overrides(contention=contention):
-        a = run_dedup_burst(num_readers=3, fanout_cap=1)
-        b = run_dedup_burst(num_readers=3, fanout_cap=1)
+        a = run(num_readers=3, fanout_cap=1)
+        b = run(num_readers=3, fanout_cap=1)
     assert a.trace.render() == b.trace.render()
 
 
@@ -175,9 +174,9 @@ def test_dedup_trace_is_byte_identical_per_contention_mode(contention):
 @pytest.mark.parametrize("mode", MODES)
 def test_dedup_1x_fabric_invariant_to_collapse(mode):
     with config.overrides(collapse_charges=False):
-        off = run_dedup_burst(num_readers=4, fanout_cap=1, mode=mode)
+        off = run(num_readers=4, fanout_cap=1, mode=mode)
     with config.overrides(collapse_charges=True):
-        on = run_dedup_burst(num_readers=4, fanout_cap=1, mode=mode)
+        on = run(num_readers=4, fanout_cap=1, mode=mode)
     assert on.ledger.origin_bytes == off.ledger.origin_bytes == PAYLOAD_BYTES
     assert on.ledger.transfer_bytes == off.ledger.transfer_bytes
     assert sorted(on.ledger.edges) == sorted(off.ledger.edges)
@@ -185,14 +184,14 @@ def test_dedup_1x_fabric_invariant_to_collapse(mode):
 
 def test_dedup_collapse_is_deterministic():
     with config.overrides(collapse_charges=True):
-        a = run_dedup_burst(num_readers=3, fanout_cap=1)
-        b = run_dedup_burst(num_readers=3, fanout_cap=1)
+        a = run(num_readers=3, fanout_cap=1)
+        b = run(num_readers=3, fanout_cap=1)
     assert a.trace.render() == b.trace.render()
 
 
 # 8. Allocation-free carriers survive the dedup path.
 def test_meta_mode_allocates_no_storage():
-    res = run_dedup_burst(num_readers=3, fanout_cap=1, mode=MODE_META)
+    res = run(num_readers=3, fanout_cap=1, mode=MODE_META)
     assert isinstance(res.expected, torch.Tensor)
     assert res.expected.device.type == "meta"
     for payload in res.results.values():
@@ -202,7 +201,7 @@ def test_meta_mode_allocates_no_storage():
 
 
 def test_metadata_mode_carries_only_a_descriptor():
-    res = run_dedup_burst(num_readers=3, fanout_cap=1, mode=MODE_METADATA)
+    res = run(num_readers=3, fanout_cap=1, mode=MODE_METADATA)
     assert isinstance(res.expected, TensorDescriptor)
     for payload in res.results.values():
         assert isinstance(payload, TensorDescriptor)
@@ -218,18 +217,19 @@ def test_metadata_mode_carries_only_a_descriptor():
 #    peer registers. These two tests pin that, because it is the whole point of
 #    the change -- the 1x number alone would still pass with the monkeypatch.
 def test_readers_run_an_untouched_real_client():
-    from realsim.scenarios.put_get import build_burst
+    from realsim.entrypoint import run_simulation
+    from realsim.scenarios.put_get import put_get_burst
 
     from dedup_sim.control.routing import DedupPolicy
     from dedup_sim.data.read_through import make_plane
 
-    sim, ctx = build_burst(
-        3, policy=DedupPolicy(fanout_cap=1), make_plane=make_plane
+    fixture = put_get_burst(3, make_plane=make_plane)
+    result = run_simulation(
+        fixture.topology, fixture.build, policy=DedupPolicy(fanout_cap=1)
     )
-    mesh = ctx["mesh"]
-    sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
+    mesh = result.sim.mesh
 
-    for reader_id in ctx["reader_ids"]:
+    for reader_id in fixture.reader_ids:
         # The one controller handle the mesh built, not a per-reader view of it.
         assert mesh.client(reader_id)._controller is mesh.handle
 
@@ -241,16 +241,16 @@ def test_the_scenario_holds_no_burst_loop():
 
     from realsim.scenarios import put_get
 
-    from dedup_sim.workload import burst
+    from dedup_sim import harness
 
-    tree = ast.parse(inspect.getsource(burst))
+    tree = ast.parse(inspect.getsource(harness))
     # The capability contributes a policy and a data plane; the burst itself is
-    # realsim's fixture. So the workload module stages nothing of its own: no
-    # coroutine, hence no gather, no await, no execution order to get wrong.
+    # realsim's fixture. So the harness stages nothing of its own: no coroutine,
+    # hence no gather, no await, no execution order to get wrong.
     assert not [
         n
         for n in ast.walk(tree)
         if isinstance(n, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor))
     ]
-    # ...and the baseline is literally realsim's fixture, unwrapped.
-    assert burst.run_naive_burst is put_get.run_burst
+    # ...and both runs go through realsim's fixture: one call, one policy apart.
+    assert harness.run_burst is put_get.run_burst

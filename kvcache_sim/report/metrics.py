@@ -188,3 +188,26 @@ def render_early_rejection(off: Metrics, early: Metrics, predict: Metrics,
         row("accepted (decoded)", lambda m: len(m.accepted)),
         row("TBT SLO attainment", lambda m: pct(m.tbt_slo_met(slo))),
     ])
+
+
+def render_eviction_sweep(rows) -> str:
+    """Render the capacity -> (hit rate, fabric bytes) sweep table."""
+    lines = ["  %10s %12s %14s" % ("capacity", "hit_rate", "fabric_bytes")]
+    for cap, hit_rate, fabric_bytes in rows:
+        lines.append("  %10d %11.1f%% %14d" % (cap, 100.0 * hit_rate, fabric_bytes))
+    return "\n".join(lines)
+
+
+def render_hotspot(baseline: Metrics, no_repl: Metrics, repl: Metrics) -> str:
+    """Render the load-balance / cache-no-repl / cache-repl comparison table."""
+    def row(label: str, fmt: str, fn) -> str:
+        return ("  %-26s" + fmt * 3) % (label, fn(baseline), fn(no_repl), fn(repl))
+
+    return "\n".join([
+        "  %-26s%12s%12s%12s" % ("", "load-bal", "cache/no-repl", "cache/repl"),
+        row("mean TTFT", "%12.3f", lambda m: m.mean_ttft),
+        row("p90 TTFT", "%12.3f", lambda m: m.pct_ttft(90)),
+        row("prefix hit rate %", "%12.1f", lambda m: 100 * m.hit_rate),
+        row("prefill tokens", "%12d", lambda m: m.compute_tokens),
+        row("KV fabric bytes", "%12d", lambda m: m.fabric_bytes),
+    ])

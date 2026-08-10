@@ -14,7 +14,7 @@ from __future__ import annotations
 from realsim.scenarios.put_get import BurstResult
 from sim_common.report import render_tree
 
-__all__ = ["render_dedup_summary"]
+__all__ = ["render_dedup_summary", "render_baseline_summary"]
 
 
 def render_dedup_summary(dedup: BurstResult, naive: BurstResult, cap: int) -> str:
@@ -41,3 +41,19 @@ def render_dedup_summary(dedup: BurstResult, naive: BurstResult, cap: int) -> st
     for line in render_tree(dedup.ledger.edges):
         lines.append("    " + line)
     return "\n".join(lines)
+
+
+def render_baseline_summary(naive: BurstResult, num_readers: int) -> str:
+    """Render the unrouted baseline's own fabric summary.
+
+    The counterpart to :func:`render_dedup_summary`: what the same burst costs
+    with no policy installed, which is the number dedup is measured against.
+    """
+    payload = naive.payload_bytes
+    return "\n".join([
+        f"fabric(origin->readers): naive={naive.ledger.origin_bytes}B "
+        f"({naive.ledger.origin_bytes / payload:.1f}x)   "
+        f"wallclock={naive.ledger.wallclock:.4f}",
+        f"every reader pulls the full payload cross-node -> m x fabric; "
+        f"concurrent so it wins wallclock, but pays {num_readers}x the bytes.",
+    ])

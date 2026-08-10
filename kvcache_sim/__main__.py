@@ -25,8 +25,9 @@ from __future__ import annotations
 import argparse
 import logging
 
+from realsim.cli import add_run_flags, apply_run_flags, log_trace
 from sim_common import config
-from sim_common.report import configure_logging, section
+from sim_common.report import section
 
 from .workload.scenarios import (
     DISAGG_TARGET_TBT,
@@ -39,6 +40,8 @@ from .workload.scenarios import (
     run_shared_prefix,
 )
 from .report.metrics import (
+    render_eviction_sweep,
+    render_hotspot,
     render_disaggregation,
     render_early_rejection,
     render_summary,
@@ -52,20 +55,8 @@ def _section(title: str) -> None:
 
 
 def _log_trace(trace, limit: int = 60) -> None:
-    """Emit the event trace at DEBUG (shown only under -v); cap very long traces.
-
-    When the ``fingerprint`` config flag is set (``--fingerprint``), also print the
-    trace's run fingerprint at INFO (a determinism-debugging digest -- see
-    :meth:`sim_common.trace.Trace.fingerprint`).
-    """
-    lines = trace.render_lines()
-    logger.debug("(a) event trace (%d events%s)", len(lines),
-                 f", first {limit} shown" if len(lines) > limit else "")
-    for line in lines[:limit]:
-        logger.debug(line)
-    if len(lines) > limit:
-        logger.debug("... (%d more)", len(lines) - limit)
-    logger.debug("")
+    """Dump the trace (shared), then this demo's fingerprint line."""
+    log_trace(logger, trace, limit=limit)
     if config.current().fingerprint:
         logger.info("run fingerprint: %s", trace.fingerprint())
 
@@ -91,9 +82,7 @@ def _eviction() -> None:
     logger.info("(the ~30%%->~50%% shape). Too-small caches also force more KV")
     logger.info("re-fetch (fabric).")
     logger.info("")
-    logger.info("  %10s %12s %14s", "capacity", "hit_rate", "fabric_bytes")
-    for cap, hr, fb in rows:
-        logger.info("  %10d %11.1f%% %14d", cap, 100.0 * hr, fb)
+    logger.info(render_eviction_sweep(rows))
 
 
 def _hotspot() -> None:
@@ -105,22 +94,7 @@ def _hotspot() -> None:
     logger.info("to peers (read-through), spreading load and cutting p90 TTFT.")
     _log_trace(repl.trace)
     logger.info("(b) summary")
-    logger.info("  %-26s%12s%12s%12s", "", "load-bal", "cache/no-repl", "cache/repl")
-    logger.info("  %-26s%12.3f%12.3f%12.3f", "mean TTFT",
-                baseline.metrics.mean_ttft, no_repl.metrics.mean_ttft,
-                repl.metrics.mean_ttft)
-    logger.info("  %-26s%12.3f%12.3f%12.3f", "p90 TTFT",
-                baseline.metrics.pct_ttft(90), no_repl.metrics.pct_ttft(90),
-                repl.metrics.pct_ttft(90))
-    logger.info("  %-26s%12.1f%12.1f%12.1f", "prefix hit rate %%",
-                100 * baseline.metrics.hit_rate, 100 * no_repl.metrics.hit_rate,
-                100 * repl.metrics.hit_rate)
-    logger.info("  %-26s%12d%12d%12d", "prefill tokens",
-                baseline.metrics.compute_tokens, no_repl.metrics.compute_tokens,
-                repl.metrics.compute_tokens)
-    logger.info("  %-26s%12d%12d%12d", "KV fabric bytes",
-                baseline.metrics.fabric_bytes, no_repl.metrics.fabric_bytes,
-                repl.metrics.fabric_bytes)
+    logger.info(render_hotspot(baseline.metrics, no_repl.metrics, repl.metrics))
     logger.info("(replication swaps recompute for cheap KV transfer when spreading a")
     logger.info(" hot prefix to a peer -> fewer prefill tokens, more fabric bytes.)")
 
@@ -215,52 +189,14 @@ def main(argv=None) -> None:
         "scenario", nargs="?", choices=sorted(SCENARIOS),
         help="scenario to run (default: all). one of: " + ", ".join(sorted(SCENARIOS)),
     )
-    parser.add_argument(
-        "-v", "--verbose", "--debug", action="store_true", dest="verbose",
-        help="show the per-event trace (log level DEBUG)",
-    )
-    parser.add_argument(
-        "--fingerprint", action="store_true",
-        help="print each shown trace's fingerprint (a determinism-debugging "
-        "digest, folded from the trace on demand; off by default -- it is not "
-        "part of the performance measurement)",
-    )
-    parser.add_argument(
-        "--shim-directory", action="store_true",
-        help="back the controller directory with a lightweight dict shim instead "
-        "of the real torchstore Trie (opt-in; skips the per-key trie tax on scale "
-        "runs). Metrics are byte-identical either way; the real directory is the "
-        "default.",
-    )
-    parser.add_argument(
-        "--contention", choices=("none", "serialize", "progressive"), default=None,
-        help="network/storage contention model (default: none -- independent, "
-        "full-bandwidth transfers). 'serialize' serves a resource one transfer at "
-        "a time; 'progressive' shares a resource's bandwidth max-min fairly among "
-        "concurrent cross-instance KV pulls. Non-default modes change timing.",
-    )
-    parser.add_argument(
-        "--collapse-charges", action="store_true",
-        help="coalesce each transport op's per-component charges (a get's "
-        "storage+mem+network; a put's network+storage) into one virtual-clock "
-        "sleep, cutting the per-op event-loop bounces on the non-contended path. "
-        "Same total time in isolation and the hit-rate/compute-saved metrics are "
-        "unchanged; not byte-identical (the sub-charge instants collapse). Inert "
-        "when --contention is not none.",
-    )
+    add_run_flags(parser)
     args = parser.parse_args(argv)
 
     # Set the process config once from the CLI flags (unset -> env / default);
     # _log_trace + the cluster's controller adapter + resource registry + the
     # transport's collapse decision read it ambiently.
-    config.configure(
-        fingerprint=args.fingerprint or None,
-        real_directory=False if args.shim_directory else None,
-        contention=args.contention,
-        collapse_charges=args.collapse_charges or None,
-    )
+    apply_run_flags(args)
 
-    configure_logging(logging.DEBUG if args.verbose else logging.INFO)
 
     if args.scenario is None:
         _shared_prefix()

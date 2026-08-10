@@ -25,68 +25,78 @@ from __future__ import annotations
 
 import argparse
 import logging
+from typing import Optional
 
 from sim_common import config
-from sim_common.report import configure_logging, section
+from realsim.cli import add_run_flags, apply_run_flags, log_trace
+from sim_common.report import section
 
-from dedup_sim.report.summary import render_dedup_summary
-from dedup_sim.workload.burst import run_dedup_burst, run_naive_burst
+from dedup_sim.report.summary import (
+    render_baseline_summary,
+    render_dedup_summary,
+)
+from dedup_sim.workload.scenarios import NUM_READERS, run_dedup_vs_baseline
 
 logger = logging.getLogger("dedup_sim")
 
-NUM_READERS = 3
+def _section(title: str) -> None:
+    section(logger, title)
 
 
-def _log_trace(trace, note: str = "") -> None:
-    """Emit every recorded virtual-time event at DEBUG (shown only under -v)."""
-    logger.debug("(a) event trace%s", f"  {note}" if note else "")
-    for line in trace.render_lines():
-        logger.debug(line)
-    logger.debug("")
+def _log_trace(trace, limit: Optional[int] = None) -> None:
+    """Dump the trace (shared). Fingerprints are labelled per run below."""
+    log_trace(logger, trace, limit=limit)
 
 
-def _demo() -> None:
-    fingerprint = config.current().fingerprint
-    naive = run_naive_burst(num_readers=NUM_READERS)
-    payload = naive.payload_bytes
-    if fingerprint:
+def _dedup() -> None:
+    comparison = run_dedup_vs_baseline()
+    naive = comparison.baseline
+    payload = comparison.payload_bytes
+    if config.current().fingerprint:
         logger.info("naive run fingerprint: %s", naive.trace.fingerprint())
 
-    section(logger, f"DEDUP on the REAL directory  --  {NUM_READERS} readers get W")
+    _section(
+        f"DEDUP on the REAL directory  --  {comparison.num_readers} readers get W"
+    )
     logger.info("directory: real torchstore.controller.Controller (real Trie state)")
     logger.info("payload(W): %dB   1x-union target (each unique byte once): %dB",
                 payload, payload)
 
-    for cap in (1, 2):
-        topo = "chain" if cap == 1 else "tree"
-        dedup = run_dedup_burst(num_readers=NUM_READERS, fanout_cap=cap)
-        section(logger, f"dedup policy  --  fanout_cap={cap} ({topo})")
-        _log_trace(dedup.trace)
-        logger.info("(b) summary")
-        logger.info(render_dedup_summary(dedup, naive, cap))
-        if fingerprint:
-            logger.info("dedup(cap=%d) run fingerprint: %s", cap, dedup.trace.fingerprint())
-        # 1x proven live on the real directory.
-        assert dedup.ledger.origin_bytes == payload
-        assert naive.ledger.origin_bytes == NUM_READERS * payload
+    for cap, routed in comparison.routed:
+        _routed(cap, routed, comparison)
 
-    section(logger, "NAIVE baseline  --  every reader pulls from the origin")
+    _section("NAIVE baseline  --  every reader pulls from the origin")
     _log_trace(naive.trace)
     logger.info("(b) summary")
-    logger.info("fabric(origin->readers): naive=%dB (%.1fx)   wallclock=%.4f",
-                naive.ledger.origin_bytes,
-                naive.ledger.origin_bytes / payload,
-                naive.ledger.wallclock)
-    logger.info("every reader pulls the full payload cross-node -> m x fabric; "
-                "concurrent so it wins wallclock, but pays %dx the bytes.",
-                NUM_READERS)
+    logger.info(render_baseline_summary(naive, comparison.num_readers))
 
-    section(logger, "TAKEAWAY")
+
+def _routed(cap: int, routed, comparison) -> None:
+    """One routed configuration: its section, trace, summary and fingerprint."""
+    naive, payload = comparison.baseline, comparison.payload_bytes
+    _section(f"dedup policy  --  fanout_cap={cap} ({'chain' if cap == 1 else 'tree'})")
+    _log_trace(routed.trace)
+    logger.info("(b) summary")
+    logger.info(render_dedup_summary(routed, naive, cap))
+    if config.current().fingerprint:
+        logger.info("dedup(cap=%d) run fingerprint: %s", cap, routed.trace.fingerprint())
+    # 1x proven live on the real directory.
+    assert routed.ledger.origin_bytes == payload
+    assert naive.ledger.origin_bytes == comparison.num_readers * payload
+
+
+def _takeaway() -> None:
+    _section("TAKEAWAY")
     logger.info("On the real directory, dedup registers each finished reader as a")
     logger.info("read-through source (real notify_put_batch), so later readers pull")
     logger.info("from a peer, not the origin: each unique byte crosses the fabric")
     logger.info("ONCE (1x vs mx). Wallclock depends on fanout_cap/topology -- a chain")
     logger.info("(cap=1) is more hops, a tree (cap=2) narrows the gap; both stay 1x.")
+
+
+SCENARIOS = {
+    "dedup": _dedup,
+}
 
 
 def main(argv=None) -> None:
@@ -99,51 +109,22 @@ def main(argv=None) -> None:
                     "virtual-time trace (DEBUG).",
     )
     parser.add_argument(
-        "-v", "--verbose", "--debug", action="store_true", dest="verbose",
-        help="show the full per-event virtual-time trace (log level DEBUG)",
+        "scenario", nargs="?", choices=sorted(SCENARIOS),
+        help="scenario to run (default: all). one of: " + ", ".join(sorted(SCENARIOS)),
     )
-    parser.add_argument(
-        "--fingerprint", action="store_true",
-        help="print each run's trace fingerprint (a determinism-debugging digest, "
-        "folded from the trace on demand; off by default -- it is not part of the "
-        "performance measurement)",
-    )
-    parser.add_argument(
-        "--shim-directory", action="store_true",
-        help="back the controller directory with a lightweight dict shim instead "
-        "of the real torchstore Trie (opt-in; skips the per-key trie tax on scale "
-        "runs). Metrics are byte-identical either way; the real directory is the "
-        "default.",
-    )
-    parser.add_argument(
-        "--contention", choices=("none", "serialize", "progressive"), default=None,
-        help="network/storage contention model (default: none -- independent, "
-        "full-bandwidth transfers). 'serialize' serves a resource one transfer at "
-        "a time; 'progressive' shares a resource's bandwidth max-min fairly. "
-        "Non-default modes change wallclock (fabric bytes stay 1x for dedup).",
-    )
-    parser.add_argument(
-        "--collapse-charges", action="store_true",
-        help="coalesce each transport op's per-component charges (a get's "
-        "storage+mem+network; a put's network+storage) into one virtual-clock "
-        "sleep, cutting the per-op event-loop bounces on the non-contended path. "
-        "Same total time in isolation and fabric stays 1x; not byte-identical "
-        "(the sub-charge instants collapse). Inert when --contention is not none.",
-    )
+    add_run_flags(parser)
     args = parser.parse_args(argv)
 
     # Set the process config once from the CLI flags (unset -> env / default);
     # the scenarios' Traces + controller adapters + resource registry + the
     # transport's collapse decision read it ambiently.
-    config.configure(
-        fingerprint=args.fingerprint or None,
-        real_directory=False if args.shim_directory else None,
-        contention=args.contention,
-        collapse_charges=args.collapse_charges or None,
-    )
+    apply_run_flags(args)
 
-    configure_logging(logging.DEBUG if args.verbose else logging.INFO)
-    _demo()
+    if args.scenario is None:
+        _dedup()
+        _takeaway()
+    else:
+        SCENARIOS[args.scenario]()
 
 
 if __name__ == "__main__":

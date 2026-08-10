@@ -1,37 +1,19 @@
-"""Scenario builders and a deterministic run harness (on the async engine).
+"""The kvcache scenarios: what each run simulates.
 
-Each scenario fixes a set of serving instances and a synthetic workload, runs it
-under a scheduler on the shared deterministic :class:`~sim_common.async_engine.AsyncEngine`,
-and returns ``(Metrics, Trace)``. Every scenario drives the **real** TorchStore
-directory (block presence via the real ``Controller``) and real per-instance
-clients, charging every cost through :mod:`sim_common.cost_model`.
-
-This module is the wiring seam, so it is the one place that touches both planes:
-it builds the data plane's :class:`~kvcache_sim.data.store.KVStore`, the control
-plane's :class:`~kvcache_sim.control.view.KVView` and scheduler over the same
-mesh, hands them to a :class:`~kvcache_sim.data.serving.ServingPlane`, and lets
-:class:`realsim.runner.Runner` release the requests on the clock.
+Each function fixes a topology and a synthetic workload and hands them to
+:func:`kvcache_sim.harness.run`, which does the assembling. Nothing here wires a
+plane, a scheduler or a clock -- a scenario is a set of choices, not a harness.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-from realsim.runner import WorkItem
-from realsim.simulation import Simulation
-from sim_common.topology import Endpoint
+from domain import decode_step_time, DEFAULT_PROFILE
+from proposed import Endpoint
 
-from sim_common.cost_model import DEFAULT_PROFILE
-from domain import decode_step_time
-from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
-from ..control.view import KVView
-from ..data.serving import ServingPlane
-from .deploy import make_store
-from ..report.metrics import Metrics, Trace
+from ..harness import BLOCK_TOKENS, Run, run
 from .generator import make_workload
-
-BLOCK_TOKENS = 512
 
 
 def make_topology(num: int, per_node: int = 2) -> Dict[str, Endpoint]:
@@ -52,92 +34,6 @@ def subset(topology: Dict[str, Endpoint], ids: List[str]) -> Dict[str, Endpoint]
     """Return the sub-topology for ``ids`` (order-stable)."""
     return {i: topology[i] for i in ids}
 
-
-@dataclass
-class Run:
-    """Output of one scheduler run."""
-
-    metrics: Metrics
-    trace: Trace
-
-
-def run(
-    topology: Dict[str, Endpoint],
-    requests,
-    kind: str,
-    *,
-    capacity: Optional[int] = None,
-    balance_threshold: float = 1.5,
-    replicate: bool = True,
-    slo_ttft: float = float("inf"),
-    slo_tbt: float = float("inf"),
-    simulate_decode: bool = False,
-    max_batch: int = 8,
-    coupled: bool = False,
-    prefill_pool: Optional[List[str]] = None,
-    decode_pool: Optional[List[str]] = None,
-    early_rejection: str = "off",
-) -> Run:
-    """Run ``requests`` on ``topology`` under scheduler ``kind``.
-
-    ``kind`` is ``"cache_aware"`` (cache-aware coordinator) or ``"load_balance"``
-    (baseline). Returns metrics + trace. The ``simulate_decode`` group of kwargs
-    drives the batched-decode / TBT model; ``coupled`` says whether prefill shares
-    the decode instances' compute, which is a data-plane fact and so is handed to
-    the serving plane, not to the scheduler.
-    """
-    # One assembled stack: clock, mesh, view, ledger, transfer-cost estimate.
-    sim = Simulation(
-        topology,
-        profile=DEFAULT_PROFILE,
-        trace=Trace(time_width=8, kind_width=7),
-        ledger=Metrics(),
-    )
-    metrics = sim.ledger
-    store = make_store(sim, block_tokens=BLOCK_TOKENS)
-    # Control senses the same real directory the data plane writes, but only
-    # ever reads it.
-    view = KVView(sim.view.directory, sim.topology)
-    common = dict(
-        transfer_cost=sim.transfer_cost,
-        block_tokens=BLOCK_TOKENS,
-        capacity=capacity,
-        profile=DEFAULT_PROFILE,
-        slo_ttft=slo_ttft,
-        slo_tbt=slo_tbt,
-        simulate_decode=simulate_decode,
-        max_batch=max_batch,
-        prefill_pool=prefill_pool,
-        decode_pool=decode_pool,
-        early_rejection=early_rejection,
-    )
-    if kind == "cache_aware":
-        sched = CacheAwareScheduler(
-            view, balance_threshold=balance_threshold,
-            replicate=replicate, **common,
-        )
-    elif kind == "load_balance":
-        sched = LoadBalanceScheduler(view, **common)
-    else:  # pragma: no cover - guard
-        raise ValueError(f"unknown scheduler kind {kind!r}")
-
-    plane = ServingPlane(
-        sim.loop, store, sched, trace=sim.trace, metrics=metrics,
-        coupled=coupled, max_batch=max_batch,
-    )
-    items = [
-        WorkItem(id=r.id, release_time=r.arrival, payload=r) for r in requests
-    ]
-    # Request coroutines end at prefill completion; decode continues on its own
-    # step tasks, so the run drains them before returning. The rows are published
-    # by the serving plane at three different lifecycle points, not per item.
-    sim.run(items, plane=plane, drain=plane.drain, record_rows=False)
-    return Run(metrics=metrics, trace=sim.trace)
-
-
-# --------------------------------------------------------------------------- #
-# Scenario builders
-# --------------------------------------------------------------------------- #
 
 def shared_prefix_workload(seed: int = 0):
     """Many conversations sharing a hot system prompt + per-conv context."""

@@ -30,7 +30,17 @@ __all__ = ["DataPlane"]
 
 
 class DataPlane:
-    """What a capability does around, and after, a transfer."""
+    """What a capability does around, and after, a transfer.
+
+    Two class-level facts let a run be driven without the caller restating them:
+    whether the capability publishes its own outcome rows, and whether it has work
+    that outlives the items. Both default to the simple answer.
+    """
+
+    #: Set by a capability that records its own outcome rows -- one published at
+    #: several different lifecycle points, say -- so the harness does not also
+    #: write one per item.
+    writes_own_outcomes: bool = False
 
     async def execute(self, item: Any) -> Any:
         """Run the work ``item`` describes; return its result.
@@ -44,4 +54,10 @@ class DataPlane:
         """Registration / eviction once ``item``'s bytes have landed.
 
         Default: nothing.
+        """
+
+    async def drain(self) -> None:
+        """Await work that outlives the items (kvcache's decode steps).
+
+        Called once, after every item's coroutine has returned. Default: nothing.
         """

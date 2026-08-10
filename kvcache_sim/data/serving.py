@@ -48,6 +48,10 @@ from .store import KVStore
 
 
 class ServingPlane(DataPlane):
+    # Rows are published at rejection, at acceptance, or when the last decode
+    # token lands -- never one per item, so the harness must not write them.
+    writes_own_outcomes = True
+
     """Runs one request's lifecycle against the real store.
 
     Args:

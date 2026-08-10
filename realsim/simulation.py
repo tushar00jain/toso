@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from proposed import Endpoint, Policy, View
+from proposed import DataPlane, Endpoint, Policy, View
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
     DEFAULT_PROFILE,
@@ -44,7 +44,7 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
-from realsim.runner import Runner, WorkItem
+from realsim.runner import Runner, Workload
 
 __all__ = ["Simulation"]
 
@@ -140,42 +140,30 @@ class Simulation:
 
     # -- driving it ---------------------------------------------------------- #
     def run(
-        self,
-        items: Sequence[WorkItem],
-        *,
-        plane: Optional[Any] = None,
-        drain: Optional[Any] = None,
-        before: Optional[Any] = None,
-        record_rows: bool = True,
+        self, workload: Workload, *, plane: Optional[DataPlane] = None
     ) -> Dict[str, Any]:
-        """Run ``items`` to completion on this stack; return ``item id -> result``.
+        """Run ``workload`` on this stack; return ``item id -> result``.
 
-        Args:
-            items: the workload, released on the clock at their release times.
-            plane: the capability's :class:`~proposed.plane.DataPlane`.
-            drain: optional coroutine function awaited after every item returns,
-                for work that outlives them (kvcache's decode steps).
-            before: optional coroutine function awaited *before* the items, for
-                setup that is part of the simulated timeline (seeding a key).
-                It runs outside the mesh's shared factory, as a single-client
-                drive would.
-            record_rows: whether the runner writes one ledger row per item. A
-                capability that publishes its own outcome rows at other
-                lifecycle points passes ``False``.
+        Everything else the run needs is already assembled or declared: the plane
+        says whether it publishes its own outcome rows and whether it has work
+        outliving the items, and the workload says what runs and what precedes it.
+        A capability supplies those two and nothing more.
 
         Closes the loop when done; a :class:`Simulation` runs once.
         """
+        plane = plane if plane is not None else DataPlane()
+        drains = type(plane).drain is not DataPlane.drain
         runner = Runner(
             self.mesh,
             plane=plane,
-            ledger=self.ledger if record_rows else None,
-            drain=drain,
+            ledger=None if plane.writes_own_outcomes else self.ledger,
+            drain=plane.drain if drains else None,
         )
 
         async def _go() -> Dict[str, Any]:
-            if before is not None:
-                await before()
-            return await runner.run(items)
+            if workload.setup is not None:
+                await workload.setup()
+            return await runner.run(workload.items)
 
         try:
             return self.loop.run_until_complete(_go())

@@ -34,7 +34,8 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 from proposed import DataPlane, Deployment, Policy
-from realsim.runner import WorkItem
+from realsim.runner import WorkItem, Workload
+from realsim.entrypoint import run_simulation
 from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint, TensorDescriptor
 from sim_common.async_engine import run_sim
@@ -84,6 +85,24 @@ MODE_METADATA = "metadata"
 
 
 @dataclass
+class _Fixture:
+    """The burst's own facts, plus the callback that builds it onto a stack.
+
+    What a scenario *is* -- a topology, a payload, m readers -- separated from how
+    a run is assembled, which is :func:`~realsim.entrypoint.run_simulation`'s job.
+    """
+
+    topology: Dict[str, Endpoint]
+    build: Any
+    expected: Any
+    descriptor: Any
+    origin_id: str
+    reader_ids: List[str]
+    mode: str
+    profile: MachineProfile
+
+
+@dataclass
 class BurstResult:
     """Output of one burst run."""
 
@@ -114,7 +133,7 @@ def _topology(num_readers: int) -> Dict[str, Endpoint]:
     return topo
 
 
-def build_burst(
+def put_get_burst(
     num_readers: int = 3,
     *,
     n: int = DEFAULT_N,
@@ -189,30 +208,9 @@ def build_burst(
     if mode not in (MODE_META, MODE_METADATA):
         raise ValueError(f"unknown data-plane mode {mode!r}")
 
+    profile = profile if profile is not None else DEFAULT_PROFILE
     topology = _topology(num_readers)
-    # One assembled stack: clock, mesh (with the policy installed in the real
-    # locate_volumes body), view, ledger, transfer-cost estimate. Nothing about
-    # the burst is wired by hand.
-    sim = Simulation(
-        topology,
-        policy=policy,
-        profile=profile,
-        trace=trace,
-        ledger=ledger,
-        real_directory=real_directory,
-        random_seed=random_seed,
-    )
-    mesh, trace, ledger = sim.mesh, sim.trace, sim.ledger
-    profile = sim.profile
     origin_id = topology["p"].id  # the volume that holds W before the burst
-    # Bytes served by the origin are the fabric cost a routing policy exists to
-    # cut; everything else is a peer-to-peer hop.
-    sim.origins(origin_id)
-
-    # The producer writes W to its co-located origin volume "p". This is a
-    # single-client drive (before the burst), so it uses the adapter's own
-    # factory rather than the mesh's shared one.
-    producer = mesh.adapter("p")
 
     reader_ids = [f"r{i}" for i in range(num_readers)]
 
@@ -238,74 +236,82 @@ def build_burst(
         expected = descriptor
         put_value = descriptor
 
-    def _get(reader_id: str) -> Callable[[], Any]:
-        """One reader's ordinary user code: bind who I am, then get the key."""
+    def build(sim: Simulation) -> Tuple[Optional[DataPlane], Workload]:
+        """Build the burst onto an assembled stack (the entry point's callback)."""
+        mesh, trace = sim.mesh, sim.trace
+        # Bytes served by the origin are the fabric cost a routing policy exists
+        # to cut; everything else is a peer-to-peer hop.
+        sim.origins(origin_id)
+        # The producer writes W to its co-located origin volume. This is a
+        # single-client drive (before the burst), so it uses the adapter's own
+        # factory rather than the mesh's shared one.
+        producer = mesh.adapter("p")
 
-        async def call() -> Any:
-            mesh.bind_source(reader_id)
-            result = await mesh.client(reader_id).get(KEY)
-            trace.record(
-                asyncio.get_running_loop().time(), "burst", f"reader {reader_id} done"
-            )
-            return result
+        def _get(reader_id: str) -> Callable[[], Any]:
+            """One reader's ordinary user code: bind who I am, then get the key."""
 
-        return call
+            async def call() -> Any:
+                mesh.bind_source(reader_id)
+                result = await mesh.client(reader_id).get(KEY)
+                trace.record(
+                    asyncio.get_running_loop().time(),
+                    "burst",
+                    f"reader {reader_id} done",
+                )
+                return result
 
-    plane = make_plane(mesh, KEY, put_value) if make_plane is not None else None
-    items: List[WorkItem] = [
-        WorkItem(id=rid, release_time=0.0, run=_get(rid)) for rid in reader_ids
-    ]
+            return call
 
-    async def seed() -> None:
+        plane = make_plane(mesh, KEY, put_value) if make_plane is not None else None
+        items: List[WorkItem] = [
+            WorkItem(id=rid, release_time=0.0, run=_get(rid)) for rid in reader_ids
+        ]
+        return plane, Workload(items=items, setup=_seed(mesh, producer, trace))
+
+    def _seed(mesh, producer, trace) -> Callable[[], Any]:
         """Everything that happens before the burst, on the same clock."""
-        # (1) COMPUTE/GPU: the producer "generates" W on its accelerator. Modeled
-        # as FLOPS_PER_ELEMENT per element, streaming the whole payload's bytes;
-        # the roofline picks the binding term on ``compute_device``. Charged on
-        # the virtual clock before the put and recorded in the trace.
-        gen_nbytes = descriptor.nbytes
-        gen_flops = FLOPS_PER_ELEMENT * descriptor.numel()
-        gen_dt = compute_time(
-            gen_flops, _dtype_name(dtype), compute_device, profile, gen_nbytes
-        )
-        await asyncio.sleep(gen_dt)
-        trace.record(
-            asyncio.get_running_loop().time(),
-            "compute",
-            f"generate {KEY} flops={gen_flops:g} {gen_nbytes}B "
-            f"dev={compute_device} cost={gen_dt:.4f}",
-        )
-        # (2) Seed W on the origin volume (also populates the real directory). The
-        # put path charges network + storage-write in the transport seam.
-        with producer.installed():
-            await producer.client.put(KEY, put_value)
-        # (3) Every reader then gets W. Each get charges storage-read + RAM
-        # staging + network in the transport seam.
-        trace.record(
-            asyncio.get_running_loop().time(),
-            "burst",
-            f"{num_readers} readers get {KEY!r}",
-        )
 
-    ctx = {
-        "sim": sim,
-        "mesh": mesh,
-        "controller": mesh.controller,
-        "producer": producer,
-        "reader_ids": reader_ids,
-        "items": items,
-        "seed": seed,
-        "plane": plane,
-        "policy": policy,
-        "topology": topology,
-        "volumes": mesh.volumes,
-        "expected": expected,
-        "descriptor": descriptor,
-        "mode": mode,
-        "origin_id": origin_id,
-        "trace": trace,
-        "ledger": ledger,
-    }
-    return sim, ctx
+        async def seed() -> None:
+            # (1) COMPUTE/GPU: the producer "generates" W on its accelerator. Modeled
+            # as FLOPS_PER_ELEMENT per element, streaming the whole payload's bytes;
+            # the roofline picks the binding term on ``compute_device``. Charged on
+            # the virtual clock before the put and recorded in the trace.
+            gen_nbytes = descriptor.nbytes
+            gen_flops = FLOPS_PER_ELEMENT * descriptor.numel()
+            gen_dt = compute_time(
+                gen_flops, _dtype_name(dtype), compute_device, profile, gen_nbytes
+            )
+            await asyncio.sleep(gen_dt)
+            trace.record(
+                asyncio.get_running_loop().time(),
+                "compute",
+                f"generate {KEY} flops={gen_flops:g} {gen_nbytes}B "
+                f"dev={compute_device} cost={gen_dt:.4f}",
+            )
+            # (2) Seed W on the origin volume (also populates the real directory). The
+            # put path charges network + storage-write in the transport seam.
+            with producer.installed():
+                await producer.client.put(KEY, put_value)
+            # (3) Every reader then gets W. Each get charges storage-read + RAM
+            # staging + network in the transport seam.
+            trace.record(
+                asyncio.get_running_loop().time(),
+                "burst",
+                f"{num_readers} readers get {KEY!r}",
+            )
+
+        return seed
+
+    return _Fixture(
+        topology=topology,
+        build=build,
+        expected=expected,
+        descriptor=descriptor,
+        origin_id=origin_id,
+        reader_ids=reader_ids,
+        mode=mode,
+        profile=profile,
+    )
 
 
 def run_burst(
@@ -319,11 +325,13 @@ def run_burst(
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
     policy: Optional[Policy] = None,
     make_plane: Optional[MakePlane] = None,
+    trace: Optional[Trace] = None,
+    ledger: Optional[Ledger] = None,
     random_seed: Optional[int] = None,
     real_directory: Optional[bool] = None,
 ) -> BurstResult:
     """Run one burst end-to-end on a fresh deterministic engine."""
-    sim, ctx = build_burst(
+    fixture = put_get_burst(
         num_readers,
         n=n,
         dtype=dtype,
@@ -331,18 +339,24 @@ def run_burst(
         device=device,
         profile=profile,
         compute_device=compute_device,
-        policy=policy,
         make_plane=make_plane,
-        random_seed=random_seed,
-        real_directory=real_directory,
     )
-    results = sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
+    result = run_simulation(
+        fixture.topology,
+        fixture.build,
+        policy=policy,
+        profile=fixture.profile,
+        trace=trace,
+        ledger=ledger,
+        real_directory=real_directory,
+        random_seed=random_seed,
+    )
     return BurstResult(
-        trace=sim.trace,
-        ledger=sim.ledger,
-        results=results,
-        expected=ctx["expected"],
-        origin_id=ctx["origin_id"],
+        trace=result.trace,
+        ledger=result.ledger,
+        results=result.results,
+        expected=fixture.expected,
+        origin_id=fixture.origin_id,
         num_readers=num_readers,
     )
 

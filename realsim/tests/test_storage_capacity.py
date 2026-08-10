@@ -34,7 +34,8 @@ import torch
 
 from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import RealControllerAdapter
-from realsim.scenarios.put_get import DEFAULT_N, build_burst
+from realsim.entrypoint import run_simulation
+from realsim.scenarios.put_get import DEFAULT_N, put_get_burst
 from realsim.seams.transport import Endpoint
 from realsim.seams.volume_handle import FakeVolumeHandle, StorageCapacityExceeded
 from sim_common.async_engine import run_sim
@@ -45,15 +46,20 @@ PAYLOAD_BYTES = DEFAULT_N * 4
 
 
 def _run_build(profile=None, *, num_readers: int = 3):
-    """Run one burst on a fresh engine; return ``(results, trace, ctx)``.
+    """Run one burst; return ``(results, trace, ctx)``.
 
-    Uses :func:`build_burst` (not :func:`run_burst`) so the caller can inspect the
-    ``ctx["volumes"]`` handles for resident/peak bytes. Any
-    :class:`StorageCapacityExceeded` raised during the run propagates out.
+    Keeps the fixture and the run result so the caller can inspect the volume
+    handles for resident/peak bytes. Any :class:`StorageCapacityExceeded` raised
+    during the run propagates out.
     """
-    sim, ctx = build_burst(num_readers, profile=profile)
-    results = sim.run(ctx["items"], plane=ctx["plane"], before=ctx["seed"])
-    return results, sim.trace, ctx
+    fixture = put_get_burst(num_readers, profile=profile)
+    result = run_simulation(fixture.topology, fixture.build, profile=fixture.profile)
+    ctx = {
+        "volumes": result.sim.mesh.volumes,
+        "origin_id": fixture.origin_id,
+        "expected": fixture.expected,
+    }
+    return result.results, result.trace, ctx
 
 
 # --------------------------------------------------------------------------
