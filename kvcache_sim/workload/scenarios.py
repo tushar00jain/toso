@@ -5,6 +5,12 @@ under a scheduler on the shared deterministic :class:`~sim_common.async_engine.A
 and returns ``(Metrics, Trace)``. Every scenario drives the **real** TorchStore
 directory (block presence via the real ``Controller``) and real per-instance
 clients, charging every cost through :mod:`sim_common.cost_model`.
+
+This module is the wiring seam, so it is the one place that touches both planes:
+it builds the data plane's :class:`~kvcache_sim.data.store.KVStore`, the control
+plane's :class:`~kvcache_sim.control.view.KVView` and scheduler over the same
+mesh, hands them to a :class:`~kvcache_sim.data.serving.ServingPlane`, and lets
+:class:`realsim.runner.Runner` release the requests on the clock.
 """
 
 from __future__ import annotations
@@ -12,14 +18,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from realsim.runner import Runner, WorkItem
 from sim_common.async_engine import AsyncEngine
 from sim_common.topology import Endpoint
 
-from ..runtime.driver import Driver
-from ..runtime.cluster import Cluster
 from sim_common.cost_model import DEFAULT_PROFILE
-from ..utils import decode_step_time
-from ..policy.scheduler import CacheAwareScheduler, LoadBalanceScheduler
+from domain.llm import decode_step_time
+from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
+from ..control.view import KVView
+from ..data.serving import ServingPlane
+from ..data.store import KVStore
 from ..report.metrics import Metrics, Trace
 from .generator import make_workload
 
@@ -74,15 +82,20 @@ def run(
 
     ``kind`` is ``"cache_aware"`` (cache-aware coordinator) or ``"load_balance"``
     (baseline). Returns metrics + trace. The ``simulate_decode`` group of kwargs
-    drives the batched-decode / TBT model exactly as before the real refactor.
+    drives the batched-decode / TBT model; ``coupled`` says whether prefill shares
+    the decode instances' compute, which is a data-plane fact and so is handed to
+    the serving plane, not to the scheduler.
     """
     trace = Trace(time_width=8, kind_width=7)
     metrics = Metrics()
     loop = AsyncEngine(trace=trace)
     try:
-        cluster = Cluster(
+        store = KVStore(
             topology, block_tokens=BLOCK_TOKENS, profile=DEFAULT_PROFILE, trace=trace
         )
+        # Control senses the same real directory the data plane writes, but only
+        # ever reads it.
+        view = KVView(store.handle, store.topology)
         common = dict(
             block_tokens=BLOCK_TOKENS,
             capacity=capacity,
@@ -91,23 +104,31 @@ def run(
             slo_tbt=slo_tbt,
             simulate_decode=simulate_decode,
             max_batch=max_batch,
-            coupled=coupled,
             prefill_pool=prefill_pool,
             decode_pool=decode_pool,
             early_rejection=early_rejection,
         )
         if kind == "cache_aware":
             sched = CacheAwareScheduler(
-                loop, cluster, balance_threshold=balance_threshold,
+                view, balance_threshold=balance_threshold,
                 replicate=replicate, **common,
             )
         elif kind == "load_balance":
-            sched = LoadBalanceScheduler(loop, cluster, **common)
+            sched = LoadBalanceScheduler(view, **common)
         else:  # pragma: no cover - guard
             raise ValueError(f"unknown scheduler kind {kind!r}")
 
-        driver = Driver(loop, cluster, sched, BLOCK_TOKENS, trace, metrics)
-        loop.run_until_complete(driver.run(requests))
+        plane = ServingPlane(
+            loop, store, sched, trace=trace, metrics=metrics,
+            coupled=coupled, max_batch=max_batch,
+        )
+        # Request coroutines end at prefill completion; decode continues on its
+        # own step tasks, so the runner drains them before it returns.
+        runner = Runner(store.mesh, plane=plane, drain=plane.drain)
+        items = [
+            WorkItem(id=r.id, release_time=r.arrival, payload=r) for r in requests
+        ]
+        loop.run_until_complete(runner.run(items))
     finally:
         loop.close()
     return Run(metrics=metrics, trace=trace)

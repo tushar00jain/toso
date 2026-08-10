@@ -101,52 +101,67 @@ The only calls a "serving engine" makes are:
 
 ```python
 plan = await scheduler.schedule(request, now)   # route; None => rejected
-...                                             # engine pulls any remote prefix + prefills
-await scheduler.on_complete(plan)               # publish computed KV blocks (read-through)
+...                                             # pull any remote prefix + prefill
+completion = scheduler.complete(plan)           # which blocks to publish / evict
+await store.publish(completion.instance, completion.publish)
+scheduler.observe_prefill_done(completion.instance, now)   # what actually happened
 ```
 
-Routing consults the real directory (`locate_volumes`); remote-prefix pulls
-(`client.get`), publishing (`client.put`) and eviction (`notify_delete`) are internal
-to the coordinator, layered over the existing `put`/`get` plumbing.
+The scheduler only ever *decides*: it reads the real directory through a view
+(`locate_volumes`), returns a plan, and is told the outcome. Remote-prefix pulls
+(`client.get_batch`), publishing (`client.put_batch`) and eviction
+(`notify_delete_batch`) are the data plane's, layered over the existing
+`put`/`get` plumbing.
 
 ## Layout
 
+Split by plane: `control/` decides, `data/` executes, and `control/` imports
+neither the data plane, the mesh, nor a client (enforced by
+`realsim/tools/check_contract.py`). The test for which folder something belongs
+in is **does it advance the clock or move bytes?** — the decode engine sleeps and
+emits tokens, so it is data; the LRU only picks victims, so it is control; a
+directory read is control even though it awaits.
+
 ```
 kvcache_sim/
-  utils.py                # prefill / decode-step GPU times. Root, not in a role
-                          #   folder, because BOTH planes use them: control
-                          #   predicts with them, data charges them.
-  policy/                 # CONTROL PLANE -- decides, moves nothing
-    scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator;
-                          #   owns the analytical prefill-queue model
+  control/                # DECIDES -- moves nothing, holds no client
+    scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator:
+                          #   prefill placement, pull-vs-recompute, SLO gates,
+                          #   decode placement; owns the PREDICTED prefill queue
+    source.py             #   LongestPrefixPolicy: the one store question
+                          #   ("which peer serves this gap"), a realsim Policy
+    view.py               #   KVView: per-instance prefix-run lengths, plus the
+                          #   pinned snapshot one routing decision reads through
     cache.py              #   per-instance LRU eviction bookkeeping (metadata)
+  data/                   # EXECUTES -- advances the clock, moves bytes
+    serving.py            #   the per-request serving loop (a realsim DataPlane):
+                          #   queue wait, real pull, prefill charge, publish/evict,
+                          #   decode admission, outcome rows. Owns prefill/decode
+                          #   coupling, which is a deployment fact, not a policy
+    decode.py             #   async DecodeEngine: batched, stepped decode -> TBT
+    store.py              #   publish / fetch / evict over a realsim.mesh.Mesh
   workload/               # WHAT IS SIMULATED
     request.py            #   inference Request + prefix-hash chain (str keys)
     generator.py          #   seeded synthetic request stream (Zipf + Poisson)
-    scenarios.py          #   scenario builders + the async run harness
-  runtime/                # DATA PLANE -- moves bytes, burns compute
-    cluster.py            #   the four KV directory verbs over a realsim.mesh.Mesh
-    driver.py             #   the serving engine's request loop (turns a Plan into
-                          #   clock advances + real ops; decides nothing)
-    decode.py             #   async DecodeEngine: batched, stepped decode -> TBT
+    scenarios.py          #   scenario builders + the run harness that wires the
+                          #   two planes and hands the requests to realsim.Runner
   report/                 # OUTCOME METRICS
-    metrics.py            #   RequestResult, Metrics + summary rendering
+    metrics.py            #   RequestResult rows on a sim_common Ledger + rendering
   __main__.py             # `python -m kvcache_sim [scenario] [-v]`
   tests/test_sim.py       # deterministic tests (real-directory + outcome assertions)
 ```
 
-`dedup_sim/` uses the same role folders, so the two capabilities can be compared
+`dedup_sim/` uses the same plane split, so the two capabilities can be compared
 folder by folder — see [Comparison with `dedup_sim`](../dedup_sim/README.md#comparison-with-kvcache_sim).
 
 The async engine, the cost model, the topology/`Endpoint` skeleton, the `Trace`
-recorder and the report helpers live in the repo-root `sim_common/`; the real
-client/controller/transport seams + adapters live in `realsim/`, and the
-multi-instance wiring they add up to — per-instance volumes + real clients, one
-directory, one resource registry, one shared transport factory — is
-`realsim.mesh.Mesh`. This package holds only the KV-cache policy (scheduler,
-cache, decode, workload, scenarios) plus the four directory verbs
-(`prefix_lengths` / `publish` / `fetch` / `evict`) that express KV caching on a
-mesh.
+recorder and the `Ledger`/report helpers live in the repo-root `sim_common/`; the
+served model's flop terms, KV block bytes and token→time conversions live in
+`domain/llm.py` (both planes call them: control predicts, data charges); the real
+client/controller/transport seams + adapters, the `Mesh`, the `Policy` / `View` /
+`DataPlane` / `Runner` types live in `realsim/`. This package holds only the
+KV-cache decisions and the three directory verbs (`publish` / `fetch` / `evict`)
+plus the prefix-run read that express KV caching on a mesh.
 
 ## Honesty notes
 

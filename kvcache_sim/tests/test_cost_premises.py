@@ -7,12 +7,12 @@ beats load balancing -- depends on one inequality:
 
 That is **not a law**; it is a property of four numbers spread across two
 descriptors (``kv_bytes_per_token`` and ``prefill_flops_per_token`` in
-:class:`~realsim.model.Model`, the fabric bandwidth and ``gpu_flops`` in
+:class:`~domain.llm.Model`, the fabric bandwidth and ``gpu_flops`` in
 :class:`~sim_common.cost_model.MachineProfile`). Change any one of them -- e.g.
 make ``gpu_flops`` realistic without touching ``kv_bytes_per_token`` -- and the
 inequality can flip, which flips what the sim concludes, with nothing failing.
 
-:data:`~realsim.model.DEFAULT_MODEL` is explicitly illustrative and its terms
+:data:`~domain.llm.DEFAULT_MODEL` is explicitly illustrative and its terms
 are *not* mutually derived, so these tests cover both:
 
 1. the illustrative default profiles keep the premise (and by how much);
@@ -32,9 +32,8 @@ from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
 from sim_common.topology import Tier
 
-from realsim.model import DEFAULT_MODEL, Model
-from kvcache_sim.utils import prefill_time
-from kvcache_sim.runtime.cluster import Cluster
+from domain.llm import DEFAULT_MODEL, Model, prefill_time
+from kvcache_sim.data.store import KVStore
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, make_topology
 
 # Bounds on how much cheaper fetching a block is than recomputing it, under the
@@ -104,7 +103,7 @@ def _ratio(model: Model, machine: MachineProfile, src, dst) -> float:
 def test_reuse_beats_recompute_under_the_illustrative_defaults():
     """Fetching a block is cheaper than recomputing it, on both locality tiers.
 
-    This is the premise ``realsim.model`` documents. If it inverts, the sim
+    This is the premise ``domain.llm`` documents. If it inverts, the sim
     still runs and still reports a "winner" -- so assert it explicitly.
     """
     local, same_node, cross_node = _endpoints()
@@ -118,7 +117,7 @@ def test_reuse_beats_recompute_under_the_illustrative_defaults():
         assert MIN_RATIO <= r <= MAX_RATIO, (
             f"{label}: recompute/fetch = {r:.3f} drifted outside the documented "
             f"[{MIN_RATIO}, {MAX_RATIO}] band; if this is intentional, update the "
-            "band and the premise note in realsim/model.py"
+            "band and the premise note in domain/llm.py"
         )
     # Pulling from a same-node peer must be cheaper than from across the fabric,
     # which is what makes the scheduler's locality preference meaningful.
@@ -198,7 +197,7 @@ def test_predicted_block_bytes_equal_the_bytes_the_data_plane_moves():
     this pins them together for the default and for a much larger model.
     """
     for model in (DEFAULT_MODEL, REAL_MODEL):
-        cl = Cluster(
+        cl = KVStore(
             make_topology(2), block_tokens=BLOCK_TOKENS, model=model
         )
         assert cl.block_nbytes == model.block_bytes(1, BLOCK_TOKENS), (
@@ -223,7 +222,7 @@ def test_a_real_pull_costs_what_get_time_predicted():
     async def scenario():
         import asyncio
 
-        cl = Cluster(topo, block_tokens=BLOCK_TOKENS)
+        cl = KVStore(topo, block_tokens=BLOCK_TOKENS)
         with cl.installed():
             await cl.publish(holder, list(keys))
             loop = asyncio.get_running_loop()

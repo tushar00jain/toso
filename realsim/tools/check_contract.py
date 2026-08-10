@@ -1,5 +1,9 @@
-"""Concurrency-contract lint for the deterministic simulation code paths.
+"""Contract lint for the deterministic simulation code paths.
 
+Two contracts, one AST walk.
+
+1. Concurrency
+--------------
 The ``realsim`` fidelity story rests on a single guarantee: every simulated code
 path is single-threaded and drives time through the loop's virtual clock, so the
 same inputs always produce a byte-identical trace. This module is a small,
@@ -27,11 +31,27 @@ simulated code paths reach for a primitive that would break determinism:
   engine, never control flow in a simulated path, so they are permitted in tests
   but still banned in library code.
 
-Scope is intentionally narrow: ``realsim/`` and ``sim_common/`` only. The sibling
-``../torchstore`` is out of scope and is *not* scanned -- it owns one benign
-wall-clock read (``torchstore/logging.py::LatencyTracker`` uses
-``perf_counter()`` for DEBUG-only elapsed display; it never affects control flow
-or the ``Trace``).
+2. Plane separation
+-------------------
+A capability folder splits into ``control/`` (decides) and ``data/`` (executes).
+Renaming folders does not hold on its own -- the previous split leaked precisely
+because a scheduler held the objects it was not supposed to drive, so it simply
+drove them. The rule that makes the leak impossible is an import-direction one:
+
+    ``*/control/`` may not import ``*/data/``, the mesh, or a store client.
+
+Control receives a :class:`~realsim.view.View` and returns a decision; anything
+that moves bytes reaches it as an *observation*, never as a handle. That is
+mechanically checkable, so it is checked here rather than left to review.
+Importing in the other direction is fine and expected: the data plane is handed
+the decisions.
+
+Scope: the simulation packages -- ``realsim/``, ``sim_common/``, ``domain/``, and
+the capability packages ``dedup_sim/`` / ``kvcache_sim/`` (whose ``control/``
+folders the plane rule applies to). The sibling ``../torchstore`` is out of scope
+and is *not* scanned -- it owns one benign wall-clock read
+(``torchstore/logging.py::LatencyTracker`` uses ``perf_counter()`` for DEBUG-only
+elapsed display; it never affects control flow or the ``Trace``).
 
 Run it directly::
 
@@ -53,7 +73,7 @@ from typing import Dict, Iterable, List, NamedTuple
 
 # Repo root is two levels up from this file (realsim/tools/check_contract.py).
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCAN_DIRS = ("realsim", "sim_common")
+SCAN_DIRS = ("dedup_sim", "domain", "kvcache_sim", "realsim", "sim_common")
 
 # --------------------------------------------------------------------------- #
 # Banned canonical references.
@@ -84,6 +104,27 @@ WALLCLOCK_READS: Dict[str, str] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Plane separation: what a ``control/`` module may not import.
+# --------------------------------------------------------------------------- #
+
+# Matched against the *resolved* dotted module path (relative imports included).
+# A module is banned if it equals one of these or starts with it plus a dot.
+CONTROL_FORBIDDEN: Dict[str, str] = {
+    "torchstore": "a real store client (control decides; it never calls the store)",
+    "realsim.mesh": "the mesh (control gets a View, not the objects behind it)",
+    "realsim.adapters": "a real client/controller adapter",
+    "realsim.seams": "the store seams (transport, volumes, controller handle)",
+    "realsim.plane": "the DataPlane interface (that is the executing half)",
+    "realsim.runner": "the Runner (releasing work is execution, not decision)",
+}
+
+# Any resolved module with this path segment is a capability's data plane.
+DATA_SEGMENT = "data"
+# ...and this one marks the importing module as control.
+CONTROL_SEGMENT = "control"
+
+
 class Violation(NamedTuple):
     """One contract breach: where it is, a short code, and why it matters."""
 
@@ -101,12 +142,41 @@ def is_test_file(path: Path) -> bool:
     return "tests" in path.parts or path.name.startswith("test_")
 
 
+def is_control_module(rel_path: str) -> bool:
+    """True for a capability's control-plane module (``<pkg>/control/...``)."""
+    parts = Path(rel_path).parts
+    return CONTROL_SEGMENT in parts[:-1]
+
+
+def resolve_module(rel_path: str, level: int, module: str) -> str:
+    """Resolve an import to an absolute dotted path.
+
+    ``level`` is ``ast.ImportFrom.level`` (0 = absolute, 1 = ``.``, 2 = ``..``).
+    A relative import is resolved against the importing file's own package, taken
+    from its repo-relative path, so ``kvcache_sim/control/scheduler.py`` doing
+    ``from ..data.store import KVStore`` resolves to ``kvcache_sim.data.store``.
+    """
+    if level == 0:
+        return module
+    package = list(Path(rel_path).parts[:-1])   # drop the file name
+    if level > 1:
+        package = package[: len(package) - (level - 1)]
+    return ".".join([*package, module] if module else package)
+
+
 class _ContractVisitor(ast.NodeVisitor):
     """Resolve import aliases, then flag banned references node-by-node."""
 
-    def __init__(self, rel_path: str, allow_wallclock_reads: bool) -> None:
+    def __init__(
+        self,
+        rel_path: str,
+        allow_wallclock_reads: bool,
+        is_control: bool = False,
+    ) -> None:
         self.rel_path = rel_path
         self.allow_wallclock_reads = allow_wallclock_reads
+        # Control-plane modules additionally may not import the executing half.
+        self.is_control = is_control
         self.violations: List[Violation] = []
         # name-in-this-module -> canonical module ("t" -> "time")
         self._module_alias: Dict[str, str] = {}
@@ -123,6 +193,7 @@ class _ContractVisitor(ast.NodeVisitor):
                 self._add(node.lineno, f"{top}-import",
                           f"imports {alias.name!r} (threads/processes are banned "
                           f"on the deterministic sim path)")
+            self._check_plane_import(alias.name, node.lineno)
             self._module_alias[bound] = alias.name
         self.generic_visit(node)
 
@@ -133,10 +204,32 @@ class _ContractVisitor(ast.NodeVisitor):
             self._add(node.lineno, f"{top}-import",
                       f"imports from {module!r} (threads/processes are banned on "
                       f"the deterministic sim path)")
+        self._check_plane_import(
+            resolve_module(self.rel_path, node.level, module), node.lineno
+        )
         for alias in node.names:
             bound = alias.asname or alias.name
             self._callable_alias[bound] = f"{module}.{alias.name}"
         self.generic_visit(node)
+
+    # -- plane separation ---------------------------------------------------- #
+
+    def _check_plane_import(self, module: str, lineno: int) -> None:
+        """Flag a ``control/`` module importing the executing half."""
+        if not self.is_control or not module:
+            return
+        parts = module.split(".")
+        if DATA_SEGMENT in parts:
+            self._add(lineno, "control-imports-data",
+                      f"control imports {module!r}: a control-plane module may "
+                      f"not reach into a data plane. Take the decision out to the "
+                      f"caller, or accept the result back as an observation")
+            return
+        for banned, why in CONTROL_FORBIDDEN.items():
+            if module == banned or module.startswith(banned + "."):
+                self._add(lineno, "control-imports-execution",
+                          f"control imports {module!r}: that is {why}")
+                return
 
     # -- usage checks ------------------------------------------------------- #
 
@@ -199,7 +292,11 @@ class _ContractVisitor(ast.NodeVisitor):
 def scan_source(source: str, rel_path: str, *, is_test: bool) -> List[Violation]:
     """Scan a single source string; return violations (sorted by line)."""
     tree = ast.parse(source, filename=rel_path)
-    visitor = _ContractVisitor(rel_path, allow_wallclock_reads=is_test)
+    visitor = _ContractVisitor(
+        rel_path,
+        allow_wallclock_reads=is_test,
+        is_control=is_control_module(rel_path),
+    )
     visitor.visit(tree)
     # Dedupe (a Name can be visited twice) and sort deterministically.
     seen = set()
@@ -234,7 +331,7 @@ def scan_paths(paths: Iterable[Path], *, root: Path = REPO_ROOT) -> List[Violati
 
 
 def scan_default() -> List[Violation]:
-    """Scan the in-scope package dirs (``realsim/`` + ``sim_common/``)."""
+    """Scan every in-scope package dir (see :data:`SCAN_DIRS`)."""
     return scan_paths([REPO_ROOT / d for d in SCAN_DIRS])
 
 
@@ -244,16 +341,16 @@ def format_violations(violations: Iterable[Violation]) -> str:
 
 
 def main(argv: List[str] | None = None) -> int:
-    """CLI: print any violations and exit non-zero if the contract is broken."""
+    """CLI: print any violations and exit non-zero if a contract is broken."""
     argv = list(sys.argv[1:] if argv is None else argv)
     paths = [Path(a) for a in argv] if argv else [REPO_ROOT / d for d in SCAN_DIRS]
     violations = scan_paths(paths)
     scanned = ", ".join(str(p) for p in paths)
     if violations:
-        print(f"Concurrency-contract check FAILED ({len(violations)} violation(s)):")
+        print(f"Contract check FAILED ({len(violations)} violation(s)):")
         print(format_violations(violations))
         return 1
-    print(f"Concurrency-contract check passed (scanned: {scanned}).")
+    print(f"Contract check passed (scanned: {scanned}).")
     return 0
 
 

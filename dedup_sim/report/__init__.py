@@ -1,7 +1,7 @@
 """Outcome metrics and console rendering.
 
-``summary.py`` renders the dedup-vs-naive fabric comparison plus the
-source->dest tree. The metrics themselves are realsim's
-:class:`~realsim.coordinator.model.BurstMetrics` -- unlike ``kvcache_sim``, this
-capability defines no metrics of its own.
+``summary.py`` renders the dedup-vs-baseline fabric comparison plus the
+source->dest tree. The measurements themselves are a shared
+:class:`sim_common.report.Ledger` -- unlike ``kvcache_sim``, this capability
+defines no metrics of its own.
 """

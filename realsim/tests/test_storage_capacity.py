@@ -34,7 +34,7 @@ import torch
 
 from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import RealControllerAdapter
-from realsim.scenarios.burst_get import DEFAULT_N, build_burst
+from realsim.scenarios.put_get import DEFAULT_N, build_burst
 from realsim.seams.transport import Endpoint
 from realsim.seams.volume_handle import FakeVolumeHandle, StorageCapacityExceeded
 from sim_common.async_engine import run_sim

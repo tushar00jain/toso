@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from realsim.scenarios.burst_get import DEFAULT_N, MODE_META, MODE_METADATA, run_burst
+from realsim.scenarios.put_get import DEFAULT_N, MODE_META, MODE_METADATA, run_burst
 from realsim.seams.transport import TensorDescriptor
 
 MODES = (MODE_META, MODE_METADATA)
@@ -43,7 +43,7 @@ def _shape_dtype_nbytes(payload):
 def test_trace_is_byte_identical_across_runs(mode):
     a = run_burst(num_readers=3, mode=mode)
     b = run_burst(num_readers=3, mode=mode)
-    # The whole trace string (engine scheduling rows + coordinator + transport)
+    # The whole trace string (engine scheduling rows + scenario + transport)
     # must match to the byte.
     assert a.trace.render() == b.trace.render()
     # Events, not just the rendered string.
@@ -97,16 +97,16 @@ def test_invariants_hold_across_seeds(mode):
             assert nbytes == payload_nbytes, reader_id
 
         # All readers completed.
-        assert res.metrics.readers_done == res.metrics.readers_total == 4
+        assert res.ledger.items_done == res.ledger.items_total == 4
 
         # Naive policy: each of m readers pulls the full payload from the origin,
         # so fabric == total delivered == m * payload (the m x baseline).
-        assert res.metrics.total_get_bytes == 4 * payload_nbytes
-        assert res.metrics.fabric_bytes == 4 * payload_nbytes
+        assert res.ledger.transfer_bytes == 4 * payload_nbytes
+        assert res.ledger.origin_bytes == 4 * payload_nbytes
 
         # The fetch tree is the origin fanning out to every reader.
-        srcs = {src for (src, _dst, _k) in res.metrics.edges}
-        dsts = {dst for (_src, dst, _k) in res.metrics.edges}
+        srcs = {src for (src, _dst, _k) in res.ledger.edges}
+        dsts = {dst for (_src, dst, _k) in res.ledger.edges}
         assert srcs == {res.origin_id}
         assert dsts == {"volr0", "volr1", "volr2", "volr3"}
 
@@ -117,5 +117,5 @@ def test_wallclock_reflects_overlap_not_sum(mode):
     # the burst wallclock is one transfer's cost, not the sum of m of them.
     one = run_burst(num_readers=1, mode=mode)
     many = run_burst(num_readers=5, mode=mode)
-    assert many.metrics.wallclock == one.metrics.wallclock
-    assert many.metrics.wallclock > 0.0
+    assert many.ledger.wallclock == one.ledger.wallclock
+    assert many.ledger.wallclock > 0.0

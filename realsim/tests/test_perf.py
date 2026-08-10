@@ -36,7 +36,7 @@ from pathlib import Path
 
 import torch
 
-from realsim.scenarios.burst_get import MODE_META, MODE_METADATA, TensorDescriptor, run_burst
+from realsim.scenarios.put_get import MODE_META, MODE_METADATA, TensorDescriptor, run_burst
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -104,13 +104,13 @@ def test_metadata_sim_path_carries_only_descriptors_at_scale():
 # by the shared torch/monarch import baseline, which is the point of the parity.
 _REALSIM_SNIPPET = (
     "import resource;"
-    "from realsim.scenarios.burst_get import run_burst;"
+    "from realsim.scenarios.put_get import run_burst;"
     "run_burst(num_readers=3, n=1024);"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
 )
 _DEDUP_SNIPPET = (
     "import resource;"
-    "from dedup_sim.workload.scenarios import run_dedup_burst, run_naive_burst;"
+    "from dedup_sim.workload.burst import run_dedup_burst, run_naive_burst;"
     "run_naive_burst(num_readers=3, n=1024);"
     "run_dedup_burst(num_readers=3, fanout_cap=1, n=1024);"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"

@@ -15,8 +15,16 @@ is here:
   ``LocalClient`` per node, one directory, one resource registry, and the single
   shared ``create_transport_buffer`` substitution. Build capabilities on this
   rather than re-deriving the wiring;
-* :class:`realsim.coordinator.model.ReadCoordinator` -- a *burst*-shaped consumer
-  of a mesh, with the pluggable ``ReadPolicy`` seam ``dedup_sim`` implements.
+* the four types every capability plugs into:
+  :class:`realsim.policy.Policy` (which volume serves these keys for this
+  requester, and when -- naive by default, and consulted inside the real
+  controller's ``locate_volumes``), :class:`realsim.view.View` (the read-only
+  observation a policy is handed), :class:`realsim.plane.DataPlane` (the work
+  around and after a transfer, both methods defaulting to real no-op behaviour)
+  and :class:`realsim.runner.Runner` (release work items on the virtual clock,
+  install the mesh once, drain);
+* :mod:`realsim.scenarios.put_get` -- ``realsim``'s own fixture (seed a key, then
+  ``m`` clients get it), so the demo and tests depend on no capability.
 
 See ``docs/realsim_design.md`` for the full design, including exactly how each
 real object is driven off-actor.

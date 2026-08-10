@@ -30,7 +30,7 @@ from realsim.adapters.real_controller import (
     RealControllerAdapter,
     ShimControllerAdapter,
 )
-from realsim.scenarios.burst_get import run_burst
+from realsim.scenarios.put_get import run_burst
 from realsim.seams.dict_directory import DictDirectory
 from torchstore.transport.types import Request, TensorSlice
 
@@ -153,15 +153,15 @@ def test_shim_directory_is_a_dict_backing():
 
 def _burst_snapshot(res):
     """The payoff metrics that must be byte-identical across backings."""
-    m = res.metrics
+    led = res.ledger
     return (
         res.trace.render(),
-        m.fabric_bytes,
-        m.total_get_bytes,
-        m.wallclock,
-        m.readers_done,
-        m.readers_total,
-        sorted(m.edges),
+        led.origin_bytes,
+        led.transfer_bytes,
+        led.wallclock,
+        led.items_done,
+        led.items_total,
+        sorted(led.edges),
     )
 
 

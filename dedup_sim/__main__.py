@@ -7,11 +7,13 @@ Run from the repo root so the package resolves::
 The demo drives a synchronized read burst over the **real** ``Controller``
 directory + **real** client/transport (via ``realsim``) under two policies:
 
-  * the naive baseline (realsim's ``NaivePolicy``): every reader pulls from the
+  * the unrouted baseline (no policy installed): every reader pulls from the
     origin -- ``m x`` fabric; and
-  * the dedup policy (:class:`dedup_sim.policy.routing.DedupPolicy`): the burst is staged
-    into a chain (``fanout_cap=1``) or tree (``fanout_cap=2``) of read-through
-    peers so each unique byte crosses the fabric once -- 1x fabric.
+  * the dedup policy (:class:`dedup_sim.control.routing.DedupPolicy`): the
+    controller routes each reader to a peer and withholds the answer until that
+    peer's read-through put registers, so the burst becomes a chain
+    (``fanout_cap=1``) or tree (``fanout_cap=2``) and each unique byte crosses
+    the fabric once -- 1x fabric.
 
 Output is routed through the ``logging`` module:
   * INFO (default): section headers, the dedup-vs-naive summary + ASCII
@@ -28,7 +30,7 @@ from sim_common import config
 from sim_common.report import configure_logging, section
 
 from dedup_sim.report.summary import render_dedup_summary
-from dedup_sim.workload.scenarios import run_dedup_burst, run_naive_burst
+from dedup_sim.workload.burst import run_dedup_burst, run_naive_burst
 
 logger = logging.getLogger("dedup_sim")
 
@@ -46,7 +48,7 @@ def _log_trace(trace, note: str = "") -> None:
 def _demo() -> None:
     fingerprint = config.current().fingerprint
     naive = run_naive_burst(num_readers=NUM_READERS)
-    payload = naive.expected.numel() * naive.expected.element_size()
+    payload = naive.payload_bytes
     if fingerprint:
         logger.info("naive run fingerprint: %s", naive.trace.fingerprint())
 
@@ -65,16 +67,16 @@ def _demo() -> None:
         if fingerprint:
             logger.info("dedup(cap=%d) run fingerprint: %s", cap, dedup.trace.fingerprint())
         # 1x proven live on the real directory.
-        assert dedup.metrics.fabric_bytes == payload
-        assert naive.metrics.fabric_bytes == NUM_READERS * payload
+        assert dedup.ledger.origin_bytes == payload
+        assert naive.ledger.origin_bytes == NUM_READERS * payload
 
     section(logger, "NAIVE baseline  --  every reader pulls from the origin")
     _log_trace(naive.trace)
     logger.info("(b) summary")
     logger.info("fabric(origin->readers): naive=%dB (%.1fx)   wallclock=%.4f",
-                naive.metrics.fabric_bytes,
-                naive.metrics.fabric_bytes / payload,
-                naive.metrics.wallclock)
+                naive.ledger.origin_bytes,
+                naive.ledger.origin_bytes / payload,
+                naive.ledger.wallclock)
     logger.info("every reader pulls the full payload cross-node -> m x fabric; "
                 "concurrent so it wins wallclock, but pays %dx the bytes.",
                 NUM_READERS)

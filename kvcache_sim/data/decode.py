@@ -4,7 +4,7 @@ Prefill answers "how fast is the first token" (TTFT); this module answers "how f
 is every *subsequent* token" (TBT). A serving instance decodes a **batch** of
 requests together: each decode *step* emits one token for every request in the
 batch, and the step's wall time is the TBT every batched request sees for that
-token. Step time rises with batch size (:func:`~kvcache_sim.utils.decode_step_time`,
+token. Step time rises with batch size (:func:`~domain.llm.decode_step_time`,
 charged on the GPU roofline), so TBT degrades as an instance fills up -- exactly
 the tension a TBT SLO bounds.
 
@@ -12,10 +12,15 @@ Two levers the design cares about are modelled here:
 
 * **VRAM cap** (``max_batch``): a batch grows only to the cap; requests over it
   queue (``pending``) and their wait counts against their TBT.
-* **Prefill/decode coupling**: when prefill and decode share an instance's compute
-  timeline (``compute_busy`` aliased to the scheduler's prefill ``busy_until``), a
-  long prefill delays the next decode step, spiking that token's TBT.
-  Disaggregation gives decode its own ``compute_busy`` so prefill never stalls it.
+* **Prefill/decode coupling**: an instance's compute timeline
+  (:attr:`DecodeEngine.compute_busy`) is owned *here*, in the data plane, because
+  it is the physical resource. On a **coupled** instance prefill runs on that same
+  timeline, so a long prefill delays the next decode step and spikes that token's
+  TBT. That is expressed by two explicit calls rather than a dict shared with the
+  scheduler: :meth:`DecodeEngine.reserve` applies a prefill reservation to the
+  timeline, and ``on_compute_busy`` reports each step's end back out so the
+  control plane's *predicted* prefill queue can be corrected. A disaggregated pool
+  simply never makes either call, so decode is never disturbed by prefill.
 
 Async & deterministic: each instance's decode runs as a coroutine on the shared
 :class:`~sim_common.async_engine.AsyncEngine` virtual clock -- one step per
@@ -29,10 +34,9 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from realsim.model import DEFAULT_MODEL, Model
+from domain.llm import DEFAULT_MODEL, decode_step_time, Model
 from sim_common.cost_model import DEFAULT_PROFILE
 
-from ..utils import decode_step_time
 from ..workload.request import Request
 
 
@@ -50,12 +54,6 @@ class _Active:
 class DecodeEngine:
     """Drives batched, stepped decode for a set of decode instances.
 
-    ``compute_busy`` is the per-instance compute timeline. Pass the scheduler's
-    prefill ``busy_until`` dict to model a **coupled** instance (prefill delays
-    decode); pass a private dict for a **disaggregated** decode pool (no
-    interference). ``on_finish(request, tbt_max)`` is called when a request emits
-    its last token.
-
     Args:
         loop: the :class:`~sim_common.async_engine.AsyncEngine` (for the virtual
             clock and task creation).
@@ -63,6 +61,12 @@ class DecodeEngine:
         max_batch: VRAM cap on a decode batch.
         profile: target-machine profile driving :func:`decode_step_time`.
         model: served-model profile supplying the decode flop term.
+        on_finish: called ``(request, tbt_max)`` when a request emits its last
+            token.
+        on_compute_busy: called ``(instance, until)`` every time a step occupies
+            an instance's compute timeline. The serving plane passes this only for
+            a **coupled** instance, where prefill shares that timeline; a
+            disaggregated pool leaves it ``None``.
     """
 
     def __init__(
@@ -73,8 +77,8 @@ class DecodeEngine:
         max_batch: int,
         profile=DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
-        compute_busy: Optional[Dict[str, float]] = None,
         on_finish: Optional[Callable[[Request, float], None]] = None,
+        on_compute_busy: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self.loop = loop
         self.ids = sorted(decode_ids)
@@ -85,19 +89,19 @@ class DecodeEngine:
         # token is assumed to cost ~one uncontended step). Derived per engine from
         # this run's profiles, not once at import from the defaults.
         self._base_step = decode_step_time(1, profile, model)
-        self.compute_busy: Dict[str, float] = (
-            compute_busy if compute_busy is not None else {i: 0.0 for i in self.ids}
-        )
-        for i in self.ids:
-            self.compute_busy.setdefault(i, 0.0)
+        # The ACTUAL per-instance compute timeline. Owned here; the control plane
+        # keeps its own predicted queue and hears about this one through
+        # ``on_compute_busy`` when the two are the same physical resource.
+        self.compute_busy: Dict[str, float] = {i: 0.0 for i in self.ids}
         self.on_finish = on_finish
+        self.on_compute_busy = on_compute_busy
         self.batch: Dict[str, List[_Active]] = {i: [] for i in self.ids}
         self.pending: Dict[str, List[_Active]] = {i: [] for i in self.ids}
         self._step_task: Dict[str, Optional["asyncio.Task"]] = {
             i: None for i in self.ids
         }
 
-    # -- queries used by the scheduler for TBT admission ------------------- #
+    # -- queries the scheduler observes us through (control.DecodeLoad) ---- #
     def occupancy(self, inst: str) -> int:
         """Requests currently decoding or queued on ``inst`` (the live batch load)."""
         return len(self.batch[inst]) + len(self.pending[inst])
@@ -115,6 +119,17 @@ class DecodeEngine:
             if finish > at_t:
                 n += 1
         return n
+
+    # -- the coupled-instance timeline ------------------------------------- #
+    def reserve(self, inst: str, until: float) -> None:
+        """Occupy ``inst``'s compute timeline until ``until`` (a prefill).
+
+        Called by the serving plane only when prefill and decode share the
+        instance. It is the actuation half of the coupling; ``on_compute_busy`` is
+        the observation half.
+        """
+        if inst in self.compute_busy:
+            self.compute_busy[inst] = until
 
     # -- lifecycle -------------------------------------------------------- #
     def admit(self, request: Request, inst: str) -> None:
@@ -153,6 +168,8 @@ class DecodeEngine:
             start = max(self.loop.time(), self.compute_busy[inst])
             step_end = start + dt
             self.compute_busy[inst] = step_end
+            if self.on_compute_busy is not None:
+                self.on_compute_busy(inst, step_end)
             await asyncio.sleep(step_end - self.loop.time())
             self._step_complete(inst, members, step_end)
 
@@ -160,7 +177,7 @@ class DecodeEngine:
         """Await all in-flight decode steps so every request finalizes.
 
         The request coroutines finish at prefill completion, but decode continues
-        afterwards on its own step tasks; the driver calls this so the loop keeps
+        afterwards on its own step tasks; the runner calls this so the loop keeps
         running until the last token of the last request is emitted.
         """
         while True:

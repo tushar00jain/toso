@@ -1,0 +1,271 @@
+"""The four shared types every capability plugs into.
+
+:class:`~realsim.view.View` (sense), :class:`~realsim.policy.Policy` (decide),
+:class:`~realsim.plane.DataPlane` (execute) and :class:`~realsim.runner.Runner`
+(release on the clock) are the generic half of both capabilities. These tests
+pin the contract each one owes its callers:
+
+1. the view reads the *real* directory and the run's virtual clock, and reading
+   it never re-enters the controller's routing hook;
+2. the naive policy is the directory's own answer -- installing it changes
+   nothing, byte for byte, which is what lets a capability policy be swapped in
+   as the only difference between two runs;
+3. a selection narrows a directory answer to its ranked sources, and withholds
+   the answer until its readiness gate opens;
+4. the data plane's two methods default to real behaviour (run the call, do
+   nothing after), so a capability overrides one method rather than filling in
+   a stub;
+5. the runner releases items in ``(release_time, id)`` order on the virtual
+   clock, installs the mesh once, and records one ledger row per item.
+
+Run from the repo root::
+
+    PYTHONPATH=. .venv/bin/python -m pytest realsim/tests/test_planes.py -q
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import torch
+
+from realsim.mesh import Mesh
+from realsim.plane import DataPlane
+from realsim.policy import NaivePolicy, Policy, Selection
+from realsim.runner import Runner, WorkItem
+from realsim.seams.transport import Endpoint
+from realsim.view import View
+from sim_common.async_engine import run_sim
+from sim_common.report import Ledger
+from sim_common.topology import Tier
+from sim_common.trace import Trace
+
+
+def _topology() -> dict[str, Endpoint]:
+    """Three nodes: a and b share a node (NVLink), c is remote (cross-node)."""
+    return {
+        "a": Endpoint(id="vola", host="hostA", node="node0"),
+        "b": Endpoint(id="volb", host="hostB", node="node0"),
+        "c": Endpoint(id="volc", host="hostC", node="node1"),
+    }
+
+
+def _payload():
+    return torch.empty(16, dtype=torch.float32, device="meta")
+
+
+# --------------------------------------------------------------------------
+# 1. View: a real directory read + the virtual clock, no mutation.
+# --------------------------------------------------------------------------
+
+
+def test_view_reads_the_real_directory_topology_and_clock():
+    mesh = Mesh(_topology())
+    view = View.of(mesh)
+
+    async def scenario():
+        with mesh.installed():
+            mesh.bind_source("a")
+            await mesh.client("a").put("W", _payload())
+            await asyncio.sleep(2.0)
+            located = await view.locate(["W", "absent"])
+            return located, view.now()
+
+    (located, now), _ = run_sim(scenario())
+    assert View.holders(located, "W") == ["a"]
+    # Absent keys are simply missing -- a sensor reports, it does not raise.
+    assert View.holders(located, "absent") == []
+    assert now >= 2.0
+    # Topology reads: b is on a's node, c is not.
+    assert view.locality("a", "b") is Tier.NVLINK
+    assert view.locality("a", "c") is Tier.RDMA
+    assert view.nearest(["c", "b"], "a") == "b"
+    assert view.endpoint("a").id == "vola"
+
+
+def test_view_locate_does_not_re_enter_the_routing_hook():
+    """A policy senses through the view, so the view must read the raw body."""
+
+    seen: list[str] = []
+
+    class _Counting(Policy):
+        async def select(self, view, keys, requester):
+            seen.append(requester)
+            # Reading the directory from inside select must not recurse.
+            await view.locate(keys)
+            return Selection()
+
+    mesh = Mesh(_topology(), policy=_Counting())
+
+    async def scenario():
+        with mesh.installed():
+            mesh.bind_source("a")
+            await mesh.client("a").put("W", _payload())
+            mesh.bind_source("c")
+            return await mesh.client("c").get("W")
+
+    got, _ = run_sim(scenario())
+    assert got is not None
+    # Exactly one consultation: c's get. The put never locates, and the view read
+    # inside select bypasses the hook.
+    assert seen == ["c"]
+
+
+# --------------------------------------------------------------------------
+# 2. The naive policy is the directory's own answer.
+# --------------------------------------------------------------------------
+
+
+def _burst_trace(policy) -> str:
+    """Run the same two-reader burst with/without a policy; return its trace."""
+    trace = Trace()
+    mesh = Mesh(_topology(), trace=trace, policy=policy)
+
+    async def scenario():
+        with mesh.installed():
+            mesh.bind_source("a")
+            await mesh.client("a").put("W", _payload())
+            mesh.bind_source("b")
+            await mesh.client("b").get("W")
+            mesh.bind_source("c")
+            await mesh.client("c").get("W")
+        return True
+
+    _ok, trace = run_sim(scenario(), trace=trace)
+    return trace.render()
+
+
+def test_installing_the_naive_policy_changes_nothing():
+    assert _burst_trace(NaivePolicy()) == _burst_trace(None)
+
+
+def test_naive_selection_leaves_a_directory_answer_untouched():
+    located = {"K": {"v1": "info1", "v0": "info0"}}
+    assert Selection().narrow(located) is located
+
+
+# --------------------------------------------------------------------------
+# 3. Selection: ranking + readiness.
+# --------------------------------------------------------------------------
+
+
+def test_selection_narrows_to_its_ranked_sources():
+    located = {"K": {"v0": "i0", "v1": "i1", "v2": "i2"}}
+    narrowed = Selection.of(["v2", "v0"]).narrow(located)
+    assert list(narrowed["K"]) == ["v2", "v0"]  # rank order, v1 dropped
+
+
+def test_selection_keeps_a_key_no_selected_source_holds():
+    """A preference must not make data disappear."""
+    located = {"K": {"v0": "i0"}}
+    assert Selection.of(["v9"]).narrow(located) == located
+
+
+def test_selection_withholds_until_its_gate_opens():
+    opened = asyncio.Event()
+    order: list[str] = []
+
+    async def gate() -> None:
+        await opened.wait()
+
+    async def waiter():
+        await Selection.of(["v0"], ready=gate).wait()
+        order.append("released")
+
+    async def opener():
+        await asyncio.sleep(1.0)
+        order.append("opened")
+        opened.set()
+
+    async def scenario():
+        await asyncio.gather(waiter(), opener())
+        return True
+
+    ok, _ = run_sim(scenario())
+    assert ok
+    assert order == ["opened", "released"]
+
+
+# --------------------------------------------------------------------------
+# 4. DataPlane defaults.
+# --------------------------------------------------------------------------
+
+
+def test_data_plane_defaults_run_the_call_and_do_nothing_after():
+    calls: list[str] = []
+
+    async def call():
+        calls.append("ran")
+        return 42
+
+    item = WorkItem(id="i0", run=call)
+
+    async def scenario():
+        plane = DataPlane()
+        result = await plane.execute(item)
+        assert await plane.after(item, result) is None
+        return result
+
+    assert asyncio.run(scenario()) == 42
+    assert calls == ["ran"]
+
+
+# --------------------------------------------------------------------------
+# 5. Runner: release order, one install, one row per item.
+# --------------------------------------------------------------------------
+
+
+def test_runner_releases_in_time_then_id_order_and_records_rows():
+    started: list[str] = []
+
+    def item(item_id: str, at: float) -> WorkItem:
+        async def call():
+            started.append(item_id)
+            return item_id.upper()
+
+        return WorkItem(id=item_id, release_time=at, run=call)
+
+    mesh = Mesh(_topology())
+    ledger = Ledger()
+    runner = Runner(mesh, ledger=ledger)
+    # Deliberately out of order, with a tie at t=0 to exercise the id tie-break.
+    items = [item("b", 0.0), item("late", 5.0), item("a", 0.0)]
+
+    results, _ = run_sim(runner.run(items))
+
+    assert started == ["a", "b", "late"]
+    assert results == {"a": "A", "b": "B", "late": "LATE"}
+    assert ledger.items_total == 3
+    assert ledger.items_done == 3
+    assert {r.id: r.done for r in ledger.rows} == {"a": 0.0, "b": 0.0, "late": 5.0}
+    assert ledger.wallclock == 5.0
+
+
+def test_runner_awaits_the_drain_before_returning():
+    drained: list[float] = []
+
+    async def call():
+        return None
+
+    async def drain():
+        await asyncio.sleep(3.0)
+        drained.append(asyncio.get_running_loop().time())
+
+    mesh = Mesh(_topology())
+    runner = Runner(mesh, drain=drain)
+    run_sim(runner.run([WorkItem(id="i0", run=call)]))
+    assert drained == [3.0]
+
+
+def test_runner_installs_the_mesh_exactly_once_and_releases_it():
+    from realsim.seams import factory
+
+    owners: list[object] = []
+
+    async def call():
+        owners.append(factory.current_owner())
+
+    mesh = Mesh(_topology())
+    run_sim(Runner(mesh).run([WorkItem(id="i0", run=call), WorkItem(id="i1", run=call)]))
+    assert owners == [mesh, mesh]
+    assert factory.current_owner() is None

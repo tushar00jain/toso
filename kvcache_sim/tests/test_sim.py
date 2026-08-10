@@ -14,11 +14,12 @@ import pytest
 from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
-from kvcache_sim.policy.cache import LRUCache
-from kvcache_sim.runtime.cluster import Cluster
+from kvcache_sim.control.cache import LRUCache
+from kvcache_sim.control.view import KVView
+from kvcache_sim.data.store import KVStore
 from sim_common.cost_model import DEFAULT_PROFILE
-from kvcache_sim.utils import decode_step_time
-from kvcache_sim.runtime.decode import DecodeEngine
+from domain.llm import decode_step_time
+from kvcache_sim.data.decode import DecodeEngine
 from kvcache_sim.workload.request import (
     block_keys_for,
     longest_prefix_run,
@@ -64,14 +65,16 @@ def test_real_directory_prefix_presence_and_eviction():
     keys = block_keys_for("m0", [0, 1, 2, 3])
 
     async def scenario():
-        cl = Cluster(topo, block_tokens=512)
-        with cl.installed():
-            await cl.publish("s0", list(keys[:3]))   # s0 holds 3 leading blocks
-            await cl.publish("s1", list(keys[:1]))   # s1 holds 1
-            counts = await cl.prefix_lengths(list(keys))
+        # The data plane publishes/evicts; the control-plane view reads back.
+        store = KVStore(topo, block_tokens=512)
+        view = KVView(store.handle, store.topology)
+        with store.installed():
+            await store.publish("s0", list(keys[:3]))  # s0 holds 3 leading blocks
+            await store.publish("s1", list(keys[:1]))  # s1 holds 1
+            counts = await view.prefix_lengths(list(keys))
             assert counts == {"s0": 3, "s1": 1}
-            await cl.evict("s0", [keys[1]])          # break s0's run at index 1
-            counts2 = await cl.prefix_lengths(list(keys))
+            await store.evict("s0", [keys[1]])         # break s0's run at index 1
+            counts2 = await view.prefix_lengths(list(keys))
             assert counts2 == {"s0": 1, "s1": 1}
         return True
 
@@ -272,7 +275,7 @@ def test_shim_overload_rejections_match_real():
 
 # 14c. Contention smoke (Task D): the shared-prefix scenario runs under each
 #      network/storage contention model and stays deterministic per mode. The
-#      registry is read ambiently by the Cluster (config.contention), mirroring
+#      registry is read ambiently by the KVStore (config.contention), mirroring
 #      how the dict-shim directory flag is wired.
 @pytest.mark.parametrize("contention", ("none", "serialize", "progressive"))
 def test_shared_prefix_runs_under_each_contention_mode(contention):
@@ -291,7 +294,7 @@ def test_shared_prefix_runs_under_each_contention_mode(contention):
 #      non-contended path -- the cache-aware payoff metrics (hit rate, compute
 #      saved) do not depend on the vanished sub-charge instants, so they are
 #      unchanged vs collapse-off, and the run stays deterministic. The flag is
-#      read ambiently by the Cluster's transports, like the contention flag.
+#      read ambiently by the KVStore's transports, like the contention flag.
 def test_shared_prefix_metrics_invariant_to_collapse():
     off = run_shared_prefix(seed=1)[0]
     with config.overrides(collapse_charges=True):

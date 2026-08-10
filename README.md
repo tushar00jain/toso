@@ -36,8 +36,12 @@ client/controller/transport), so they depend on the from-source
 
 - [`realsim/`](realsim/) — the **real-code** cooperative DES foundation: it drives
   the **real** TorchStore client planning core, controller directory, and
-  in-memory transport/store off-actor on a deterministic virtual clock, modeling
-  only the new read coordinator (with a pluggable `ReadPolicy` seam). `Mesh` is the
+  in-memory transport/store off-actor on a deterministic virtual clock. It models
+  only what a capability plugs in, through four shared types: `Policy` (which
+  volume serves these keys for this requester, and when — consulted *inside* the
+  real `locate_volumes`, naive by default), `View` (the read-only observation a
+  policy is handed), `DataPlane` (work around and after a transfer) and `Runner`
+  (release work on the clock, install the mesh once, drain). `Mesh` is the
   multi-client wiring the capability sims build on — per-node volumes + real
   clients, one directory, one resource registry, and the single shared transport
   factory — so a capability package holds only capability code. It runs
@@ -45,27 +49,37 @@ client/controller/transport), so they depend on the from-source
   modeled payload of any size costs no memory) and charges **every** resource —
   network, storage, RAM, CPU, and GPU/compute — as analytic functions of a
   *target-machine* `MachineProfile`, never measured on the box running the sim.
-- [`dedup_sim/`](dedup_sim/) — the dedup capability **on the real directory**:
-  `import realsim` and implement dedup routing as a real `ReadPolicy` (a 1× peer
-  read-through against the real `Controller`), plus the dedup scenario + metrics
-  (fabric bytes 1× vs naive *m×*).
+- [`dedup_sim/`](dedup_sim/) — the dedup capability **on the real directory**: a
+  real `Policy` that routes each reader to a peer and withholds the controller's
+  answer until that peer's read-through put registers, plus the one-method data
+  plane that does the put. The scenario is `realsim`'s ordinary put/get fixture,
+  unchanged — installing the policy is the whole difference between *m×* and 1×
+  fabric.
 - [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
-  real directory**: the scheduler/decode/cache logic consults real KV-block
-  presence per instance (real `Controller`) and drives real fetches via
-  `realsim`'s `Mesh`/client/engine/cost model, expressed as four directory verbs
-  (`prefix_lengths` / `publish` / `fetch` / `evict`).
+  real directory**: the scheduler keeps its compute decisions (prefill placement,
+  pull-vs-recompute, SLO gates, decode placement) and delegates only "which peer
+  serves this prefix gap" to the same `Policy.select`; the serving loop and the
+  batched decode engine drive real fetches via `realsim`'s `Mesh`/client/engine/
+  cost model.
 
-  Both capability packages use the same **role folders** — `policy/` (the
-  algorithm under test), `workload/` (what is simulated), `report/` (outcome
-  metrics), plus `runtime/` and `cost.py` where needed — so they can be read
-  folder by folder, and the folders a capability *lacks* show what it does not
-  need. The comparison is tabulated in
+  Both capability packages are split the same way, **by plane** — `control/`
+  decides, `data/` executes, plus `workload/` (what is simulated) and `report/`
+  (outcome metrics). `control/` may not import `data/`, the mesh, or a client,
+  which `realsim/tools/check_contract.py` enforces. The test for which folder
+  something belongs in: *does it advance the clock or move bytes?* The comparison
+  is tabulated in
   [`dedup_sim/README.md`](dedup_sim/README.md#comparison-with-kvcache_sim).
 - [`sim_common/`](sim_common/) — the shared building blocks all three sims use:
   the deterministic virtual-clock `AsyncEngine` (the sim path) plus the original
   callback engine (`engine.py`: `Sim`/`Promise`), the locality/topology skeleton,
   an analytic resource cost model (`cost_model.py`: `MachineProfile` +
-  network/RAM/storage/CPU/GPU functions), a trace recorder, and reporting helpers.
+  network/RAM/storage/CPU/GPU functions), a trace recorder, and the reporting
+  helpers including `Ledger` (transfer edges, byte counters, outcome rows and the
+  aggregations every report computes over them).
+- [`domain/`](domain/) — domain facts rather than simulator machinery:
+  `llm.py` reduces the served transformer to flops/token and KV bytes/token, and
+  converts token counts into seconds. Both capabilities describe operations on a
+  model's tensors, so it belongs to neither of them.
 - [`docs/des_explained.md`](docs/des_explained.md) — how the shared core works and
   how the two sims differ.
 

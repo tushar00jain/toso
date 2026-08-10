@@ -35,7 +35,7 @@ from __future__ import annotations
 import pytest
 
 import realsim.seams.transport as transport_mod
-from realsim.scenarios.burst_get import MODE_META, MODE_METADATA, run_burst
+from realsim.scenarios.put_get import MODE_META, MODE_METADATA, run_burst
 from sim_common import config
 
 MODES = (MODE_META, MODE_METADATA)
@@ -84,7 +84,7 @@ def test_off_is_the_default():
     default = run_burst(num_readers=4)  # pure ambient default (no override)
     explicit = _run(num_readers=4, collapse_charges=False)
     assert default.trace.render() == explicit.trace.render()
-    assert default.metrics.wallclock == explicit.metrics.wallclock
+    assert default.ledger.wallclock == explicit.ledger.wallclock
 
 
 @pytest.mark.parametrize("carrier", MODES)
@@ -95,9 +95,9 @@ def test_collapse_changes_the_trace_but_not_the_metrics(carrier):
     off = _run(num_readers=3, mode=carrier, collapse_charges=False)
     on = _run(num_readers=3, mode=carrier, collapse_charges=True)
     assert off.trace.render() != on.trace.render()
-    assert on.metrics.fabric_bytes == off.metrics.fabric_bytes
-    assert on.metrics.total_get_bytes == off.metrics.total_get_bytes
-    assert on.metrics.readers_done == off.metrics.readers_done
+    assert on.ledger.origin_bytes == off.ledger.origin_bytes
+    assert on.ledger.transfer_bytes == off.ledger.transfer_bytes
+    assert on.ledger.items_done == off.ledger.items_done
 
 
 # --------------------------------------------------------------------------
@@ -138,7 +138,7 @@ def test_isolated_wallclock_is_preserved(carrier):
     # at exactly the same virtual instant as the three separate sleeps did.
     off = _run(num_readers=1, mode=carrier, collapse_charges=False)
     on = _run(num_readers=1, mode=carrier, collapse_charges=True)
-    assert on.metrics.wallclock == off.metrics.wallclock
+    assert on.ledger.wallclock == off.ledger.wallclock
 
 
 # --------------------------------------------------------------------------
@@ -150,8 +150,8 @@ def test_isolated_wallclock_is_preserved(carrier):
 def test_fabric_bytes_invariant_to_collapse(carrier):
     m = 3
     on = _run(num_readers=m, mode=carrier, collapse_charges=True)
-    assert on.metrics.fabric_bytes == m * PAYLOAD_BYTES
-    assert on.metrics.total_get_bytes == m * PAYLOAD_BYTES
+    assert on.ledger.origin_bytes == m * PAYLOAD_BYTES
+    assert on.ledger.transfer_bytes == m * PAYLOAD_BYTES
 
 
 @pytest.mark.parametrize("carrier", MODES)
@@ -175,8 +175,8 @@ def test_collapse_is_inert_under_contention(mode):
     contention_only = _run(num_readers=4, contention=mode, collapse_charges=False)
     with_collapse = _run(num_readers=4, contention=mode, collapse_charges=True)
     assert with_collapse.trace.render() == contention_only.trace.render()
-    assert with_collapse.metrics.wallclock == contention_only.metrics.wallclock
-    assert with_collapse.metrics.fabric_bytes == contention_only.metrics.fabric_bytes
+    assert with_collapse.ledger.wallclock == contention_only.ledger.wallclock
+    assert with_collapse.ledger.origin_bytes == contention_only.ledger.origin_bytes
 
 
 @pytest.mark.parametrize("mode", ("serialize", "progressive"))

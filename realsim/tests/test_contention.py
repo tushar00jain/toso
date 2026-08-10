@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-from realsim.scenarios.burst_get import MODE_META, MODE_METADATA, run_burst
+from realsim.scenarios.put_get import MODE_META, MODE_METADATA, run_burst
 from sim_common import config
 
 MODES = (MODE_META, MODE_METADATA)
@@ -40,7 +40,7 @@ def test_none_is_the_default():
     with config.overrides(contention="none"):
         explicit = run_burst(num_readers=4)
     assert default.trace.render() == explicit.trace.render()
-    assert default.metrics.wallclock == explicit.metrics.wallclock
+    assert default.ledger.wallclock == explicit.ledger.wallclock
 
 
 # --------------------------------------------------------------------------
@@ -60,8 +60,8 @@ def test_hot_source_wallclock_rises_with_contention():
     # Under "none" the m concurrent pulls from the single origin overlap for free
     # (each assumes the full egress bandwidth). Modeling contention on the origin's
     # egress makes them share it, so the burst takes longer.
-    assert serialize.metrics.wallclock > none.metrics.wallclock
-    assert progressive.metrics.wallclock > none.metrics.wallclock
+    assert serialize.ledger.wallclock > none.ledger.wallclock
+    assert progressive.ledger.wallclock > none.ledger.wallclock
 
 
 @pytest.mark.parametrize("mode", CONTENTION)
@@ -71,9 +71,9 @@ def test_fabric_bytes_are_invariant_to_contention(mode):
     m = 3
     with config.overrides(contention=mode):
         res = run_burst(num_readers=m)
-    assert res.metrics.fabric_bytes == m * PAYLOAD_BYTES
-    assert res.metrics.total_get_bytes == m * PAYLOAD_BYTES
-    assert res.metrics.readers_done == res.metrics.readers_total == m
+    assert res.ledger.origin_bytes == m * PAYLOAD_BYTES
+    assert res.ledger.transfer_bytes == m * PAYLOAD_BYTES
+    assert res.ledger.items_done == res.ledger.items_total == m
 
 
 # --------------------------------------------------------------------------

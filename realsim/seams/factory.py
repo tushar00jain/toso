@@ -8,7 +8,7 @@ the bound name on the ``torchstore.client`` module object (see
 
 Because that global is process-wide, *every* substitution in this repo must go
 through this module. Three call sites used to patch it independently -- the
-single-client :class:`~realsim.adapters.real_client.RealClientAdapter`, the read
+single-client :class:`~realsim.adapters.real_client.RealClientAdapter`, a read
 coordinator, and ``kvcache_sim``'s cluster -- each with its own save/restore and
 (for the latter two) its own :class:`~contextvars.ContextVar` for the calling
 client's source endpoint. Nothing stopped two of them being active at once, and
@@ -50,6 +50,13 @@ _current_src: "contextvars.ContextVar[Endpoint]" = contextvars.ContextVar(
     "realsim_current_src_endpoint"
 )
 
+# The *directory* identity (volume id) of that same client, for the controller's
+# routing hook: a policy is asked "which source for this requester". Defaults to
+# ``None`` so an unrouted drive simply gets the directory's own answer.
+_current_requester: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "realsim_current_requester", default=None
+)
+
 # The object currently holding the process-wide patch (``None`` == nobody).
 _owner: Optional[Any] = None
 
@@ -57,6 +64,30 @@ _owner: Optional[Any] = None
 def bind_source(endpoint: Endpoint) -> None:
     """Bind the source endpoint for the calling coroutine's transfers."""
     _current_src.set(endpoint)
+
+
+def bind_requester(volume_id: Optional[str]) -> None:
+    """Bind the *directory* identity of the client whose operation is running.
+
+    The endpoint bound by :func:`bind_source` is the locality the cost model
+    prices against; this is the same client's volume id in the real directory,
+    which is what a routing policy needs to know who is asking. They are
+    separate ids (a topology may name a node ``"r0"`` and its endpoint
+    ``"volr0"``), so both are bound together by
+    :meth:`realsim.mesh.Mesh.bind_source`.
+    """
+    _current_requester.set(volume_id)
+
+
+def current_requester() -> Optional[str]:
+    """The directory identity of the calling client, or ``None`` if unbound.
+
+    Unlike :func:`current_source` this returns ``None`` rather than raising: a
+    routing policy that cannot tell who is asking must fall back to the
+    directory's own answer, which is always correct, whereas an unbound *source*
+    would silently misprice a transfer.
+    """
+    return _current_requester.get()
 
 
 def current_source() -> Endpoint:

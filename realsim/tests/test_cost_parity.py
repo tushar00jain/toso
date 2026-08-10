@@ -7,7 +7,7 @@ consumers depend on it:
 * the transport seam **charges** it, as three virtual-clock sleeps (or one
   combined sleep under ``collapse_charges``); and
 * a scheduler **predicts** it, to decide whether pulling a remote copy beats
-  recomputing (``kvcache_sim.policy.scheduler``).
+  recomputing (``kvcache_sim.control.scheduler``).
 
 If those two ever drift apart nothing fails: the sim keeps running and keeps
 producing plausible numbers, while every routing decision is made against a cost

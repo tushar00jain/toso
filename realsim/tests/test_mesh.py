@@ -10,7 +10,7 @@ closes:
    client's source locality (the contextvar resolution the process-wide factory
    global forces on us);
 2. :attr:`Mesh.on_transfer` is read at call time, so a consumer constructed after
-   the mesh (:class:`~realsim.coordinator.model.ReadCoordinator`) can claim it; and
+   the mesh (a ledger's transfer accounting) can claim it; and
 3. overlapping installs **raise** instead of silently shadowing each other.
 
 (3) is the hazard: ``create_transport_buffer`` is a process-wide module global, so
@@ -102,8 +102,8 @@ def test_multi_client_drive_charges_the_calling_client_locality():
 def test_on_transfer_is_read_at_call_time():
     """A hook attached after construction still sees every transfer.
 
-    The coordinator needs the mesh to exist before it can be built, so it claims
-    the hook post-construction; the factory must therefore not capture it eagerly.
+    A consumer needs the mesh to exist before it can be built, so it claims the
+    hook post-construction; the factory must therefore not capture it eagerly.
     """
     topo = _topology()
     mesh = Mesh(topo)

@@ -1,9 +1,10 @@
-"""A model, described by the properties a simulation needs.
+"""The served model, described by the properties a simulation needs.
 
 :class:`Model` reduces a transformer to the quantities a simulation charges
 against: how many flops a token costs to prefill, how many a decode step costs per
 batched request, and how many bytes of KV cache a token occupies
-(:meth:`Model.block_bytes`). The hardware half is separate and lives in
+(:meth:`Model.block_bytes`). :func:`prefill_time` and :func:`decode_step_time`
+turn those into seconds. The hardware half is separate and lives in
 ``sim_common`` (:class:`~sim_common.cost_model.MachineProfile`).
 
 The model is a third axis, independent of both the workload and the hardware: the
@@ -13,30 +14,40 @@ because a sim's unit of work is a **token** while
 :func:`~sim_common.cost_model.compute_time` prices **flops** -- something has to
 convert, and the model's architecture *is* that conversion.
 
-It lives in ``realsim`` rather than in one capability package because **both**
-capabilities describe operations on a model's tensors, and it needs ``torch`` to
-build carriers (``sim_common`` is deliberately torch-free):
+Why it is neither in ``realsim`` nor in a capability
+----------------------------------------------------
+These are **domain facts** -- what a transformer costs -- not simulator
+machinery and not a policy. ``realsim`` is about driving the real store; a
+capability is about one decision. Both capabilities describe operations on a
+model's tensors:
 
-* ``kvcache_sim`` prices prefill/decode compute and KV block bytes from it (see
-  :mod:`kvcache_sim.policy.compute`);
+* ``kvcache_sim`` prices prefill/decode compute and KV block bytes from it;
 * ``dedup_sim`` syncs a model's **weights**, so the payload it moves should be
   derived from a model too rather than an arbitrary element count -- see the TODO
   below.
 
+:func:`prefill_time` and :func:`decode_step_time` live here for the same reason
+and because each is used on **both sides** of the control/data split -- once to
+decide, once to charge:
+
+* :func:`prefill_time` -- control compares it against the cost of pulling a
+  prefix (:func:`sim_common.cost_model.get_time`) to choose reuse over recompute;
+  data then sleeps the chosen value as the actual prefill charge;
+* :func:`decode_step_time` -- control predicts TBT with it for the admission/SLO
+  decision; data charges it per step as the real time-between-tokens.
+
 Three cost premises the KV-cache algorithm rests on:
 
 * recomputing a token costs GPU compute, so reusing a cached prefix is cheaper
-  (:func:`kvcache_sim.policy.compute.prefill_time`);
+  (:func:`prefill_time`);
 * moving a cached KV block over the fabric is cheaper than recomputing it, so
   remote reuse / hot-block replication pays off
-  (:func:`sim_common.cost_model.get_time` vs
-  :func:`~kvcache_sim.policy.compute.prefill_time` per token);
+  (:func:`sim_common.cost_model.get_time` vs :func:`prefill_time` per token);
 * a decode step's per-token time (TBT) rises with the decode-batch size, so
   packing more concurrent requests trades throughput for latency
-  (:func:`kvcache_sim.policy.compute.decode_step_time`).
+  (:func:`decode_step_time`).
 
-Premises the KV-cache capability rests on are documented with
-:mod:`kvcache_sim.policy.compute`; the one that constrains *this* module's numbers:
+The premise that constrains *this* module's numbers:
 **it is a property of the numbers, not a law**, and its real
 precondition is the KV pool's **read bandwidth**, not the interconnect. At
 realistic sizes a KV block is large (a 512-token block of an 8B-class model is
@@ -62,8 +73,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sim_common.cost_model import compute_time, DEFAULT_PROFILE, MachineProfile
 
-__all__ = ["Model", "DEFAULT_MODEL"]
+
+__all__ = ["Model", "DEFAULT_MODEL", "prefill_time", "decode_step_time"]
 
 @dataclass(frozen=True)
 class Model:
@@ -135,9 +148,9 @@ class Model:
     def block_bytes(self, num_blocks: int, block_tokens: int) -> int:
         """Modeled KV byte size of ``num_blocks`` blocks of ``block_tokens`` tokens.
 
-        The single source of the block byte count: ``runtime.cluster`` sizes the KV
+        The single source of the block byte count: the KV data plane sizes its
         block carrier from it (so this is what the transport charges) and the
-        scheduling policy prices a prefix pull with it, so both sides of a routing
+        scheduler prices a prefix pull with it, so both sides of a routing
         decision are the same number.
         """
         return num_blocks * block_tokens * self.kv_bytes_per_token
@@ -177,7 +190,7 @@ DEFAULT_MODEL = Model(
 #   * ``weight_bytes`` -- total parameter bytes;
 #   * ``weight_carriers(world_size)`` -- per-rank **allocation-free** carriers (a
 #     ``device="meta"`` tensor or a ``TensorDescriptor``, as
-#     ``realsim.scenarios.burst_get`` already builds), so a 60 GiB burst still
+#     ``realsim.scenarios.put_get`` already builds), so a 60 GiB burst still
 #     costs no memory;
 #   * optionally a whole ``state_dict``'s worth of them (~290 keys for an 8B
 #     model), which is what real weight sync moves.
@@ -190,6 +203,46 @@ DEFAULT_MODEL = Model(
 # ``TensorSlice``s of a model's weights across two different meshes -- not the
 # intersection math.
 #
-# Keep it opt-in: leave ``burst_get``'s ``n``-based default byte-identical (per the
+# Keep it opt-in: leave ``put_get``'s ``n``-based default byte-identical (per the
 # repo's default-off convention) and select a model explicitly, so the existing
 # numbers and recorded fingerprints stand.
+
+
+# --------------------------------------------------------------------------- #
+# Token -> time. Both sides of the control/data split call these (see the module
+# docstring), which is why they sit beside the model rather than behind either
+# plane.
+# --------------------------------------------------------------------------- #
+
+
+def prefill_time(
+    uncached_tokens: int,
+    profile: MachineProfile = DEFAULT_PROFILE,
+    model: Model = DEFAULT_MODEL,
+) -> float:
+    """GPU prefill compute for the uncached suffix (0 if fully cached).
+
+    Charged through :func:`~sim_common.cost_model.compute_time` on the model's
+    accelerator: the cost a prefix cache hit avoids.
+    """
+    if uncached_tokens <= 0:
+        return 0.0
+    flops = model.prefill_flops_per_token * uncached_tokens
+    return compute_time(flops, model.compute_dtype, model.compute_device, profile)
+
+
+def decode_step_time(
+    batch_size: int,
+    profile: MachineProfile = DEFAULT_PROFILE,
+    model: Model = DEFAULT_MODEL,
+) -> float:
+    """Time to generate one token for every request in a decode batch.
+
+    This is the time-between-tokens (TBT) each batched request observes for that
+    step. Charged as GPU compute proportional to the batch size (clamped to
+    ``>= 1``), so it is strictly increasing in the batch -- a request's TBT
+    degrades as its decode instance fills up.
+    """
+    b = max(1, batch_size)
+    flops = model.decode_step_flops_per_request * b
+    return compute_time(flops, model.compute_dtype, model.compute_device, profile)

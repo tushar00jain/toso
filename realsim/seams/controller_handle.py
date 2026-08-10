@@ -15,11 +15,22 @@ has not extracted into sync helpers, so their bodies are **mirrored verbatim**
 below (each mirrored block quotes the real endpoint it reproduces). All state
 touched (``controller.keys_to_storage_volumes``, ``_is_dtensor_fully_committed``,
 ``_notify_put``, ``assert_initialized``) is the real object's.
+
+The routing hook
+----------------
+:meth:`FakeControllerHandle.locate_volumes` is also the one place a
+:class:`~realsim.policy.Policy` is consulted on the request path: the mirrored
+real body runs first (:meth:`FakeControllerHandle.locate_raw`), then, if a policy
+is installed, the controller asks it which of the directory's volumes should
+serve this requester and *withholds the answer* until the chosen source is
+usable. A scenario that just calls ``client.get(K)`` is therefore routed without
+knowing a policy exists, and no client change is needed. With no policy installed
+-- the default -- ``locate_volumes`` is exactly the mirrored real body.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Sequence
 
 
 class _ControllerEndpoint:
@@ -50,6 +61,22 @@ class FakeControllerHandle:
         self.keys = _ControllerEndpoint(self._keys)
         self.notify_delete = _ControllerEndpoint(self._notify_delete)
         self.notify_delete_batch = _ControllerEndpoint(self._notify_delete_batch)
+        # The routing hook (see the module docstring). ``None`` == the directory
+        # answers for itself, which is also exactly what the naive policy says.
+        self._policy: Optional[Any] = None
+        self._view: Optional[Any] = None
+
+    def install_policy(self, policy: Any, view: Any) -> None:
+        """Consult ``policy`` inside ``locate_volumes``, handing it ``view``.
+
+        Args:
+            policy: a :class:`realsim.policy.Policy`.
+            view: the :class:`realsim.view.View` the policy senses through. It
+                reads :meth:`locate_raw`, so a policy reading the directory back
+                does not re-enter this hook.
+        """
+        self._policy = policy
+        self._view = view
 
     async def _locate_volumes(
         self,
@@ -57,6 +84,31 @@ class FakeControllerHandle:
         missing_ok: bool = False,
         require_fully_committed: bool = True,
     ) -> dict[str, dict[str, Any]]:
+        """The real ``locate_volumes`` body, then the routing hook."""
+        if self._policy is None:
+            return await self.locate_raw(keys, missing_ok, require_fully_committed)
+        # Import locally: the seam is otherwise dependency-free, and only a
+        # routed run needs to know who is calling.
+        from realsim.seams import factory
+
+        requester = factory.current_requester()
+        if requester is None:
+            return await self.locate_raw(keys, missing_ok, require_fully_committed)
+        selection = await self._policy.select(self._view, list(keys), requester)
+        # Withhold the answer until the chosen source is usable. The directory is
+        # re-read afterwards because waiting is exactly what lets it change: the
+        # source the policy picked registers while we are blocked here.
+        await selection.wait()
+        located = await self.locate_raw(keys, missing_ok, require_fully_committed)
+        return selection.narrow(located)
+
+    async def locate_raw(
+        self,
+        keys: Sequence[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        """The real ``locate_volumes`` body, unrouted (the sensor read)."""
         # Mirrors Controller.locate_volumes @endpoint body verbatim
         # (torchstore/controller.py, the body after the docstring):
         c = self.controller
@@ -90,6 +142,10 @@ class FakeControllerHandle:
         c.assert_initialized()
         for request in requests:
             c._notify_put(request, storage_volume_id)
+        # The directory just changed. A policy that withheld an answer pending a
+        # source's registration is released here (default: nothing).
+        if self._policy is not None:
+            self._policy.notice(storage_volume_id, [r.key for r in requests])
 
     async def _keys(self, prefix: str | None = None) -> list[str]:
         # Mirrors Controller.keys @endpoint body verbatim:

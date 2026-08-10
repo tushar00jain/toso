@@ -1,4 +1,4 @@
-"""KV-cache verbs over the *real* TorchStore directory + clients.
+"""KV directory verbs over the *real* TorchStore clients: :class:`KVStore`.
 
 A **serving instance** is a real storage volume plus a co-located real
 ``LocalClient``. All of that wiring -- the real ``Controller`` directory behind
@@ -7,8 +7,8 @@ A **serving instance** is a real storage volume plus a co-located real
 :class:`~realsim.adapters.real_client.RealClientAdapter` per instance, the shared
 :class:`~sim_common.resources.ResourceRegistry`, and the single shared
 ``create_transport_buffer`` substitution -- is generic multi-client machinery, so
-it comes from :class:`realsim.mesh.Mesh`. This module holds only what is specific
-to KV caching: the four directory verbs the scheduler speaks in.
+it comes from :class:`realsim.mesh.Mesh` via :class:`realsim.mesh.MeshView`. This
+module holds only the three KV verbs that move bytes or change the directory.
 
 Mapping (real directory + real types throughout):
 
@@ -16,49 +16,48 @@ Mapping (real directory + real types throughout):
 * **"instance X holds block K"** is the directory entry
   ``keys_to_storage_volumes[K][volume_X]`` -- created by a real, metadata-only
   ``put`` from X's client and read back by the real ``locate_volumes``;
-* **publishing** a prefix after prefill (:meth:`Cluster.publish`) is a real
+* **publishing** a prefix after prefill (:meth:`KVStore.publish`) is a real
   ``client.put_batch`` of metadata-only carriers (a ``(shape, dtype)``
   ``TensorDescriptor`` per block -- zero real tensor storage), which both writes
   the carrier into X's real store and registers ``K -> volume_X`` via the real
   ``notify_put_batch``;
-* a **remote prefix pull** (:meth:`Cluster.fetch`) is a real ``client.get_batch``
+* a **remote prefix pull** (:meth:`KVStore.fetch`) is a real ``client.get_batch``
   driven through ``realsim``'s transport seam, so the fabric/storage/RAM cost is
   charged by the real cost model;
-* **eviction** (:meth:`Cluster.evict`) removes ``K -> volume_X`` from the real
-  directory via the real ``notify_delete_batch`` endpoint;
-* the scheduler's core query (:meth:`Cluster.prefix_lengths`) is derived from a
-  real ``locate_volumes``.
+* **eviction** (:meth:`KVStore.evict`) removes ``K -> volume_X`` from the real
+  directory via the real ``notify_delete_batch`` endpoint.
+
+Reading the directory is *not* here: a ``locate`` decides nothing and moves
+nothing, so per-instance prefix presence is a control-plane view
+(:class:`kvcache_sim.control.view.KVView`).
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
-from realsim.mesh import Mesh
+from realsim.mesh import Mesh, MeshView
 from realsim.seams.transport import Endpoint, TensorDescriptor
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
-from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
-from realsim.model import DEFAULT_MODEL, Model
+from domain.llm import DEFAULT_MODEL, Model
 
 
-class Cluster:
-    """Serving instances over the real directory + real per-instance clients.
+class KVStore(MeshView):
+    """The KV data plane's three verbs over real per-instance clients.
 
     Args:
         topology: ``instance_id -> Endpoint`` (instance id == its volume id).
         block_tokens: tokens per KV block.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`.
             Also supplies each volume's byte capacity.
-        model: served-model :class:`~realsim.model.Model`, which sets
-            how many bytes one KV block occupies. The block carrier is sized from
-            it (see :attr:`block_nbytes`) so the bytes the transport charges are
-            always the bytes :meth:`~realsim.model.Model.block_bytes`
-            predicts.
+        model: served-model :class:`~domain.llm.Model`, which sets how many bytes
+            one KV block occupies. The block carrier is sized from it (see
+            :attr:`block_nbytes`) so the bytes the transport charges are always
+            the bytes :meth:`~domain.llm.Model.block_bytes` predicts.
         trace: shared :class:`~sim_common.trace.Trace` for transfer events.
         real_directory: controller directory backing (``None`` -> the ambient
             :data:`sim_common.config.SimConfig.real_directory`, default real
@@ -82,11 +81,13 @@ class Cluster:
         trace: Trace | None = None,
         real_directory: Optional[bool] = None,
     ) -> None:
-        self.mesh = Mesh(
-            topology,
-            profile=profile,
-            trace=trace,
-            real_directory=real_directory,
+        super().__init__(
+            Mesh(
+                topology,
+                profile=profile,
+                trace=trace,
+                real_directory=real_directory,
+            )
         )
         self.block_tokens = block_tokens
         self.model = model
@@ -98,79 +99,16 @@ class Cluster:
             shape=(model.block_bytes(1, block_tokens),), dtype=torch.uint8
         )
 
-    # -- the mesh's shared pieces, surfaced for the scheduler/driver -------- #
-    @property
-    def topology(self) -> Dict[str, Endpoint]:
-        """``instance_id -> Endpoint`` for transfer-cost locality."""
-        return self.mesh.topology
-
-    @property
-    def ids(self) -> List[str]:
-        """Instance ids, sorted."""
-        return self.mesh.ids
-
-    @property
-    def handle(self):
-        """The real ``Controller`` directory behind the actor surface."""
-        return self.mesh.handle
-
-    @property
-    def trace(self) -> Trace:
-        """The run's shared :class:`~sim_common.trace.Trace`."""
-        return self.mesh.trace
-
-    @property
-    def profile(self) -> MachineProfile:
-        """The target-machine :class:`~sim_common.cost_model.MachineProfile`."""
-        return self.mesh.profile
-
-    @property
-    def registry(self) -> ResourceRegistry:
-        """The run's shared :class:`~sim_common.resources.ResourceRegistry`."""
-        return self.mesh.registry
-
     @property
     def block_nbytes(self) -> int:
         """Bytes the data plane actually moves for one KV block.
 
         The authoritative byte count: this is the carrier's size, i.e. what the
-        transport seam charges. It must equal
-        ``model.block_bytes(1, block_tokens)`` -- the value the scheduler
-        predicts a fetch against -- which
-        ``kvcache_sim/tests/test_cost_premises.py`` asserts.
+        transport seam charges. It must equal ``model.block_bytes(1,
+        block_tokens)`` -- the value the scheduler predicts a fetch against --
+        which ``kvcache_sim/tests/test_cost_premises.py`` asserts.
         """
         return self._block_carrier.nbytes
-
-    @contextmanager
-    def installed(self) -> Iterator["Cluster"]:
-        """Install the mesh's shared transport factory for the whole run."""
-        with self.mesh.installed():
-            yield self
-
-    # -- real directory reads --------------------------------------------- #
-    async def prefix_lengths(self, block_keys: List[str]) -> Dict[str, int]:
-        """Per-instance leading-prefix length held, read from the REAL directory.
-
-        The cache-aware scheduler's core query: ``instance_id -> how many leading
-        blocks of block_keys it holds contiguously``. Computed from the real
-        ``locate_volumes`` result (``{key -> {volume_id -> StorageInfo}}``);
-        instances holding none of the first block are omitted.
-        """
-        if not block_keys:
-            return {}
-        located = await self.handle.locate_volumes.call_one(
-            list(block_keys), missing_ok=True
-        )
-        counts: Dict[str, int] = {}
-        for inst in sorted(located.get(block_keys[0], {})):
-            n = 0
-            for k in block_keys:
-                if inst in located.get(k, {}):
-                    n += 1
-                else:
-                    break
-            counts[inst] = n
-        return counts
 
     # -- real data-plane ops (presence + fabric cost) --------------------- #
     async def publish(self, inst: str, keys: List[str]) -> None:

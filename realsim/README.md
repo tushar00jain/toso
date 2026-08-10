@@ -3,19 +3,19 @@
 A single-threaded, deterministic discrete-event simulation that drives the
 **real** TorchStore client planning core, the **real** controller directory, and
 the **real** in-memory transport/store off-actor, under a virtual clock. It models
-only the *new* read coordinator.
+only the pieces a capability plugs in: the routing policy and what it executes.
 
 `realsim` is the real-code foundation that [`dedup_sim/`](../dedup_sim/) and
 [`kvcache_sim/`](../kvcache_sim/) build on: both `import realsim` and run their
 algorithms on the real directory + real types. It deliberately depends on the real
 `torchstore` / `torch` / `monarch` install — the client, controller, transport,
-and store types that execute are the real ones; only the coordinator (the component
-being designed) and the actor/RPC boundary are substituted with in-process seams.
+and store types that execute are the real ones; only the components being designed
+(a routing `Policy`, a capability's `DataPlane`) and the actor/RPC boundary are
+substituted with in-process seams.
 
 **See [`../docs/realsim_design.md`](../docs/realsim_design.md) for the full design**
 — the concurrency model, how each real object is driven off-actor, the cost model,
-the allocation-free data plane, the coordinator/policy seam, and the concurrency
-contract.
+the allocation-free data plane, the policy seam, and the concurrency contract.
 
 ## What executes
 
@@ -24,8 +24,11 @@ contract.
 - **Real** `Controller` directory logic (`_notify_put` / `_notify_delete` over a
   real `Trie`; the two ~5-line read-endpoint bodies are mirrored verbatim).
 - **Real** `MonarchRPCTransportBuffer` + `InMemoryStore` put/get lifecycle.
-- **Model:** the new `ReadCoordinator` and its pluggable `ReadPolicy` (naive
-  shipped; a dedup/cache-aware read-through policy is a documented seam).
+- **Model:** the four types a capability plugs into — `Policy` (which volume
+  serves these keys for this requester, and when; consulted *inside* the real
+  `locate_volumes`, naive by default), `View` (the read-only observation a policy
+  is handed), `DataPlane` (work around and after a transfer) and `Runner`
+  (release work items on the virtual clock, install the mesh once, drain).
 - **Virtual clock:** every resource cost advances time via `asyncio.sleep` on
   `sim_common.async_engine.AsyncEngine`, so the run is free and deterministic.
 
@@ -102,11 +105,13 @@ couple of seeds under random scheduling):
 
 ## Concurrency-contract lint
 
-`realsim/tools/check_contract.py` fails the build if any simulated path under
-`realsim/` or `sim_common/` reaches for a determinism-breaking primitive (threads,
-forks, `time.sleep`, wall-clock reads in library code, unseeded randomness).
-`asyncio.sleep` (virtual clock) and seeded `random.Random(seed)` are allowed. It is
-wired into `tests/test_contract.py` and also runs standalone:
+`realsim/tools/check_contract.py` fails the build if any simulated path in the
+scanned packages reaches for a determinism-breaking primitive (threads, forks,
+`time.sleep`, wall-clock reads in library code, unseeded randomness), **or** if a
+capability's `control/` module imports the executing half (a `data/` package, the
+mesh, or a store client). `asyncio.sleep` (virtual clock) and seeded
+`random.Random(seed)` are allowed. It is wired into `tests/test_contract.py` and
+also runs standalone:
 
 ```
 PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_contract
@@ -123,19 +128,31 @@ realsim/
   mesh.py         Mesh -- the multi-client wiring a capability builds on: per-node
                   volumes + real clients, one directory, one resource registry,
                   one shared transport factory
-  model.py        Model -- a transformer reduced to what a sim charges against
-                  (flops/token, KV bytes/token). Shared: kvcache_sim prices
-                  compute from it; dedup_sim will size synced weights from it
-  coordinator/    the NEW read coordinator -- a burst-shaped consumer of a Mesh,
-                  a model with a pluggable policy
-  scenarios/      burst_get.py: a synchronized read burst; meta/metadata data
+                  one shared transport factory. MeshView is the base every
+                  consumer of a mesh shares
+  policy.py       Policy.select(view, keys, requester) -> ranked sources +
+                  readiness. Naive (all holders, directory order) is the default;
+                  the controller consults it inside locate_volumes
+  view.py         View -- awaited, read-only observation: locate, topology and
+                  locality, the clock. No mutation
+  plane.py        DataPlane -- execute(item) / after(item, result), both
+                  defaulting to real no-op behaviour
+  runner.py       Runner -- release work items on the virtual clock in
+                  (release_time, id) order, install the mesh once, gather, drain
+  scenarios/      put_get.py: seed a key, then m clients get it; meta/metadata data
                   plane + full resource-cost exercise
   run_realsim.py  the demo entrypoint
-  tools/          check_contract.py: the concurrency-contract lint
+  tools/          check_contract.py: the concurrency + plane-separation lint
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
-                  perf guard, composability, mesh wiring
+                  perf guard, composability, mesh wiring, the shared plane types
+domain/
+  llm.py          Model -- a transformer reduced to what a sim charges against
+                  (flops/token, KV bytes/token) -- plus prefill/decode-step times.
+                  Domain facts: not sim machinery, not policy
 sim_common/
   async_engine.py deterministic asyncio loop + virtual clock
   cost_model.py   MachineProfile + analytic network/RAM/storage/CPU/GPU costs
-  engine.py trace.py topology.py report.py   shared DES library (reused)
+  report.py       Ledger (transfer edges + byte counters + outcome rows +
+                  aggregations) and the source->dest tree renderer
+  engine.py trace.py topology.py   shared DES library (reused)
 ```

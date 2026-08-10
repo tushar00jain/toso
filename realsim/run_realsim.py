@@ -1,9 +1,10 @@
-"""``python -m realsim.run_realsim`` -- run the read-burst scenario and print it.
+"""``python -m realsim.run_realsim`` -- run the put/get fixture and print it.
 
 Mirrors the ``dedup_sim`` demo style (``sim_common.report`` headers, a digest at
-INFO and the full per-event trace at DEBUG under ``-v``), but every layer below
-the coordinator is **real** TorchStore code driven off-actor on the deterministic
-virtual-clock engine.
+INFO and the full per-event trace at DEBUG under ``-v``), but every layer under
+the scenario is **real** TorchStore code driven off-actor on the deterministic
+virtual-clock engine. The scenario itself (``realsim/scenarios/put_get.py``) is
+ordinary user code and depends on no capability.
 
 Run from the worktree with the venv interpreter::
 
@@ -19,7 +20,7 @@ from sim_common import config
 from sim_common.cost_model import DEFAULT_PROFILE
 from sim_common.report import configure_logging, section
 
-from realsim.scenarios.burst_get import (
+from realsim.scenarios.put_get import (
     MODE_META,
     MODE_METADATA,
     render_burst_summary,
@@ -148,9 +149,10 @@ def main(argv=None) -> None:
     logger.info("(b) summary")
     logger.info(render_burst_summary(res))
     logger.info(
-        "naive policy => %dx fabric (every reader pulls the origin). The pluggable "
-        "ReadPolicy seam (coordinator/model.py) would register read-through peers "
-        "in the real directory to cut this toward 1x.",
+        "no routing policy => %dx fabric (every reader pulls the origin). Installing "
+        "a realsim Policy (policy.py) in the controller's locate_volumes -- as "
+        "dedup_sim does -- routes later readers to read-through peers and cuts this "
+        "toward 1x, with the scenario code above unchanged.",
         res.num_readers,
     )
 

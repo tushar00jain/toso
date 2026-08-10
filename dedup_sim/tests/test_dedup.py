@@ -22,7 +22,7 @@ from collections import Counter
 import pytest
 import torch
 
-from dedup_sim.workload.scenarios import (
+from dedup_sim.workload.burst import (
     DEFAULT_N,
     MODE_META,
     MODE_METADATA,
@@ -64,12 +64,12 @@ def test_fabric_dedup_is_1x_naive_is_mx(mode):
     naive = run_naive_burst(num_readers=m, mode=mode)
 
     union = PAYLOAD_BYTES  # the key crosses the fabric exactly once
-    assert dedup.metrics.fabric_bytes == union
-    assert naive.metrics.fabric_bytes == m * union  # full replication baseline
-    assert dedup.metrics.fabric_bytes < naive.metrics.fabric_bytes
+    assert dedup.ledger.origin_bytes == union
+    assert naive.ledger.origin_bytes == m * union  # full replication baseline
+    assert dedup.ledger.origin_bytes < naive.ledger.origin_bytes
     # Both still deliver the full payload to every reader (dedup saves *fabric*,
     # not delivered bytes).
-    assert dedup.metrics.total_get_bytes == naive.metrics.total_get_bytes == m * union
+    assert dedup.ledger.transfer_bytes == naive.ledger.transfer_bytes == m * union
 
 
 # 3. 1x fabric holds for any fan-out cap.
@@ -77,17 +77,17 @@ def test_fabric_dedup_is_1x_naive_is_mx(mode):
 def test_fabric_dedup_1x_independent_of_fanout_cap(mode):
     for cap in (1, 2, 3):
         dedup = run_dedup_burst(num_readers=4, fanout_cap=cap, mode=mode)
-        assert dedup.metrics.fabric_bytes == PAYLOAD_BYTES, cap
+        assert dedup.ledger.origin_bytes == PAYLOAD_BYTES, cap
 
 
 # 4. Exactly one reader pulls from the origin; the rest pull from peers.
 @pytest.mark.parametrize("mode", MODES)
 def test_only_one_hop_crosses_from_the_origin(mode):
     dedup = run_dedup_burst(num_readers=5, fanout_cap=1, mode=mode)
-    origin_edges = [e for e in dedup.metrics.edges if e[0] == dedup.origin_id]
+    origin_edges = [e for e in dedup.ledger.edges if e[0] == dedup.origin_id]
     assert len(origin_edges) == 1  # the single fabric hop
     # Every other transfer's source is a reader-side peer, not the origin.
-    peer_edges = [e for e in dedup.metrics.edges if e[0] != dedup.origin_id]
+    peer_edges = [e for e in dedup.ledger.edges if e[0] != dedup.origin_id]
     assert len(peer_edges) == 4
     assert all(src != dedup.origin_id for (src, _dst, _k) in peer_edges)
 
@@ -95,13 +95,13 @@ def test_only_one_hop_crosses_from_the_origin(mode):
 # 5. Fan-out cap shapes the topology: cap 1 = chain, cap 2 = tree.
 def test_fanout_cap1_is_a_chain():
     dedup = run_dedup_burst(num_readers=4, fanout_cap=1)
-    fanout = Counter(src for (src, _dst, _k) in dedup.metrics.edges)
+    fanout = Counter(src for (src, _dst, _k) in dedup.ledger.edges)
     assert max(fanout.values()) == 1  # every source serves at most one reader
 
 
 def test_fanout_cap2_builds_a_tree():
     dedup = run_dedup_burst(num_readers=4, fanout_cap=2)
-    fanout = Counter(src for (src, _dst, _k) in dedup.metrics.edges)
+    fanout = Counter(src for (src, _dst, _k) in dedup.ledger.edges)
     assert max(fanout.values()) == 2  # a source fans out to two peers
 
 
@@ -126,7 +126,7 @@ def test_trace_is_byte_identical_for_fixed_seed(mode):
 def test_all_readers_complete(mode):
     for cap in (1, 2, 3):
         res = run_dedup_burst(num_readers=5, fanout_cap=cap, mode=mode)
-        assert res.metrics.readers_done == res.metrics.readers_total == 5
+        assert res.ledger.items_done == res.ledger.items_total == 5
 
 
 # 7b. Divergence gate: the opt-in dict-shim directory yields byte-identical
@@ -138,10 +138,10 @@ def test_shim_directory_matches_real(mode):
     real = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode, real_directory=True)
     shim = run_dedup_burst(num_readers=3, fanout_cap=1, mode=mode, real_directory=False)
     assert shim.trace.render() == real.trace.render()
-    assert shim.metrics.fabric_bytes == real.metrics.fabric_bytes
-    assert shim.metrics.total_get_bytes == real.metrics.total_get_bytes
-    assert shim.metrics.wallclock == real.metrics.wallclock
-    assert sorted(shim.metrics.edges) == sorted(real.metrics.edges)
+    assert shim.ledger.origin_bytes == real.ledger.origin_bytes
+    assert shim.ledger.transfer_bytes == real.ledger.transfer_bytes
+    assert shim.ledger.wallclock == real.ledger.wallclock
+    assert sorted(shim.ledger.edges) == sorted(real.ledger.edges)
 
 
 # 7c. Contention gate (Task D): the payoff metric -- 1x fabric -- is invariant to
@@ -155,8 +155,8 @@ CONTENTION = ("none", "serialize", "progressive")
 def test_dedup_stays_1x_under_every_contention_mode(contention):
     with config.overrides(contention=contention):
         dedup = run_dedup_burst(num_readers=4, fanout_cap=1)
-    assert dedup.metrics.fabric_bytes == PAYLOAD_BYTES  # 1x union, any mode
-    assert dedup.metrics.readers_done == dedup.metrics.readers_total == 4
+    assert dedup.ledger.origin_bytes == PAYLOAD_BYTES  # 1x union, any mode
+    assert dedup.ledger.items_done == dedup.ledger.items_total == 4
 
 
 @pytest.mark.parametrize("contention", CONTENTION)
@@ -178,9 +178,9 @@ def test_dedup_1x_fabric_invariant_to_collapse(mode):
         off = run_dedup_burst(num_readers=4, fanout_cap=1, mode=mode)
     with config.overrides(collapse_charges=True):
         on = run_dedup_burst(num_readers=4, fanout_cap=1, mode=mode)
-    assert on.metrics.fabric_bytes == off.metrics.fabric_bytes == PAYLOAD_BYTES
-    assert on.metrics.total_get_bytes == off.metrics.total_get_bytes
-    assert sorted(on.metrics.edges) == sorted(off.metrics.edges)
+    assert on.ledger.origin_bytes == off.ledger.origin_bytes == PAYLOAD_BYTES
+    assert on.ledger.transfer_bytes == off.ledger.transfer_bytes
+    assert sorted(on.ledger.edges) == sorted(off.ledger.edges)
 
 
 def test_dedup_collapse_is_deterministic():
@@ -206,3 +206,52 @@ def test_metadata_mode_carries_only_a_descriptor():
     assert isinstance(res.expected, TensorDescriptor)
     for payload in res.results.values():
         assert isinstance(payload, TensorDescriptor)
+
+
+# 9. The routing lives in the controller, not in a lie told to the client.
+#
+#    The 1x chain used to be produced by swapping each reader's private
+#    ``client._controller`` for a handle that narrowed the real directory answer,
+#    and by a burst loop inside the policy. Both are gone: the readers run an
+#    untouched real client over the mesh's own controller handle, and the chain
+#    is a consequence of the controller withholding each answer until the planned
+#    peer registers. These two tests pin that, because it is the whole point of
+#    the change -- the 1x number alone would still pass with the monkeypatch.
+def test_readers_run_an_untouched_real_client():
+    from realsim.scenarios.put_get import build_burst
+    from sim_common.async_engine import run_sim
+
+    from dedup_sim.control.routing import DedupPolicy
+    from dedup_sim.data.read_through import make_plane
+
+    scenario_coro, ctx = build_burst(
+        3, policy=DedupPolicy(fanout_cap=1), make_plane=make_plane
+    )
+    mesh = ctx["mesh"]
+    run_sim(scenario_coro())
+
+    for reader_id in ctx["reader_ids"]:
+        # The one controller handle the mesh built, not a per-reader view of it.
+        assert mesh.client(reader_id)._controller is mesh.handle
+
+
+def test_the_scenario_holds_no_burst_loop():
+    """Dedup and the baseline run the *same* scenario code, policy aside."""
+    import ast
+    import inspect
+
+    from realsim.scenarios import put_get
+
+    from dedup_sim.workload import burst
+
+    tree = ast.parse(inspect.getsource(burst))
+    # The capability contributes a policy and a data plane; the burst itself is
+    # realsim's fixture. So the workload module stages nothing of its own: no
+    # coroutine, hence no gather, no await, no execution order to get wrong.
+    assert not [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor))
+    ]
+    # ...and the baseline is literally realsim's fixture, unwrapped.
+    assert burst.run_naive_burst is put_get.run_burst

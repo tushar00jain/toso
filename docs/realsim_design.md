@@ -140,12 +140,18 @@ realsim/
     real_client.py            # RealClientAdapter + FakeStrategy (single-client transport install)
   mesh.py                     # Mesh — multi-client wiring: per-node volumes + real clients,
                               #   one directory + registry, one shared transport factory
-  model.py                    # Model — a transformer's per-token flops / KV bytes; shared by
-                              #   both capability sims (see the TODO for the weight-side use)
-  coordinator/                # the NEW component under design — a model
-    model.py                  # Reader, ReadPolicy/NaivePolicy, ReadCoordinator, BurstMetrics
+                              #   MeshView is the base every consumer of a mesh shares
+  policy.py                   # Policy.select(view, keys, requester) -> ranked sources +
+                              #   readiness. Naive is the default; consulted inside the
+                              #   real locate_volumes body
+  view.py                     # View — awaited read-only observation: locate, topology and
+                              #   locality, the clock. No mutation
+  plane.py                    # DataPlane — execute(item) / after(item, result), both
+                              #   defaulting to real no-op behaviour
+  runner.py                   # Runner — release work on the virtual clock in
+                              #   (release_time, id) order, install the mesh once, drain
   scenarios/                  # runnable scenarios
-    burst_get.py              # synchronized read burst; meta/metadata data plane +
+    put_get.py                # seed a key, then m clients get it; meta/metadata data plane +
                               #   compute/network/storage/RAM cost exercise
   run_realsim.py              # `python -m realsim.run_realsim` demo entrypoint (+ --mode)
   tools/
@@ -158,6 +164,7 @@ realsim/
     test_perf.py              # no-real-allocation-at-scale + parity vs. a capability sim
     test_composability.py     # import the real-directory backend + swap proof
     test_mesh.py              # Mesh wiring, per-operation source locality, one-owner install
+    test_planes.py            # the shared Policy / View / DataPlane / Runner contracts
 
 sim_common/                   # shared DES library (repo root)
   async_engine.py             # deterministic asyncio loop + virtual clock
@@ -175,12 +182,12 @@ logic; the entire `MonarchRPCTransportBuffer` + base `TransportBuffer` lifecycle
 the entire `InMemoryStore`; and the real `Request` / `TensorSlice` / `StorageInfo`
 / `Trie` types.
 
-**What is modeled or glue:** the new `ReadCoordinator` and its `ReadPolicy` (the
-component being designed); the `.call` / `.call_one` awaitable wrappers standing in
-for Monarch RPC; the ~5-line verbatim mirrors of the `locate_volumes` / `keys`
-read endpoints (see §4); the transport's resource-cost charges; the minimal
-`FakeStrategy`; the `Mesh`/`Cluster` wiring that constructs the real objects; and
-the `create_transport_buffer` substitution.
+**What is modeled or glue:** the components being designed — a routing `Policy`
+and the capability `DataPlane` that executes its answer; the `.call` / `.call_one`
+awaitable wrappers standing in for Monarch RPC; the ~5-line verbatim mirrors of the
+`locate_volumes` / `keys` read endpoints (see §4); the transport's resource-cost
+charges; the minimal `FakeStrategy`; the `Mesh` wiring that constructs the real
+objects; and the `create_transport_buffer` substitution.
 
 ---
 
@@ -385,59 +392,81 @@ with mesh.installed():
 at call time, so a consumer built *after* the mesh can claim it for accounting.
 
 This wiring is independent of the capability under test, so it does not belong to
-any one of them. It originally lived inside `ReadCoordinator`, whose shape is a
-single synchronized burst (`run_burst(readers, key)`); a capability that is not a
-burst — `kvcache_sim`'s continuous arrival stream — could not reuse the
-coordinator and re-derived the wiring underneath it, duplicating the factory, the
-contextvar, and the per-node adapter construction. With `Mesh` extracted, the
-coordinator is a burst-shaped consumer of a mesh and `kvcache_sim`'s `Cluster` is a
-KV-shaped one (four directory verbs), so each capability package holds only
-capability code.
+any one of them. It originally lived inside a burst-shaped read coordinator
+(`run_burst(readers, key)`); a capability that is not a burst — `kvcache_sim`'s
+continuous arrival stream — could not reuse it and re-derived the wiring
+underneath, duplicating the factory, the contextvar, and the per-node adapter
+construction. With `Mesh` extracted, each capability package holds only capability
+code, and `MeshView` is the base every consumer of a mesh shares (topology, ids,
+directory handle, trace, profile, registry, install).
 
-### `coordinator/model.py` — the new component
+### `policy.py` / `view.py` / `plane.py` / `runner.py` — the components under design
 
-- `ReadCoordinator.run_burst(readers, key)` consults the **real** controller
-  directory (`locate_volumes`) then fans each reader's **real** `client.get` out on
-  the engine via `asyncio.gather`. The real objects it drives come from a
-  `Mesh` (§8a); the coordinator adds only the read path, the policy seam, and the
-  fabric accounting. It installs the mesh's shared, contextvar-aware
-  `create_transport_buffer` for the burst so concurrent readers each charge the
-  right locality: the process-wide transport global is replaced by one factory that
-  reads the calling reader's source endpoint from a `ContextVar` set per reader
-  task (`asyncio` copies the context into each `gather`-created task, so the lookup
-  is task-local and deterministic — §10 recommendation 2 worked around).
-- `ReadPolicy` is the pluggable seam. `NaivePolicy` (shipped) fetches
-  independently: in a synchronized burst every reader locates the origin before
-  anyone finishes, so each pulls from the origin volume — `m×` fabric, the
-  baseline. A dedup/cache-aware policy overrides `run_burst` (to stage the burst
-  into a read-through chain/tree) and/or `after_fetch` (to register a finished
-  reader back into the **real** directory via `notify_put_batch`, the real
-  read-through path, so later `locate_volumes` calls route to a closer peer). The
-  routing is expressed purely by mutating real directory state; `dedup_sim`'s
-  `DedupPolicy` is exactly such an override.
-- `BurstMetrics` accounts `fabric_bytes` (origin-served) vs `total_get_bytes` and
-  records `(src, dst, key)` edges for `render_tree`. For the naive policy the two
-  are equal (`m×`); a dedup policy drives `fabric_bytes` toward the 1× union while
-  `total_get_bytes` stays `m×`.
+- **`Policy.select(view, keys, requester) -> Selection`.** One interface,
+  answering one question: which volume serves these keys for this requester, and
+  *when* is it usable. A `Selection` is a ranked list of sources plus an optional
+  **readiness gate**. It is invoked in two named places: inside the real
+  controller's `locate_volumes` body, after it reads the directory and before it
+  returns (so a scenario that just calls `client.get(K)` is routed without knowing
+  a policy exists, and the controller can *withhold* its answer until the gate
+  opens); and directly from an app through the `View`, when the app wants to price
+  the alternatives rather than be handed one. The default implementation is
+  **naive** — every holder, in directory order — which is precisely what the real
+  directory answers unaided, so installing it is byte-identical to installing
+  nothing.
+  What deliberately does *not* go through it: compute placement, admission and SLO
+  gates. The moment `select` answers those it becomes a union type serving neither
+  caller.
+- **`View`.** The read-only observation a policy is handed: `locate` (the raw
+  directory body, so a policy reading it back does not re-enter the hook),
+  topology/locality, and the virtual clock. Awaited reads, no mutation. It stops
+  there on purpose — `kvcache_sim`'s prefix-run lengths are a KV notion and live
+  in its own `control/`, and neither capability's *load* signal is an observation
+  (the scheduler's is its own predicted queue, the dedup policy's is its planned
+  tree), so there is no `load()` on the base type.
+- **`DataPlane`.** `execute(item)` for the work around a transfer and
+  `after(item, result)` for registration/eviction, both defaulting to real
+  behaviour (run the call; do nothing after). A plain fetch takes both unchanged,
+  `dedup_sim` overrides `after`, `kvcache_sim` overrides both.
+- **`Runner`.** The generic half of the two private drivers this replaced: order
+  work by `(release_time, id)`, install the mesh's shared transport factory
+  **once**, release each item at its time and gather, drain whatever outlives them
+  (a batched decode loop), and record one ledger row per item. The shared factory
+  is what lets concurrent clients each charge the right locality: the process-wide
+  transport global is replaced by one factory that reads the calling client's
+  source endpoint from a `ContextVar` bound per task (`asyncio` copies the context
+  into each `gather`-created task, so the lookup is task-local and deterministic —
+  §10 recommendation 2 worked around).
+- **`sim_common.report.Ledger`** is the measurement half: transfer edges,
+  `transfer_bytes` (every byte delivered) vs `origin_bytes` (the subset served by a
+  pre-existing holder), outcome rows, and the aggregations every report computes
+  over them.
 
-### `scenarios/burst_get.py` — a synchronized read burst
+### `scenarios/put_get.py` — realsim's own fixture
 
 One origin volume on node `P` holds `W`; `m` reader volumes on distinct hosts of
-node `R` each want overlapping data (default: the whole tensor). `build_burst(...)`
-/ `run_burst(...)` seed `W`, run the burst on a fresh engine, and return a
-`BurstResult` (trace, metrics, results, expected carrier). They take `mode=`
-(`"meta"` default / `"metadata"`, §7), `profile=` (the target `MachineProfile`,
-§6), and `compute_device=` (the producer's roofline device, default `"cuda"`).
+node `R` each get it. `build_burst(...)` / `run_burst(...)` seed `W`, run the
+readers on a fresh engine, and return a `BurstResult` (trace, ledger, results,
+expected carrier). They take `mode=` (`"meta"` default / `"metadata"`, §7),
+`profile=` (the target `MachineProfile`, §6), `compute_device=` (the producer's
+roofline device, default `"cuda"`), and optionally a `policy=` / `make_plane=`.
+The scenario body is ordinary user code — a `client.put` and a gather of
+`client.get` — and installing a policy is the *only* change that turns the same
+`m×` run into a 1× one, which is exactly what `dedup_sim` does with it.
 `render_burst_summary` prints the fabric/wallclock digest + the ASCII source→dest
 tree.
 
 ---
 
-## 9. Concurrency-contract lint (`realsim/tools/check_contract.py`)
+## 9. Contract lint (`realsim/tools/check_contract.py`)
 
 A dependency-free AST checker that fails the build if any **simulated code path**
-under `realsim/` or `sim_common/` reaches for a determinism-breaking primitive. It
-is scoped to those two directories only — the sibling `../torchstore` is not
+in the scanned packages reaches for a determinism-breaking primitive, **or** if a
+capability's `control/` module imports the executing half (a `data/` package, the
+mesh, or a store client) — control receives a `View` and returns a decision, and
+that direction is mechanically checkable. It is scoped to the simulation packages
+(`realsim/`, `sim_common/`, `domain/`, `dedup_sim/`, `kvcache_sim/`) — the sibling
+`../torchstore` is not
 scanned.
 
 **Banned on the sim path:**
@@ -509,11 +538,11 @@ Both capability sims consume `realsim` directly, speaking the real torchstore
 `Request` / `TensorSlice` / `StorageInfo` / `Trie` types natively — so there is no
 region↔`TensorSlice` translation layer anywhere:
 
-- [`dedup_sim/`](../dedup_sim/) implements dedup routing as a real
-  `ReadPolicy` (`DedupPolicy`) plugged into the `ReadCoordinator`, driving the real
+- [`dedup_sim/`](../dedup_sim/) implements dedup routing as a real `Policy`
+  (`DedupPolicy`) consulted inside the real `locate_volumes`, driving the real
   `Controller` directory + `LocalClient` to a 1× peer read-through.
 - [`kvcache_sim/`](../kvcache_sim/) consults the real `Controller` directory for
-  KV-block presence (`Cluster.prefix_lengths` over `locate_volumes`) and drives
+  KV-block presence (`KVView.prefix_lengths` over `locate_volumes`) and drives
   real per-instance clients for prefix publish / remote pull / eviction.
 
 `test_composability.py` also builds a tiny 1-D region↔`TensorSlice` round-trip, but
