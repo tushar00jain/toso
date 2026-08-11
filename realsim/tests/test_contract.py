@@ -499,7 +499,7 @@ def test_lint_flags_the_proposal_leaning_on_the_simulator():
     """``proposed/`` has to be implementable inside torchstore with nothing under it."""
     for line in (
         "from realsim.mesh import Mesh\n",
-        "from realsim.seams.controller_handle import FakeControllerHandle\n",
+        "from realsim.seams.controller_handle import LocalControllerHandle\n",
         "import torchstore\n",
         "from kvcache_sim.control._source import LongestPrefixPolicy\n",
     ):

@@ -96,7 +96,7 @@ capability's decisions:
   peak RSS, and a `putget_sim` run must stay within a tolerant multiple of a
   `dedup_sim` run's wall + RSS (measured in fresh subprocesses).
 - **`test_composability.py`** — imports realsim's real-directory backend
-  (`RealControllerAdapter` / `FakeControllerHandle`) standalone and exercises it.
+  (`RealControllerAdapter` / `LocalControllerHandle`) standalone and exercises it.
 - **`test_demos.py`** — every sim's `Demo` declares its parts (the ABC refuses
   otherwise) and every scenario of every sim runs end to end.
 

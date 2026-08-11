@@ -32,7 +32,7 @@ missing" section.
 
 # Re-export the contract surface so callers import from the package directly.
 from .cost import TransferCost
-from .deployment import ActorEndpoint, Controller, ControllerHandle, Deployment
+from .deployment import Controller, Deployment
 from .plane import ControlPlane, DataPlane
 from .policy import DecisionLog, Policy, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL
@@ -46,8 +46,6 @@ __all__ = [
     "View",
     "Directory",
     "Controller",
-    "ControllerHandle",
-    "ActorEndpoint",
     "Endpoint",
     "Tier",
     "TIER_LABEL",

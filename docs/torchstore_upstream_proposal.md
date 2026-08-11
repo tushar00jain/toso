@@ -30,7 +30,7 @@ actor path.
 `_notify_put`, but `locate_volumes` and `keys` keep their ~5-line `Trie` reads
 *inside* the `@endpoint async` methods. Since `@endpoint` methods are descriptors
 that aren't callable off-actor, a caller without a mesh must re-implement those
-bodies (which `realsim`'s `FakeControllerHandle` does, mirroring them verbatim).
+bodies (which `realsim`'s `LocalControllerHandle` does, mirroring them verbatim).
 
 **Proposal.** Move the bodies into sync helpers and have the endpoints delegate,
 mirroring the existing `_notify_put` pattern:

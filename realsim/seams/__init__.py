@@ -9,7 +9,9 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
 - ``volume_handle.FakeVolumeHandle`` -- mimics the ``.put.call`` /
   ``.get.call_one`` / ``.handshake.call_one`` actor surface, delegating to a
   real ``InMemoryStore`` exactly like the real ``StorageVolume`` endpoints.
-- ``controller_handle.FakeControllerHandle`` -- mimics the controller actor
+- ``controller_service.ControllerService`` -- the directory server: the real
+  ``Controller``, the policy installed in it, and the endpoint bodies
+- ``controller_handle.LocalControllerHandle`` -- mimics the controller actor
   surface (``locate_volumes`` / ``notify_put_batch`` / ``keys``), dispatching to
   a real ``Controller`` instance's sync logic.
 - ``dict_directory.DictDirectory`` -- a plain-``dict`` stand-in for the

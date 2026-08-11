@@ -5,7 +5,7 @@ Both are deliberate and both can rot silently:
 * :class:`proposed.deployment.Controller` declares the directory surface, because
   ``proposed`` must not import torchstore -- it is what torchstore would gain, so
   depending on it would invert the claim. The signatures are therefore a copy;
-* :class:`realsim.seams.controller_handle.FakeControllerHandle` mirrors the bodies
+* :class:`realsim.seams.controller_handle.LocalControllerHandle` mirrors the bodies
   of ``locate_volumes`` and ``keys`` **verbatim**, because ``@endpoint`` makes them
   ``EndpointProperty`` descriptors that cannot be invoked off-actor, and torchstore
   has not extracted sync helpers for them the way it has for ``_notify_put``.
@@ -27,12 +27,12 @@ import inspect
 from torchstore.controller import Controller as RealController
 
 from proposed import Controller as ProposedController
-from proposed import ControllerHandle
-from realsim.seams.controller_handle import FakeControllerHandle
+from realsim.seams.controller_handle import LocalControllerHandle
+from realsim.seams.controller_service import ControllerService
 
 #: Endpoints whose bodies are mirrored verbatim, and the digest of the source we
 #: mirrored. A failure here is not a bug: it means upstream edited the body and the
-#: mirror in ``FakeControllerHandle`` has to be re-copied (then update the digest).
+#: mirror in ``LocalControllerHandle`` has to be re-copied (then update the digest).
 MIRRORED_BODIES = {
     "locate_volumes": "9604ec9210bbb386841f4c0cb447900a",
     "keys": "f3b003d0a74bf6e671bc2242cf2cb114",
@@ -79,26 +79,29 @@ def test_the_mirrored_bodies_are_still_the_ones_we_mirrored():
     """A verbatim copy has to be told when the original changes."""
     for name, expected in MIRRORED_BODIES.items():
         assert _digest(name) == expected, (
-            f"Controller.{name}'s body changed upstream. FakeControllerHandle "
+            f"Controller.{name}'s body changed upstream. LocalControllerHandle "
             f"mirrors it verbatim, so re-copy the body and update the digest in "
             f"MIRRORED_BODIES."
         )
 
 
-def test_the_seam_implements_the_handle_and_not_the_service():
-    """Two shapes, and the seam is the caller's one.
+def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
+    """Two objects, two shapes, and only one of them is a Controller.
 
-    ``FakeControllerHandle`` is a handle, so it offers an endpoint per method --
-    which is what real ``LocalClient`` code requires
-    (``locate_volumes.call_one(...)``). It deliberately does *not* implement
-    :class:`proposed.Controller`: that is the service surface, and collapsing the
-    endpoints into methods would break every real caller.
+    ``ControllerService`` implements :class:`proposed.Controller` -- plain async
+    methods, the server side. ``LocalControllerHandle`` offers an endpoint per
+    method instead, which is what real ``LocalClient`` code requires
+    (``locate_volumes.call_one(...)``); collapsing those into methods would break
+    every real caller, which is why the two are separate objects.
     """
-    handle = FakeControllerHandle(RealController())
-    declared = [n for n in ControllerHandle.__annotations__]
-    assert sorted(declared) == sorted(
-        n for n in vars(ProposedController) if not n.startswith("_")
-    ), "the handle type and the service surface must name the same members"
+    service = ControllerService(RealController())
+    handle = LocalControllerHandle(service)
+    declared = [n for n in vars(ProposedController) if not n.startswith("_")]
+    for name in declared:
+        assert inspect.iscoroutinefunction(getattr(service, name)), (
+            f"{name} is not a coroutine on the service: that is the surface "
+            f"proposed.Controller declares, and the service is what implements it"
+        )
     for name in declared:
         endpoint = getattr(handle, name)
         assert hasattr(endpoint, "call_one") and hasattr(endpoint, "call"), (

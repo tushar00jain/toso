@@ -1,7 +1,7 @@
 """One service boundary, and what crossing it costs: :class:`ServiceHop`.
 
 Every `[S]` seam in this package stands in for something that is an actor
-endpoint in a deployment -- :class:`~realsim.seams.controller_handle.FakeControllerHandle`
+endpoint in a deployment -- :class:`~realsim.seams.controller_handle.LocalControllerHandle`
 for the directory, :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` for a
 capability's coordinator. Standing in for an endpoint means two things: dispatch
 to a real object in this process, and *be the place the distance is charged*.

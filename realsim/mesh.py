@@ -12,7 +12,7 @@ It owns, for a run:
 
 * one controller adapter (the real ``Controller`` directory, real ``Trie`` or the
   dict shim -- see :func:`~realsim.adapters.real_controller.make_controller_adapter`)
-  and its :class:`~realsim.seams.controller_handle.FakeControllerHandle`;
+  and its :class:`~realsim.seams.controller_handle.LocalControllerHandle`;
 * one :class:`~realsim.seams.volume_handle.FakeVolumeHandle` per node, each
   backed by a real ``InMemoryStore``;
 * one :class:`~realsim.adapters.real_client.RealClientAdapter` -- hence one real
@@ -112,7 +112,7 @@ class Mesh:
         # ``Deployment`` port uses, rather than a second alias here.
         self.directory = make_controller_adapter(real_directory)
         # A policy installed here IS a control plane, and this is where it runs:
-        # inside the endpoint's locate_volumes (see FakeControllerHandle._route).
+        # inside the endpoint's locate_volumes (see LocalControllerHandle._route).
         # ``None`` is the naive answer -- every holder, directory order -- which
         # is what the real directory returns unaided, so an unrouted mesh pays
         # nothing for the hook.
@@ -146,8 +146,14 @@ class Mesh:
 
         Built here rather than in ``proposed`` so the proposal never has to know
         what a :class:`Mesh` is.
+
+        Senses through the directory *service*, not the handle in front of it:
+        ``locate_raw`` is the unrouted read, so a policy consulted inside
+        ``locate_volumes`` cannot re-enter the hook it is being called from. Note
+        what that also means -- a control plane's directory reads do not cross the
+        handle, so they are neither routed nor charged the hop a real one would pay.
         """
-        return View(self.controller_handle, self.topology)
+        return View(self.directory.service, self.topology)
 
     def adapter(self, node_id: str) -> RealClientAdapter:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""

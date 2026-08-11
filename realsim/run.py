@@ -114,7 +114,7 @@ class Run:
             * a :class:`~proposed.policy.Policy` runs **in the directory
               service**, installed in the real controller's ``locate_volumes``,
               and is reached through the seam already standing there
-              (:class:`~realsim.seams.controller_handle.FakeControllerHandle`) --
+              (:class:`~realsim.seams.controller_handle.LocalControllerHandle`) --
               a caller just calls ``client.get`` and is routed. This is dedupe:
               its whole control plane is the policy, and it must exist before the
               mesh is built, which is why an object rather than a factory;

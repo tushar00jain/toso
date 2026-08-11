@@ -77,7 +77,7 @@ class RealClientAdapter:
     """Wires a real ``LocalClient`` to the seams.
 
     Args:
-        controller_handle: a :class:`FakeControllerHandle`.
+        controller_handle: a :class:`LocalControllerHandle`.
         volume_handles: mapping ``volume_id -> FakeVolumeHandle``.
         client_volume_id: the volume this client is co-located with.
         topology: mapping ``volume_id -> Endpoint`` for transfer-cost locality.

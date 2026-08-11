@@ -9,7 +9,7 @@ It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsi
 
 - **Real directory.** KV-block presence is the real `torchstore.controller.Controller`
   directory (`keys_to_storage_volumes`), driven off-actor through `realsim`'s
-  `RealControllerAdapter` / `FakeControllerHandle`. A KV block is a directory **key**
+  `RealControllerAdapter` / `LocalControllerHandle`. A KV block is a directory **key**
   (the prefix-hash chain string); "instance X holds block K" is the directory entry
   `K -> volume_X`. Routing consults the real `locate_volumes`.
 - **Real clients + types.** Each serving instance is a real storage volume with a

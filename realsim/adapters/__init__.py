@@ -2,7 +2,7 @@
 and injects the seams so the real planning + directory logic executes.
 
 - ``real_controller.RealControllerAdapter`` -- constructs a real ``Controller``
-  off-actor and exposes it via a :class:`~realsim.seams.controller_handle.FakeControllerHandle`.
+  off-actor and exposes it via a :class:`~realsim.seams.controller_handle.LocalControllerHandle`.
 - ``real_controller.RealControllerAdapter(shim=True)`` -- same, but swaps the ``Controller``'s
   ``Trie`` directory for a lightweight dict shim; ``make_controller_adapter``
   selects between the two from the ambient ``real_directory`` config flag.

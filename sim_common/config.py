@@ -94,7 +94,7 @@ class SimConfig:
     # One-way latency of a service boundary, charged by realsim.seams.link's
     # ServiceHop: ``coordinator_rtt`` for a serving host reaching its coordinator
     # (CoordinatorHandle), ``controller_rtt`` for anyone reaching the directory
-    # (FakeControllerHandle) -- which is every capability, the baseline included,
+    # (LocalControllerHandle) -- which is every capability, the baseline included,
     # and every consultation of a policy installed there. Like ``contention``
     # these are fidelity knobs that DO change measured timing, and deliberately
     # so: a request pays a hop out and back before it can proceed, so a

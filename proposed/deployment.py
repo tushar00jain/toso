@@ -13,10 +13,11 @@ Either way the application code is the same.
 The *payload* types stay untyped here -- a ``StorageInfo``, a ``Request``, a
 tensor are torchstore's, and this package cannot import torchstore, being what
 torchstore would gain rather than something layered on top of it. The **surface**
-is not payload, so it is declared: :class:`Controller` says which endpoints the
-directory service offers and with what arguments, and :class:`ControllerHandle` is
-what a caller actually holds -- an endpoint per method, which is a different shape
-and a different type. Leaving that as ``Any``
+is not payload, so it is declared: :class:`Controller` says which methods the
+directory service offers and with what arguments. What a caller *holds* is a
+reference to that service rather than the service itself -- a different shape,
+declared by Monarch, and left untyped here for the reason given on
+:attr:`Deployment.controller_handle`. Leaving that as ``Any``
 made the directory look like it had no interface at all, which in turn made
 :class:`~proposed.policy.Policy` look like the primary one instead of a hook
 consulted inside this surface.
@@ -31,7 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
-__all__ = ["Controller", "ActorEndpoint", "ControllerHandle", "Deployment"]
+__all__ = ["Controller", "Deployment"]
 
 
 class Controller(Protocol):
@@ -60,7 +61,7 @@ class Controller(Protocol):
     A caller does not hold one of these -- it holds a :class:`ControllerHandle`.
     torchstore's ``Controller`` implements this; under simulation the two bodies
     Monarch will not let us invoke off-actor are mirrored privately inside
-    :class:`realsim.seams.controller_handle.FakeControllerHandle`.
+    :class:`realsim.seams.controller_handle.LocalControllerHandle`.
     """
 
     async def locate_volumes(
@@ -88,44 +89,6 @@ class Controller(Protocol):
         """Every registered key, or those under ``prefix``."""
 
 
-class ActorEndpoint(Protocol):
-    """One method of a service, as a caller reaches it.
-
-    Monarch declares this (``monarch._src.actor.endpoint.Endpoint``, generic over a
-    ``ParamSpec``); it is restated here only because this package cannot import the
-    runtime it proposes against. Deliberately *not* generic: hand-written parameter
-    lists would lose the keyword names a caller actually uses, and the signatures
-    already live on :class:`Controller`, which is the honest place to read them.
-    """
-
-    async def call_one(self, *args: Any, **kwargs: Any) -> Any:
-        """Invoke it on a single actor."""
-
-    async def call(self, *args: Any, **kwargs: Any) -> Any:
-        """Invoke it on every actor in a mesh."""
-
-
-class ControllerHandle(Protocol):
-    """What a caller *holds*: an endpoint per method of :class:`Controller`.
-
-    The two are different shapes, and both are real. ``@endpoint`` turns each
-    method of the service into an ``EndpointProperty``, so a handle offers
-    ``locate_volumes`` as an object and the call reads
-    ``locate_volumes.call_one(keys, missing_ok=True)`` -- which is what real
-    ``LocalClient`` code does, so nothing may collapse it back into a method.
-
-    This is the type of :attr:`Deployment.controller_handle`, and the one
-    :class:`realsim.seams.controller_handle.FakeControllerHandle` implements. Read
-    the argument lists off :class:`Controller`.
-    """
-
-    locate_volumes: ActorEndpoint
-    notify_put_batch: ActorEndpoint
-    notify_delete: ActorEndpoint
-    notify_delete_batch: ActorEndpoint
-    keys: ActorEndpoint
-
-
 class Deployment(Protocol):
     """The store, as application code sees it."""
 
@@ -139,6 +102,19 @@ class Deployment(Protocol):
         ...
 
     @property
-    def controller_handle(self) -> ControllerHandle:
-        """The controller's endpoint surface: the directory calls."""
+    def controller_handle(self) -> Any:
+        """A reference to the directory service: the calls a caller makes.
+
+        Untyped on purpose. What a caller holds is not a :class:`Controller` but a
+        *reference* to one, and Monarch already declares that shape --
+        ``@endpoint`` makes each method an ``Endpoint`` reached through ``call_one``
+        or ``call``, so the call reads
+        ``controller_handle.locate_volumes.call_one(keys, missing_ok=True)``.
+        Restating it here would either lose the keyword names a caller uses or
+        duplicate a generic this package cannot import. Read the argument lists off
+        :class:`Controller`, which is the surface behind the reference: in
+        production Monarch's handle over the ``Controller`` actor, under simulation
+        :class:`realsim.seams.controller_handle.LocalControllerHandle` over a
+        :class:`realsim.seams.controller_service.ControllerService`.
+        """
         ...

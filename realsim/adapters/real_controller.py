@@ -34,7 +34,8 @@ from typing import Optional
 
 from sim_common import config
 
-from realsim.seams.controller_handle import FakeControllerHandle
+from realsim.seams.controller_handle import LocalControllerHandle
+from realsim.seams.controller_service import ControllerService
 from realsim.seams.link import ServiceHop
 from realsim.seams.dict_directory import DictDirectory
 from torchstore.controller import Controller
@@ -53,12 +54,15 @@ class RealControllerAdapter:
             real ``Trie``. Everything else stays real -- the ``Controller``'s own
             decision logic (``_notify_put`` / ``_notify_delete`` /
             ``_is_dtensor_fully_committed``, and the ``locate_volumes`` body
-            mirrored in :class:`FakeControllerHandle`) runs unchanged over it, so
+            mirrored in :class:`LocalControllerHandle`) runs unchanged over it, so
             metrics stay byte-identical while the run skips the per-key trie tax.
 
     Attributes:
         controller: the real ``Controller`` instance.
-        handle: a :class:`FakeControllerHandle` exposing its actor surface.
+        service: the :class:`ControllerService` around it -- the server side, which
+            holds the policy and the endpoint bodies.
+        handle: a :class:`LocalControllerHandle` referring to that service -- the
+            client side, which is what a caller holds.
     """
 
     def __init__(
@@ -72,7 +76,8 @@ class RealControllerAdapter:
         # Mirror the tail of Controller.init: we skip the @endpoint (it needs a
         # Monarch mesh) and only need the directory marked initialized.
         self.controller.is_initialized = True
-        self.handle = FakeControllerHandle(self.controller, hop=hop)
+        self.service = ControllerService(self.controller)
+        self.handle = LocalControllerHandle(self.service, hop=hop)
 
     @property
     def shimmed(self) -> bool:

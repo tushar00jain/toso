@@ -133,7 +133,7 @@ realsim/
                               #   charges the cost model per put/get; re-exports Endpoint;
                               #   TensorDescriptor (metadata-only carrier)
     volume_handle.py          # FakeVolumeHandle (mirrors StorageVolume endpoints; real InMemoryStore)
-    controller_handle.py      # FakeControllerHandle (dispatches to a real Controller)
+    controller_handle.py      # LocalControllerHandle (dispatches to a real Controller)
     factory.py                # THE create_transport_buffer substitution point + source contextvar
   adapters/                   # thin wiring that constructs the real objects off-actor
     real_controller.py        # RealControllerAdapter (constructs a real Controller off-actor)
@@ -228,7 +228,7 @@ modifying any torchstore source**.
 - **Endpoints are not directly callable off-actor.** `controller.locate_volumes`,
   `.notify_put_batch`, `.keys` are `EndpointProperty` descriptors that expose no
   call surface off-actor, so the handle cannot `await` them directly.
-- **How `FakeControllerHandle` drives them.** `notify_put_batch` /
+- **How `LocalControllerHandle` drives them.** `notify_put_batch` /
   `notify_delete*` are already plain sync helpers upstream
   (`Controller._notify_put` / `_notify_delete`), so the handle calls the **real**
   helper (after `assert_initialized`). The `locate_volumes` / `keys` read bodies
@@ -245,7 +245,7 @@ modifying any torchstore source**.
   real planning core runs unmodified.
 - **Controller RPC seam.** The client calls
   `self._controller.locate_volumes.call_one(...)`, `.notify_put_batch.call(...)`,
-  `.keys.call_one(...)`. `FakeControllerHandle` presents `.call` / `.call_one`
+  `.keys.call_one(...)`. `LocalControllerHandle` presents `.call` / `.call_one`
   awaitables on each name; in-process both resolve to the same coroutine, and
   callers that ignore a real `.call`'s `ValueMesh` return are unaffected.
 - **Transport seam (the one substitution).** The client resolves the transport via
@@ -548,7 +548,7 @@ upstream changes that would each remove a piece of glue:
 
 The **real controller directory** is a cleanly separable, importable unit: `from
 realsim.adapters.real_controller import RealControllerAdapter` (and
-`FakeControllerHandle`) is a plain top-level import with **no import-time side
+`LocalControllerHandle`) is a plain top-level import with **no import-time side
 effects** (no background threads, no running event loop, no Monarch mesh), and its
 directory operations (`notify_put_batch` → `locate_volumes` / `keys`) run
 standalone. `tests/test_composability.py` proves the import and the

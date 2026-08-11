@@ -22,7 +22,7 @@ import sys
 # consumer imports ``sim_common``. These imports must be side-effect-free (asserted
 # below).
 from realsim.adapters.real_controller import RealControllerAdapter
-from realsim.seams.controller_handle import FakeControllerHandle
+from realsim.seams.controller_handle import LocalControllerHandle
 
 
 def test_backend_imports_with_no_side_effects():
@@ -44,7 +44,7 @@ def test_backend_imports_with_no_side_effects():
     # No background threads were started by import or construction.
     assert len(sys._current_frames()) == threads_before
     # The backend is the real objects, wired but inert until called.
-    assert isinstance(adapter.handle, FakeControllerHandle)
+    assert isinstance(adapter.handle, LocalControllerHandle)
     assert adapter.controller.is_initialized is True
     # No event loop is running at import/construction time.
     with_no_loop = True

@@ -8,7 +8,7 @@ real ``Controller`` decision logic in place. These tests pin three things:
    ``notify_put_batch`` / ``keys`` / ``notify_delete`` / ``notify_delete_batch``
    with the same shapes and semantics (including ``missing_ok`` and
    ``require_fully_committed`` on a partially committed DTensor) as the real
-   :class:`~realsim.seams.controller_handle.FakeControllerHandle`.
+   :class:`~realsim.seams.controller_handle.LocalControllerHandle`.
 2. **Divergence gate** -- a small real burst produces a byte-identical trace and
    identical payoff metrics under real vs shim mode.
 3. **Selection** -- the ``real_directory`` flag defaults to real, and an explicit
@@ -57,7 +57,7 @@ def test_dict_directory_prefix_matches_trie_semantics():
 
 
 # --------------------------------------------------------------------------
-# Handle surface parity: shim vs the real FakeControllerHandle.
+# Handle surface parity: shim vs the real LocalControllerHandle.
 # --------------------------------------------------------------------------
 
 

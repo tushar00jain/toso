@@ -4,7 +4,7 @@ The whole path is real TorchStore code driven off-actor via the in-process seams
 
     producer.client.put(...)   -> real LocalClient.put_batch
                                -> real InMemoryStore.put (via InMemoryTransport)
-                               -> real Controller._notify_put (via FakeControllerHandle)
+                               -> real Controller._notify_put (via LocalControllerHandle)
 
     consumer.client.get(...)   -> real LocalClient._fetch / _build_volume_requests
                                   / _assemble_results / _apply_inplace

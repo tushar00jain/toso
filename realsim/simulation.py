@@ -130,7 +130,7 @@ class Simulation:
 
         # The same ``control`` object, reached from the other side. It has already
         # gone into the Mesh above if it answers the store's question, where the
-        # seam in front of the directory (FakeControllerHandle) consults it; what
+        # seam in front of the directory (LocalControllerHandle) consults it; what
         # happens here is the second seam, for a control plane that also decides
         # more than that. So: one object, two services, a handle built in one place
         # only -- the directory's already existed.
