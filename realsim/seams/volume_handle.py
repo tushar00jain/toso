@@ -33,6 +33,8 @@ from realsim.seams.transport import _nbytes
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from torchstore.storage_volume import InMemoryStore
 
+__all__ = ["StorageCapacityExceeded", "FakeVolumeHandle"]
+
 
 class StorageCapacityExceeded(Exception):
     """Raised when a put would push a volume's resident bytes past its capacity.

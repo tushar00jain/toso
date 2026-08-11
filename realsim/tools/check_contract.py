@@ -68,6 +68,32 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, NamedTuple
 
+__all__ = [
+    "REPO_ROOT",
+    "SCAN_DIRS",
+    "BANNED_IMPORT_MODULES",
+    "BANNED_ALWAYS",
+    "WALLCLOCK_READS",
+    "CONTROL_FORBIDDEN",
+    "DATA_FORBIDDEN",
+    "CONTROL_FORBIDDEN_NAMES",
+    "DATA_SEGMENT",
+    "CONTROL_SEGMENT",
+    "PROPOSED_PKG",
+    "PROPOSED_FORBIDDEN",
+    "Violation",
+    "is_test_file",
+    "is_control_module",
+    "is_capability_data_module",
+    "is_proposed_module",
+    "resolve_module",
+    "scan_source",
+    "scan_paths",
+    "scan_default",
+    "format_violations",
+    "main",
+]
+
 # --------------------------------------------------------------------------- #
 # What we scan.
 # --------------------------------------------------------------------------- #

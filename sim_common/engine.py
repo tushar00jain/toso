@@ -11,6 +11,8 @@ from __future__ import annotations
 import heapq
 from typing import Callable, List, Tuple
 
+__all__ = ["Sim", "Promise"]
+
 
 class Sim:
     """A minimal discrete-event simulator.

@@ -40,6 +40,8 @@ from domain import (
 
 from ..workload.request import Request
 
+__all__ = ["DecodeEngine"]
+
 
 @dataclass
 class _Active:

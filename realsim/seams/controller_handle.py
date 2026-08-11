@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, Sequence
 
+__all__ = ["FakeControllerHandle"]
+
 
 class _ControllerEndpoint:
     """Mimics a Monarch endpoint's ``.call`` / ``.call_one`` awaitable surface."""

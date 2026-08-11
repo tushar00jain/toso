@@ -30,6 +30,8 @@ from __future__ import annotations
 from collections.abc import Iterator, KeysView, MutableMapping
 from typing import Any
 
+__all__ = ["DictDirectory"]
+
 
 class _PrefixKeysView(KeysView):
     """A ``KeysView`` that adds ``Trie``-compatible prefix filtering.

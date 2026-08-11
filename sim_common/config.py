@@ -35,6 +35,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Iterator, Optional
 
+__all__ = ["SimConfig", "current", "configure", "overrides"]
+
 
 @dataclass(frozen=True)
 class SimConfig:

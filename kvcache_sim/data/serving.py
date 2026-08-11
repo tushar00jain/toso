@@ -46,6 +46,8 @@ from ..workload.request import Request
 from ._decode import DecodeEngine
 from .store import KVStore
 
+__all__ = ["ServingPlane"]
+
 
 class ServingPlane(DataPlane):
     # Rows are published at rejection, at acceptance, or when the last decode

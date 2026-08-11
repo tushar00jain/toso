@@ -56,6 +56,14 @@ from ._cache import LRUCache
 from ._source import LongestPrefixPolicy
 from ..workload.request import Request
 
+__all__ = [
+    "DecodeLoad",
+    "Plan",
+    "Completion",
+    "LoadBalanceScheduler",
+    "CacheAwareScheduler",
+]
+
 
 class DecodeLoad(Protocol):
     """How busy the decode side is -- an observation, not a handle to it.

@@ -41,7 +41,7 @@ from typing import (
 
 from proposed.view import View
 
-__all__ = ["Selection", "Policy", "NaivePolicy"]
+__all__ = ["Ready", "Selection", "DecisionLog", "Policy", "NaivePolicy"]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
 # usable. ``None`` means "usable now".

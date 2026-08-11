@@ -23,6 +23,8 @@ from typing import List, Optional, Sequence, Union
 
 from sim_common.trace import chain_digests, Event, Trace
 
+__all__ = ["Events", "Divergence", "first_divergence"]
+
 # Either a Trace or a bare event sequence may be compared.
 Events = Union[Trace, Sequence[Event]]
 

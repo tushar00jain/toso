@@ -70,6 +70,8 @@ from typing import Any, Coroutine, Optional, Tuple, TypeVar
 from sim_common import config
 from sim_common.trace import Trace
 
+__all__ = ["AsyncEngine", "run_sim"]
+
 _T = TypeVar("_T")
 
 

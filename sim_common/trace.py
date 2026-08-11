@@ -30,6 +30,8 @@ from typing import List, Sequence, Tuple
 
 from sim_common import config
 
+__all__ = ["Event", "chain_digests", "fingerprint", "Trace"]
+
 # One trace event: (virtual time, kind, message).
 Event = Tuple[float, str, str]
 

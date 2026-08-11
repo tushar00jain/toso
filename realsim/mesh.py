@@ -58,6 +58,8 @@ from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
+__all__ = ["OnTransfer", "Mesh"]
+
 # A transfer-accounting callback: (kind, src_id, dst_id, nbytes, cost).
 OnTransfer = Callable[[str, str, str, int, float], None]
 

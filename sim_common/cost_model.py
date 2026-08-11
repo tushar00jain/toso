@@ -38,9 +38,10 @@ __all__ = [
     "network_rate",
     "mem_copy_time",
     "storage_time",
-    "storage_rate",
     "get_time",
+    "storage_rate",
     "compute_time",
+    "ProfileTransferCost",
 ]
 
 # Device families the compute roofline understands. Anything in ``_GPU_DEVICES``

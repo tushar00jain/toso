@@ -19,6 +19,14 @@ Three rules, none of which a type system can express:
 3. **A README's layout block matches the tree.** It may not name a ``.py`` file
    that does not exist, and it may not omit one of the package's structural
    files. Prose drifts silently; this makes it fail.
+4. **Every module declares its surface.** A module with public top-level
+   definitions declares ``__all__``, it names only things that exist, and it
+   names all of them. Before this, roughly a third of the modules had one and
+   the rest did not, four of the lists were incomplete (``sim_common.cost_model``
+   omitted ``ProfileTransferCost``, which ``realsim.simulation`` imports), and
+   nothing said which was intended. ``__init__.py`` is exempt -- a package's
+   ``__all__`` is a curated re-export list, not a mirror of its own contents --
+   and so is ``__main__.py``.
 
 The ``Demo`` contract is *not* checked here. ``realsim.demo.Demo`` is an ABC with
 an abstract ``scenarios()`` and a required ``name``/``description``, so a demo
@@ -50,10 +58,21 @@ from realsim.tools.check_contract import (
 )
 
 __all__ = [
-    "check_all",
+    "SIM_SUFFIX",
+    "REQUIRED_FILES",
+    "REQUIRED_DIRS",
+    "PLANE_DIRS",
+    "GRAPH_PKGS",
+    "PUBLIC_ANYWAY",
+    "sim_packages",
     "check_package_parts",
     "check_private_naming",
     "check_readme_layout",
+    "public_defs",
+    "declared_all",
+    "check_module_exports",
+    "check_all",
+    "main",
 ]
 
 # Packages whose shape is checked. A sim is a ``*_sim``; ``realsim`` is the
@@ -251,12 +270,88 @@ def check_readme_layout(root: Path = REPO_ROOT) -> List[Violation]:
     return sorted(out)
 
 
+def public_defs(tree: ast.Module) -> List[str]:
+    """Public top-level definitions, in definition order."""
+    out: List[str] = []
+    for n in tree.body:
+        if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not n.name.startswith("_"):
+                out.append(n.name)
+        elif isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name) and not t.id.startswith("_") \
+                        and t.id != "__all__":
+                    out.append(t.id)
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            if not n.target.id.startswith("_"):
+                out.append(n.target.id)
+    seen: Set[str] = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
+
+
+def declared_all(tree: ast.Module) -> List[str] | None:
+    """The module's ``__all__``, or ``None`` if it declares none."""
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__all__" for t in n.targets
+        ):
+            return [e.value for e in n.value.elts]
+    return None
+
+
+def check_module_exports(root: Path = REPO_ROOT) -> List[Violation]:
+    """Rule 4: a module's ``__all__`` exists and matches its public surface."""
+    out: List[Violation] = []
+    for pkg in GRAPH_PKGS:
+        for f in sorted((root / pkg).rglob("*.py")):
+            if "__pycache__" in f.parts or "tests" in f.parts:
+                continue
+            if f.name in ("__init__.py", "__main__.py"):
+                continue
+            rel = str(f.relative_to(root))
+            tree = ast.parse(f.read_text())
+            defined = public_defs(tree)
+            if not defined:
+                continue
+            declared = declared_all(tree)
+            if declared is None:
+                out.append(Violation(
+                    rel, 0, "missing-all",
+                    f"defines {', '.join(defined)} but declares no __all__: a "
+                    f"module's surface should be stated, not inferred",
+                ))
+                continue
+            names = set(defined) | {
+                a.asname or a.name.split(".")[0]
+                for n in ast.walk(tree) if isinstance(n, ast.Import)
+                for a in n.names
+            } | {
+                a.asname or a.name
+                for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                for a in n.names
+            }
+            for ghost in [x for x in declared if x not in names]:
+                out.append(Violation(
+                    rel, 0, "all-names-nothing",
+                    f"__all__ names {ghost!r}, which this module neither defines "
+                    f"nor imports",
+                ))
+            for missing in [x for x in defined if x not in declared]:
+                out.append(Violation(
+                    rel, 0, "all-omits-public",
+                    f"{missing!r} is public but missing from __all__ (add it, or "
+                    f"rename it _{missing} if it is not part of the surface)",
+                ))
+    return sorted(out)
+
+
 def check_all(root: Path = REPO_ROOT) -> List[Violation]:
     """Every structure rule, in one list."""
     return sorted(
         check_package_parts(root)
         + check_private_naming(root)
         + check_readme_layout(root)
+        + check_module_exports(root)
     )
 
 

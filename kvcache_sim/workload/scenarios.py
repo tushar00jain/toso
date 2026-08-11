@@ -20,6 +20,25 @@ from ..report.metrics import Metrics
 from ._generator import make_workload
 from ._serving import BLOCK_TOKENS, KVWorkload, serving_plane
 
+__all__ = [
+    "configure",
+    "make_topology",
+    "subset",
+    "shared_prefix_workload",
+    "shared_prefix",
+    "EVICTION_CAPACITIES",
+    "eviction_sweep",
+    "hotspot_workload",
+    "hotspot",
+    "overload",
+    "DISAGG_TARGET_TBT",
+    "DISAGG_MAX_BATCH",
+    "disaggregation",
+    "EARLY_SLO_TBT",
+    "EARLY_MAX_BATCH",
+    "early_rejection",
+]
+
 
 def configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     """One labelled configuration over ``requests``.

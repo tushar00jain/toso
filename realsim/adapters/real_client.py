@@ -39,6 +39,8 @@ from torchstore.strategy import StorageVolumeRef
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 
+__all__ = ["FakeStrategy", "RealClientAdapter"]
+
 
 class FakeStrategy:
     """Minimal stand-in for ``TorchStoreStrategy`` (only the surface the client uses).

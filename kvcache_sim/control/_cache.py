@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Set
 
+__all__ = ["LRUCache"]
+
 
 class LRUCache:
     """A bounded, LRU-evicting set of block keys held by one instance.

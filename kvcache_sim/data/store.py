@@ -41,6 +41,8 @@ from proposed import Deployment
 
 from domain import DEFAULT_MODEL, Model
 
+__all__ = ["KVStore"]
+
 
 class KVStore:
     """The KV data plane's three verbs over real per-instance clients.

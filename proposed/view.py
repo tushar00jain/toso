@@ -42,6 +42,8 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from proposed.topology import Endpoint, locality, Tier
 
+__all__ = ["Directory", "View"]
+
 
 class Directory(Protocol):
     """What a view needs from a controller: one unrouted directory read.

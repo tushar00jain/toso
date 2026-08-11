@@ -38,7 +38,7 @@ from sim_common.trace import Trace
 from realsim.runner import WorkItem
 from realsim.simulation import Simulation
 
-__all__ = ["Report", "Result", "Run", "Workload", "execute"]
+__all__ = ["Workload", "Report", "MakePlane", "Run", "Result", "execute"]
 
 
 class Workload(ABC):

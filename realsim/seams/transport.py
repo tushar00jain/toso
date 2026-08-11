@@ -84,7 +84,7 @@ from sim_common.topology import Endpoint
 from sim_common.trace import Trace
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
 
-__all__ = ["Endpoint", "InMemoryTransport", "TensorDescriptor"]
+__all__ = ["TensorDescriptor", "InMemoryTransport"]
 
 
 @dataclass(frozen=True)

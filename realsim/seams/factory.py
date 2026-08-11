@@ -38,6 +38,15 @@ import torchstore.client  # noqa: F401  (ensure the submodule is in sys.modules)
 
 from sim_common.topology import Endpoint
 
+__all__ = [
+    "bind_source",
+    "bind_requester",
+    "current_requester",
+    "current_source",
+    "current_owner",
+    "installed",
+]
+
 # The real ``torchstore.client`` submodule object. It is shadowed on the
 # ``torchstore`` package by a ``client`` *function*, so it must be fetched from
 # ``sys.modules`` rather than by attribute access on the package.

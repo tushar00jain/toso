@@ -119,8 +119,12 @@ PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_contr
 `realsim/tools/check_structure.py` fails the build if a sim package drifts out of
 shape: a missing part (`__main__.py`, `README.md`, `workload/`, `report/`), a
 `control/` without a `data/`, a folder-private module whose name does not say so
-(`_thing.py`), or a README layout block that names a file which does not exist —
-or omits one that does. `PUBLIC_ANYWAY` is the explicit exception list.
+(`_thing.py`), a README layout block that names a file which does not exist — or
+omits one that does — or a module whose `__all__` is absent, names something that
+is not there, or omits something public. `PUBLIC_ANYWAY` is the explicit
+exception list for the privacy rule; `__init__.py` and `__main__.py` are exempt
+from the `__all__` rule, since a package's `__all__` is a curated re-export list
+rather than a mirror of its own contents.
 
 The `Demo` contract is deliberately *not* linted: `realsim.demo.Demo` is an ABC,
 so a demo that has not declared its scenarios cannot be constructed, and

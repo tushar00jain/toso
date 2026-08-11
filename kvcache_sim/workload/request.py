@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
+__all__ = ["Request", "block_keys_for", "longest_prefix_run"]
+
 
 @dataclass(frozen=True)
 class Request:

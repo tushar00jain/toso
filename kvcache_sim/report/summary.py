@@ -26,10 +26,10 @@ from .metrics import (
 
 __all__ = [
     "CacheVsBaselineReport",
-    "DisaggregationReport",
-    "EarlyRejectionReport",
     "EvictionReport",
     "HotspotReport",
+    "DisaggregationReport",
+    "EarlyRejectionReport",
 ]
 
 

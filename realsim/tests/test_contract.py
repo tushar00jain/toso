@@ -9,8 +9,9 @@ detects each banned pattern and does not flag the sanctioned ones -- so a green
 run means the contract holds, not that the lint is asleep.
 
 ``test_sim_packages_keep_their_shape`` does the same for the *structure* lint:
-the parts every ``*_sim`` carries, the underscore on a folder-private module, and
-a README layout block that matches the tree.
+the parts every ``*_sim`` carries, the underscore on a folder-private module, a
+README layout block that matches the tree, and an ``__all__`` on every module
+that matches its public surface.
 
 See ``realsim/tools/check_contract.py`` and ``check_structure.py`` for the full
 contracts and their rationale.
@@ -30,6 +31,12 @@ from realsim.tools import check_structure
 
 def _codes(source: str, *, is_test: bool = False, path: str = "snippet.py"):
     return {v.code for v in scan_source(source, path, is_test=is_test)}
+
+
+def _parse(source: str):
+    import ast
+
+    return ast.parse(source)
 
 
 CONTROL = "kvcache_sim/control/scheduler.py"
@@ -84,6 +91,52 @@ def test_structure_lint_flags_half_a_plane_split(tmp_path):
     (pkg / "README.md").write_text("")
     codes = {v.code for v in check_structure.check_package_parts(tmp_path)}
     assert "half-a-plane-split" in codes
+
+
+def test_structure_lint_flags_a_module_with_no_all(tmp_path):
+    """A module that defines something public must say what its surface is."""
+    src = "import os\n\n\ndef helper():\n    pass\n"
+    assert check_structure.public_defs(_parse(src)) == ["helper"]
+    assert check_structure.declared_all(_parse(src)) is None
+
+
+def test_structure_lint_reads_a_declared_all():
+    src = '__all__ = ["a", "b"]\n'
+    assert check_structure.declared_all(_parse(src)) == ["a", "b"]
+
+
+def test_public_defs_sees_classes_functions_and_constants_but_not_privates():
+    src = (
+        "CAP = 3\n"
+        "_HIDDEN = 4\n"
+        "class Thing:\n    pass\n"
+        "class _Secret:\n    pass\n"
+        "def go():\n    pass\n"
+        "async def go_async():\n    pass\n"
+        "def _helper():\n    pass\n"
+    )
+    assert check_structure.public_defs(_parse(src)) == [
+        "CAP", "Thing", "go", "go_async"
+    ]
+
+
+def test_every_module_in_scope_actually_declares_its_surface():
+    """The rule would be vacuous if it matched nothing; it covers ~50 modules."""
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    checked = 0
+    for pkg in check_structure.GRAPH_PKGS:
+        for f in (check_structure.REPO_ROOT / pkg).rglob("*.py"):
+            if "__pycache__" in f.parts or "tests" in f.parts:
+                continue
+            if f.name in ("__init__.py", "__main__.py"):
+                continue
+            tree = _ast.parse(f.read_text())
+            if check_structure.public_defs(tree):
+                assert check_structure.declared_all(tree) is not None, f
+                checked += 1
+    assert checked > 40, f"only {checked} modules in scope -- rule 4 is too narrow"
 
 
 def test_structure_lint_reads_a_layout_block():

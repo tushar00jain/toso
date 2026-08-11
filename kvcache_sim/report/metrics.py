@@ -18,7 +18,16 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from sim_common.report import Ledger
-from sim_common.trace import Trace  # noqa: F401  (re-exported for scenarios)
+
+__all__ = [
+    "RequestResult",
+    "Metrics",
+    "render_summary",
+    "render_disaggregation",
+    "render_early_rejection",
+    "render_eviction_sweep",
+    "render_hotspot",
+]
 
 
 @dataclass

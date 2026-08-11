@@ -27,6 +27,8 @@ from typing import List
 
 from .request import block_keys_for, Request
 
+__all__ = ["make_workload"]
+
 
 def _zipf_weights(n: int, s: float) -> List[float]:
     """Normalized Zipf weights for ``n`` items with exponent ``s``."""

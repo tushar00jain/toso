@@ -45,8 +45,14 @@ from sim_common.report import configure_logging, section
 
 from realsim.run import Report
 
-__all__ = ["add_run_flags", "apply_run_flags", "Console", "Demo", "log_trace",
-           "Scenario"]
+__all__ = [
+    "add_run_flags",
+    "apply_run_flags",
+    "log_trace",
+    "Console",
+    "Scenario",
+    "Demo",
+]
 
 
 # --------------------------------------------------------------------------- #

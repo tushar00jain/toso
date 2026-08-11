@@ -35,7 +35,7 @@ from ..data.store import KVStore
 #: Tokens per KV block. Fixed for every scenario so runs stay comparable.
 BLOCK_TOKENS = 512
 
-__all__ = ["BLOCK_TOKENS", "KVWorkload", "serving_plane", "sim_block_carrier"]
+__all__ = ["BLOCK_TOKENS", "sim_block_carrier", "KVWorkload", "serving_plane"]
 
 
 def sim_block_carrier(

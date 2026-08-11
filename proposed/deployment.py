@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+__all__ = ["Deployment"]
+
 
 class Deployment(Protocol):
     """The store, as application code sees it."""

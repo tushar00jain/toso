@@ -39,6 +39,12 @@ from realsim.seams.controller_handle import FakeControllerHandle
 from realsim.seams.dict_directory import DictDirectory
 from torchstore.controller import Controller
 
+__all__ = [
+    "RealControllerAdapter",
+    "ShimControllerAdapter",
+    "make_controller_adapter",
+]
+
 
 class RealControllerAdapter:
     """Owns a real ``Controller`` and its off-actor handle.

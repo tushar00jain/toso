@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict
 
+__all__ = ["Endpoint", "Tier", "TIER_LABEL", "locality"]
+
 @dataclass(frozen=True)
 class Endpoint:
     """A transfer endpoint: the minimal locality identity :func:`transfer_time` needs.

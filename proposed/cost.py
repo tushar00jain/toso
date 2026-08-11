@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
+__all__ = ["TransferCost"]
+
 
 class TransferCost(Protocol):
     """Predicts the time to move ``nbytes`` between two volumes."""
