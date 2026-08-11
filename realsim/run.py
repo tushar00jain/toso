@@ -48,7 +48,7 @@ from sim_common.trace import Trace
 from realsim.runner import WorkItem
 from realsim.simulation import Simulation
 
-__all__ = ["Workload", "Report", "MakeControl", "MakePlane", "Run", "Result"]
+__all__ = ["Workload", "Report", "MakePlane", "Run", "Result"]
 
 
 class Workload(ABC):
@@ -95,9 +95,6 @@ class Report(ABC):
 #: coordinator handle, none of which exist before the ``Simulation`` does.
 MakePlane = Callable[[Simulation], DataPlane]
 
-#: Builds the capability's control plane once the stack exists -- for a control
-#: plane that runs as its own service and needs to sense through ``sim.view``.
-MakeControl = Callable[[Simulation], Any]
 
 
 @dataclass
@@ -172,17 +169,9 @@ class Run:
         the scenario declaring them -- the CLI's ``--seed``, a test forcing the
         shim directory. Everything that describes the run itself is a field.
         """
-        pieces = (
-            list(self.control) if isinstance(self.control, (list, tuple))
-            else [] if self.control is None
-            else [self.control]
-        )
-        installed = next((p for p in pieces if isinstance(p, Policy)), None)
-        service = next((p for p in pieces if not isinstance(p, Policy)), None)
         sim = Simulation(
             self.workload.topology,
-            policy=installed,
-            control=service,
+            control=self.control,
             profile=self.profile,
             trace=self.trace,
             ledger=self.ledger,

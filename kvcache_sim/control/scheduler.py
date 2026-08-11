@@ -18,7 +18,7 @@ data-plane object, and nothing here is a field the data plane reads -- see
 ``schedule`` models the cache-aware coordinator's serialized mailbox: the real
 directory read completes without suspending the loop, so the whole routing
 decision runs atomically before the next event -- routing sees a consistent
-directory snapshot (:class:`~kvcache_sim.control.view.PinnedKVView` makes that
+directory snapshot (:class:`~kvcache_sim.control._view.PinnedKVView` makes that
 snapshot explicit). Prefill cost is deterministic, so the *predicted* TTFT used
 for routing equals the *actual* completion time.
 
@@ -33,7 +33,7 @@ for routing equals the *actual* completion time.
 Control plane only
 ------------------
 Nothing here executes: this module holds no client, no volume, no deployment and no
-decode engine. It senses through a :class:`~kvcache_sim.control.view.KVView`,
+decode engine. It senses through a :class:`~kvcache_sim.control._view.KVView`,
 returns decisions, and learns what actually happened through the ``observe_*``
 calls the data plane makes.
 
@@ -60,7 +60,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
-from proposed import Endpoint
+from proposed import Endpoint, Policy, Selection
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -69,6 +69,7 @@ from domain import (
 from proposed import TransferCost
 
 from ._cache import LRUCache
+from ._view import KVView
 from ._source import LongestPrefixPolicy
 from .request import Request
 
@@ -166,11 +167,11 @@ class Completion:
     evict: List[str]     # blocks LRU dropped, to remove from the directory
 
 
-class _Base:
+class _Base(Policy):
     """Shared state + prediction/commit helpers for both schedulers.
 
     Args:
-        view: a :class:`~kvcache_sim.control.view.KVView` -- the only way this
+        view: a :class:`~kvcache_sim.control._view.KVView` -- the only way this
             object sees the world.
         block_tokens: tokens per KV block.
         capacity: per-instance cache capacity in blocks (``None`` = unbounded).
@@ -187,12 +188,10 @@ class _Base:
 
     def __init__(
         self,
-        view,
         *,
         block_tokens: int,
         capacity: Optional[int] = None,
         profile: MachineProfile = DEFAULT_PROFILE,
-        transfer_cost: TransferCost,
         model: Model = DEFAULT_MODEL,
         decode_pool: Optional[List[str]] = None,
         prefill_pool: Optional[List[str]] = None,
@@ -203,40 +202,102 @@ class _Base:
         early_rejection: str = "off",
         source_policy: Optional[Any] = None,
     ) -> None:
-        self.view = view
-        self.topo: Dict[str, Endpoint] = view.topology
-        self.ids: List[str] = sorted(self.topo)
         self.B = block_tokens
+        self.capacity = capacity
         self.profile = profile
-        # Priced through the protocol, never a simulator function: the scheduler
-        # is written against an estimate, not against one cost model. The caller
-        # supplies the implementation; a simulated run passes one priced off the
-        # same model the transport charges, a deployment its measured numbers.
-        self.transfer_cost = transfer_cost
         self.model = model
         self.source_policy = (
             source_policy if source_policy is not None else LongestPrefixPolicy()
         )
-        self.caches: Dict[str, LRUCache] = {i: LRUCache(capacity) for i in self.ids}
-        # PREDICTED prefill queue tail over ALL instances (the disaggregated-
-        # prefill pool may be a subset; decode may be a disjoint or overlapping
-        # subset). This is control's own model of the servers, corrected by the
-        # data plane's observations -- see the module docstring.
-        self.busy_until: Dict[str, float] = {i: 0.0 for i in self.ids}
-        self.prefill_ids: List[str] = (
-            sorted(prefill_pool) if prefill_pool else self.ids
-        )
-        self.decode_ids: List[str] = sorted(decode_pool) if decode_pool else self.ids
+        self._prefill_pool = prefill_pool
+        self._decode_pool = decode_pool
         self.slo_ttft = slo_ttft
         self.slo_tbt = slo_tbt
         self.early_rejection = early_rejection
         self.max_batch = max_batch
         self.tbt_enabled = simulate_decode
+        # Filled by attach(); a coordinator cannot model servers it has not been
+        # told about, and the run knows them only once its stack exists.
+        self.view: Any = None
+        self.transfer_cost: Optional[TransferCost] = None
+        self.topo: Dict[str, Endpoint] = {}
+        self.ids: List[str] = []
+        self.caches: Dict[str, LRUCache] = {}
+        self.busy_until: Dict[str, float] = {}
+        self.prefill_ids: List[str] = []
+        self.decode_ids: List[str] = []
+        self._decode_finishes: Dict[str, List[float]] = {}
+        self._inflight: List[Tuple[float, str, int]] = []
+        # Pulls this coordinator has already routed and priced, oldest first:
+        # ``(requester, gap keys, chosen peer)``. Read back by :meth:`select` when
+        # the directory asks who should serve those keys -- see its docstring.
+        self._routed: List[Tuple[str, Tuple[str, ...], str]] = []
+
+    # -- the stack hands over its ports ----------------------------------- #
+    def attach(self, view, transfer_cost: TransferCost) -> None:
+        """Receive the ports this coordinator senses and prices through.
+
+        Two-phase on purpose: a capability writes ``MyControl(knobs)`` and the run
+        hands it the stack, exactly as the controller hands an installed policy its
+        view. It is what lets a control plane be an *object* a scenario declares
+        rather than a factory the harness has to call at the right moment.
+
+        The view is upgraded to a :class:`~kvcache_sim.control._view.KVView` here:
+        prefix runs are this capability's notion, and deriving them is its job,
+        not the store's.
+        """
+        self.view = KVView(view.directory, view.topology)
+        # Priced through the protocol, never a simulator function: the scheduler
+        # is written against an estimate, not against one cost model. A simulated
+        # run passes one priced off the same model the transport charges, a
+        # deployment its measured numbers.
+        self.transfer_cost = transfer_cost
+        self.topo = dict(view.topology)
+        self.ids = sorted(self.topo)
+        self.caches = {i: LRUCache(self.capacity) for i in self.ids}
+        # PREDICTED prefill queue tail over ALL instances (the disaggregated-
+        # prefill pool may be a subset; decode may be a disjoint or overlapping
+        # subset). This is control's own model of the servers, corrected by the
+        # data plane's observations -- see the module docstring.
+        self.busy_until = {i: 0.0 for i in self.ids}
+        self.prefill_ids = (
+            sorted(self._prefill_pool) if self._prefill_pool else self.ids
+        )
+        self.decode_ids = (
+            sorted(self._decode_pool) if self._decode_pool else self.ids
+        )
         # Control's model of the decode side: instance -> one estimated finish
         # time per request decoding or queued there. Empty until the data plane
         # reports, which it does whenever a batch changes.
-        self._decode_finishes: Dict[str, List[float]] = {i: [] for i in self.ids}
-        self._inflight: List[Tuple[float, str, int]] = []
+        self._decode_finishes = {i: [] for i in self.ids}
+
+    # -- the store's question, answered from what we already decided ------ #
+    async def select(
+        self, view: Any, keys: Sequence[str], requester: str
+    ) -> Selection:
+        """:class:`~proposed.policy.Policy` -- who serves ``keys`` for ``requester``.
+
+        This coordinator is *also* the policy the directory consults, which is the
+        whole point: it priced this pull against a specific peer's locality tier
+        before asking for the bytes, so being asked again is a chance to say what
+        it already decided rather than to decide twice. Re-deriving would not even
+        agree -- routing ranks over a request's whole block chain, while the fetch
+        names only the gap -- and a directory answer that named a different holder
+        would charge a cross-node read for a same-node prediction.
+
+        Matching is by requester plus a *superset* of the keys, because a block may
+        have been evicted between routing and fetching, and the read-through asks
+        only for what is still present. Oldest routed pull first, so two requests
+        in flight to one instance resolve in a fixed order.
+        """
+        wanted = set(keys)
+        for i, (inst, gap, peer) in enumerate(self._routed):
+            if inst == requester and wanted <= set(gap):
+                del self._routed[i]
+                return Selection.of([peer])
+        # Nothing routed for this caller: whoever is asking chose nothing, so the
+        # ranking is the honest answer (and an empty one lets the directory speak).
+        return await self.source_policy.select(self.view or view, list(keys), requester)
 
     # -- what the data plane reports back --------------------------------- #
     def observe_prefill_done(self, inst: str, now: float) -> float:
@@ -352,6 +413,12 @@ class _Base:
         the data plane must register in the real directory (the *new* ones -- the
         ones already cached locally are not re-put) and the ones it must remove.
         """
+        # The pull, if there was one, has happened by now: drop the routing note
+        # so a later pull to this instance cannot match a stale one.
+        self._routed = [
+            e for e in self._routed
+            if not (e[0] == plan.prefill and e[1] == tuple(plan.pull_keys))
+        ]
         keys = list(plan.request.block_keys)
         cache = self.caches[plan.prefill]
         already = cache.held()
@@ -361,6 +428,13 @@ class _Base:
 
     def _commit(self, plan: Plan) -> Plan:
         """Reserve the prefill server for an accepted plan (decode admitted later)."""
+        # Remember the peer this pull was priced against, for the moment the
+        # directory asks (see :meth:`select`). Recorded at commit, so a plan that
+        # was considered and dropped leaves nothing behind.
+        if plan.reuse_source is not None and plan.pull_keys:
+            self._routed.append(
+                (plan.prefill, tuple(plan.pull_keys), plan.reuse_source)
+            )
         self.busy_until[plan.prefill] = plan.done_time
         matched = list(plan.request.block_keys[: plan.match_blocks])
         self.caches[plan.prefill].touch(matched)

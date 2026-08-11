@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from proposed import Policy, Selection
 
-from .view import prefix_lengths_of
+from ._view import prefix_lengths_of
 
 __all__ = ["LongestPrefixPolicy"]
 
@@ -38,11 +38,7 @@ class LongestPrefixPolicy(Policy):
     name = "longest-prefix"
 
     async def select(
-        self,
-        view: Any,
-        keys: Sequence[str],
-        requester: str,
-        chosen: Optional[str] = None,
+        self, view: Any, keys: Sequence[str], requester: str
     ) -> Selection:
         """Instances holding a leading run of ``keys``, longest run first.
 
@@ -55,8 +51,6 @@ class LongestPrefixPolicy(Policy):
         the scheduler ranks over the request's whole block chain, while the fetch
         only names the gap.
         """
-        if chosen is not None:
-            return Selection.of([chosen])
         counts = await self._prefix_runs(view, list(keys))
         if not counts:
             return Selection.of([])
@@ -67,7 +61,7 @@ class LongestPrefixPolicy(Policy):
     async def _prefix_runs(view: Any, keys: Sequence[str]) -> Dict[str, int]:
         """Per-instance prefix runs, from whichever view this caller has.
 
-        The scheduler hands a :class:`~kvcache_sim.control.view.KVView` -- usually
+        The scheduler hands a :class:`~kvcache_sim.control._view.KVView` -- usually
         the *pinned* one, so a whole routing decision reads one directory snapshot
         and the candidate loop cannot disagree with itself. The controller can only
         hand the plain :class:`~proposed.view.View` it was built with, because a

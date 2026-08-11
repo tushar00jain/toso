@@ -509,7 +509,7 @@ def test_the_proposal_stands_on_its_own():
     """It may use itself and the stdlib -- nothing else, not even sim_common."""
     assert _codes(
         "from proposed import Endpoint, locality, Tier\n"
-        "from .view import View\n"
+        "from ._view import View\n"
         "import asyncio\n",
         path=PROPOSED,
     ) == set()

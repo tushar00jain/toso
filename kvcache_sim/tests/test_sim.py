@@ -15,7 +15,7 @@ from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
 from kvcache_sim.control._cache import LRUCache
-from kvcache_sim.control.view import KVView, _longest_prefix_run
+from kvcache_sim.control._view import KVView, _longest_prefix_run
 from kvcache_sim.workload._serving import _sim_block_carrier
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE

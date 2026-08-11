@@ -32,7 +32,6 @@ from realsim.simulation import Simulation
 from realsim.run import Workload
 
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
-from ..control.view import KVView
 from ..data.serving import ServingPlane
 from ..data.store import KVStore
 
@@ -92,15 +91,18 @@ def coordinator(
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "off",
-) -> Callable[[Simulation], object]:
-    """Build the factory for this run's **control plane**.
+) -> object:
+    """This run's **control plane**, as an object a scenario can just declare.
 
     ``kind`` is ``"cache_aware"`` (the coordinator under test) or
-    ``"load_balance"`` (the baseline). A factory rather than an object because a
-    scheduler senses through ``sim.view``, which does not exist until the stack
-    does; the :class:`~realsim.run.Run` wraps what this returns in a
-    :class:`~realsim.seams.coordinator.CoordinatorHandle`, so the serving host
-    reaches it as a service.
+    ``"load_balance"`` (the baseline). Knobs only: the stack's ports arrive later
+    through :meth:`~kvcache_sim.control.scheduler._Base.attach`, which is what
+    lets this be a value rather than a factory the harness must call at the right
+    moment. The :class:`~realsim.run.Run` installs it in the directory (it answers
+    the store's routing question) *and* fronts it with a
+    :class:`~realsim.seams.coordinator.CoordinatorHandle` (it decides compute
+    placement) -- one object, reached through the seam of whichever service is
+    asking.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
@@ -116,22 +118,11 @@ def coordinator(
         decode_pool=decode_pool,
         early_rejection=early_rejection,
     )
-
-    def build(sim: Simulation) -> object:
-        # Control senses the same real directory the data plane writes, but only
-        # ever reads it.
-        view = KVView(sim.view.directory, sim.topology)
-        common = dict(transfer_cost=sim.transfer_cost, **knobs)
-        if kind == "cache_aware":
-            return CacheAwareScheduler(
-                view,
-                balance_threshold=balance_threshold,
-                replicate=replicate,
-                **common,
-            )
-        return LoadBalanceScheduler(view, **common)
-
-    return build
+    if kind == "cache_aware":
+        return CacheAwareScheduler(
+            balance_threshold=balance_threshold, replicate=replicate, **knobs
+        )
+    return LoadBalanceScheduler(**knobs)
 
 
 def serving_plane(

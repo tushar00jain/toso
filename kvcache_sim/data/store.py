@@ -30,7 +30,7 @@ Mapping (real directory + real types throughout):
 
 Reading the directory is *not* here: a ``locate`` decides nothing and moves
 nothing, so per-instance prefix presence is a control-plane view
-(:class:`kvcache_sim.control.view.KVView`).
+(:class:`kvcache_sim.control._view.KVView`).
 """
 
 from __future__ import annotations
@@ -133,20 +133,16 @@ class KVStore:
         entries = {k: self._block_carrier for k in keys}
         await self.deployment.client_for(inst).put_batch(entries)
 
-    async def fetch(
-        self, inst: str, keys: List[str], *, source: Optional[str] = None
-    ) -> None:
+    async def fetch(self, inst: str, keys: List[str]) -> None:
         """Pull ``keys`` into ``inst`` via a real ``get_batch`` (charges fabric).
 
         Drives the real client planning core + transport seam, so the storage /
         RAM / network cost is charged by the real cost model against the peer that
         actually serves the blocks.
 
-        ``source`` is the peer the control plane priced this pull against. Without
-        it the client takes whichever holder the directory lists first, which for
-        a block several instances hold is not necessarily that peer -- so a pull
-        predicted over NVLink can be charged over RDMA. Naming it lets the
-        installed policy narrow the directory answer to the peer that was priced.
+        The peer that serves it is the one the control plane priced: the installed
+        policy *is* that control plane, so it narrows the directory answer to the
+        decision it already made. Nothing has to be threaded through this call.
 
         A routing decision is made when the request arrives, but the pull runs
         later (after the prefill queue), by which time a peer may have *evicted*
@@ -163,7 +159,7 @@ class KVStore:
         present = [k for k in keys if k in located]
         if not present:
             return
-        await self.deployment.client_for(inst, source=source).get_batch(present)
+        await self.deployment.client_for(inst).get_batch(present)
 
     async def evict(self, inst: str, keys: List[str]) -> None:
         """Drop ``key -> volume`` for ``inst`` from the REAL directory (eviction)."""

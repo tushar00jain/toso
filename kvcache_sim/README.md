@@ -141,8 +141,10 @@ kvcache_sim/
                           #   and its model of the decode load
     _source.py            #   LongestPrefixPolicy: the one store question
                           #   ("which peer serves this gap"), a proposed.Policy
-    view.py               #   KVView: per-instance prefix-run lengths, plus the
+    _view.py              #   KVView: per-instance prefix-run lengths, plus the
                           #   pinned snapshot one routing decision reads through
+                          #   (underscored: the coordinator builds its own, so
+                          #   nothing outside control/ names this)
     _cache.py             #   per-instance LRU eviction bookkeeping (metadata)
     request.py            #   inference Request, carrying its prefix-hash chain
                           #   (str keys): what is decided about, and what data/

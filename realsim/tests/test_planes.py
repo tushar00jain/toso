@@ -99,13 +99,13 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
     seen: list[str] = []
 
     class _Counting(Policy):
-        async def select(self, view, keys, requester, chosen=None):
+        async def select(self, view, keys, requester):
             seen.append(requester)
             # Reading the directory from inside select must not recurse.
             await view.locate(keys)
             return Selection()
 
-    sim = Simulation(_topology(), policy=_Counting())
+    sim = Simulation(_topology(), control=_Counting())
 
     async def scenario():
         with sim.mesh.installed():
@@ -129,7 +129,7 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
 def _burst_trace(policy) -> str:
     """Run the same two-reader burst with/without a policy; return its trace."""
     trace = Trace()
-    sim = Simulation(_topology(), trace=trace, policy=policy)
+    sim = Simulation(_topology(), trace=trace, control=policy)
 
     async def scenario():
         with sim.mesh.installed():

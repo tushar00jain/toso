@@ -13,7 +13,7 @@
   used twice: the scheduler calls it to *price* a pull against recomputing, and
   the run installs it in the directory so the fetch is *served* by the peer that
   was priced;
-* :mod:`~kvcache_sim.control.view` -- the single derived directory read the
+* :mod:`~kvcache_sim.control._view` -- the single derived directory read the
   scheduler needs (per-instance prefix-run lengths, and the private prefix walk
   behind them), plus the pinned snapshot one decision reads it through;
 * :mod:`~kvcache_sim.control._cache` -- per-instance LRU. It picks victims; it

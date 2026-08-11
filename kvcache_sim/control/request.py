@@ -9,7 +9,7 @@ so no separate key type is needed.
 
 Building that chain is the *prompt generator's* job
 (``workload/_generator.py``) and walking it against a directory snapshot is the
-*view's* (``control/view.py``); both are private to those modules. What is left
+*view's* (``control/_view.py``); both are private to those modules. What is left
 here is the request itself.
 """
 

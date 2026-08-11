@@ -8,7 +8,7 @@ made an ``AsyncEngine`` directly and one went through ``run_sim``; one hooked
 transfer accounting and one did not; one built its transfer-cost estimate from the
 same profile and topology as its mesh with nothing holding the two together.
 
-    sim = Simulation(topology, policy=DedupPolicy())
+    sim = Simulation(topology, control=DedupPolicy())
     results = sim.run(my_workload, plane=my_plane)
 
 What it builds, top to bottom (compare the stack in the design doc):
@@ -60,16 +60,23 @@ class Simulation:
     Args:
         topology: ``node_id -> Endpoint``. The node id is also its storage-volume
             id in the real directory.
-        policy: optional :class:`~proposed.policy.Policy`, installed in the real
-            controller's ``locate_volumes``. ``None`` leaves the directory
-            answering for itself, which is what the naive policy says anyway.
-            This is a control plane that runs *in the directory service*.
-        control: optional factory for a control plane that runs as its **own**
-            service -- called with this stack once it is assembled, and fronted by
-            a :class:`~realsim.seams.coordinator.CoordinatorHandle` as
-            :attr:`coordinator_handle`. A factory rather than an object because
-            such a control plane senses through :attr:`view`, which does not exist
-            until the mesh does.
+        control: the capability's control plane, or ``None`` for the plain path.
+            One object, installed wherever it can be reached from:
+
+            * if it is a :class:`~proposed.policy.Policy` it is installed in the
+              real controller's ``locate_volumes``, so it runs *in the directory
+              service* and a caller that just does ``client.get(K)`` is routed;
+            * if it declares ``attach(view, transfer_cost)`` it also senses and
+              prices through this stack, which only a control plane deciding more
+              than the store's question needs -- so it is fronted by a
+              :class:`~realsim.seams.coordinator.CoordinatorHandle` as
+              :attr:`coordinator_handle` and reached as its own service.
+
+            Both, for one object, is the interesting case: kvcache's coordinator
+            decides compute placement over the handle *and* answers "which peer
+            serves this prefix" in the directory, which is how the peer it priced
+            is the peer that serves the pull without anything being threaded
+            through the data plane to say so.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`;
             supplies every cost constant and each volume's byte capacity.
         trace: shared :class:`~sim_common.trace.Trace` (created if omitted).
@@ -84,8 +91,7 @@ class Simulation:
         self,
         topology: Dict[str, Endpoint],
         *,
-        policy: Optional[Policy] = None,
-        control: Optional[Callable[["Simulation"], Any]] = None,
+        control: Optional[Any] = None,
         profile: Optional[MachineProfile] = None,
         trace: Optional[Trace] = None,
         ledger: Optional[Ledger] = None,
@@ -96,7 +102,6 @@ class Simulation:
         self.profile = profile if profile is not None else DEFAULT_PROFILE
         self.trace = trace if trace is not None else Trace()
         self.ledger = ledger if ledger is not None else Ledger()
-        self.policy = policy
 
         # The clock, created on first use: assembling a stack should not have the
         # side effect of standing up an event loop, and a caller may only want
@@ -111,7 +116,7 @@ class Simulation:
             topology,
             profile=self.profile,
             trace=self.trace,
-            policy=policy,
+            policy=control if isinstance(control, Policy) else None,
             real_directory=real_directory,
         )
         # Every transfer the transports charge lands in the run's one ledger.
@@ -128,9 +133,16 @@ class Simulation:
         # in front of it (FakeControllerHandle); one that runs on its own gets its
         # seam here. Built last because a control plane senses through the view
         # and prices through the transfer-cost estimate, so both must exist first.
-        self.coordinator_handle: Optional[Any] = (
-            CoordinatorHandle(control(self)) if control is not None else None
-        )
+        # A control plane that senses through the stack says so by declaring
+        # attach() -- and that is exactly the one that decides more than the
+        # store's question, so it is also the one worth reaching as a service. A
+        # pure directory policy declares neither and gets no handle: it is reached
+        # through the seam already in front of the directory.
+        attach = getattr(control, "attach", None) if control is not None else None
+        self.coordinator_handle: Optional[Any] = None
+        if attach is not None:
+            attach(self.view, self.transfer_cost)
+            self.coordinator_handle = CoordinatorHandle(control)
 
     @property
     def loop(self) -> AsyncEngine:

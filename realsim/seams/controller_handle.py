@@ -137,9 +137,7 @@ class FakeControllerHandle:
         requester = factory.current_requester()
         if requester is None:
             return None
-        return await self._policy.select(
-            self._view, list(keys), requester, chosen=factory.current_choice()
-        )
+        return await self._policy.select(self._view, list(keys), requester)
 
     async def locate_raw(
         self,
