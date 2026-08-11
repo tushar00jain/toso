@@ -218,7 +218,7 @@ def test_readers_run_an_untouched_real_client():
 
     for reader_id in result.workload.reader_ids:
         # The one controller handle the mesh built, not a per-reader view of it.
-        assert mesh.client(reader_id)._controller is mesh.handle
+        assert mesh.client(reader_id)._controller is mesh.controller_handle
 
 
 def test_the_scenario_holds_no_burst_loop():

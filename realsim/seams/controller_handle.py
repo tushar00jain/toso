@@ -16,14 +16,15 @@ below (each mirrored block quotes the real endpoint it reproduces). All state
 touched (``controller.keys_to_storage_volumes``, ``_is_dtensor_fully_committed``,
 ``_notify_put``, ``assert_initialized``) is the real object's.
 
-The routing hook
-----------------
-:meth:`FakeControllerHandle.locate_volumes` is also the one place a
-:class:`~proposed.policy.Policy` is consulted on the request path: the mirrored
-real body runs first (:meth:`FakeControllerHandle.locate_raw`), then, if a policy
-is installed, the controller asks it which of the directory's volumes should
-serve this requester and *withholds the answer* until the chosen source is
-usable. A scenario that just calls ``client.get(K)`` is therefore routed without
+A control plane runs here
+-------------------------
+This file is the directory *service*, and a policy installed in it is a
+capability's control plane running inside that service --- all of dedupe's, and
+the source half of kvcache's. :meth:`FakeControllerHandle._route` is that call
+site, kept as its own method so it is findable: the mirrored real body runs first
+(:meth:`FakeControllerHandle.locate_raw`), then the policy is asked which of the
+directory's volumes should serve this requester, and the answer is *withheld*
+until the chosen source is usable. A scenario that just calls ``client.get(K)`` is therefore routed without
 knowing a policy exists, and no client change is needed. With no policy installed
 -- the default -- ``locate_volumes`` is exactly the mirrored real body.
 """
@@ -105,24 +106,40 @@ class FakeControllerHandle:
         require_fully_committed: bool = True,
     ) -> dict[str, dict[str, Any]]:
         """The real ``locate_volumes`` body, then the routing hook."""
-        if self._policy is None:
+        selection = await self._route(keys)
+        if selection is None:
             return await self.locate_raw(keys, missing_ok, require_fully_committed)
-        # Import locally: the seam is otherwise dependency-free, and only a
-        # routed run needs to know who is calling.
-        from realsim.seams import factory
-
-        requester = factory.current_requester()
-        if requester is None:
-            return await self.locate_raw(keys, missing_ok, require_fully_committed)
-        selection = await self._policy.select(
-            self._view, list(keys), requester, chosen=factory.current_choice()
-        )
         # Withhold the answer until the chosen source is usable. The directory is
         # re-read afterwards because waiting is exactly what lets it change: the
         # source the policy picked registers while we are blocked here.
         await selection.wait()
         located = await self.locate_raw(keys, missing_ok, require_fully_committed)
         return selection.narrow(located)
+
+    async def _route(self, keys: Sequence[str]) -> Optional[Any]:
+        """Ask the installed control plane who should serve ``keys``.
+
+        **This is where a directory-side control plane runs** -- all of dedupe's,
+        and the source half of kvcache's. It is one method rather than three
+        conditions inside :meth:`_locate_volumes` because "the control plane is
+        consulted here" is the single most important fact about this file.
+
+        ``None`` means there is nobody to ask -- no policy installed, or no
+        requester bound (a caller the seam cannot identify, GAP 2) -- and the
+        directory answers for itself, which is what the naive policy would say.
+        """
+        if self._policy is None:
+            return None
+        # Import locally: the seam is otherwise dependency-free, and only a
+        # routed run needs to know who is calling.
+        from realsim.seams import factory
+
+        requester = factory.current_requester()
+        if requester is None:
+            return None
+        return await self._policy.select(
+            self._view, list(keys), requester, chosen=factory.current_choice()
+        )
 
     async def locate_raw(
         self,

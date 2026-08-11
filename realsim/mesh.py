@@ -106,15 +106,18 @@ class Mesh:
         )
         self.on_transfer = on_transfer
 
-        self.controller = make_controller_adapter(real_directory)
-        self.handle = self.controller.handle
-        # The routing policy the controller consults inside locate_volumes. The
-        # default (``None``) is the naive answer -- every holder, directory
-        # order -- which is what the real directory returns unaided, so an
-        # unrouted mesh pays nothing for the hook.
-        self.policy = policy
+        # The directory service: an adapter owning the real ``Controller`` and
+        # the endpoint in front of it (``.controller`` / ``.handle``). Reach the
+        # endpoint through :attr:`controller_handle`, which is the name the
+        # ``Deployment`` port uses, rather than a second alias here.
+        self.directory = make_controller_adapter(real_directory)
+        # A policy installed here IS a control plane, and this is where it runs:
+        # inside the endpoint's locate_volumes (see FakeControllerHandle._route).
+        # ``None`` is the naive answer -- every holder, directory order -- which
+        # is what the real directory returns unaided, so an unrouted mesh pays
+        # nothing for the hook.
         if policy is not None:
-            self.handle.install_policy(policy, self.view)
+            self.controller_handle.install_policy(policy, self.view)
         # Each volume's byte capacity comes from the run's profile
         # (``storage_capacity_bytes``, default unbounded); the seam enforces it
         # against the aggregate resident working set.
@@ -125,7 +128,7 @@ class Mesh:
         # One real LocalClient per node, co-located with that node's volume.
         self.adapters: Dict[str, RealClientAdapter] = {
             vid: RealClientAdapter(
-                self.handle,
+                self.controller_handle,
                 volume_handles=self.volumes,
                 client_volume_id=vid,
                 topology=self.topology,
@@ -144,7 +147,7 @@ class Mesh:
         Built here rather than in ``proposed`` so the proposal never has to know
         what a :class:`Mesh` is.
         """
-        return View(self.handle, self.topology)
+        return View(self.controller_handle, self.topology)
 
     def adapter(self, node_id: str) -> RealClientAdapter:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""
@@ -168,8 +171,12 @@ class Mesh:
 
     @property
     def controller_handle(self) -> Any:
-        """:class:`proposed.deployment.Deployment` -- the directory endpoints."""
-        return self.handle
+        """:class:`proposed.deployment.Deployment` -- the directory endpoints.
+
+        The one way to reach the directory service: a client is built with it, a
+        ``View`` reads through it, and an installed policy is consulted inside it.
+        """
+        return self.directory.handle
 
     def client(self, node_id: str) -> Any:
         """The real ``LocalClient`` co-located with ``node_id``."""
