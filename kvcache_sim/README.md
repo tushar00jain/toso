@@ -192,7 +192,12 @@ plus the prefix-run read that express KV caching on a mesh.
 - A remote pull is routed on the directory snapshot at the request's arrival, but the
   fetch runs after the prefill queue; if a peer evicted a planned block meanwhile,
   the read-through fetches only what remains present (the rest is recomputed) -- the
-  faithful real-directory behavior.
+  faithful real-directory behavior. The peer it pulls *from* is the one the
+  coordinator priced: the run installs `LongestPrefixPolicy` in the directory and the
+  fetch names its source, so `locate_volumes` narrows to that peer. Without it the
+  client takes whichever holder the directory lists first, which for a block several
+  instances hold (a shared system prompt, anything replicated) can be a different
+  locality tier than the one the TTFT prediction was built on.
 - **The coordinator hop is free by default.** Control is a service, reached through
   `realsim/seams/coordinator.py` — so there is now somewhere to charge the round trip,
   but `--coordinator-rtt` defaults to `0` and every call is inline. Turn it up and it

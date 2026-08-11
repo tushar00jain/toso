@@ -15,7 +15,7 @@ itself, through the view, and then decides.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 from proposed import Policy, Selection
 
@@ -36,9 +36,25 @@ class LongestPrefixPolicy(Policy):
     name = "longest-prefix"
 
     async def select(
-        self, view: Any, keys: Sequence[str], requester: str
+        self,
+        view: Any,
+        keys: Sequence[str],
+        requester: str,
+        chosen: Optional[str] = None,
     ) -> Selection:
-        """Instances holding a leading run of ``keys``, longest run first."""
+        """Instances holding a leading run of ``keys``, longest run first.
+
+        ``chosen`` short-circuits the ranking. When the scheduler asks, it is
+        pricing alternatives and passes nothing. When the *controller* asks, the
+        caller is a serving host fetching a gap it already decided to pull from a
+        specific peer -- priced at that peer's locality tier -- so re-ranking here
+        could hand it a different one and charge a cross-node read for a
+        same-node prediction. Re-deriving would not even agree by construction:
+        the scheduler ranks over the request's whole block chain, while the fetch
+        only names the gap.
+        """
+        if chosen is not None:
+            return Selection.of([chosen])
         counts = await view.prefix_lengths(list(keys))
         if not counts:
             return Selection.of([])

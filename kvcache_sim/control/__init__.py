@@ -9,7 +9,10 @@
   These are *compute* decisions the store knows nothing about, which is why they
   are app code and not part of the shared policy interface;
 * :mod:`~kvcache_sim.control._source` -- the one part that *is* a store question,
-  "which peer serves this prefix gap", as a :class:`proposed.policy.Policy`;
+  "which peer serves this prefix gap", as a :class:`proposed.policy.Policy`. It is
+  used twice: the scheduler calls it to *price* a pull against recomputing, and
+  the run installs it in the directory so the fetch is *served* by the peer that
+  was priced;
 * :mod:`~kvcache_sim.control.view` -- the single derived directory read the
   scheduler needs (per-instance prefix-run lengths, and the private prefix walk
   behind them), plus the pinned snapshot one decision reads it through;

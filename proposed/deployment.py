@@ -18,7 +18,7 @@ application typing them is the right place for that.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 __all__ = ["Deployment"]
 
@@ -26,12 +26,18 @@ __all__ = ["Deployment"]
 class Deployment(Protocol):
     """The store, as application code sees it."""
 
-    def client_for(self, node_id: str) -> Any:
+    def client_for(self, node_id: str, *, source: Optional[str] = None) -> Any:
         """The torchstore client for ``node_id``, ready to be driven.
 
         A deployment that runs one node per process ignores the argument and
         returns its own client. A harness running many nodes in one process
         resolves the node and attributes the work to it.
+
+        ``source`` names the volume the caller already chose to read from, for an
+        application that routes before it fetches. It reaches an installed
+        :class:`~proposed.policy.Policy` as ``chosen``; without it the directory
+        answers for itself and the client takes whichever holder comes first,
+        which need not be the one the caller priced.
         """
         ...
 

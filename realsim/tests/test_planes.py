@@ -99,7 +99,7 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
     seen: list[str] = []
 
     class _Counting(Policy):
-        async def select(self, view, keys, requester):
+        async def select(self, view, keys, requester, chosen=None):
             seen.append(requester)
             # Reading the directory from inside select must not recurse.
             await view.locate(keys)

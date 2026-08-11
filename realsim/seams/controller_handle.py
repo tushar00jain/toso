@@ -96,7 +96,9 @@ class FakeControllerHandle:
         requester = factory.current_requester()
         if requester is None:
             return await self.locate_raw(keys, missing_ok, require_fully_committed)
-        selection = await self._policy.select(self._view, list(keys), requester)
+        selection = await self._policy.select(
+            self._view, list(keys), requester, chosen=factory.current_choice()
+        )
         # Withhold the answer until the chosen source is usable. The directory is
         # re-read afterwards because waiting is exactly what lets it change: the
         # source the policy picked registers while we are blocked here.

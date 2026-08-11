@@ -150,14 +150,20 @@ class Mesh:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""
         return self.adapters[node_id]
 
-    def client_for(self, node_id: str) -> Any:
+    def client_for(self, node_id: str, *, source: Optional[str] = None) -> Any:
         """:class:`proposed.deployment.Deployment` -- the client for ``node_id``.
 
         Binds the calling coroutine to ``node_id`` first, so a capability's data
         plane never has to know that many clients share this process. A real
         deployment has one client and no binding to do.
+
+        ``source`` is the holder the caller already chose; it is bound for this
+        operation and reaches an installed policy as ``chosen``. Always bound,
+        including when it is ``None``, so one operation's choice cannot leak into
+        the next.
         """
         self.bind_source(node_id)
+        factory.bind_choice(source)
         return self.client(node_id)
 
     @property

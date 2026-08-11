@@ -375,3 +375,34 @@ def test_coordinator_rtt_lands_in_ttft_and_costs_reuse():
         cache_aware, load_balance = run_shared_prefix(seed=1)
     assert cache_aware.ledger.hit_rate > load_balance.ledger.hit_rate
     assert cache_aware.ledger.mean_ttft < load_balance.ledger.mean_ttft
+
+
+# 17. The peer that serves a pull is the peer the coordinator priced.
+#     Control ranks candidates by prefix and prices the pull at that peer's
+#     locality tier (NVLink within a node, RDMA across). The store cannot know
+#     that: `locate_volumes` returns every holder and the client takes the first,
+#     so for a block several instances hold -- a shared system prompt, or
+#     anything replicated -- the bytes could come from a different tier than the
+#     one predicted. The run installs LongestPrefixPolicy in the directory and
+#     the fetch names its source, so the answer is narrowed to the priced peer.
+def _unplanned_edges(result) -> int:
+    """Transfer edges whose (source, destination) no accepted plan asked for."""
+    from collections import Counter
+
+    planned = Counter(
+        (r.reuse_source, r.prefill)
+        for r in result.ledger.rows
+        if getattr(r, "reuse_source", None)
+    )
+    actual = Counter((src, dst) for src, dst, _label in result.ledger.edges)
+    return sum((actual - planned).values())
+
+
+def test_a_pull_is_served_by_the_peer_that_was_priced():
+    cache_aware = run_shared_prefix(seed=1)[0]
+    assert cache_aware.ledger.edges, "no transfers -- the assertion would be vacuous"
+    assert _unplanned_edges(cache_aware) == 0
+    # Replication is the case that makes a block multi-holder on purpose.
+    _baseline, _no_repl, replicated = run_hotspot(seed=2)
+    assert replicated.ledger.edges
+    assert _unplanned_edges(replicated) == 0

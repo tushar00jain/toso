@@ -30,6 +30,7 @@ from ..report.summary import (
     EvictionReport,
     HotspotReport,
 )
+from ..control._source import LongestPrefixPolicy
 from ._generator import make_workload
 from ._serving import BLOCK_TOKENS, coordinator, KVWorkload, serving_plane
 
@@ -67,7 +68,10 @@ def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     return Run(
         label,
         KVWorkload(topology, requests),
-        control=coordinator(kind, **knobs),
+        # Both halves of this capability's control plane: the coordinator in
+        # its own service, and the source policy in the directory, so the
+        # pull is served by the peer the coordinator priced.
+        control=[LongestPrefixPolicy(), coordinator(kind, **knobs)],
         data=serving_plane(
             coupled=coupled,
             simulate_decode=knobs.get("simulate_decode", False),

@@ -181,7 +181,9 @@ class ServingPlane(DataPlane):
             await asyncio.sleep(plan.queue_wait)
         # (2) pull the remote prefix (a real client.get_batch -> real fabric cost).
         if plan.reuse_source is not None and plan.pull_keys:
-            await self.store.fetch(plan.prefill, plan.pull_keys)
+            await self.store.fetch(
+                plan.prefill, plan.pull_keys, source=plan.reuse_source
+            )
         # (3) charge the prefill compute for the uncached suffix.
         if plan.prefill_t > 0:
             await asyncio.sleep(plan.prefill_t)

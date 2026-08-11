@@ -129,10 +129,18 @@ class Run:
               instance's queue, cache and decode occupancy, so it needs
               ``sim.view`` and cannot be built before the stack.
 
-            ``None`` leaves the directory answering for itself. (Neither seam
-            charges its hop by default: ``--coordinator-rtt`` gives the second one
-            a cost, and the client-to-controller hop the first one crosses is
-            free for every capability, including the baseline.)
+            A capability whose control plane runs in *both* places passes a
+            sequence of the two, which is what kvcache does: the coordinator
+            decides where to prefill, and a
+            :class:`~kvcache_sim.control._source.LongestPrefixPolicy` in the
+            directory narrows the pull to the peer the coordinator already priced
+            -- without it the client reads from whichever holder the directory
+            lists first, and a pull predicted over NVLink can be charged over
+            RDMA. ``None`` leaves the directory answering for itself.
+
+            (Neither seam charges its hop by default: ``--coordinator-rtt`` gives
+            the coordinator one a cost, and the client-to-controller hop is free
+            for every capability, including the baseline.)
         data: builds the capability's :class:`~proposed.plane.DataPlane` onto the
             assembled stack -- the half that executes. ``None`` -> no plane, the
             plain path. It reaches the control plane through ``sim.coordinator``,
@@ -164,7 +172,13 @@ class Run:
         the scenario declaring them -- the CLI's ``--seed``, a test forcing the
         shim directory. Everything that describes the run itself is a field.
         """
-        installed = self.control if isinstance(self.control, Policy) else None
+        pieces = (
+            list(self.control) if isinstance(self.control, (list, tuple))
+            else [] if self.control is None
+            else [self.control]
+        )
+        installed = next((p for p in pieces if isinstance(p, Policy)), None)
+        service = next((p for p in pieces if not isinstance(p, Policy)), None)
         sim = Simulation(
             self.workload.topology,
             policy=installed,
@@ -178,8 +192,8 @@ class Run:
         # A control plane that is not installed in the controller runs beside
         # it, and the data plane reaches it through a handle -- the seam a
         # deployment replaces with an actor endpoint.
-        if self.control is not None and installed is None:
-            sim.coordinator = CoordinatorHandle(self.control(sim))
+        if service is not None:
+            sim.coordinator = CoordinatorHandle(service(sim))
         plane = self.data(sim) if self.data is not None else None
         results = sim.run(self.workload, plane=plane)
         return Result(results=results, sim=sim, run=self)

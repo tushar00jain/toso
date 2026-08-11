@@ -75,9 +75,18 @@ class DedupPolicy(Policy):
 
     # -- decide -------------------------------------------------------------- #
     async def select(
-        self, view: Any, keys: Sequence[str], requester: str
+        self,
+        view: Any,
+        keys: Sequence[str],
+        requester: str,
+        chosen: Optional[str] = None,
     ) -> Selection:
-        """Route ``requester`` to a peer (or, if it is first, to a holder)."""
+        """Route ``requester`` to a peer (or, if it is first, to a holder).
+
+        ``chosen`` is ignored: dedupe's callers are plain ``client.get(K)`` users
+        that pick nothing, which is the whole point -- the fan-out tree is a
+        consequence of the controller's answers, not of anything a reader decided.
+        """
         source = self._route.get(requester)
         if source is None:
             source = await self._assign(view, keys, requester)

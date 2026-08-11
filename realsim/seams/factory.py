@@ -39,6 +39,8 @@ import torchstore.client  # noqa: F401  (ensure the submodule is in sys.modules)
 from sim_common.topology import Endpoint
 
 __all__ = [
+    "bind_choice",
+    "current_choice",
     "bind_source",
     "bind_requester",
     "current_requester",
@@ -70,6 +72,13 @@ _current_requester: "contextvars.ContextVar[Optional[str]]" = contextvars.Contex
 _owner: Optional[Any] = None
 
 
+#: The source an application already chose for the current operation (GAP 1/2:
+#: the controller cannot otherwise be told what the caller decided).
+_current_choice: contextvars.ContextVar = contextvars.ContextVar(
+    "toso_current_choice", default=None
+)
+
+
 def bind_source(endpoint: Endpoint) -> None:
     """Bind the source endpoint for the calling coroutine's transfers."""
     _current_src.set(endpoint)
@@ -97,6 +106,22 @@ def current_requester() -> Optional[str]:
     would silently misprice a transfer.
     """
     return _current_requester.get()
+
+
+def bind_choice(volume_id: Optional[str]) -> None:
+    """Bind the source the caller already chose for this operation.
+
+    The third identity a client call carries, alongside the locality endpoint and
+    the requester volume id: *which holder the application decided to read from*.
+    An installed policy receives it as ``chosen``. ``None`` clears it, so an
+    operation that made no choice cannot inherit the previous one's.
+    """
+    _current_choice.set(volume_id)
+
+
+def current_choice() -> Optional[str]:
+    """The source bound by :func:`bind_choice`, or ``None`` if the caller had none."""
+    return _current_choice.get()
 
 
 def current_source() -> Endpoint:

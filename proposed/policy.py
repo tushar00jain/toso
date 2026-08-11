@@ -116,9 +116,19 @@ class Policy:
     name = "naive"
 
     async def select(
-        self, view: View, keys: Sequence[str], requester: str
+        self,
+        view: View,
+        keys: Sequence[str],
+        requester: str,
+        chosen: Optional[str] = None,
     ) -> Selection:
         """Rank the volumes that should serve ``keys`` for ``requester``.
+
+        ``chosen`` is the source the caller *already* decided on, when it is a
+        caller that decides: kvcache prices pull-vs-recompute against a specific
+        peer before it asks for the bytes, so re-deriving the source here could
+        route the fetch to a different one than was priced. It is a hint, not a
+        command -- a policy is free to ignore it, and the naive answer does.
 
         Naive: every holder, in directory order, usable now. That is precisely
         the real directory's own answer, so this returns the empty
