@@ -12,9 +12,10 @@ simulator, ``proposed`` is the design being argued for.
   :class:`~proposed.policy.NaivePolicy` returns the directory's own answer, so an
   installed policy changes nothing until one is written.
 * :mod:`proposed.coordinator` -- :class:`~proposed.coordinator.Coordinator`, the
-  other kind of control plane: one that runs as its own service because its
-  decision needs the cluster-wide picture no single host holds. The abstract base a
-  capability subclasses, as ``Policy`` is for the kind the controller consults.
+  other kind of control plane: an *application's*, deciding about its own resources
+  from facts only it can see. Two members, ``decide`` and ``observe``, with the
+  questions carried as payloads the application defines -- so a second application
+  reuses the shape (and the seam that carries it) instead of inventing one.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
   directory surface a caller reaches (torchstore names this type but never declares
   it: ``api.py`` annotates the spawned handle as the actor class and ``LocalClient``

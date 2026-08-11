@@ -100,15 +100,16 @@ on wall-clock timing.
 The only calls a "serving engine" makes are:
 
 ```python
-plan = await coordinator.schedule(request, now)  # route; None => rejected
-...                                              # pull any remote prefix + prefill
-completion = coordinator.complete(plan)          # which blocks to publish / evict
+plan = await coordinator.decide(Route(request))        # route; None => rejected
+...                                                    # pull remote prefix + prefill
+completion = await coordinator.decide(Published(plan))  # which blocks to publish/evict
 await store.publish(completion.instance, completion.publish)
-busy = coordinator.observe_prefill_done(completion.instance, now)  # what happened
+busy = await coordinator.decide(PrefillFinished(completion.instance, now))
 ```
 
-That is the whole `Coordinator` port (plus `decode_admission` and two more
-`observe_*` calls), and it is deliberately all a serving host may touch: control
+That is the whole `Coordinator` port: two members, `decide` and `observe`, with this
+application's questions carried as values (plus `AdmitDecode`, and the `ComputeBusy` /
+`DecodeState` facts). It is deliberately all a serving host may touch: control
 holds every instance's queue, cache and decode occupancy, so it runs as a service,
 not here. Everything crossing is a value, which is what lets the in-process call
 become an actor endpoint without either side changing shape. The scheduler only

@@ -1,22 +1,22 @@
 """Schedulers under test: ``LoadBalanceScheduler`` and ``CacheAwareScheduler``.
 
-Both implement :class:`~proposed.coordinator.Coordinator`, which is the whole
-surface the data plane may touch -- and, because control runs in a coordinator
-service rather than on the serving host, the whole surface that would go on a
-wire::
+Both implement :class:`~proposed.coordinator.Coordinator`, whose two members are
+the whole surface the data plane may touch -- and, because control runs in a
+coordinator service rather than on the serving host, the whole surface that would go
+on a wire. The *questions* are this application's, carried as values::
 
-    await schedule(request)      -> Plan | None   # None == rejected (SLO/overload)
-    complete(plan)               -> Completion    # what to publish / evict
-    decode_admission(plan)       -> bool          # may it enter a decode batch
-    observe_prefill_done(inst, now) -> float      # -> the corrected queue tail
-    observe_compute_busy(inst, until)             # a decode step's actual end
-    observe_decode_state(inst, finishes)          # who is still decoding, and until when
+    await decide(Route(request))        -> Plan | None   # None == rejected (SLO)
+    await decide(Published(plan))       -> Completion    # what to publish / evict
+    await decide(AdmitDecode(plan))     -> True | None   # may it enter a decode batch
+    await decide(PrefillFinished(i, t)) -> float         # the corrected queue tail
+    observe(ComputeBusy(i, until))                       # a decode step's actual end
+    observe(DecodeState(i, finishes))                    # who is decoding, until when
 
 Every argument and every return is a value. Nothing here takes a handle to a
 data-plane object, and nothing here is a field the data plane reads -- see
 "Control plane only" below.
 
-``schedule`` models the cache-aware coordinator's serialized mailbox: the real
+Routing models the cache-aware coordinator's serialized mailbox: the real
 directory read completes without suspending the loop, so the whole routing
 decision runs atomically before the next event -- routing sees a consistent
 directory snapshot (:class:`~kvcache_sim.control._view.PinnedKVView` makes that
@@ -35,22 +35,21 @@ Control plane only
 ------------------
 Nothing here executes: this module holds no client, no volume, no deployment and no
 decode engine. It senses through a :class:`~kvcache_sim.control._view.KVView`,
-returns decisions, and learns what actually happened through the ``observe_*``
-calls the data plane makes.
+returns decisions, and learns what actually happened from the facts the data plane
+reports.
 
 Everything the scheduler knows about the running cluster is therefore a *model*
 corrected by observations, never a live read:
 
-* the **prefill queue** (:attr:`_Base.busy_until`) is predicted -- ``schedule``
-  reserves an instance until the TTFT it predicted -- and corrected by
-  :meth:`_Base.observe_prefill_done`. On a **coupled** instance prefill and decode
-  are one physical resource, so the data plane also mirrors each decode step back
-  through :meth:`_Base.observe_compute_busy`; it is the data plane that decides
-  whether coupling applies, because whether the two contend is a fact about the
-  deployment, not about the policy;
+* the **prefill queue** (:attr:`_Base.busy_until`) is predicted -- routing reserves
+  an instance until the TTFT it predicted -- and corrected by :class:`PrefillFinished`.
+  On a **coupled** instance prefill and decode are one physical resource, so the data
+  plane also mirrors each decode step back as :class:`ComputeBusy`; it is the data
+  plane that decides whether coupling applies, because whether the two contend is a
+  fact about the deployment, not about the policy;
 * **decode occupancy** (:attr:`_Base._decode_finishes`) is a per-instance list of
-  estimated finish times, replaced wholesale by
-  :meth:`_Base.observe_decode_state` whenever a batch changes. This used to be a
+  estimated finish times, replaced wholesale by :class:`DecodeState` whenever a batch
+  changes. This used to be a
   handle: the data plane passed its ``DecodeEngine`` in and the scheduler called
   ``occupancy()`` on it mid-decision. Same numbers, but a pointer into another
   host, so it became a value the data plane pushes.
@@ -75,11 +74,89 @@ from ._source import LongestPrefixPolicy
 from .request import Request
 
 __all__ = [
+    "Route",
+    "AdmitDecode",
+    "PrefillFinished",
+    "Published",
+    "ComputeBusy",
+    "DecodeState",
     "Plan",
     "Completion",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
 ]
+
+
+# -- what this application asks its coordinator, and tells it ---------------- #
+# :class:`proposed.coordinator.Coordinator` declares two members, ``decide`` and
+# ``observe``, and leaves the questions to the application. These are this
+# application's: four demands it asks and two facts it reports. Values, so they
+# cross a process boundary unchanged, and frozen, so an answer cannot be edited
+# after it was given.
+
+
+@dataclass(frozen=True)
+class Route:
+    """*Where should this request run?* Answered with a :class:`Plan`, or refused."""
+
+    request: Request
+
+
+@dataclass(frozen=True)
+class AdmitDecode:
+    """*May this request enter its decode batch?* Answered ``True`` / ``None``.
+
+    Asked after prefill, so a refusal here has already cost the prefill -- which is
+    what a surface that could answer *not yet* would avoid, and cannot today.
+    """
+
+    plan: "Plan"
+
+
+@dataclass(frozen=True)
+class PrefillFinished:
+    """*Prefill really finished at this clock -- what is the queue tail now?*
+
+    Both a report and a question, which is why it is a demand and not a fact:
+    ``schedule`` reserved the instance until a *predicted* completion, the executed
+    cost can differ, and the data plane needs the corrected tail back to apply it to
+    a coupled instance's decode timeline.
+    """
+
+    inst: str
+    now: float
+
+
+@dataclass(frozen=True)
+class Published:
+    """*This plan's prefill is done -- what must the store be told?*
+
+    Answered with a :class:`Completion`: the blocks to register and the ones to
+    remove. Deciding *which* blocks survive is control's, the store calls that make
+    it true are the data plane's.
+    """
+
+    plan: "Plan"
+
+
+@dataclass(frozen=True)
+class ComputeBusy:
+    """A decode step occupied a **coupled** instance's compute until ``until``."""
+
+    inst: str
+    until: float
+
+
+@dataclass(frozen=True)
+class DecodeState:
+    """``inst``'s live decode batch, as one estimated finish time per request.
+
+    Its length is the occupancy and its values answer "still decoding at ``t``?".
+    Reported whenever the batch changes, which is the only time either answer moves.
+    """
+
+    inst: str
+    finishes: Tuple[float, ...]
 
 
 @dataclass
@@ -231,6 +308,125 @@ class _Base(Policy, Coordinator):
         # time per request decoding or queued there. Empty until the data plane
         # reports, which it does whenever a batch changes.
         self._decode_finishes = {i: [] for i in self.ids}
+        # demand type -> the method that answers it, and fact type -> the method
+        # that learns it. Bound here, so they resolve through this instance's MRO:
+        # overriding an answer in a subclass is all a subclass has to do.
+        self._answers = {
+            Route: self._decide_route,
+            AdmitDecode: self._decide_admit_decode,
+            PrefillFinished: self._decide_prefill_finished,
+            Published: self._decide_published,
+        }
+        self._facts = {
+            ComputeBusy: self._observe_compute_busy,
+            DecodeState: self._observe_decode_state,
+        }
+
+    # -- proposed.Coordinator: two members, one per kind of interaction ---- #
+    async def decide(self, demand: Any) -> Optional[Any]:
+        """:class:`~proposed.coordinator.Coordinator` -- answer ``demand``.
+
+        Dispatch is the demand's own type, looked up in a table bound at
+        construction, so the answer a subclass overrides *is* the answer that runs.
+        ``functools.singledispatchmethod`` cannot do that: it captures the function
+        registered on this class, and a subclass redefining one is silently ignored.
+        """
+        answer = self._answers.get(type(demand))
+        if answer is None:
+            raise TypeError(
+                f"{type(self).__name__} does not answer {type(demand).__name__}: "
+                f"this application's demands are "
+                f"{', '.join(sorted(d.__name__ for d in self._answers))}"
+            )
+        return await answer(demand)
+
+    def observe(self, fact: Any) -> None:
+        """:class:`~proposed.coordinator.Coordinator` -- learn that ``fact`` happened."""
+        learn = self._facts.get(type(fact))
+        if learn is None:
+            raise TypeError(
+                f"{type(self).__name__} is not told {type(fact).__name__}: this "
+                f"application's facts are "
+                f"{', '.join(sorted(f.__name__ for f in self._facts))}"
+            )
+        learn(fact)
+
+    async def _decide_route(self, demand: Route) -> Optional["Plan"]:
+        """Where should this request run? Answered by whichever scheduler this is."""
+        raise NotImplementedError(
+            f"{type(self).__name__} answers no Route: a scheduler decides where a "
+            f"request runs"
+        )
+
+    async def _decide_admit_decode(self, demand: AdmitDecode) -> Optional[bool]:
+        """May this accepted request enter its decode batch now?
+
+        ``None`` -- the refusal the surface defines -- when decode cannot honour the
+        TBT SLO. In ``off`` mode this is the only TBT gate, so a refusal here means
+        the prefill was already spent: a *wasted* prefill. The data plane performs
+        (or skips) the admission; this only decides.
+        """
+        plan = demand.plan
+        if not self.tbt_enabled:
+            return True
+        if self.early_rejection == "off":
+            pred = decode_step_time(
+                self._occupancy(plan.decode) + 1, self.profile, self.model
+            )
+            if pred > self.slo_tbt:
+                return None  # late reject -> wasted prefill
+        return True
+
+    async def _decide_prefill_finished(self, demand: PrefillFinished) -> float:
+        """Correct the predicted queue with the clock the real ops reached.
+
+        Routing reserved this instance until the *predicted* ``done_time``; the
+        executed cost can differ (the pull may find fewer blocks still resident, may
+        be served by a different peer than the one priced, or may be slowed by
+        contention), and only now is the true completion time known.
+
+        Answers with the corrected queue tail. The data plane needs it on a coupled
+        instance -- prefill just occupied the timeline decode steps run on -- and
+        answering is what keeps that a reply rather than a field it reads.
+        """
+        if demand.now > self.busy_until[demand.inst]:
+            self.busy_until[demand.inst] = demand.now
+        return self.busy_until[demand.inst]
+
+    async def _decide_published(self, demand: Published) -> "Completion":
+        """Admit the request's blocks into its prefill instance's cache.
+
+        After prefill the instance holds KV for the whole prompt, so every block key
+        is admitted (evicting the coldest past capacity). Answers with the blocks the
+        data plane must register in the real directory (the *new* ones -- the ones
+        already cached locally are not re-put) and the ones it must remove.
+        """
+        plan = demand.plan
+        # The pull, if there was one, has happened by now: drop the routing note
+        # so a later pull to this instance cannot match a stale one.
+        self._routed = [
+            e for e in self._routed
+            if not (e[0] == plan.prefill and e[1] == tuple(plan.pull_keys))
+        ]
+        keys = list(plan.request.block_keys)
+        cache = self.caches[plan.prefill]
+        already = cache.held()
+        new_keys = [k for k in keys if k not in already]
+        evicted = cache.admit(keys)
+        return Completion(instance=plan.prefill, publish=new_keys, evict=evicted)
+
+    def _observe_compute_busy(self, fact: ComputeBusy) -> None:
+        """A decode step on a **coupled** instance occupied its compute.
+
+        Only the data plane knows whether prefill and decode share a timeline, so
+        only it reports this; when they are disaggregated it never does, and the
+        predicted prefill queue is untouched by decode.
+        """
+        self.busy_until[fact.inst] = fact.until
+
+    def _observe_decode_state(self, fact: DecodeState) -> None:
+        """Replace control's model of ``inst``'s decode batch."""
+        self._decode_finishes[fact.inst] = list(fact.finishes)
 
     # -- the store's question, answered from what we already decided ------ #
     async def select(
@@ -260,28 +456,7 @@ class _Base(Policy, Coordinator):
         # ranking is the honest answer (and an empty one lets the directory speak).
         return await self.source_policy.select(self.view or view, list(keys), requester)
 
-    # -- what the data plane reports back --------------------------------- #
-    async def observe_prefill_done(self, inst: str, now: float) -> float:
-        """Correct the predicted queue with the clock the real ops reached.
-
-        ``schedule`` reserved this instance until the *predicted* ``done_time``;
-        the executed cost can differ (the pull may find fewer blocks still
-        resident, may be served by a different peer than the one priced, or may
-        be slowed by contention), and only now is the true completion time known.
-
-        Returns the corrected queue tail. The data plane needs it on a coupled
-        instance -- prefill just occupied the timeline decode steps on -- and
-        returning it is what keeps that a reply rather than a field it reads.
-        """
-        if now > self.busy_until[inst]:
-            self.busy_until[inst] = now
-        return self.busy_until[inst]
-
-    def observe_decode_state(self, inst: str, finishes: Sequence[float]) -> None:
-        """Replace control's model of ``inst``'s decode batch."""
-        self._decode_finishes[inst] = list(finishes)
-
-    # -- reading that model (never the data plane's objects) -------------- #
+    # -- reading the model the facts above maintain ----------------------- #
     def _occupancy(self, inst: str) -> int:
         """Requests currently decoding or queued on ``inst``."""
         return len(self._decode_finishes.get(inst, ()))
@@ -289,15 +464,6 @@ class _Base(Policy, Coordinator):
     def _predict_occupancy(self, inst: str, at_t: float) -> int:
         """How many of those are estimated to still be decoding at ``at_t``."""
         return sum(1 for f in self._decode_finishes.get(inst, ()) if f > at_t)
-
-    def observe_compute_busy(self, inst: str, until: float) -> None:
-        """A decode step on a **coupled** instance occupied its compute to ``until``.
-
-        Only the data plane knows whether prefill and decode share a timeline, so
-        only it makes this call; when they are disaggregated it never does, and
-        the predicted prefill queue is untouched by decode.
-        """
-        self.busy_until[inst] = until
 
     # -- prediction (no mutation) ---------------------------------------- #
     def _predict(self, inst: str, now: float, transfer_t: float, prefill_t: float):
@@ -347,46 +513,7 @@ class _Base(Policy, Coordinator):
             return None
         return self._commit(plan)
 
-    async def decode_admission(self, plan: Plan) -> bool:
-        """May this accepted request enter its decode batch now?
-
-        ``False`` when decode cannot honour the TBT SLO. In ``off`` mode this is
-        the only TBT gate, so a refusal here means the prefill was already spent
-        -- a *wasted* prefill. The data plane performs (or skips) the admission;
-        this only decides.
-        """
-        if not self.tbt_enabled:
-            return True
-        if self.early_rejection == "off":
-            pred = decode_step_time(
-                self._occupancy(plan.decode) + 1, self.profile, self.model
-            )
-            if pred > self.slo_tbt:
-                return False  # late reject -> wasted prefill
-        return True
-
-    # -- commit / completion --------------------------------------------- #
-    async def complete(self, plan: Plan) -> Completion:
-        """Admit the request's blocks into its prefill instance's cache.
-
-        After prefill the instance holds KV for the whole prompt, so every block
-        key is admitted (evicting the coldest past capacity). Returns the blocks
-        the data plane must register in the real directory (the *new* ones -- the
-        ones already cached locally are not re-put) and the ones it must remove.
-        """
-        # The pull, if there was one, has happened by now: drop the routing note
-        # so a later pull to this instance cannot match a stale one.
-        self._routed = [
-            e for e in self._routed
-            if not (e[0] == plan.prefill and e[1] == tuple(plan.pull_keys))
-        ]
-        keys = list(plan.request.block_keys)
-        cache = self.caches[plan.prefill]
-        already = cache.held()
-        new_keys = [k for k in keys if k not in already]
-        evicted = cache.admit(keys)
-        return Completion(instance=plan.prefill, publish=new_keys, evict=evicted)
-
+    # -- commit ----------------------------------------------------------- #
     def _commit(self, plan: Plan) -> Plan:
         """Reserve the prefill server for an accepted plan (decode admitted later)."""
         # Remember the peer this pull was priced against, for the moment the
@@ -411,7 +538,8 @@ class _Base(Policy, Coordinator):
 class LoadBalanceScheduler(_Base):
     """Baseline: route to the least-loaded instance; local-only cache reuse."""
 
-    async def schedule(self, request: Request) -> Optional[Plan]:
+    async def _decide_route(self, demand: Route) -> Optional[Plan]:
+        request = demand.request
         now = self.view.now()
         keys = list(request.block_keys)
         prompt = request.prompt_tokens
@@ -453,7 +581,8 @@ class CacheAwareScheduler(_Base):
         # prefix locally). Used to isolate replication's contribution in the demo.
         self.replicate = replicate
 
-    async def schedule(self, request: Request) -> Optional[Plan]:
+    async def _decide_route(self, demand: Route) -> Optional[Plan]:
+        request = demand.request
         now = self.view.now()
         keys = list(request.block_keys)
         prompt = request.prompt_tokens

@@ -23,6 +23,10 @@ from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data.store import KVStore
 from kvcache_sim.control.request import Request
+from kvcache_sim.control.scheduler import (
+    AdmitDecode, ComputeBusy, DecodeState, LoadBalanceScheduler,
+    PrefillFinished, Published, Route,
+)
 from kvcache_sim.workload._generator import _block_keys_for
 from kvcache_sim.tests._run import (
     run,
@@ -439,3 +443,91 @@ def test_the_source_policy_accepts_a_plain_view():
         sim.loop.close()
     assert empty.sources == ()                  # nobody holds it yet
     assert ranked.sources == ("s1",)            # ...and now the holder is ranked
+
+
+# --------------------------------------------------------------------------
+# The coordinator surface: two members, this application's questions as values.
+# --------------------------------------------------------------------------
+
+
+def _scheduler(n: int = 2):
+    """A scheduler attached to a real mesh view, ready to be asked things."""
+    sim = Simulation(_make_topology(n))
+    sched = LoadBalanceScheduler(block_tokens=512)
+    sched.attach(sim.view, sim.transfer_cost)
+    return sim, sched
+
+
+def test_decide_dispatches_each_demand_to_its_own_handler():
+    """One member, four questions, told apart by the demand's type."""
+    sim, sched = _scheduler()
+    request = Request(
+        id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
+        block_keys=tuple(_block_keys_for("m0", [0, 1])),
+    )
+
+    async def scenario():
+        with sim.mesh.installed():
+            plan = await sched.decide(Route(request))
+            admitted = await sched.decide(AdmitDecode(plan))
+            completion = await sched.decide(Published(plan))
+            tail = await sched.decide(PrefillFinished(plan.prefill, 42.0))
+        return plan, admitted, completion, tail
+
+    try:
+        plan, admitted, completion, tail = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+    assert plan is not None and plan.prefill in sched.ids
+    assert admitted is True                       # no TBT SLO in this run
+    assert completion.instance == plan.prefill
+    assert completion.publish == list(request.block_keys)
+    assert tail == 42.0                            # the corrected queue tail, echoed
+
+
+def test_observe_dispatches_each_fact_and_answers_nothing():
+    """The learning half: it corrects the model and returns None."""
+    sim, sched = _scheduler()
+    try:
+        assert sched.observe(ComputeBusy("s0", 7.0)) is None
+        assert sched.busy_until["s0"] == 7.0
+        assert sched.observe(DecodeState("s1", (1.0, 2.0))) is None
+        assert sched._occupancy("s1") == 2
+    finally:
+        sim.loop.close()
+
+
+def test_a_subclass_answer_is_the_answer_that_runs():
+    """The dispatch table binds per instance, so overriding an answer suffices.
+
+    ``functools.singledispatchmethod`` would fail this silently: it captures the
+    function registered on the base class, so a subclass redefining the handler is
+    ignored and the base answer runs instead. Both schedulers override exactly this
+    way, so the trap would be invisible in a passing suite.
+    """
+    sim = Simulation(_make_topology(2))
+
+    class Fixed(LoadBalanceScheduler):
+        async def _decide_route(self, demand):
+            return "overridden"
+
+    sched = Fixed(block_tokens=512)
+    sched.attach(sim.view, sim.transfer_cost)
+    try:
+        answer = sim.loop.run_until_complete(sched.decide(Route(request=None)))
+    finally:
+        sim.loop.close()
+    assert answer == "overridden"
+
+
+@pytest.mark.parametrize("member,payload", [("decide", "Route"), ("observe", 3)])
+def test_an_unknown_payload_is_refused_not_guessed(member, payload):
+    """A demand this application does not define must fail loudly at the surface."""
+    sim, sched = _scheduler()
+    try:
+        with pytest.raises(TypeError, match="does not answer|is not told"):
+            result = getattr(sched, member)(payload)
+            if member == "decide":
+                sim.loop.run_until_complete(result)
+    finally:
+        sim.loop.close()

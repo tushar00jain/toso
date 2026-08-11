@@ -12,22 +12,27 @@ through a handle, over calls that carry values.
 which holds the deciding object -- and is the single place a round trip is charged. In a deployment it becomes a Monarch actor endpoint and nothing on
 either side changes shape.
 
-One endpoint per member of the surface
---------------------------------------
-The members are :class:`proposed.deployment.Coordinator`'s, so naming them here is
-not the harness knowing what a capability decided -- it is the harness knowing the
-port, which lives in ``proposed`` exactly so that both sides can be written without
-either knowing the other. Same as
+One endpoint per member of the surface -- and there are two
+-----------------------------------------------------------
+The members are :class:`proposed.deployment.Coordinator`'s: ``decide`` and
+``observe``. Naming them here is not the harness knowing what a capability decided --
+it is the harness knowing the port, which lives in ``proposed`` exactly so both sides
+can be written without either knowing the other. Same as
 :class:`realsim.seams.controller_handle.LocalControllerHandle` and its five.
+
+It used to name six, after one application's questions. That put a KV-cache
+vocabulary in a generic harness file and meant a second application would have to
+edit this one. The questions are payload now, so this file is done: any application,
+two endpoints.
 
 Calls and sends
 ---------------
 Every member comes back as a :class:`~realsim.seams.link.LocalEndpoint`, so the
 *caller* chooses how to send, exactly as it would with Monarch:
 
-* ``schedule.call_one(request)`` -- a call, awaited, paying the hop twice because
+* ``decide.call_one(demand)`` -- a call, awaited, paying the hop twice because
   the caller is blocked out and back;
-* ``observe_decode_state.broadcast(inst, finishes)`` -- one-way, free, because the
+* ``observe.broadcast(fact)`` -- one-way, free, because the
   sender does not wait. A real bus would still deliver it ``rtt`` later, so control
   would act on a slightly stale picture; that lag is *not* modelled, and it is the
   one piece of coordinator distance this seam leaves out.
@@ -73,18 +78,9 @@ class CoordinatorHandle:
         self.hop = ServiceHop(
             rtt if rtt is not None else config.current().coordinator_rtt
         )
-        self.schedule = LocalEndpoint(service.schedule, self.hop)
-        self.complete = LocalEndpoint(service.complete, self.hop)
-        self.decode_admission = LocalEndpoint(service.decode_admission, self.hop)
-        self.observe_prefill_done = LocalEndpoint(
-            service.observe_prefill_done, self.hop
-        )
-        self.observe_compute_busy = LocalEndpoint(
-            service.observe_compute_busy, self.hop
-        )
-        self.observe_decode_state = LocalEndpoint(
-            service.observe_decode_state, self.hop
-        )
+        # One hop shared by both endpoints: they are the same boundary.
+        self.decide = LocalEndpoint(service.decide, self.hop)
+        self.observe = LocalEndpoint(service.observe, self.hop)
 
     @property
     def control(self) -> Any:

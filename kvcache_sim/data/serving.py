@@ -31,7 +31,7 @@ the build on a field read, a subscript or a ``getattr`` through it, because none
 of those survive the two planes being in different processes.
 
 Concretely, this plane owns the decode engine and *reports* it: every batch change
-goes out as :meth:`~kvcache_sim.control.scheduler._Base.observe_decode_state` (a
+goes out as a :class:`~kvcache_sim.control.scheduler.DecodeState` fact (a
 list of estimated finish times -- the whole of what control asks about decode),
 rather than control holding the engine and calling it. The engine's callbacks come
 back here first, to their owner on this host, and this plane decides what to send
@@ -44,7 +44,7 @@ deployment, not about the policy, so this plane owns it. On a coupled instance i
 applies each accepted plan's reservation to the decode engine's timeline
 (:meth:`~kvcache_sim.data._decode.DecodeEngine.reserve`) and reports each decode
 step's end on through
-:meth:`~kvcache_sim.control.scheduler._Base.observe_compute_busy`, so the control
+a :class:`~kvcache_sim.control.scheduler.ComputeBusy` fact, so the control
 plane's *predicted* prefill queue tracks the timeline decode is actually using. A
 disaggregated pool does neither, and prefill never stalls decode.
 """
@@ -57,7 +57,9 @@ from typing import Dict, List, Optional
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
 from proposed import Coordinator, DataPlane
 
-from ..control.scheduler import Plan
+from ..control.scheduler import (
+    AdmitDecode, ComputeBusy, DecodeState, Plan, PrefillFinished, Published, Route,
+)
 from ..report.metrics import Metrics, RequestResult
 from ..control.request import Request
 from ._decode import DecodeEngine
@@ -135,11 +137,11 @@ class ServingPlane(DataPlane):
     # -- what this host tells the coordinator about its decode side -------- #
     def _decode_state(self, inst: str, finishes: List[float]) -> None:
         """Forward a changed decode batch. The engine reports here, not there."""
-        self.coordinator.observe_decode_state.broadcast(inst, finishes)
+        self.coordinator.observe.broadcast(DecodeState(inst, tuple(finishes)))
 
     def _compute_busy(self, inst: str, until: float) -> None:
         """Forward a coupled instance's occupied compute timeline."""
-        self.coordinator.observe_compute_busy.broadcast(inst, until)
+        self.coordinator.observe.broadcast(ComputeBusy(inst, until))
 
     async def drain(self) -> None:
         """Keep the loop running until the last decode token is emitted."""
@@ -151,7 +153,7 @@ class ServingPlane(DataPlane):
         """Serve one request end to end (the runner already waited for arrival)."""
         request: Request = item.payload
 
-        plan = await self.coordinator.schedule.call_one(request)
+        plan = await self.coordinator.decide.call_one(Route(request))
         if plan is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"
@@ -187,15 +189,15 @@ class ServingPlane(DataPlane):
             await asyncio.sleep(plan.prefill_t)
 
         # (4) publish the computed KV blocks into the real directory; evict.
-        completion = await self.coordinator.complete.call_one(plan)
+        completion = await self.coordinator.decide.call_one(Published(plan))
         await self.store.publish(completion.instance, completion.publish)
         if completion.evict:
             await self.store.evict(completion.instance, completion.evict)
         # (5) tell control the clock the real ops reached, and (coupled only) the
         # decode timeline the same instance now carries.
         now = self._now()
-        busy_until = await self.coordinator.observe_prefill_done.call_one(
-            completion.instance, now
+        busy_until = await self.coordinator.decide.call_one(
+            PrefillFinished(completion.instance, now)
         )
         if self.coupled and self.engine is not None:
             # The reply, not a read of control's queue: prefill just occupied the
@@ -246,7 +248,7 @@ class ServingPlane(DataPlane):
             return
         # Decode-simulating path: control decides whether decode can honour the
         # TBT SLO; we perform (or skip) the admission.
-        if not await self.coordinator.decode_admission.call_one(plan):
+        if not await self.coordinator.decide.call_one(AdmitDecode(plan)):
             result = self._pending.pop(plan.request.id)
             result.accepted = False
             result.decode_rejected = True

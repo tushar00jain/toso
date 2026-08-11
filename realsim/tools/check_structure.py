@@ -79,7 +79,7 @@ Rule 6 is the mechanical half of "no state object is shared across the planes",
 which had been a written rule with nothing behind it: ``data/`` -> ``control/`` is
 a legal import, so the contract lint saw nothing while four things crossed that a
 wire could not carry -- a live ``DecodeEngine`` handed to the scheduler, a bound
-``observe_compute_busy`` fired per decode step, a subscript into control's
+observation method fired per decode step, a subscript into control's
 ``busy_until``, and ``getattr(scheduler, "tbt_enabled")``. The rule is
 call-vs-read rather than a member whitelist, because that distinction alone
 catches all four and needs no list to maintain: what the port *offers* is a type

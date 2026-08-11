@@ -125,39 +125,33 @@ class Coordinator(Protocol):
 
     Declared as methods, like :class:`Controller`, because that is where the
     signatures live. A caller holds a reference rather than the object, so the call
-    goes through an endpoint (``schedule.call_one(request)``,
-    ``observe_decode_state.broadcast(...)``); upstream that reference is Monarch's
-    handle over an ``Actor`` carrying one ``@endpoint`` per member below, each
-    forwarding to the plain object -- decorate the shim, not the deciding logic, or
-    its members become ``EndpointProperty`` descriptors that cannot be invoked
-    off-actor. That tax is on display in
-    :mod:`realsim.seams.controller_service`, which exists because torchstore
-    decorated ``Controller``'s own methods.
+    goes through an endpoint (``decide.call_one(demand)``,
+    ``observe.broadcast(fact)``); upstream that reference is Monarch's handle over an
+    ``Actor`` carrying one ``@endpoint`` per member below, each forwarding to the
+    plain object -- decorate the shim, not the deciding logic, or its members become
+    ``EndpointProperty`` descriptors that cannot be invoked off-actor. That tax is on
+    display in :mod:`realsim.seams.controller_service`, which exists because
+    torchstore decorated ``Controller``'s own methods.
+
+    Two members, matching :class:`proposed.coordinator.Coordinator` exactly. It used
+    to name one member per question a KV-cache scheduler asks -- ``schedule``,
+    ``decode_admission``, three ``observe_*`` -- which put one application's
+    vocabulary in the store's contract, and in the seam that carries it, and left the
+    author's half and this half to be kept in step by hand. With the questions moved
+    into the *payload*, there is nothing application-specific in either half to
+    drift, and a second application reaches its coordinator across the same two
+    endpoints without a line changing here or in the seam.
 
     The payloads are ``Any`` for the reason given at the top of this module: a
-    request, a plan and a completion are the application's types, and this package
-    cannot import an application any more than it can import torchstore.
+    demand, an answer and a fact are the application's types, and this package cannot
+    import an application any more than it can import torchstore.
     """
 
-    async def schedule(self, request: Any) -> Optional[Any]:
-        """Decide what to do with ``request``; ``None`` rejects it."""
+    async def decide(self, demand: Any) -> Optional[Any]:
+        """Ask the control plane to answer ``demand``; ``None`` is a refusal."""
 
-    async def complete(self, plan: Any) -> Any:
-        """What the executing half must do once it has carried ``plan`` out."""
-
-    async def decode_admission(self, plan: Any) -> bool:
-        """Whether the accepted ``plan`` may enter the stage it is queued for."""
-
-    async def observe_prefill_done(self, inst: str, now: float) -> float:
-        """Report the clock the real work reached; answer with the corrected model."""
-
-    async def observe_compute_busy(self, inst: str, until: float) -> None:
-        """Report a resource occupied until ``until``."""
-
-    async def observe_decode_state(
-        self, inst: str, finishes: Sequence[float]
-    ) -> None:
-        """Report what is still running on ``inst``, as finish estimates."""
+    async def observe(self, fact: Any) -> None:
+        """Report ``fact``. The reply carries nothing; ``broadcast`` and do not wait."""
 
 
 class Deployment(Protocol):

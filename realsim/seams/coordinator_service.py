@@ -11,14 +11,19 @@ declared there -- by storing the capability's control plane and calling it. Whic
 all a service is: the surface is generic (it is in ``proposed``), the decisions are
 the capability's, and neither has to know about the other's process.
 
-Nothing about a capability is named here. That is what makes the split possible at
-this layer: the member list comes from ``proposed``, not from ``kvcache_sim``, so the
-harness can spell out six forwarders without knowing what any of them decide.
+Two forwarders, and that is the whole file
+------------------------------------------
+It used to spell out six, named after one application's questions -- ``schedule``,
+``decode_admission``, three ``observe_*`` -- which meant this generic harness file
+carried a KV-cache vocabulary, and a second application would have had to come here
+and add its own. Now the questions live in the *payload*: a demand is a value the
+application defines, and this service neither names nor inspects one. A second
+application needs no change here at all.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 __all__ = ["CoordinatorService"]
 
@@ -37,22 +42,11 @@ class CoordinatorService:
         self.control = control
 
     # -- proposed.deployment.Coordinator ------------------------------------ #
-    async def schedule(self, request: Any) -> Optional[Any]:
-        return await self.control.schedule(request)
+    async def decide(self, demand: Any) -> Optional[Any]:
+        return await self.control.decide(demand)
 
-    async def complete(self, plan: Any) -> Any:
-        return await self.control.complete(plan)
-
-    async def decode_admission(self, plan: Any) -> bool:
-        return await self.control.decode_admission(plan)
-
-    async def observe_prefill_done(self, inst: str, now: float) -> float:
-        return await self.control.observe_prefill_done(inst, now)
-
-    async def observe_compute_busy(self, inst: str, until: float) -> None:
-        self.control.observe_compute_busy(inst, until)
-
-    async def observe_decode_state(
-        self, inst: str, finishes: Sequence[float]
-    ) -> None:
-        self.control.observe_decode_state(inst, finishes)
+    async def observe(self, fact: Any) -> None:
+        # Awaited from outside (a message crosses a boundary either way), handled
+        # without suspending: a body that cannot yield cannot lose a fact halfway
+        # through learning it.
+        self.control.observe(fact)
