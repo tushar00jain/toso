@@ -33,11 +33,12 @@ a gather of ``client.get(K)``, with no idea a policy exists.
 
 from __future__ import annotations
 
-import asyncio
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Optional, Sequence, Set, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence
 
 from proposed import DecisionLog, Policy, Selection
+
+from ._readiness import Readiness
 
 __all__ = ["DedupPolicy"]
 
@@ -68,10 +69,9 @@ class DedupPolicy(Policy):
         self._planned: Dict[str, int] = defaultdict(int)
         # sources still under the fan-out cap, oldest first.
         self._avail: Deque[str] = deque()
-        # (volume, key) pairs the real directory has registered, plus the gates
-        # waiting on the ones it has not.
-        self._registered: Set[Tuple[str, str]] = set()
-        self._gates: Dict[Tuple[str, str], asyncio.Event] = {}
+        # Which (volume, key) the real directory has registered, and the waiting
+        # for the ones it has not. The concurrency lives there, not here.
+        self._ready = Readiness()
 
     # -- decide -------------------------------------------------------------- #
     async def select(
@@ -90,7 +90,12 @@ class DedupPolicy(Policy):
                 self.trace.record(
                     view.now(), "route", f"{requester} <- {source}"
                 )
-        return Selection.of([source], ready=self._gate_for(source, keys))
+        # The gate is built here, where the answer is formed, rather than where the
+        # source was picked: a requester asking again after its source registered is
+        # told to wait for nothing.
+        return Selection.of(
+            [source], ready=self._ready.gate((source, key) for key in keys)
+        )
 
     async def _assign(
         self, view: Any, keys: Sequence[str], requester: str
@@ -124,21 +129,4 @@ class DedupPolicy(Policy):
         Releases any requester whose answer was withheld pending that volume.
         """
         for key in keys:
-            slot = (volume_id, key)
-            self._registered.add(slot)
-            gate = self._gates.get(slot)
-            if gate is not None:
-                gate.set()
-
-    def _gate_for(self, source: str, keys: Sequence[str]):
-        """A gate that opens once ``source`` holds every key (``None`` if it does)."""
-        pending = [(source, k) for k in keys if (source, k) not in self._registered]
-        if not pending:
-            return None
-        events = [self._gates.setdefault(slot, asyncio.Event()) for slot in pending]
-
-        async def ready() -> None:
-            for event in events:
-                await event.wait()
-
-        return ready
+            self._ready.record((volume_id, key))

@@ -17,15 +17,18 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 
 import pytest
 import torch
 
+from dedup_sim.control._readiness import Readiness
 from dedup_sim.tests._run import run
 from putget_sim.workload.put_get import DEFAULT_N, MODE_META, MODE_METADATA
 from realsim.seams.transport import TensorDescriptor
 from sim_common import config
+from sim_common.async_engine import run_sim
 
 MODES = (MODE_META, MODE_METADATA)
 PAYLOAD_BYTES = DEFAULT_N * 4  # DEFAULT_N float32 elements
@@ -247,3 +250,53 @@ def test_the_scenario_holds_no_burst_loop():
     assert len({id(r.workload) for r in runs}) == 1
     assert runs[0].control is None and runs[0].data is None
     assert all(r.control is not None and r.data is not None for r in runs[1:])
+
+
+# --------------------------------------------------------------------------
+# Readiness: the waiting the policy delegates. Its three safety properties are
+# the ones a hand-rolled latch gets wrong, so they are asserted directly rather
+# than only through a burst that happens to exercise them.
+# --------------------------------------------------------------------------
+
+
+def test_a_fact_recorded_first_needs_no_gate():
+    """The lost-wakeup guard: never wait for something that already happened."""
+    ready = Readiness()
+    ready.record(("v0", "K"))
+    assert ready.gate([("v0", "K")]) is None
+
+
+def test_a_gate_opens_when_its_last_fact_is_recorded():
+    """Recorded *after* the waiter parked: it is released, not stranded."""
+
+    async def _wait() -> str:
+        ready = Readiness()
+        gate = ready.gate([("v0", "K"), ("v1", "K")])
+        assert gate is not None
+        order: list[str] = []
+
+        async def waiter() -> None:
+            await gate()
+            order.append("released")
+
+        task = asyncio.get_running_loop().create_task(waiter())
+        await asyncio.sleep(0)
+        ready.record(("v0", "K"))
+        await asyncio.sleep(0)
+        assert order == [], "released before every fact was true"
+        ready.record(("v1", "K"))
+        await task
+        return order[0]
+
+    result, _trace = run_sim(_wait())
+    assert result == "released"
+
+
+def test_a_released_gate_is_dropped_but_the_fact_is_kept():
+    """Otherwise the map grows for the life of the run, holding dead events."""
+    ready = Readiness()
+    assert ready.gate([("v0", "K")]) is not None
+    assert len(ready._gates) == 1
+    ready.record(("v0", "K"))
+    assert ready._gates == {}, "a released gate is never consulted again"
+    assert ready.gate([("v0", "K")]) is None, "the fact outlives its gate"

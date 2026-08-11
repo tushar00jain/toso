@@ -108,6 +108,8 @@ dedup_sim/
   control/                # DECIDES
     routing.py            #   DedupPolicy: a proposed.Policy -- ranked source
                           #   + a readiness gate, from a read-only View
+    _readiness.py         #   Readiness: facts observed + a gate per fact not
+                          #   true yet -- the waiting, kept out of the routing
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- the
                           #   reader's put, via the Deployment's client for it
