@@ -6,7 +6,7 @@ banner-delimited sections consistently.
 
 This module is also the **canonical home** of
 
-* the shared source->dest fetch-graph renderers, :func:`edge_graph` and
+* the shared source->dest fetch-graph renderers, :func:`_edge_graph` and
   :func:`render_tree`. Both ``dedup_sim`` and ``realsim`` record who-served-whom
   as ``(src, dst, label)`` edges and want the same ASCII picture -- reuse these
   (they are label-agnostic) rather than re-implementing a tree renderer per sim;
@@ -28,11 +28,9 @@ __all__ = [
     "Edge",
     "configure_logging",
     "section",
-    "edge_graph",
     "render_tree",
     "Outcome",
     "Ledger",
-    "percentile",
 ]
 
 # A fetch edge: (source id, destination id, label). The label is opaque to the
@@ -70,7 +68,7 @@ def section(logger: logging.Logger, title: str) -> None:
 # label-agnostic, so it lives here rather than in any one sim.
 # --------------------------------------------------------------------------- #
 
-def edge_graph(edges: List[Edge]):
+def _edge_graph(edges: List[Edge]):
     """Return ``(children, roots, is_chain)`` derived from fetch edges.
 
     ``children`` maps a source to its distinct destinations (insertion order);
@@ -98,7 +96,7 @@ def render_tree(edges: List[Edge]) -> List[str]:
     subtree is expanded only on its first appearance; later references are shown
     as ``name (^)`` leaves so the picture stays compact.
     """
-    children, roots, is_chain = edge_graph(edges)
+    children, roots, is_chain = _edge_graph(edges)
     if not roots:
         return ["(no transfers)"]
 
@@ -240,7 +238,7 @@ class Ledger:
         last element), which is what the KV-cache report has always used; ``0.0``
         when there are no rows.
         """
-        return percentile([getattr(r, attr) for r in self.select(where)], pct)
+        return _percentile([getattr(r, attr) for r in self.select(where)], pct)
 
     def count(self, where: Callable[[Any], bool]) -> int:
         """How many rows match ``where``."""
@@ -260,7 +258,7 @@ class Ledger:
         return sum(1 for r in rows if where(r)) / len(rows)
 
 
-def percentile(values: Sequence[float], pct: float) -> float:
+def _percentile(values: Sequence[float], pct: float) -> float:
     """Nearest-rank ``pct`` percentile of ``values`` (``0.0`` when empty)."""
     ordered = sorted(values)
     if not ordered:

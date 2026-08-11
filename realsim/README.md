@@ -119,10 +119,13 @@ PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_contr
 `realsim/tools/check_structure.py` fails the build if a sim package drifts out of
 shape: a missing part (`__main__.py`, `README.md`, `workload/`, `report/`), a
 `control/` without a `data/`, a folder-private module whose name does not say so
-(`_thing.py`), a README layout block that names a file which does not exist — or
-omits one that does — or a module whose `__all__` is absent, names something that
-is not there, or omits something public. `PUBLIC_ANYWAY` is the explicit
-exception list for the privacy rule; `__init__.py` and `__main__.py` are exempt
+(`_thing.py`), a public function no other module uses (same remedy: `_thing`), a
+README layout block that names a file which does not exist — or omits one that
+does — or a module whose `__all__` is absent, names something that
+is not there, or omits something public. A test importing a name does not make it
+surface: that is how a helper with no callers stays alive, and it is what the
+name rule is for. `PUBLIC_ANYWAY` and `PUBLIC_NAMES` are the explicit exception
+lists for the two privacy rules; `__init__.py` and `__main__.py` are exempt
 from the `__all__` rule, since a package's `__all__` is a curated re-export list
 rather than a mirror of its own contents.
 

@@ -74,8 +74,8 @@ client/controller/transport), so they depend on the from-source
   what makes it the baseline. Two lints hold the shape:
   `realsim/tools/check_contract.py` (a `control/` module may not import `data/`,
   the mesh, or a client) and `check_structure.py` (a sim package's parts, the
-  underscore on a folder-private module, and a README layout block that matches
-  the tree). Each sim declares itself with the same four types — `Workload`,
+  underscore on a folder-private module or an unused public function, and a
+  README layout block that matches the tree). Each sim declares itself with the same four types — `Workload`,
   `Run`, `Report`, `Demo` — so none of them wires a stack of its own. The test
   for which folder something belongs in: *does it advance the clock or move
   bytes?* The comparison is tabulated in

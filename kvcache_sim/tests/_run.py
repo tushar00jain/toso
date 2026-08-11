@@ -33,7 +33,7 @@ def results(runs: Sequence[Run]) -> List[Result]:
 
 def run(topology, requests, kind: str, **knobs) -> Result:
     """One ad-hoc configuration, built the same way every scenario builds one."""
-    return scenarios.configure(kind, topology, requests, kind, **knobs).execute()
+    return scenarios._configure(kind, topology, requests, kind, **knobs).execute()
 
 
 def run_shared_prefix(seed: int = 0) -> List[Result]:

@@ -15,18 +15,15 @@ from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
 from kvcache_sim.control._cache import LRUCache
-from kvcache_sim.control.view import KVView
-from kvcache_sim.workload._serving import sim_block_carrier
+from kvcache_sim.control.view import KVView, _longest_prefix_run
+from kvcache_sim.workload._serving import _sim_block_carrier
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data.store import KVStore
-from kvcache_sim.control.request import (
-    block_keys_for,
-    longest_prefix_run,
-    Request,
-)
+from kvcache_sim.control.request import Request
+from kvcache_sim.workload._generator import _block_keys_for
 from kvcache_sim.tests._run import (
     run,
     run_disaggregation,
@@ -39,25 +36,25 @@ from kvcache_sim.tests._run import (
 from kvcache_sim.workload.scenarios import (
     DISAGG_TARGET_TBT,
     EARLY_SLO_TBT,
-    make_topology,
-    shared_prefix_workload,
+    _make_topology,
+    _shared_prefix_workload,
 )
 
 
 # 1. Prefix-hash addressing: shared prefixes yield shared keys.
 def test_prefix_hash_chain_shares_prefix():
-    a = block_keys_for("m0", [0, 1, 7, 9])
-    b = block_keys_for("m0", [0, 1, 8])
+    a = _block_keys_for("m0", [0, 1, 7, 9])
+    b = _block_keys_for("m0", [0, 1, 8])
     assert a[:2] == b[:2]         # shared leading segments -> identical keys
     assert a[2] != b[2]           # divergence -> distinct keys
     # different model never aliases:
-    assert block_keys_for("m1", [0, 1])[0] != block_keys_for("m0", [0, 1])[0]
+    assert _block_keys_for("m1", [0, 1])[0] != _block_keys_for("m0", [0, 1])[0]
 
 
 def test_longest_prefix_run():
-    keys = block_keys_for("m0", [0, 1, 2, 3])
+    keys = _block_keys_for("m0", [0, 1, 2, 3])
     present = {keys[0], keys[1], keys[3]}   # a gap at index 2
-    assert longest_prefix_run(keys, present) == 2   # stops at first miss
+    assert _longest_prefix_run(keys, present) == 2   # stops at first miss
 
 
 # 2. REAL directory: per-instance prefix-match length, incl. after eviction.
@@ -65,12 +62,12 @@ def test_longest_prefix_run():
 #    locate_volumes reads it back; eviction removes it. This is the cache-aware
 #    scheduler's core query, answered directly by the real directory.
 def test_real_directory_prefix_presence_and_eviction():
-    topo = make_topology(2)
-    keys = block_keys_for("m0", [0, 1, 2, 3])
+    topo = _make_topology(2)
+    keys = _block_keys_for("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
     store = KVStore.for_deployment(
-        sim.mesh, block_tokens=512, carrier=sim_block_carrier(512)
+        sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512)
     )
     view = KVView(sim.view.directory, sim.topology)
 
@@ -145,8 +142,8 @@ def test_eviction_hit_rate_monotone_then_plateau():
     # a large cache is strictly better than the smallest useful one
     assert hrs[-1] > hrs[0]
     # large finite cap reaches (near) the unbounded hit rate
-    topo = make_topology(4)
-    reqs = shared_prefix_workload()
+    topo = _make_topology(4)
+    reqs = _shared_prefix_workload()
     unbounded = run(topo, reqs, "cache_aware", capacity=None).ledger.hit_rate
     big = run(topo, reqs, "cache_aware", capacity=100000).ledger.hit_rate
     assert abs(unbounded - big) < 1e-9
@@ -173,8 +170,8 @@ def test_overload_fewer_rejections():
 # 10. Fan-out sanity: the LRU primitive never exceeds capacity, and a comfortably
 #     sized run still reuses.
 def test_cache_never_exceeds_capacity():
-    topo = make_topology(4)
-    reqs = shared_prefix_workload()
+    topo = _make_topology(4)
+    reqs = _shared_prefix_workload()
     r = run(topo, reqs, "cache_aware", capacity=64)
     assert r.ledger.hit_rate > 0
     cap = 8

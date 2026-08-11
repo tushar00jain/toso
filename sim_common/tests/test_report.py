@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sim_common.report import Ledger, Outcome, percentile, render_tree
+from sim_common.report import Ledger, Outcome, _percentile, render_tree
 
 
 @dataclass
@@ -106,11 +106,11 @@ def test_empty_selection_gives_the_documented_neutral_value():
 
 def test_percentile_is_nearest_rank_and_clamped():
     values = [1.0, 2.0, 3.0, 4.0]
-    assert percentile(values, 0) == 1.0
-    assert percentile(values, 50) == 3.0    # index int(0.5 * 4) == 2
-    assert percentile(values, 90) == 4.0    # index int(3.6) == 3
-    assert percentile(values, 100) == 4.0   # clamped to the last element
-    assert percentile([], 90) == 0.0
+    assert _percentile(values, 0) == 1.0
+    assert _percentile(values, 50) == 3.0    # index int(0.5 * 4) == 2
+    assert _percentile(values, 90) == 4.0    # index int(3.6) == 3
+    assert _percentile(values, 100) == 4.0   # clamped to the last element
+    assert _percentile([], 90) == 0.0
     ledger = _ledger_with_rows()
     assert ledger.percentile("value", 90, lambda r: r.ok) == 3.0
 

@@ -9,9 +9,10 @@ detects each banned pattern and does not flag the sanctioned ones -- so a green
 run means the contract holds, not that the lint is asleep.
 
 ``test_sim_packages_keep_their_shape`` does the same for the *structure* lint:
-the parts every ``*_sim`` carries, the underscore on a folder-private module, a
-README layout block that matches the tree, and an ``__all__`` on every module
-that matches its public surface.
+the parts every ``*_sim`` carries, the underscore on a folder-private module and
+on a public function nothing outside its module uses, a README layout block that
+matches the tree, and an ``__all__`` on every module that matches its public
+surface.
 
 See ``realsim/tools/check_contract.py`` and ``check_structure.py`` for the full
 contracts and their rationale.
@@ -206,6 +207,76 @@ def test_private_naming_rule_actually_examines_the_tree():
     assert "kvcache_sim.workload._generator" in mods
 
 
+def test_structure_lint_flags_a_public_name_only_its_own_module_uses(tmp_path):
+    """Rule 5 fires: what ``longest_prefix_run`` was -- a helper with no caller.
+
+    The defining module uses it, and a test imports it. Neither makes it surface.
+    """
+    pkgs = _toy_pkg(tmp_path, {
+        "__init__.py": "",
+        "workload/__init__.py": "",
+        "control/view.py": (
+            "__all__ = ['View']\n\n\n"
+            "def walk(keys):\n    return len(keys)\n\n\n"
+            "class View:\n    def lengths(self, keys):\n        return walk(keys)\n"
+        ),
+        "tests/__init__.py": "",
+        "tests/test_view.py": "from ..control.view import walk\n",
+    })
+    violations = check_structure.check_name_privacy(tmp_path, pkgs)
+    assert [v.code for v in violations] == ["public-name-no-consumer"]
+    assert violations[0].path.endswith("view.py")
+    assert "walk" in violations[0].message
+
+
+def test_structure_lint_accepts_a_name_another_module_uses(tmp_path):
+    """One real importer -- module or package re-export -- and the name is surface."""
+    common = {
+        "__init__.py": "",
+        "workload/__init__.py": "",
+        "control/view.py": "__all__ = ['walk']\n\n\ndef walk(keys):\n    return keys\n",
+    }
+    direct = _toy_pkg(tmp_path / "a", {
+        **common, "workload/scenarios.py": "from ..control.view import walk\n",
+    })
+    assert check_structure.check_name_privacy(tmp_path / "a", direct) == []
+
+    # Published through the package, imported from there: still a consumer.
+    reexport = _toy_pkg(tmp_path / "b", {
+        **common,
+        "control/__init__.py": "from .view import walk\n",
+        "workload/scenarios.py": "from ..control import walk\n",
+    })
+    assert check_structure.check_name_privacy(tmp_path / "b", reexport) == []
+
+
+def test_structure_lint_accepts_an_attribute_call_and_a_cli_entry_point(tmp_path):
+    """``import m`` ... ``m.go()`` is use, and a ``__main__`` hook is a caller."""
+    pkgs = _toy_pkg(tmp_path / "c", {
+        "__init__.py": "",
+        "workload/__init__.py": "",
+        "workload/helper.py": "__all__ = ['go']\n\n\ndef go():\n    pass\n",
+        "workload/scenarios.py": (
+            "from . import helper\n\n\ndef _run():\n    return helper.go()\n"
+        ),
+        "tool.py": (
+            "__all__ = ['main']\n\n\ndef main():\n    return 0\n\n\n"
+            "if __name__ == '__main__':\n    raise SystemExit(main())\n"
+        ),
+    })
+    assert check_structure.check_name_privacy(tmp_path / "c", pkgs) == []
+
+
+def test_name_privacy_rule_actually_examines_the_tree():
+    """Vacuous if no name resolved: pin one known consumer edge in the real tree."""
+    mods, trees, consumers = check_structure._name_consumers(
+        check_structure.REPO_ROOT, check_structure.GRAPH_PKGS
+    )
+    assert len(mods) > 50, f"only {len(mods)} modules in the graph"
+    users = consumers[("sim_common.async_engine", "AsyncEngine")]
+    assert "realsim.simulation" in users, sorted(users)
+
+
 def test_structure_lint_reads_a_layout_block():
     """The README parser must actually find a block, or rule 3 is vacuous."""
     block = check_structure._layout_block(
@@ -324,7 +395,7 @@ def test_workload_may_import_the_planes_it_wires():
 def test_lint_keeps_control_out_of_the_simulator():
     """Estimates come through a protocol; machine facts come from domain."""
     assert "control-imports-execution" in _codes(
-        "from sim_common.cost_model import get_time\n", path=CONTROL
+        "from sim_common.cost_model import _get_time\n", path=CONTROL
     )
     # Both the module path and the package re-export, since proposed surfaces
     # its whole contract at package level.

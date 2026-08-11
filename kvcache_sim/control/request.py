@@ -1,4 +1,4 @@
-"""Domain model: inference requests and prefix-hash block addressing.
+"""Domain model: the inference request all three planes pass around.
 
 A prompt is chunked into fixed ``B``-token blocks. Each block is content-addressed
 by a **prefix-hash chain**: a block's key encodes the whole prefix up to it, so two
@@ -7,17 +7,18 @@ reuse falls out for free. A block key is a plain ``str`` and is used directly as
 key in the **real** TorchStore directory (``Controller.keys_to_storage_volumes``),
 so no separate key type is needed.
 
-We model the "hash" as the concatenation of the prompt's *segment ids* up to a
-block (a deterministic, collision-free stand-in for a real content hash), so the
-sim never needs Python's (salted) ``hash``.
+Building that chain is the *prompt generator's* job
+(``workload/_generator.py``) and walking it against a directory snapshot is the
+*view's* (``control/view.py``); both are private to those modules. What is left
+here is the request itself.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Tuple
 
-__all__ = ["Request", "block_keys_for", "longest_prefix_run"]
+__all__ = ["Request"]
 
 
 @dataclass(frozen=True)
@@ -34,34 +35,3 @@ class Request:
     block_keys: Tuple[str, ...]
     prompt_tokens: int
     output_tokens: int
-
-
-def block_keys_for(model_id: str, segments: Sequence[int]) -> Tuple[str, ...]:
-    """Build the prefix-hash chain for a prompt made of ``segments``.
-
-    ``block_keys_for("m0", [3, 7, 2])`` -> ``("m0|3", "m0|3|7", "m0|3|7|2")``.
-    Sharing a leading run of segments yields identical leading keys, which is
-    exactly what makes a shared prefix a single set of entries in the directory.
-    ``model_id`` is included so caches for different models never alias.
-    """
-    keys: List[str] = []
-    acc = model_id
-    for seg in segments:
-        acc = f"{acc}|{seg}"
-        keys.append(acc)
-    return tuple(keys)
-
-
-def longest_prefix_run(block_keys: Sequence[str], present: set) -> int:
-    """Return how many leading blocks of ``block_keys`` are in ``present``.
-
-    The prefix match stops at the first missing block (a cache is only useful as a
-    contiguous prefix), matching block-by-block prefix comparison.
-    """
-    n = 0
-    for k in block_keys:
-        if k in present:
-            n += 1
-        else:
-            break
-    return n

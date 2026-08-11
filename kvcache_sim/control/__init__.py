@@ -1,7 +1,7 @@
 """The KV-cache control plane: everything that is decided, nothing that runs.
 
 * :mod:`~kvcache_sim.control.request` -- what is being decided *about*: an
-  inference ``Request`` plus prefix-hash block addressing (a block key is a plain
+  inference ``Request``, carrying its prefix-hash block keys (each a plain
   directory key). It sits here rather than in ``workload/`` because all three
   planes pass it, and ``workload/`` does not exist in production;
 * :mod:`~kvcache_sim.control.scheduler` -- the serving scheduler: which instance
@@ -11,8 +11,8 @@
 * :mod:`~kvcache_sim.control._source` -- the one part that *is* a store question,
   "which peer serves this prefix gap", as a :class:`proposed.policy.Policy`;
 * :mod:`~kvcache_sim.control.view` -- the single derived directory read the
-  scheduler needs (per-instance prefix-run lengths), plus the pinned snapshot one
-  decision reads it through;
+  scheduler needs (per-instance prefix-run lengths, and the private prefix walk
+  behind them), plus the pinned snapshot one decision reads it through;
 * :mod:`~kvcache_sim.control._cache` -- per-instance LRU. It picks victims; it
   does not delete anything.
 

@@ -14,7 +14,7 @@ import asyncio
 from sim_common import config
 from sim_common.async_engine import AsyncEngine
 from sim_common.diverge import first_divergence
-from sim_common.trace import fingerprint, Trace
+from sim_common.trace import _fingerprint, Trace
 
 
 # --------------------------------------------------------------------------
@@ -57,7 +57,7 @@ def test_identical_runs_share_fingerprint_and_have_no_divergence():
 def test_trace_fingerprint_matches_module_function():
     # Trace.fingerprint() folds on demand -> equal to the free fold over events.
     t = _run(2.0)
-    assert t.fingerprint() == fingerprint(t.events)
+    assert t.fingerprint() == _fingerprint(t.events)
 
 
 def test_trace_hash_chain_defaults_off_and_follows_config():
@@ -75,7 +75,7 @@ def test_config_enables_incremental_chain_matching_on_demand():
     with config.overrides(fingerprint=True):
         t = _run(2.0)
     assert t.hash_chain is True
-    assert t.fingerprint() == fingerprint(t.events)
+    assert t.fingerprint() == _fingerprint(t.events)
 
 
 def test_fingerprint_differs_when_traces_differ():

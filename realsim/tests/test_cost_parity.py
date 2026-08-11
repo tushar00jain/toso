@@ -1,6 +1,6 @@
 """The charge and the prediction of a ``get`` must stay one formula.
 
-:func:`sim_common.cost_model.get_time` is the single definition of what serving a
+:func:`sim_common.cost_model._get_time` is the single definition of what serving a
 get costs (``storage read + host-RAM staging + fabric``). Two very different
 consumers depend on it:
 
@@ -28,7 +28,7 @@ from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint
 from sim_common import config
 from sim_common.async_engine import run_sim
-from sim_common.cost_model import DEFAULT_PROFILE, get_time, network_time
+from sim_common.cost_model import DEFAULT_PROFILE, _get_time, network_time
 
 KEY = "W"
 N = 4096  # float32 elements -> a payload big enough that every term is non-zero
@@ -112,7 +112,7 @@ def test_a_colocated_get_is_not_free():
 
     Only the *fabric* term of a get is zero when server and client coincide --
     reading your own pool is not free. This is the case a well-meaning
-    "optimization" would short-circuit to ``0.0`` inside ``get_time``, which would
+    "optimization" would short-circuit to ``0.0`` inside ``_get_time``, which would
     silently break its agreement with the transport; the cross-node tests above
     would not catch that, so pin it explicitly.
     """
@@ -136,7 +136,7 @@ def test_a_colocated_get_is_not_free():
         advance, nbytes = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    # Priced through the stack's own estimator, not a parallel call to get_time:
+    # Priced through the stack's own estimator, not a parallel call to _get_time:
     # the point is that what a scheduler is handed matches what it is charged.
     expected = sim.transfer_cost.get_time("solo", "solo", nbytes)
     assert expected > 0.0, "a co-located get must still cost storage + RAM"

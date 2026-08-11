@@ -1,4 +1,5 @@
-"""Synthetic request generator (seeded, deterministic).
+"""Synthetic request generator (seeded, deterministic), and the block keys it
+addresses prompts with.
 
 Models the target workload shape: many requests that **share prefixes**.
 Each request's prompt is three parts:
@@ -23,11 +24,33 @@ byte-identical across runs of the same seed.
 from __future__ import annotations
 
 import random
-from typing import List
+from typing import List, Sequence, Tuple
 
-from ..control.request import block_keys_for, Request
+from ..control.request import Request
 
 __all__ = ["make_workload"]
+
+
+def _block_keys_for(model_id: str, segments: Sequence[int]) -> Tuple[str, ...]:
+    """Build the prefix-hash chain for a prompt made of ``segments``.
+
+    ``_block_keys_for("m0", [3, 7, 2])`` -> ``("m0|3", "m0|3|7", "m0|3|7|2")``.
+    Sharing a leading run of segments yields identical leading keys, which is
+    exactly what makes a shared prefix a single set of entries in the directory.
+    ``model_id`` is included so caches for different models never alias.
+
+    The "hash" is modelled as the concatenation of the prompt's *segment ids* up
+    to a block -- a deterministic, collision-free stand-in for a real content
+    hash, so the sim never needs Python's (salted) ``hash``. Only a generator of
+    prompts computes these; the planes are handed the finished chain on a
+    :class:`~kvcache_sim.control.request.Request` and treat it as opaque keys.
+    """
+    keys: List[str] = []
+    acc = model_id
+    for seg in segments:
+        acc = f"{acc}|{seg}"
+        keys.append(acc)
+    return tuple(keys)
 
 
 def _zipf_weights(n: int, s: float) -> List[float]:
@@ -82,7 +105,7 @@ def make_workload(
         query = list(range(fresh, fresh + query_blocks))
         fresh += query_blocks
         segments = conv_prefix[c] + query
-        keys = block_keys_for(model_id, segments)
+        keys = _block_keys_for(model_id, segments)
         requests.append(Request(
             id=f"r{i}",
             arrival=t,

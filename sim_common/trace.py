@@ -30,7 +30,7 @@ from typing import List, Sequence, Tuple
 
 from sim_common import config
 
-__all__ = ["Event", "chain_digests", "fingerprint", "Trace"]
+__all__ = ["Event", "chain_digests", "Trace"]
 
 # One trace event: (virtual time, kind, message).
 Event = Tuple[float, str, str]
@@ -77,7 +77,7 @@ def _fold_all(events: Sequence[Event]) -> bytes:
     return h
 
 
-def fingerprint(events: Sequence[Event]) -> str:
+def _fingerprint(events: Sequence[Event]) -> str:
     """Fold an event sequence into a single hex run-fingerprint digest."""
     return _fold_all(events).hex()
 

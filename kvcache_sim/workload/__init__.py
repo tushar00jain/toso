@@ -2,7 +2,7 @@
 
 - ``_generator.py`` -- the seeded synthetic request stream (shared system prompt +
   per-conversation context + unique query suffix; Zipf popularity, Poisson
-  arrivals).
+  arrivals), including the prefix-hash chain it addresses each prompt with.
 - ``_serving.py`` -- ``KVWorkload`` (the request stream, a
   ``realsim.run.Workload``) and ``serving_plane``, the factory that wires the
   store, view, scheduler and serving plane onto an assembled stack. Also

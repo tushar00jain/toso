@@ -35,10 +35,10 @@ from ..data.store import KVStore
 #: Tokens per KV block. Fixed for every scenario so runs stay comparable.
 BLOCK_TOKENS = 512
 
-__all__ = ["BLOCK_TOKENS", "sim_block_carrier", "KVWorkload", "serving_plane"]
+__all__ = ["BLOCK_TOKENS", "KVWorkload", "serving_plane"]
 
 
-def sim_block_carrier(
+def _sim_block_carrier(
     block_tokens: int = BLOCK_TOKENS, model: Model = DEFAULT_MODEL
 ):
     """What one KV block is stored as **under simulation**.
@@ -116,7 +116,7 @@ def serving_plane(
         # The simulation *is* the deployment: it vends the client for an instance
         # and holds the directory. All the run adds is the block carrier.
         store = KVStore.for_deployment(
-            sim.mesh, block_tokens=BLOCK_TOKENS, carrier=sim_block_carrier()
+            sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
         )
         # Control senses the same real directory the data plane writes, but only
         # ever reads it.

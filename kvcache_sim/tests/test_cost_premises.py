@@ -29,14 +29,14 @@ import math
 from dataclasses import replace
 
 from sim_common.async_engine import run_sim
-from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
+from sim_common.cost_model import DEFAULT_PROFILE, _get_time, MachineProfile
 from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
 from kvcache_sim.data.store import KVStore
-from kvcache_sim.workload._serving import sim_block_carrier
+from kvcache_sim.workload._serving import _sim_block_carrier
 from realsim.simulation import Simulation
-from kvcache_sim.workload.scenarios import BLOCK_TOKENS, make_topology
+from kvcache_sim.workload.scenarios import BLOCK_TOKENS, _make_topology
 
 # Bounds on how much cheaper fetching a block is than recomputing it, under the
 # illustrative defaults. Wide on purpose: the point is to catch a *sign* change
@@ -86,7 +86,7 @@ NVME_MACHINE = replace(
 
 def _endpoints():
     """A local instance, a same-node peer (NVLink) and a cross-node peer (RDMA)."""
-    topo = make_topology(4, per_node=2)
+    topo = _make_topology(4, per_node=2)
     ids = sorted(topo)
     local = topo[ids[0]]
     same_node = next(topo[i] for i in ids[1:] if topo[i].node == local.node)
@@ -97,7 +97,7 @@ def _endpoints():
 def _ratio(model: Model, machine: MachineProfile, src, dst) -> float:
     """recompute-one-block / fetch-one-block. > 1 means reuse pays off."""
     nbytes = model.block_bytes(1, BLOCK_TOKENS)
-    fetch = get_time(src, dst, nbytes, machine)
+    fetch = _get_time(src, dst, nbytes, machine)
     assert fetch > 0.0, "a cross-instance fetch must cost something"
     return prefill_time(BLOCK_TOKENS, machine, model) / fetch
 
@@ -200,9 +200,9 @@ def test_predicted_block_bytes_equal_the_bytes_the_data_plane_moves():
     """
     for model in (DEFAULT_MODEL, REAL_MODEL):
         cl = KVStore.for_deployment(
-            Simulation(make_topology(2)).mesh,
+            Simulation(_make_topology(2)).mesh,
             block_tokens=BLOCK_TOKENS,
-            carrier=sim_block_carrier(BLOCK_TOKENS, model),
+            carrier=_sim_block_carrier(BLOCK_TOKENS, model),
             model=model,
         )
         assert cl.block_nbytes == model.block_bytes(1, BLOCK_TOKENS), (
@@ -219,14 +219,14 @@ def test_a_real_pull_costs_what_get_time_predicted():
     ``client.get_batch``, real transport charge -- rather than comparing two
     formulas.
     """
-    topo = make_topology(4, per_node=2)
+    topo = _make_topology(4, per_node=2)
     ids = sorted(topo)
     holder, puller = ids[0], next(i for i in ids[1:] if topo[i].node != topo[ids[0]].node)
     keys = ["blk0"]
 
     sim = Simulation(topo)
     cl = KVStore.for_deployment(
-        sim.mesh, block_tokens=BLOCK_TOKENS, carrier=sim_block_carrier()
+        sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
     )
 
     async def scenario():
@@ -245,9 +245,9 @@ def test_a_real_pull_costs_what_get_time_predicted():
         advance, nbytes = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    predicted = get_time(topo[holder], topo[puller], nbytes, DEFAULT_PROFILE)
+    predicted = _get_time(topo[holder], topo[puller], nbytes, DEFAULT_PROFILE)
     assert advance > 0.0
     assert math.isclose(advance, predicted, rel_tol=1e-12), (
-        f"a real cross-node pull advanced the clock {advance!r} but get_time "
+        f"a real cross-node pull advanced the clock {advance!r} but _get_time "
         f"predicted {predicted!r}"
     )

@@ -35,12 +35,7 @@ from ._serving import BLOCK_TOKENS, KVWorkload, serving_plane
 
 __all__ = [
     "TRACE_LIMIT",
-    "configure",
-    "make_topology",
-    "subset",
-    "shared_prefix_workload",
     "EVICTION_CAPACITIES",
-    "hotspot_workload",
     "DISAGG_TARGET_TBT",
     "DISAGG_MAX_BATCH",
     "EARLY_SLO_TBT",
@@ -58,7 +53,7 @@ __all__ = [
 TRACE_LIMIT = 60
 
 
-def configure(label: str, topology, requests, kind: str, **knobs) -> Run:
+def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     """One labelled configuration over ``requests``.
 
     Every kvcache run is built here -- by the scenarios below and by the tests --
@@ -75,7 +70,7 @@ def configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     )
 
 
-def make_topology(num: int, per_node: int = 2) -> Dict[str, Endpoint]:
+def _make_topology(num: int, per_node: int = 2) -> Dict[str, Endpoint]:
     """Build ``num`` instances laid out ``per_node`` per node (distinct hosts).
 
     Same-node instances exchange KV over NVLink; cross-node over RDMA -- so *where*
@@ -89,12 +84,12 @@ def make_topology(num: int, per_node: int = 2) -> Dict[str, Endpoint]:
     return topo
 
 
-def subset(topology: Dict[str, Endpoint], ids: List[str]) -> Dict[str, Endpoint]:
+def _subset(topology: Dict[str, Endpoint], ids: List[str]) -> Dict[str, Endpoint]:
     """Return the sub-topology for ``ids`` (order-stable)."""
     return {i: topology[i] for i in ids}
 
 
-def shared_prefix_workload(seed: int = 0):
+def _shared_prefix_workload(seed: int = 0):
     """Many conversations sharing a hot system prompt + per-conv context."""
     return make_workload(
         num_requests=200, num_conversations=8, system_blocks=4,
@@ -109,7 +104,7 @@ EVICTION_CAPACITIES = (2, 4, 8, 16, 32, 64, 256)
 
 
 
-def hotspot_workload(seed: int = 0):
+def _hotspot_workload(seed: int = 0):
     """One dominant conversation (extreme skew) -> a single hot instance."""
     return make_workload(
         num_requests=160, num_conversations=4, system_blocks=6,
@@ -146,11 +141,11 @@ class SharedPrefix(Scenario):
         self.seed = seed
 
     def runs(self, args=None) -> List[Run]:
-        topo = make_topology(4)
-        reqs = shared_prefix_workload(self.seed)
+        topo = _make_topology(4)
+        reqs = _shared_prefix_workload(self.seed)
         return [
-            configure("cache_aware", topo, reqs, "cache_aware"),
-            configure("load_balance", topo, reqs, "load_balance"),
+            _configure("cache_aware", topo, reqs, "cache_aware"),
+            _configure("load_balance", topo, reqs, "load_balance"),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
@@ -174,14 +169,14 @@ class Eviction(Scenario):
         self.seed = seed
 
     def runs(self, args=None) -> List[Run]:
-        topo = make_topology(4)
+        topo = _make_topology(4)
         reqs = make_workload(
             num_requests=400, num_conversations=12, system_blocks=2,
             conv_base_blocks=4, query_blocks=2, zipf_s=1.05, arrival_rate=2.5,
             block_tokens=BLOCK_TOKENS, output_tokens=64, seed=self.seed,
         )
         return [
-            configure(str(cap), topo, reqs, "cache_aware", capacity=cap)
+            _configure(str(cap), topo, reqs, "cache_aware", capacity=cap)
             for cap in EVICTION_CAPACITIES
         ]
 
@@ -204,12 +199,12 @@ class Hotspot(Scenario):
         self.seed = seed
 
     def runs(self, args=None) -> List[Run]:
-        topo = make_topology(4)
-        reqs = hotspot_workload(self.seed)
+        topo = _make_topology(4)
+        reqs = _hotspot_workload(self.seed)
         return [
-            configure("baseline", topo, reqs, "load_balance"),
-            configure("no_replication", topo, reqs, "cache_aware", replicate=False),
-            configure("replication", topo, reqs, "cache_aware",
+            _configure("baseline", topo, reqs, "load_balance"),
+            _configure("no_replication", topo, reqs, "cache_aware", replicate=False),
+            _configure("replication", topo, reqs, "cache_aware",
                  balance_threshold=1.2, replicate=True),
         ]
 
@@ -234,7 +229,7 @@ class Overload(Scenario):
         self.seed = seed
 
     def runs(self, args=None) -> List[Run]:
-        topo = make_topology(4)
+        topo = _make_topology(4)
         reqs = make_workload(
             num_requests=300, num_conversations=6, system_blocks=6,
             conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=9.0,
@@ -242,8 +237,8 @@ class Overload(Scenario):
         )
         slo = 6.0
         return [
-            configure("cache_aware", topo, reqs, "cache_aware", slo_ttft=slo),
-            configure("load_balance", topo, reqs, "load_balance", slo_ttft=slo),
+            _configure("cache_aware", topo, reqs, "cache_aware", slo_ttft=slo),
+            _configure("load_balance", topo, reqs, "load_balance", slo_ttft=slo),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
@@ -269,7 +264,7 @@ class Disaggregation(Scenario):
         self.seed = seed
 
     def runs(self, args=None) -> List[Run]:
-        topo = make_topology(4)  # s0..s3
+        topo = _make_topology(4)  # s0..s3
         reqs = make_workload(
             num_requests=120, num_conversations=8, system_blocks=2,
             conv_base_blocks=2, query_blocks=1, zipf_s=1.1, arrival_rate=1.2,
@@ -280,10 +275,10 @@ class Disaggregation(Scenario):
             max_batch=DISAGG_MAX_BATCH,
         )
         return [
-            configure("disaggregated", topo, reqs, "cache_aware",
+            _configure("disaggregated", topo, reqs, "cache_aware",
                  prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], coupled=False,
                  **common),
-            configure("coupled", subset(topo, ["s2", "s3"]), reqs, "cache_aware",
+            _configure("coupled", _subset(topo, ["s2", "s3"]), reqs, "cache_aware",
                  coupled=True, **common),
         ]
 
@@ -314,7 +309,7 @@ class EarlyRejection(Scenario):
         self.seed = seed
 
     def runs(self, args=None) -> List[Run]:
-        topo = make_topology(4)
+        topo = _make_topology(4)
         reqs = make_workload(
             num_requests=160, num_conversations=6, system_blocks=6,
             conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=20.0,
@@ -324,7 +319,7 @@ class EarlyRejection(Scenario):
             simulate_decode=True, slo_tbt=EARLY_SLO_TBT, max_batch=EARLY_MAX_BATCH
         )
         return [
-            configure(mode, topo, reqs, "cache_aware", early_rejection=mode, **common)
+            _configure(mode, topo, reqs, "cache_aware", early_rejection=mode, **common)
             for mode in ("off", "early", "predict")
         ]
 

@@ -5,7 +5,7 @@ enforces what a package *is* -- the part that had been maintained by hand across
 six files per package and had already drifted (two of three READMEs stopped
 naming a structural file after it was added).
 
-Three rules, none of which a type system can express:
+Five rules, none of which a type system can express:
 
 1. **A sim package has the same parts.** Every ``*_sim/`` carries ``__init__.py``,
    ``__main__.py``, ``README.md``, ``workload/`` and ``report/``. ``control/`` and
@@ -27,17 +27,44 @@ Three rules, none of which a type system can express:
    nothing said which was intended. ``__init__.py`` is exempt -- a package's
    ``__all__`` is a curated re-export list, not a mirror of its own contents --
    and so is ``__main__.py``.
+5. **A public function has a consumer.** A public top-level function that no
+   *other* module uses is rule 2 one level down, with the same remedy: name it
+   ``_thing``. :data:`PUBLIC_NAMES` is the explicit, reviewable list of
+   exceptions.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
-public. That sounds like rule 2 one level down, and it was tried: flagging every
-exported name with no consumer outside its own module produces ~70 hits, and most
-are correct as they stand -- type aliases that appear only in this module's own
-annotations (``MakePlane``, ``DecodeLoad``), rule tables that exist to be read
-(``BANNED_ALWAYS``), types a caller receives without importing
-(``KVView.pin`` -> ``PinnedKVView``), and exceptions a caller catches
-(``StorageCapacityExceeded``). A rule whose exception list is longer than its
-findings is not enforcing anything, so name-level privacy stays a review
-question. Renaming to ``_thing`` is the answer when review says so.
+public -- it reads "public" off the leading underscore and nothing else. So a
+function could be dead, exported, and green: ``longest_prefix_run`` sat in
+``kvcache_sim/control/request.py`` with no caller but a test while
+``KVView.prefix_lengths`` carried its own copy of the same walk, and every rule
+above passed. Rule 5 is the answer, narrowed until it was worth enforcing:
+
+* over *all* public names it is unenforceable -- 78 hits, mostly correct as they
+  stand: type aliases used only in this module's annotations (``MakePlane``,
+  ``DecodeLoad``), rule tables that exist to be read (``BANNED_ALWAYS``), types a
+  caller receives without importing (``KVView.pin`` -> ``PinnedKVView``),
+  exceptions a caller catches (``StorageCapacityExceeded``). A rule whose
+  exception list is longer than its findings enforces nothing;
+* over public **functions** it is 12, because every category above is a class or
+  a value, not a function. Those 12 were resolved (10 renamed, 2 in
+  :data:`PUBLIC_NAMES` with reasons), so the rule now runs at zero.
+
+Two judgements are wired into it. A **test is not a consumer**: a test importing
+a name is what kept ``longest_prefix_run`` alive, so counting tests would leave
+the hole open -- which means a helper written *for* tests must say so in
+:data:`PUBLIC_NAMES`. And the line the exceptions draw is helper vs entry point:
+a helper only its own module calls is private, while an entry point that exists
+to be called from outside the repo's own graph (``run_sim``) has no in-repo
+consumer by construction and is not thereby dead. Classes and module-level values
+stay a review question, for the reasons listed above.
+
+Two limits, stated rather than hidden. The rule skips the modules
+:data:`PUBLIC_ANYWAY` already declares public on purpose -- these lint CLIs, the
+ambient config, the run lifecycle -- where "nothing in the graph imports this" is
+the documented condition, not a finding; enforcing it there costs 17 exemptions
+to buy nothing. And "uses it" is resolved statically: an import of the name, an
+attribute through an imported module, or a package re-export. A name reached only
+by ``getattr`` would read as unused.
 
 The ``Demo`` contract is *not* checked here. ``realsim.demo.Demo`` is an ABC with
 an abstract ``scenarios()`` and a required ``name``/``description``, so a demo
@@ -75,9 +102,11 @@ __all__ = [
     "PLANE_DIRS",
     "GRAPH_PKGS",
     "PUBLIC_ANYWAY",
+    "PUBLIC_NAMES",
     "sim_packages",
     "check_package_parts",
     "check_private_naming",
+    "check_name_privacy",
     "check_readme_layout",
     "public_defs",
     "declared_all",
@@ -118,6 +147,20 @@ PUBLIC_ANYWAY: Dict[str, str] = {
     "sim_common/config.py": "the ambient run config every leaf reads",
 }
 
+#: Public *names* nothing outside their module uses, public on purpose (rule 5).
+#: Keyed ``<repo-relative module>:<name>``. The distinction being drawn is
+#: helper vs entry point: a helper only its own module calls is private, but an
+#: entry point whose whole purpose is out-of-band use has no in-repo caller by
+#: construction and is not thereby dead.
+PUBLIC_NAMES: Dict[str, str] = {
+    "sim_common/async_engine.py:run_sim": "the engine-only run entry point -- a "
+                                          "scenario needing no mesh goes through "
+                                          "it instead of Simulation",
+    "realsim/seams/factory.py:current_owner": "introspection on the process-wide "
+                                              "patch: what asserts that install "
+                                              "discipline held",
+}
+
 
 def sim_packages(root: Path = REPO_ROOT) -> List[Path]:
     """Every ``*_sim`` package directory, sorted."""
@@ -156,12 +199,8 @@ def check_package_parts(root: Path = REPO_ROOT) -> List[Violation]:
     return sorted(out)
 
 
-def _import_graph(root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS):
-    """``module path -> set of importing module paths``, re-exports resolved.
-
-    ``pkgs`` is a parameter so a test can point the rule at a synthetic tree and
-    prove it still fires -- see ``realsim/tests/test_contract.py``.
-    """
+def _module_map(root: Path, pkgs: Sequence[str]) -> Dict[str, Path]:
+    """``dotted module path -> repo-relative path`` for every module in ``pkgs``."""
     mods: Dict[str, Path] = {}
     for pkg in pkgs:
         for f in sorted((root / pkg).rglob("*.py")):
@@ -172,6 +211,16 @@ def _import_graph(root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS):
             if dotted.endswith(".__init__"):
                 dotted = dotted[: -len(".__init__")]
             mods[dotted] = rel
+    return mods
+
+
+def _import_graph(root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS):
+    """``module path -> set of importing module paths``, re-exports resolved.
+
+    ``pkgs`` is a parameter so a test can point the rule at a synthetic tree and
+    prove it still fires -- see ``realsim/tests/test_contract.py``.
+    """
+    mods = _module_map(root, pkgs)
 
     # A package __init__ that re-exports a name makes the defining module public.
     reexport: Dict[tuple, str] = {}
@@ -235,6 +284,97 @@ def check_private_naming(
             f"only {rel.parent}/ imports it, so the name should say so: "
             f"rename to _{rel.name} (or add it to PUBLIC_ANYWAY with a reason)",
         ))
+    return sorted(out)
+
+
+def _name_consumers(root: Path, pkgs: Sequence[str]):
+    """``(defining module, name) -> set of modules that use it``.
+
+    Rule 2's graph is module-granular; this is the same idea one level down. A
+    use is either an import of the name (``from m import go``) or an attribute
+    reference through the module (``import m`` ... ``m.go()``), and a package
+    ``__init__`` that re-exports a name passes its own consumers back to the
+    module that defined it -- so a name published through a package counts as
+    used by whoever imports it from there.
+    """
+    mods = _module_map(root, pkgs)
+    trees = {d: ast.parse((root / r).read_text()) for d, r in mods.items()}
+    consumers: Dict[tuple, Set[str]] = defaultdict(set)
+    for dotted, rel in mods.items():
+        modname: Dict[str, str] = {}    # local binding -> the module it names
+        for node in ast.walk(trees[dotted]):
+            if isinstance(node, ast.ImportFrom):
+                base = resolve_module(str(rel), node.level, node.module or "")
+                for alias in node.names:
+                    if f"{base}.{alias.name}" in mods:      # from pkg import mod
+                        modname[alias.asname or alias.name] = f"{base}.{alias.name}"
+                    elif base in mods:                      # from mod import name
+                        consumers[(base, alias.name)].add(dotted)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    # Only a plain (or aliased) module binding; ``import a.b``
+                    # binds ``a``, whose attributes are packages, not names.
+                    if alias.name in mods and (alias.asname or "." not in alias.name):
+                        modname[alias.asname or alias.name] = alias.name
+        for node in ast.walk(trees[dotted]):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                src = modname.get(node.value.id)
+                if src is not None:
+                    consumers[(src, node.attr)].add(dotted)
+    for dotted, rel in mods.items():
+        if rel.name != "__init__.py":
+            continue
+        for node in ast.walk(trees[dotted]):
+            if isinstance(node, ast.ImportFrom):
+                src = resolve_module(str(rel), node.level, node.module or "")
+                for alias in node.names:
+                    name = alias.asname or alias.name
+                    consumers[(src, name)] |= consumers.get((dotted, name), set())
+    return mods, trees, consumers
+
+
+def _entry_points(tree: ast.Module) -> Set[str]:
+    """Names referenced under ``if __name__ == "__main__":`` (a CLI's own hook)."""
+    out: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.If) and "__main__" in ast.dump(node.test):
+            out |= {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    return out
+
+
+def check_name_privacy(
+    root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS
+) -> List[Violation]:
+    """Rule 5: a public function no other module uses is named ``_thing``."""
+    mods, trees, consumers = _name_consumers(root, pkgs)
+    out: List[Violation] = []
+    for dotted, rel in sorted(mods.items()):
+        if rel.name in ("__init__.py", "__main__.py") or _is_test(dotted):
+            continue
+        if str(rel) in PUBLIC_ANYWAY or rel.parts[0] in PUBLIC_ANYWAY:
+            continue
+        entry = _entry_points(trees[dotted])
+        for node in trees[dotted].body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            name = node.name
+            if name.startswith("_") or name in entry:
+                continue
+            if f"{rel}:{name}" in PUBLIC_NAMES:
+                continue
+            outside = {
+                c for c in consumers.get((dotted, name), set())
+                if c != dotted and not _is_test(c)
+            }
+            if outside:
+                continue
+            out.append(Violation(
+                str(rel), node.lineno, "public-name-no-consumer",
+                f"{name!r} is public but no other module uses it: rename it "
+                f"_{name} (or add {rel}:{name} to PUBLIC_NAMES with a reason). "
+                f"A test importing it is not a consumer -- that is how a helper "
+                f"with no callers stays alive",
+            ))
     return sorted(out)
 
 
@@ -367,6 +507,7 @@ def check_all(root: Path = REPO_ROOT) -> List[Violation]:
     return sorted(
         check_package_parts(root)
         + check_private_naming(root)
+        + check_name_privacy(root)
         + check_readme_layout(root)
         + check_module_exports(root)
     )

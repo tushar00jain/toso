@@ -5,6 +5,8 @@ asks something one step further on: *how many leading blocks of this prompt does
 each instance hold contiguously?* -- because a cache is only useful as a
 contiguous prefix. That is a KV-cache notion (a block-key chain), not a store
 notion, so it is a subclass here rather than a field on the base view.
+:func:`_longest_prefix_run` is that walk -- stop at the first missing block -- and
+lives here because this is the only thing that performs it.
 
 :class:`PinnedKVView` is the second half of the same idea. A routing decision
 reads the prefix runs several times -- once for the candidate loop's local
@@ -17,11 +19,26 @@ Pinning the snapshot for the duration of one decision makes that explicit
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import AbstractSet, Dict, List, Optional, Sequence
 
 from proposed import View
 
 __all__ = ["KVView", "PinnedKVView"]
+
+
+def _longest_prefix_run(block_keys: Sequence[str], present: AbstractSet[str]) -> int:
+    """Return how many leading blocks of ``block_keys`` are in ``present``.
+
+    The prefix match stops at the first missing block (a cache is only useful as a
+    contiguous prefix), matching block-by-block prefix comparison.
+    """
+    n = 0
+    for k in block_keys:
+        if k in present:
+            n += 1
+        else:
+            break
+    return n
 
 
 class KVView(View):
@@ -40,13 +57,8 @@ class KVView(View):
         located = await self.locate(keys)
         counts: Dict[str, int] = {}
         for inst in sorted(located.get(keys[0], {})):
-            n = 0
-            for key in keys:
-                if inst in located.get(key, {}):
-                    n += 1
-                else:
-                    break
-            counts[inst] = n
+            held = {key for key in keys if inst in located.get(key, {})}
+            counts[inst] = _longest_prefix_run(keys, held)
         return counts
 
     def pin(self, block_keys: Sequence[str]) -> "PinnedKVView":

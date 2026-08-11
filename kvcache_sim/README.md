@@ -137,8 +137,9 @@ kvcache_sim/
     view.py               #   KVView: per-instance prefix-run lengths, plus the
                           #   pinned snapshot one routing decision reads through
     _cache.py             #   per-instance LRU eviction bookkeeping (metadata)
-    request.py            #   inference Request + prefix-hash chain (str keys):
-                          #   what is decided about, and what data/ is handed
+    request.py            #   inference Request, carrying its prefix-hash chain
+                          #   (str keys): what is decided about, and what data/
+                          #   is handed
   data/                   # EXECUTES -- advances the clock, moves bytes
     serving.py            #   the per-request serving loop (a DataPlane):
                           #   queue wait, real pull, prefill charge, publish/evict,
@@ -149,7 +150,8 @@ kvcache_sim/
     store.py              #   publish / fetch / evict over a Deployment's clients,
                           #   plus KVStore.for_deployment, the one factory
   workload/               # WHAT IS SIMULATED
-    _generator.py         #   seeded synthetic request stream (Zipf + Poisson)
+    _generator.py         #   seeded synthetic request stream (Zipf + Poisson),
+                          #   incl. the prompt's prefix-hash chain (str keys)
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
                           #   the wiring a run installs around it
     scenarios.py          #   the six Scenarios: each declares its Runs over one
