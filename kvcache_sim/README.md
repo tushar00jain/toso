@@ -100,15 +100,20 @@ on wall-clock timing.
 The only calls a "serving engine" makes are:
 
 ```python
-plan = await scheduler.schedule(request, now)   # route; None => rejected
-...                                             # pull any remote prefix + prefill
-completion = scheduler.complete(plan)           # which blocks to publish / evict
+plan = await coordinator.schedule(request, now)  # route; None => rejected
+...                                              # pull any remote prefix + prefill
+completion = coordinator.complete(plan)          # which blocks to publish / evict
 await store.publish(completion.instance, completion.publish)
-scheduler.observe_prefill_done(completion.instance, now)   # what actually happened
+busy = coordinator.observe_prefill_done(completion.instance, now)  # what happened
 ```
 
-The scheduler only ever *decides*: it reads the real directory through a view
-(`locate_volumes`), returns a plan, and is told the outcome. Remote-prefix pulls
+That is the whole `Coordinator` port (plus `decode_admission` and two more
+`observe_*` calls), and it is deliberately all a serving host may touch: control
+holds every instance's queue, cache and decode occupancy, so it runs as a service,
+not here. Everything crossing is a value, which is what lets the in-process call
+become an actor endpoint without either side changing shape. The scheduler only
+ever *decides*: it reads the real directory through a view (`locate_volumes`),
+returns a plan, and is told the outcome. Remote-prefix pulls
 (`client.get_batch`), publishing (`client.put_batch`) and eviction
 (`notify_delete_batch`) are the data plane's, layered over the existing
 `put`/`get` plumbing.
@@ -129,9 +134,11 @@ directory read is control even though it awaits.
 ```
 kvcache_sim/
   control/                # DECIDES -- moves nothing, holds no client
-    scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator:
+    scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator,
+                          #   behind the Coordinator port the data plane calls:
                           #   prefill placement, pull-vs-recompute, SLO gates,
                           #   decode placement; owns the PREDICTED prefill queue
+                          #   and its model of the decode load
     _source.py            #   LongestPrefixPolicy: the one store question
                           #   ("which peer serves this gap"), a proposed.Policy
     view.py               #   KVView: per-instance prefix-run lengths, plus the
@@ -186,4 +193,12 @@ plus the prefix-run read that express KV caching on a mesh.
   fetch runs after the prefill queue; if a peer evicted a planned block meanwhile,
   the read-through fetches only what remains present (the rest is recomputed) -- the
   faithful real-directory behavior.
+- **The coordinator hop is free here.** Control is a service, but under simulation it
+  is an in-process object behind the `Coordinator` port, so `schedule` costs nothing
+  and neither do the `observe_*` reports (on a coupled instance there is one per
+  decode step). A deployment pays a round trip before prefill can start, and that
+  lands in TTFT. It is the same hop for both schedulers under comparison, so the
+  cache-aware-vs-load-balance *ranking* holds; the absolute TTFTs are missing it.
+  Every other boundary in the stack has a seam that charges -- this one does not,
+  which is `GAP 6` in the design notes.
 ```

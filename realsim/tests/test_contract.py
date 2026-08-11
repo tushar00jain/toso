@@ -277,6 +277,73 @@ def test_name_privacy_rule_actually_examines_the_tree():
     assert "realsim.simulation" in users, sorted(users)
 
 
+_PORT_CONTROL = (
+    "from typing import Protocol\n\n\n"
+    "class Coordinator(Protocol):\n"
+    "    def complete(self, plan): ...\n\n\n"
+    "class Plan:\n    prefill: str\n"
+)
+
+
+def _port_pkg(root, plane_src):
+    return _toy_pkg(root, {
+        "__init__.py": "", "workload/__init__.py": "", "report/__init__.py": "",
+        "control/__init__.py": "", "control/sched.py": _PORT_CONTROL,
+        "data/__init__.py": "", "data/plane.py": plane_src,
+    })
+
+
+def test_structure_lint_flags_every_way_data_read_the_control_port(tmp_path):
+    """Rule 6 fires on all four crossings the coordinator port replaced."""
+    pkgs = _port_pkg(tmp_path, (
+        "from ..control.sched import Coordinator, Plan\n\n\n"
+        "class Plane:\n"
+        "    def __init__(self, coordinator: Coordinator) -> None:\n"
+        "        self.coordinator = coordinator\n"
+        "        self.tbt = getattr(coordinator, 'tbt_enabled', False)\n"
+        "        self.ids = coordinator.decode_ids\n"
+        "        self.cb = coordinator.observe_compute_busy\n"
+        "    def go(self, plan: Plan) -> None:\n"
+        "        self.coordinator.busy_until[plan.prefill]\n"
+    ))
+    violations = check_structure.check_plane_ports(tmp_path, pkgs)
+    assert [v.code for v in violations] == ["data-reads-control-port"] * 4
+    assert [v.lineno for v in violations] == [7, 8, 9, 11]
+
+
+def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
+    """A call is a request; a dataclass that crossed is meant to be read."""
+    pkgs = _port_pkg(tmp_path, (
+        "from ..control.sched import Coordinator, Plan\n\n\n"
+        "class Plane:\n"
+        "    def __init__(self, coordinator: Coordinator) -> None:\n"
+        "        self.coordinator: Coordinator = coordinator\n"
+        "    async def go(self, plan: Plan) -> None:\n"
+        "        self.coordinator.complete(plan)\n"
+        "        await self.coordinator.schedule(plan, 0.0)\n"
+        "        return plan.prefill\n"
+    ))
+    assert check_structure.check_plane_ports(tmp_path, pkgs) == []
+
+
+def test_plane_port_rule_actually_resolves_the_real_port():
+    """Vacuous unless it finds kvcache's Coordinator and the plane that holds it."""
+    root, pkgs = check_structure.REPO_ROOT, check_structure.GRAPH_PKGS
+    mods = check_structure._module_map(root, pkgs)
+    import ast
+
+    rel = mods["kvcache_sim.data.serving"]
+    tree = ast.parse((root / rel).read_text())
+    trees = {"kvcache_sim.control.scheduler": ast.parse(
+        (root / mods["kvcache_sim.control.scheduler"]).read_text()
+    )}
+    ports = check_structure._control_protocols(rel, tree, mods, trees)
+    assert ports == {"Coordinator"}, ports
+    # ...and that the plane's field is recognised as holding one.
+    _local, attrs = check_structure._port_names(tree, ports)
+    assert "coordinator" in attrs, attrs
+
+
 def test_structure_lint_reads_a_layout_block():
     """The README parser must actually find a block, or rule 3 is vacuous."""
     block = check_structure._layout_block(

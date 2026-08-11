@@ -4,9 +4,10 @@
   :class:`proposed.plane.DataPlane`: queue wait, the real prefix pull, the prefill
   charge, the real publish/evict, decode admission, and the outcome rows;
 * :mod:`~kvcache_sim.data._decode` -- the batched decode engine. It sleeps and
-  emits tokens, so it is data even though the scheduler *reads* its occupancy.
-  Underscored because nothing outside this package drives it: the serving plane
-  constructs it and owns it;
+  emits tokens, so it is data. Underscored because nothing outside this package
+  drives it: the serving plane constructs it, owns it, and is the only thing it
+  reports to -- control learns the decode load as a value the plane forwards, not
+  by holding this object;
 * :mod:`~kvcache_sim.data.store` -- the three KV verbs (publish / fetch / evict)
   as real ``put_batch`` / ``get_batch`` / ``notify_delete_batch`` calls, plus
   :meth:`~kvcache_sim.data.store.KVStore.for_deployment`, the factory a run (real

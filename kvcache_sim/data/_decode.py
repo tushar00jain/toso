@@ -71,6 +71,13 @@ class DecodeEngine:
             an instance's compute timeline. The serving plane passes this only for
             a **coupled** instance, where prefill shares that timeline; a
             disaggregated pool leaves it ``None``.
+        on_state: called ``(instance, finishes)`` whenever a batch changes, with
+            one estimated finish time per request decoding or queued there. The
+            plane forwards it to the coordinator, which is how control knows the
+            decode load without holding this object.
+
+    Both callbacks are the plane's, not control's: this engine reports to its
+    owner on the same host, and the owner decides what to send onward.
     """
 
     def __init__(
@@ -82,6 +89,7 @@ class DecodeEngine:
         model: Model = DEFAULT_MODEL,
         on_finish: Optional[Callable[[Request, float], None]] = None,
         on_compute_busy: Optional[Callable[[str, float], None]] = None,
+        on_state: Optional[Callable[[str, List[float]], None]] = None,
     ) -> None:
         self.ids = sorted(decode_ids)
         self.max_batch = max_batch
@@ -97,30 +105,30 @@ class DecodeEngine:
         self.compute_busy: Dict[str, float] = {i: 0.0 for i in self.ids}
         self.on_finish = on_finish
         self.on_compute_busy = on_compute_busy
+        self.on_state = on_state
         self.batch: Dict[str, List[_Active]] = {i: [] for i in self.ids}
         self.pending: Dict[str, List[_Active]] = {i: [] for i in self.ids}
         self._step_task: Dict[str, Optional["asyncio.Task"]] = {
             i: None for i in self.ids
         }
 
-    # -- queries the scheduler observes us through (control.DecodeLoad) ---- #
-    def occupancy(self, inst: str) -> int:
-        """Requests currently decoding or queued on ``inst`` (the live batch load)."""
-        return len(self.batch[inst]) + len(self.pending[inst])
+    # -- what we report about ourselves ------------------------------------ #
+    def _report(self, inst: str) -> None:
+        """Push ``inst``'s batch state to whoever is listening (the plane).
 
-    def predict_occupancy(self, inst: str, at_t: float) -> int:
-        """Estimate how many current occupants are *still* decoding at ``at_t``.
-
-        Uses the uniform per-token assumption (each remaining token ~ one
-        uncontended step), matching the decode-load prediction: a request is still
-        resident at ``at_t`` if its estimated finish time is past ``at_t``.
+        One estimated finish time per request decoding or queued there, under the
+        uniform per-token assumption (each remaining token ~ one uncontended
+        step). The count is the occupancy and the values answer "still decoding
+        at ``t``?", which is everything control asks about decode -- so control
+        can answer both from this list instead of holding this object. Sent on
+        every batch change, because that is when either answer moves.
         """
-        n = 0
-        for a in self.batch[inst] + self.pending[inst]:
-            finish = a.last_token_time + a.remaining * self._base_step
-            if finish > at_t:
-                n += 1
-        return n
+        if self.on_state is None:
+            return
+        self.on_state(inst, [
+            a.last_token_time + a.remaining * self._base_step
+            for a in self.batch[inst] + self.pending[inst]
+        ])
 
     # -- the coupled-instance timeline ------------------------------------- #
     def reserve(self, inst: str, until: float) -> None:
@@ -155,6 +163,7 @@ class DecodeEngine:
             self.batch[inst].append(a)
         else:
             self.pending[inst].append(a)  # VRAM full: wait counts against TBT
+        self._report(inst)
         self._ensure_stepping(inst)
 
     def _ensure_stepping(self, inst: str) -> None:
@@ -214,3 +223,4 @@ class DecodeEngine:
         # A freed VRAM slot admits the next queued request (still counting its wait).
         while self.pending[inst] and len(self.batch[inst]) < self.max_batch:
             self.batch[inst].append(self.pending[inst].pop(0))
+        self._report(inst)

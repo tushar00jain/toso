@@ -5,7 +5,7 @@ enforces what a package *is* -- the part that had been maintained by hand across
 six files per package and had already drifted (two of three READMEs stopped
 naming a structural file after it was added).
 
-Five rules, none of which a type system can express:
+Six rules, none of which a type system can express:
 
 1. **A sim package has the same parts.** Every ``*_sim/`` carries ``__init__.py``,
    ``__main__.py``, ``README.md``, ``workload/`` and ``report/``. ``control/`` and
@@ -31,6 +31,11 @@ Five rules, none of which a type system can express:
    *other* module uses is rule 2 one level down, with the same remedy: name it
    ``_thing``. :data:`PUBLIC_NAMES` is the explicit, reviewable list of
    exceptions.
+6. **A ``data/`` module may call a control port, never read it.** The planes run
+   in different services, so what passes between them has to be something a wire
+   could carry. Calling a ``Protocol`` the module imports from its sibling
+   ``control/`` is a request; reading a field off it, handing one of its bound
+   methods out as a callback, or ``getattr``-ing it are not.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -41,7 +46,7 @@ above passed. Rule 5 is the answer, narrowed until it was worth enforcing:
 
 * over *all* public names it is unenforceable -- 78 hits, mostly correct as they
   stand: type aliases used only in this module's annotations (``MakePlane``,
-  ``DecodeLoad``), rule tables that exist to be read (``BANNED_ALWAYS``), types a
+  ``Edge``), rule tables that exist to be read (``BANNED_ALWAYS``), types a
   caller receives without importing (``KVView.pin`` -> ``PinnedKVView``),
   exceptions a caller catches (``StorageCapacityExceeded``). A rule whose
   exception list is longer than its findings enforces nothing;
@@ -66,6 +71,18 @@ to buy nothing. And "uses it" is resolved statically: an import of the name, an
 attribute through an imported module, or a package re-export. A name reached only
 by ``getattr`` would read as unused.
 
+Rule 6 is the mechanical half of "no state object is shared across the planes",
+which had been a written rule with nothing behind it: ``data/`` -> ``control/`` is
+a legal import, so the contract lint saw nothing while four things crossed that a
+wire could not carry -- a live ``DecodeEngine`` handed to the scheduler, a bound
+``observe_compute_busy`` fired per decode step, a subscript into control's
+``busy_until``, and ``getattr(scheduler, "tbt_enabled")``. The rule is
+call-vs-read rather than a member whitelist, because that distinction alone
+catches all four and needs no list to maintain: what the port *offers* is a type
+checker's question, what the host is *allowed to touch* is this one. Values that
+cross (a ``Plan``, a ``Completion``) are dataclasses, not Protocols, so reading
+their fields stays legal -- which is the point of sending them.
+
 The ``Demo`` contract is *not* checked here. ``realsim.demo.Demo`` is an ABC with
 an abstract ``scenarios()`` and a required ``name``/``description``, so a demo
 that does not declare its parts cannot be constructed -- and
@@ -89,6 +106,8 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Set
 
 from realsim.tools.check_contract import (
+    CONTROL_SEGMENT,
+    DATA_SEGMENT,
     format_violations,
     resolve_module,
     REPO_ROOT,
@@ -107,6 +126,7 @@ __all__ = [
     "check_package_parts",
     "check_private_naming",
     "check_name_privacy",
+    "check_plane_ports",
     "check_readme_layout",
     "public_defs",
     "declared_all",
@@ -378,6 +398,121 @@ def check_name_privacy(
     return sorted(out)
 
 
+def _control_protocols(rel: Path, tree: ast.Module, mods: Dict[str, Path],
+                       trees: Dict[str, ast.Module]) -> Set[str]:
+    """Names this module imports from a sibling ``control/`` that are Protocols.
+
+    A ``Plan`` or a ``Completion`` crossing the plane boundary is a *value* and
+    its fields are meant to be read. A ``Protocol`` is a *port*: an object living
+    in the other plane. Only the second is subject to rule 6, and the difference
+    is visible where it is declared.
+    """
+    out: Set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        src = resolve_module(str(rel), node.level, node.module or "")
+        if CONTROL_SEGMENT not in src.split(".") or src not in trees:
+            continue
+        defined = {
+            n.name: n for n in trees[src].body if isinstance(n, ast.ClassDef)
+        }
+        for alias in node.names:
+            cls = defined.get(alias.name)
+            if cls is not None and any(
+                isinstance(b, ast.Name) and b.id == "Protocol" for b in cls.bases
+            ):
+                out.add(alias.asname or alias.name)
+    return out
+
+
+def _port_names(tree: ast.Module, ports: Set[str]) -> tuple:
+    """``(local names, self attributes)`` in this module bound to a port type."""
+    local: Set[str] = set()
+    attrs: Set[str] = set()
+
+    def named(ann) -> bool:
+        if isinstance(ann, ast.Name):
+            return ann.id in ports
+        return isinstance(ann, ast.Constant) and ann.value in ports
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for a in [*node.args.args, *node.args.kwonlyargs, *node.args.posonlyargs]:
+                if named(a.annotation):
+                    local.add(a.arg)
+        elif isinstance(node, ast.AnnAssign) and named(node.annotation):
+            t = node.target
+            if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) \
+                    and t.value.id == "self":
+                attrs.add(t.attr)
+            elif isinstance(t, ast.Name):
+                local.add(t.id)
+    # ``self.x = <a port parameter>`` binds the attribute too.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) \
+                and node.value.id in local:
+            for t in node.targets:
+                if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) \
+                        and t.value.id == "self":
+                    attrs.add(t.attr)
+    return local, attrs
+
+
+def check_plane_ports(
+    root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS
+) -> List[Violation]:
+    """Rule 6: a ``data/`` module may **call** a control port, never read it."""
+    mods = _module_map(root, pkgs)
+    trees = {d: ast.parse((root / r).read_text()) for d, r in mods.items()}
+    out: List[Violation] = []
+    for dotted, rel in sorted(mods.items()):
+        parts = rel.parts
+        if not (parts and parts[0].endswith(SIM_SUFFIX)) or _is_test(dotted):
+            continue
+        if DATA_SEGMENT not in parts[:-1]:
+            continue
+        tree = trees[dotted]
+        ports = _control_protocols(rel, tree, mods, trees)
+        if not ports:
+            continue
+        local, attrs = _port_names(tree, ports)
+        if not (local or attrs):
+            continue
+
+        def is_port(node) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id in local
+            return (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and node.attr in attrs
+            )
+
+        called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id == "getattr" and node.args \
+                    and is_port(node.args[0]):
+                out.append(Violation(
+                    str(rel), node.lineno, "data-reads-control-port",
+                    "getattr on a control port: the other plane's fields are not "
+                    "this host's to inspect, and a default hides that it moved",
+                ))
+            elif isinstance(node, ast.Attribute) and is_port(node.value) \
+                    and id(node) not in called:
+                out.append(Violation(
+                    str(rel), node.lineno, "data-reads-control-port",
+                    f"reads {node.attr!r} off a control port instead of calling "
+                    f"it. Control is a different service: a field read (or a "
+                    f"bound method handed out as a callback) is not something a "
+                    f"wire can carry -- add it to the protocol as a call, or "
+                    f"have the run wire the value into this plane directly",
+                ))
+    return sorted(out)
+
+
 def _layout_block(text: str) -> str | None:
     """The fenced block under a ``## Layout`` / ``## Module layout`` heading."""
     m = re.search(
@@ -508,6 +643,7 @@ def check_all(root: Path = REPO_ROOT) -> List[Violation]:
         check_package_parts(root)
         + check_private_naming(root)
         + check_name_privacy(root)
+        + check_plane_ports(root)
         + check_readme_layout(root)
         + check_module_exports(root)
     )

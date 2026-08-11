@@ -131,9 +131,17 @@ def serving_plane(
             )
         else:
             sched = LoadBalanceScheduler(view, **common)
+        # The plane's own decode settings come from here, the same values the
+        # coordinator was built with -- not read back off the coordinator, which
+        # is a different service. One wiring site, two recipients.
         return ServingPlane(
             store, sched, trace=sim.trace, metrics=sim.ledger,
-            coupled=coupled, max_batch=max_batch,
+            coupled=coupled,
+            simulate_decode=simulate_decode,
+            decode_ids=sorted(decode_pool) if decode_pool else sim.ids,
+            max_batch=max_batch,
+            profile=DEFAULT_PROFILE,
+            model=DEFAULT_MODEL,
         )
 
     return build

@@ -4,15 +4,15 @@
 The run harness releases one work item per request at its arrival
 time; everything from there is here:
 
-1. ask the scheduler to route the request (control), and record a rejection if it
-   refuses;
+1. ask the coordinator to route the request (control), and record a rejection if
+   it refuses;
 2. wait out the prefill queue;
 3. if the plan pulls a remote prefix, drive a **real** ``get_batch`` (charging
    fabric via the cost model);
 4. charge the prefill compute;
-5. ask the scheduler what to publish and evict (control), then make those real
+5. ask the coordinator what to publish and evict (control), then make those real
    ``put_batch`` / ``notify_delete_batch`` calls;
-6. tell the scheduler the clock the real ops actually reached;
+6. tell the coordinator the clock the real ops actually reached;
 7. on the decode-simulating path, admit the request to a decode batch (if control
    allows) and finalize its outcome when its last token is emitted.
 
@@ -20,17 +20,33 @@ Simplification (documented in SPEC): a block becomes reusable at prefill
 *completion*, not while in flight, so two requests racing for the same brand-new
 prefix may both compute it. Arrivals are typically spaced enough that this is rare.
 
+The coordinator is not on this host
+-----------------------------------
+Control runs as a service holding the cluster-wide picture, so this plane reaches
+it exactly the way it reaches the store: through a port, over calls that carry
+values. That port is
+:class:`~kvcache_sim.control.scheduler.Coordinator`, and it is the *only* thing
+this module may touch on the control side -- ``check_structure.py`` rule 6 fails
+the build on a field read, a subscript or a ``getattr`` through it, because none
+of those survive the two planes being in different processes.
+
+Concretely, this plane owns the decode engine and *reports* it: every batch change
+goes out as :meth:`~kvcache_sim.control.scheduler._Base.observe_decode_state` (a
+list of estimated finish times -- the whole of what control asks about decode),
+rather than control holding the engine and calling it. The engine's callbacks come
+back here first, to their owner on this host, and this plane decides what to send
+on.
+
 Coupling lives here
 -------------------
 Whether prefill and decode contend for one instance's compute is a fact about the
 deployment, not about the policy, so this plane owns it. On a coupled instance it
 applies each accepted plan's reservation to the decode engine's timeline
 (:meth:`~kvcache_sim.data._decode.DecodeEngine.reserve`) and reports each decode
-step's end back to the scheduler
-(:meth:`~kvcache_sim.control.scheduler._Base.observe_compute_busy`), so the
-control plane's *predicted* prefill queue tracks the timeline decode is actually
-using. A disaggregated pool does neither, and prefill never stalls decode. This
-replaces the dict the scheduler and the decode engine used to share.
+step's end on through
+:meth:`~kvcache_sim.control.scheduler._Base.observe_compute_busy`, so the control
+plane's *predicted* prefill queue tracks the timeline decode is actually using. A
+disaggregated pool does neither, and prefill never stalls decode.
 """
 
 from __future__ import annotations
@@ -38,9 +54,10 @@ from __future__ import annotations
 import asyncio
 from typing import Dict, List, Optional
 
+from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
 from proposed import DataPlane
 
-from ..control.scheduler import Plan
+from ..control.scheduler import Coordinator, Plan
 from ..report.metrics import Metrics, RequestResult
 from ..control.request import Request
 from ._decode import DecodeEngine
@@ -60,56 +77,69 @@ class ServingPlane(DataPlane):
 
     Args:
         store: the :class:`~kvcache_sim.data.store.KVStore` verbs.
-        scheduler: the control-plane scheduler (decides; never executes).
+        coordinator: the control plane, through its
+            :class:`~kvcache_sim.control.scheduler.Coordinator` port and nothing
+            else. It decides; it never executes, and it is not on this host.
         trace: the run's shared trace.
         metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger.
         coupled: whether prefill shares each decode instance's compute timeline.
-        max_batch / profile / model: passed to the decode engine when decode is
-            simulated.
+        simulate_decode / decode_ids / max_batch / profile / model: how this plane
+            models decode. They come from the run's wiring
+            (:func:`kvcache_sim.workload._serving.serving_plane`), which is the
+            same place the coordinator got them -- not read off the coordinator,
+            which would be this host inspecting another service's fields.
     """
 
     def __init__(
         self,
         store: KVStore,
-        scheduler,
+        coordinator: Coordinator,
         *,
         trace,
         metrics: Metrics,
         coupled: bool = False,
+        simulate_decode: bool = False,
+        decode_ids: Optional[List[str]] = None,
         max_batch: int = 8,
-        profile=None,
-        model=None,
+        profile=DEFAULT_PROFILE,
+        model: Model = DEFAULT_MODEL,
     ) -> None:
         self.store = store
-        self.scheduler = scheduler
+        self.coordinator: Coordinator = coordinator
         self.trace = trace
         self.metrics = metrics
         self.coupled = coupled
+        self.simulate_decode = simulate_decode
         # On the decode-simulating path acceptance is provisional until the request
         # is admitted to a decode batch (it may still be shed on the TBT SLO). We
         # stash the accepted row here and publish it once decode finishes (success)
         # or admission is refused (wasted prefill).
         self._pending: Dict[str, RequestResult] = {}
         self.engine: Optional[DecodeEngine] = None
-        if getattr(scheduler, "tbt_enabled", False):
+        if simulate_decode:
             self.engine = DecodeEngine(
-                scheduler.decode_ids,
+                decode_ids if decode_ids is not None else [],
                 max_batch=max_batch,
-                profile=profile if profile is not None else scheduler.profile,
-                model=model if model is not None else scheduler.model,
+                profile=profile,
+                model=model,
                 on_finish=self._decode_done,
                 # Coupled: prefill and decode are one timeline, so every step is
                 # reported to control's predicted queue. Disaggregated: never.
-                on_compute_busy=(
-                    scheduler.observe_compute_busy if coupled else None
-                ),
+                on_compute_busy=self._compute_busy if coupled else None,
+                on_state=self._decode_state,
             )
-            # Control may *observe* decode occupancy for its TBT gates; it cannot
-            # admit, step or drain through this interface.
-            scheduler.attach_decode_load(self.engine)
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
+
+    # -- what this host tells the coordinator about its decode side -------- #
+    def _decode_state(self, inst: str, finishes: List[float]) -> None:
+        """Forward a changed decode batch. The engine reports here, not there."""
+        self.coordinator.observe_decode_state(inst, finishes)
+
+    def _compute_busy(self, inst: str, until: float) -> None:
+        """Forward a coupled instance's occupied compute timeline."""
+        self.coordinator.observe_compute_busy(inst, until)
 
     async def drain(self) -> None:
         """Keep the loop running until the last decode token is emitted."""
@@ -121,7 +151,7 @@ class ServingPlane(DataPlane):
         """Serve one request end to end (the runner already waited for arrival)."""
         request: Request = item.payload
 
-        plan = await self.scheduler.schedule(request, self._now())
+        plan = await self.coordinator.schedule(request, self._now())
         if plan is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"
@@ -139,7 +169,7 @@ class ServingPlane(DataPlane):
         if self.coupled and self.engine is not None:
             self.engine.reserve(plan.prefill, plan.done_time)
 
-        tbt = getattr(self.scheduler, "tbt_enabled", False)
+        tbt = self.simulate_decode
         self._trace_route(plan)
         if not tbt:
             self.metrics.add(self._make_accepted(plan))
@@ -157,18 +187,18 @@ class ServingPlane(DataPlane):
             await asyncio.sleep(plan.prefill_t)
 
         # (4) publish the computed KV blocks into the real directory; evict.
-        completion = self.scheduler.complete(plan)
+        completion = self.coordinator.complete(plan)
         await self.store.publish(completion.instance, completion.publish)
         if completion.evict:
             await self.store.evict(completion.instance, completion.evict)
         # (5) tell control the clock the real ops reached, and (coupled only) the
         # decode timeline the same instance now carries.
         now = self._now()
-        self.scheduler.observe_prefill_done(completion.instance, now)
+        busy_until = self.coordinator.observe_prefill_done(completion.instance, now)
         if self.coupled and self.engine is not None:
-            self.engine.reserve(
-                completion.instance, self.scheduler.busy_until[completion.instance]
-            )
+            # The reply, not a read of control's queue: prefill just occupied the
+            # timeline decode steps on, and only the coordinator knows the tail.
+            self.engine.reserve(completion.instance, busy_until)
         self._prefill_done(plan, completion.evict)
 
     # -- outcome bookkeeping ---------------------------------------------- #
@@ -204,7 +234,7 @@ class ServingPlane(DataPlane):
         note = ""
         if evicted:
             note = f"; evicted {len(evicted)} blk from {plan.prefill}"
-        if not getattr(self.scheduler, "tbt_enabled", False):
+        if not self.simulate_decode:
             self.trace.record(
                 self._now(),
                 "DONE",
@@ -214,7 +244,7 @@ class ServingPlane(DataPlane):
             return
         # Decode-simulating path: control decides whether decode can honour the
         # TBT SLO; we perform (or skip) the admission.
-        if not self.scheduler.decode_admission(plan):
+        if not self.coordinator.decode_admission(plan):
             result = self._pending.pop(plan.request.id)
             result.accepted = False
             result.decode_rejected = True

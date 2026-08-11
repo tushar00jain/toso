@@ -1,11 +1,19 @@
 """Schedulers under test: ``LoadBalanceScheduler`` and ``CacheAwareScheduler``.
 
-Both share an interface so scenarios/tests can swap them::
+Both implement :class:`Coordinator`, which is the whole surface the data plane may
+touch -- and, because control runs in a coordinator service rather than on the
+serving host, the whole surface that would go on a wire::
 
     await schedule(request, now) -> Plan | None   # None == rejected (SLO/overload)
     complete(plan)               -> Completion    # what to publish / evict
-    observe_prefill_done(inst, now)               # the clock the data plane reached
+    decode_admission(plan)       -> bool          # may it enter a decode batch
+    observe_prefill_done(inst, now) -> float      # -> the corrected queue tail
     observe_compute_busy(inst, until)             # a decode step's actual end
+    observe_decode_state(inst, finishes)          # who is still decoding, and until when
+
+Every argument and every return is a value. Nothing here takes a handle to a
+data-plane object, and nothing here is a field the data plane reads -- see
+"Control plane only" below.
 
 ``schedule`` models the cache-aware coordinator's serialized mailbox: the real
 directory read completes without suspending the loop, so the whole routing
@@ -26,23 +34,31 @@ Control plane only
 ------------------
 Nothing here executes: this module holds no client, no volume, no deployment and no
 decode engine. It senses through a :class:`~kvcache_sim.control.view.KVView`,
-returns decisions, and learns what actually happened through two ``observe_*``
+returns decisions, and learns what actually happened through the ``observe_*``
 calls the data plane makes.
 
-That second point is what replaced the old ``busy_until`` / ``compute_busy``
-alias. Control keeps a *predicted* prefill queue (:attr:`_Base.busy_until`), which
-is a model: ``schedule`` reserves an instance until the TTFT it predicted. The
-data plane keeps the *actual* compute timeline. On a **coupled** instance the two
-are the same physical resource, so the data plane mirrors its decode steps back
-here via :meth:`_Base.observe_compute_busy` -- an observation, not a shared dict,
-and it is the data plane that decides whether coupling applies, because whether
-prefill and decode contend is a fact about the deployment, not about the policy.
+Everything the scheduler knows about the running cluster is therefore a *model*
+corrected by observations, never a live read:
+
+* the **prefill queue** (:attr:`_Base.busy_until`) is predicted -- ``schedule``
+  reserves an instance until the TTFT it predicted -- and corrected by
+  :meth:`_Base.observe_prefill_done`. On a **coupled** instance prefill and decode
+  are one physical resource, so the data plane also mirrors each decode step back
+  through :meth:`_Base.observe_compute_busy`; it is the data plane that decides
+  whether coupling applies, because whether the two contend is a fact about the
+  deployment, not about the policy;
+* **decode occupancy** (:attr:`_Base._decode_finishes`) is a per-instance list of
+  estimated finish times, replaced wholesale by
+  :meth:`_Base.observe_decode_state` whenever a batch changes. This used to be a
+  handle: the data plane passed its ``DecodeEngine`` in and the scheduler called
+  ``occupancy()`` on it mid-decision. Same numbers, but a pointer into another
+  host, so it became a value the data plane pushes.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from proposed import Endpoint
 
@@ -57,7 +73,7 @@ from ._source import LongestPrefixPolicy
 from .request import Request
 
 __all__ = [
-    "DecodeLoad",
+    "Coordinator",
     "Plan",
     "Completion",
     "LoadBalanceScheduler",
@@ -65,18 +81,43 @@ __all__ = [
 ]
 
 
-class DecodeLoad(Protocol):
-    """How busy the decode side is -- an observation, not a handle to it.
+class Coordinator(Protocol):
+    """The coordinator as the data plane may use it: values in, values out.
 
-    The data plane's decode engine satisfies this; control never learns anything
-    else about it (it cannot admit, step or drain through this interface).
+    This is the port between the two planes, and it is deliberately the *whole*
+    port -- a serving host that held anything else would be reaching into another
+    service. ``realsim/tools/check_contract.py`` enforces that: a ``data/`` module
+    annotating a field with this protocol may name only these members on it (no
+    other attribute, no subscript, no ``getattr``), which is the rule that would
+    have caught the four crossings this replaced.
+
+    A run under simulation calls it in-process, so the round trip is free; a real
+    deployment puts an actor endpoint here and pays for it. Nothing on either side
+    changes shape when it does, which is the point.
     """
 
-    def occupancy(self, inst: str) -> int:
-        """Requests currently decoding or queued on ``inst``."""
+    async def schedule(self, request: Request, now: float) -> Optional["Plan"]:
+        """Route one request, or ``None`` to reject it (SLO / overload)."""
 
-    def predict_occupancy(self, inst: str, at_t: float) -> int:
-        """How many of those are estimated to still be decoding at ``at_t``."""
+    def complete(self, plan: "Plan") -> "Completion":
+        """What to publish and what to evict, once prefill has finished."""
+
+    def decode_admission(self, plan: "Plan") -> bool:
+        """May this accepted request enter its decode batch now?"""
+
+    def observe_prefill_done(self, inst: str, now: float) -> float:
+        """Report the clock the real ops reached; return the corrected queue tail."""
+
+    def observe_compute_busy(self, inst: str, until: float) -> None:
+        """Report a decode step occupying a **coupled** instance's compute."""
+
+    def observe_decode_state(self, inst: str, finishes: Sequence[float]) -> None:
+        """Report ``inst``'s live decode batch as estimated finish times.
+
+        One entry per request currently decoding or queued there, so its length
+        is the occupancy and its values answer "still decoding at ``t``?". Sent
+        whenever the batch changes, which is the only time either answer moves.
+        """
 
 
 @dataclass
@@ -182,27 +223,41 @@ class _Base:
         self.early_rejection = early_rejection
         self.max_batch = max_batch
         self.tbt_enabled = simulate_decode
-        # Attached by the data plane when decode is modelled (read-only: see
-        # DecodeLoad). ``None`` until then, and always ``None`` when decode is
-        # not simulated.
-        self.decode_load: Optional[DecodeLoad] = None
+        # Control's model of the decode side: instance -> one estimated finish
+        # time per request decoding or queued there. Empty until the data plane
+        # reports, which it does whenever a batch changes.
+        self._decode_finishes: Dict[str, List[float]] = {i: [] for i in self.ids}
         self._inflight: List[Tuple[float, str, int]] = []
 
-    # -- what the data plane attaches / reports back ---------------------- #
-    def attach_decode_load(self, load: DecodeLoad) -> None:
-        """Let control observe decode occupancy (it can only read it)."""
-        self.decode_load = load
-
-    def observe_prefill_done(self, inst: str, now: float) -> None:
+    # -- what the data plane reports back --------------------------------- #
+    def observe_prefill_done(self, inst: str, now: float) -> float:
         """Correct the predicted queue with the clock the real ops reached.
 
         ``schedule`` reserved this instance until the *predicted* ``done_time``;
         the executed cost can differ (the pull may find fewer blocks still
         resident, may be served by a different peer than the one priced, or may
         be slowed by contention), and only now is the true completion time known.
+
+        Returns the corrected queue tail. The data plane needs it on a coupled
+        instance -- prefill just occupied the timeline decode steps on -- and
+        returning it is what keeps that a reply rather than a field it reads.
         """
         if now > self.busy_until[inst]:
             self.busy_until[inst] = now
+        return self.busy_until[inst]
+
+    def observe_decode_state(self, inst: str, finishes: Sequence[float]) -> None:
+        """Replace control's model of ``inst``'s decode batch."""
+        self._decode_finishes[inst] = list(finishes)
+
+    # -- reading that model (never the data plane's objects) -------------- #
+    def _occupancy(self, inst: str) -> int:
+        """Requests currently decoding or queued on ``inst``."""
+        return len(self._decode_finishes.get(inst, ()))
+
+    def _predict_occupancy(self, inst: str, at_t: float) -> int:
+        """How many of those are estimated to still be decoding at ``at_t``."""
+        return sum(1 for f in self._decode_finishes.get(inst, ()) if f > at_t)
 
     def observe_compute_busy(self, inst: str, until: float) -> None:
         """A decode step on a **coupled** instance occupied its compute to ``until``.
@@ -225,10 +280,10 @@ class _Base:
     def _predicted_batch(self, d: str, done_time: float) -> int:
         """Predicted decode batch size on ``d`` seen by a request admitted at
         ``done_time`` (its prefill completion). Drives TBT prediction."""
-        if not self.tbt_enabled or self.decode_load is None:
+        if not self.tbt_enabled:
             return 0
         if self.early_rejection == "predict":
-            n = self.decode_load.predict_occupancy(d, done_time)
+            n = self._predict_occupancy(d, done_time)
             for pd_done, dec_id, out in self._inflight:
                 if (
                     dec_id == d
@@ -238,11 +293,11 @@ class _Base:
                 ):
                     n += 1
             return n
-        return self.decode_load.occupancy(d)
+        return self._occupancy(d)
 
     def _select_decode(self, done_time: float) -> Tuple[str, int]:
         """Pick the decode instance with the smallest predicted batch (id tie-break)."""
-        if not self.tbt_enabled or self.decode_load is None:
+        if not self.tbt_enabled:
             return (min(self.decode_ids), 0)
         d = min(
             self.decode_ids, key=lambda d: (self._predicted_batch(d, done_time), d)
@@ -269,11 +324,11 @@ class _Base:
         -- a *wasted* prefill. The data plane performs (or skips) the admission;
         this only decides.
         """
-        if not self.tbt_enabled or self.decode_load is None:
+        if not self.tbt_enabled:
             return True
         if self.early_rejection == "off":
             pred = decode_step_time(
-                self.decode_load.occupancy(plan.decode) + 1, self.profile, self.model
+                self._occupancy(plan.decode) + 1, self.profile, self.model
             )
             if pred > self.slo_tbt:
                 return False  # late reject -> wasted prefill
