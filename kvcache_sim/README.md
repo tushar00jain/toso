@@ -209,4 +209,12 @@ plus the prefix-run read that express KV caching on a mesh.
   instantly (a real bus would leave control acting on a slightly stale decode picture,
   and on a coupled instance there is one per decode step), and the recorded TTFT is
   control's own prediction, so it moves with queueing rather than by exactly one RTT.
+- **The directory hop is free by default too**, and it is charged the same way
+  (`--controller-rtt`, one `ServiceHop` per boundary). It is the hop every capability
+  crosses on every `locate_volumes` / `notify_put_batch`, the baseline included. Note
+  what it does *not* move: TTFT here is control's prediction, made before any store
+  call, so directory latency shows up in the run's wall clock and in later requests'
+  queue waits but never directly in the TTFT column. Recording a measured TTFT instead
+  would fix that and would also fold in fetch-vs-prediction divergence -- a different
+  decision, not made.
 ```

@@ -104,6 +104,13 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--contention is not none.",
     )
     parser.add_argument(
+        "--controller-rtt", type=float, default=None, metavar="SECONDS",
+        help="one-way latency of the hop to the directory service (default: 0 -- "
+        "the in-process call). Every capability pays it on every directory read, "
+        "and so does every consultation of a policy installed there; it is a "
+        "fidelity model, not byte-identical to 0.",
+    )
+    parser.add_argument(
         "--coordinator-rtt", type=float, default=None, metavar="SECONDS",
         help="one-way latency of the hop to the control plane's coordinator "
         "service (default: 0 -- the in-process call, byte-identical to holding "
@@ -130,6 +137,7 @@ def _apply_run_flags(
         contention=args.contention,
         collapse_charges=args.collapse_charges or None,
         coordinator_rtt=args.coordinator_rtt,
+        controller_rtt=args.controller_rtt,
     )
     if logger is None:
         configure_logging(logging.DEBUG if args.verbose else logging.INFO)

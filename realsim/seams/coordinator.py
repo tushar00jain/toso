@@ -41,6 +41,8 @@ from typing import Any, Optional, Sequence
 
 from sim_common import config
 
+from realsim.seams.link import ServiceHop
+
 __all__ = ["CoordinatorHandle"]
 
 
@@ -57,45 +59,34 @@ class CoordinatorHandle:
 
     def __init__(self, control: Any, *, rtt: Optional[float] = None) -> None:
         self.control = control
-        self.rtt = rtt if rtt is not None else config.current().coordinator_rtt
-
-    async def _hop(self) -> None:
-        """Pay one leg of the round trip (free, and inline, when ``rtt`` is 0)."""
-        if self.rtt:
-            await asyncio.sleep(self.rtt)
+        self.hop = ServiceHop(
+            rtt if rtt is not None else config.current().coordinator_rtt
+        )
 
     # -- calls: the caller waits for a reply, so it pays both legs --------- #
     async def schedule(self, request: Any, now: float) -> Any:
-        await self._hop()
-        # The coordinator decides against *its own* clock at the moment the
-        # message lands, not the one the sender stamped on the way out -- by then
-        # the sender's reading is a hop old, and routing that compares against
-        # every instance's queue would be reading the cluster in the past.
-        plan = await self.control.schedule(request, self._clock(now))
-        await self._hop()
-        return plan
+        # The thunk runs on the far side, so the coordinator decides against
+        # *its own* clock at the moment the message lands -- not the stamp the
+        # sender took on the way out, which by then is a hop old. Routing that
+        # compares every instance's queue would otherwise read a past cluster.
+        return await self.hop.call(
+            lambda: self.control.schedule(request, self._clock(now))
+        )
 
     def _clock(self, sent: float) -> float:
         """The receiver's clock: the sender's stamp when the hop is free."""
-        return sent if not self.rtt else asyncio.get_running_loop().time()
+        return sent if not self.hop.rtt else asyncio.get_running_loop().time()
 
     async def complete(self, plan: Any) -> Any:
-        await self._hop()
-        completion = self.control.complete(plan)
-        await self._hop()
-        return completion
+        return await self.hop.call(lambda: self.control.complete(plan))
 
     async def decode_admission(self, plan: Any) -> bool:
-        await self._hop()
-        ok = self.control.decode_admission(plan)
-        await self._hop()
-        return ok
+        return await self.hop.call(lambda: self.control.decode_admission(plan))
 
     async def observe_prefill_done(self, inst: str, now: float) -> float:
-        await self._hop()
-        busy_until = self.control.observe_prefill_done(inst, now)
-        await self._hop()
-        return busy_until
+        return await self.hop.call(
+            lambda: self.control.observe_prefill_done(inst, now)
+        )
 
     # -- sends: one-way, so the sender does not block --------------------- #
     def observe_compute_busy(self, inst: str, until: float) -> None:

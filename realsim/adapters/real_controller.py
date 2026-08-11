@@ -36,6 +36,7 @@ from typing import Optional, Union
 from sim_common import config
 
 from realsim.seams.controller_handle import FakeControllerHandle
+from realsim.seams.link import ServiceHop
 from realsim.seams.dict_directory import DictDirectory
 from torchstore.controller import Controller
 
@@ -55,12 +56,12 @@ class RealControllerAdapter:
             surface to the client.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hop: Optional[ServiceHop] = None) -> None:
         self.controller = Controller()
         # Mirror the tail of Controller.init: we skip the @endpoint (it needs a
         # Monarch mesh) and only need the directory marked initialized.
         self.controller.is_initialized = True
-        self.handle = FakeControllerHandle(self.controller)
+        self.handle = FakeControllerHandle(self.controller, hop=hop)
 
 
 class ShimControllerAdapter:
@@ -81,7 +82,7 @@ class ShimControllerAdapter:
             surface to the client (identical surface to the real adapter).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hop: Optional[ServiceHop] = None) -> None:
         self.controller = Controller()
         # Swap only the directory container -- everything else stays real. The
         # Trie built by Controller.__init__ is discarded here (a one-time
@@ -89,7 +90,7 @@ class ShimControllerAdapter:
         self.controller.keys_to_storage_volumes = DictDirectory()
         # Mirror the tail of Controller.init (see RealControllerAdapter).
         self.controller.is_initialized = True
-        self.handle = FakeControllerHandle(self.controller)
+        self.handle = FakeControllerHandle(self.controller, hop=hop)
 
 
 def make_controller_adapter(
@@ -110,4 +111,7 @@ def make_controller_adapter(
         attributes regardless of backing.
     """
     use_real = config.current().real_directory if real_directory is None else real_directory
-    return RealControllerAdapter() if use_real else ShimControllerAdapter()
+    # What reaching this controller costs. Resolved once, here, because this is
+    # the one place a run's controller is built.
+    hop = ServiceHop(config.current().controller_rtt)
+    return RealControllerAdapter(hop) if use_real else ShimControllerAdapter(hop)

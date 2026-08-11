@@ -32,20 +32,31 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, Sequence
 
+from realsim.seams.link import ServiceHop
+
 __all__ = ["FakeControllerHandle"]
 
 
 class _ControllerEndpoint:
-    """Mimics a Monarch endpoint's ``.call`` / ``.call_one`` awaitable surface."""
+    """Mimics a Monarch endpoint's ``.call`` / ``.call_one`` awaitable surface.
 
-    def __init__(self, fn: Callable[..., Any]) -> None:
+    Including its distance: reaching the controller is a round trip, so every
+    endpoint pays one through the shared :class:`~realsim.seams.link.ServiceHop`.
+    At the default ``rtt`` of 0 that is inline and changes nothing, which is why
+    it went unnoticed that this boundary -- crossed by every capability on every
+    directory read, and by every consultation of a policy installed here -- was
+    the one seam charging nothing.
+    """
+
+    def __init__(self, fn: Callable[..., Any], hop: "ServiceHop") -> None:
         self._fn = fn
+        self._hop = hop
 
     async def call(self, *args: Any, **kwargs: Any) -> Any:
-        return await self._fn(*args, **kwargs)
+        return await self._hop.call(lambda: self._fn(*args, **kwargs))
 
     async def call_one(self, *args: Any, **kwargs: Any) -> Any:
-        return await self._fn(*args, **kwargs)
+        return await self._hop.call(lambda: self._fn(*args, **kwargs))
 
 
 class FakeControllerHandle:
@@ -54,15 +65,22 @@ class FakeControllerHandle:
     Args:
         controller: a real ``Controller`` instance (constructed off-actor and
             marked initialized by :class:`realsim.adapters.real_controller.RealControllerAdapter`).
+        hop: what reaching this controller costs. ``None`` is a free hop, which
+            is what a test wanting the directory and nothing else wants; a run
+            builds one from :attr:`sim_common.config.SimConfig.controller_rtt`.
     """
 
-    def __init__(self, controller) -> None:
+    def __init__(self, controller, *, hop: Optional[ServiceHop] = None) -> None:
         self.controller = controller
-        self.locate_volumes = _ControllerEndpoint(self._locate_volumes)
-        self.notify_put_batch = _ControllerEndpoint(self._notify_put_batch)
-        self.keys = _ControllerEndpoint(self._keys)
-        self.notify_delete = _ControllerEndpoint(self._notify_delete)
-        self.notify_delete_batch = _ControllerEndpoint(self._notify_delete_batch)
+        # One hop shared by every endpoint: they are all the same boundary.
+        self.hop = hop if hop is not None else ServiceHop()
+        self.locate_volumes = _ControllerEndpoint(self._locate_volumes, self.hop)
+        self.notify_put_batch = _ControllerEndpoint(self._notify_put_batch, self.hop)
+        self.keys = _ControllerEndpoint(self._keys, self.hop)
+        self.notify_delete = _ControllerEndpoint(self._notify_delete, self.hop)
+        self.notify_delete_batch = _ControllerEndpoint(
+            self._notify_delete_batch, self.hop
+        )
         # The routing hook (see the module docstring). ``None`` == the directory
         # answers for itself, which is also exactly what the naive policy says.
         self._policy: Optional[Any] = None

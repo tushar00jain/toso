@@ -279,3 +279,46 @@ def test_runner_installs_the_mesh_exactly_once_and_releases_it():
     run_sim(Runner(mesh).run([WorkItem(id="i0", run=call), WorkItem(id="i1", run=call)]))
     assert owners == [mesh, mesh]
     assert factory.current_owner() is None
+
+
+# --------------------------------------------------------------------------
+# Service hops: what reaching a service costs (realsim.seams.link).
+# --------------------------------------------------------------------------
+
+
+def _end_of_run(result) -> float:
+    """The virtual clock at the last traced event."""
+    return max(t for t, _kind, _msg in result.trace.events)
+
+
+def test_a_service_hop_is_free_and_inline_by_default():
+    """The default seam changes nothing: awaiting a non-suspending call is inline."""
+    from sim_common import config
+
+    from realsim.tests._burst import run_burst
+
+    baseline = run_burst(3)
+    with config.overrides(controller_rtt=0.0):
+        explicit = run_burst(3)
+    assert explicit.trace.render() == baseline.trace.render()
+
+
+def test_the_controller_hop_is_charged_to_every_capability():
+    """Even the baseline pays it -- it reaches the directory like everyone else.
+
+    This boundary used to be the one seam charging nothing: the transport charged
+    bytes and the coordinator handle charged its round trip, while every
+    ``locate_volumes`` / ``notify_put_batch`` in the repo was free. A burst that
+    routes nothing and installs no policy still crosses it.
+    """
+    from sim_common import config
+
+    from realsim.tests._burst import run_burst
+
+    rtt = 0.25
+    free = run_burst(3)
+    with config.overrides(controller_rtt=rtt):
+        distant = run_burst(3)
+    # Every directory call now costs a round trip, so the run ends later -- by at
+    # least one, since the reads that remain on the critical path are serialized.
+    assert _end_of_run(distant) >= _end_of_run(free) + 2 * rtt
