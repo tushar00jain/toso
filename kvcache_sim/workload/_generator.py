@@ -25,7 +25,7 @@ from __future__ import annotations
 import random
 from typing import List
 
-from .request import block_keys_for, Request
+from ..control.request import block_keys_for, Request
 
 __all__ = ["make_workload"]
 

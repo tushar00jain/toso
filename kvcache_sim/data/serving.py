@@ -42,7 +42,7 @@ from proposed import DataPlane
 
 from ..control.scheduler import Plan
 from ..report.metrics import Metrics, RequestResult
-from ..workload.request import Request
+from ..control.request import Request
 from ._decode import DecodeEngine
 from .store import KVStore
 

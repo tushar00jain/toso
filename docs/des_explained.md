@@ -157,7 +157,7 @@ through `realsim`'s transport seam, and eviction is the real `notify_delete_batc
 
 | Component | File | Role |
 |---|---|---|
-| `Instance`, `Request`, prefix-hash | `workload/request.py` | An `Instance` owns one KV pool. A prompt is chunked into fixed `B`-token blocks, each **content-addressed by a prefix-hash chain** so shared leading blocks get identical keys (dedup/prefix-reuse falls out for free). `longest_prefix_run` counts leading matched blocks. |
+| `Instance`, `Request`, prefix-hash | `control/request.py` | An `Instance` owns one KV pool. A prompt is chunked into fixed `B`-token blocks, each **content-addressed by a prefix-hash chain** so shared leading blocks get identical keys (dedup/prefix-reuse falls out for free). `longest_prefix_run` counts leading matched blocks. |
 | `KVStore` | `data/store.py` | The three KV verbs that move bytes or change the directory (`publish` / `fetch` / `evict`), built by `KVStore.for_deployment`, over a `realsim.mesh.Mesh`, which supplies the **real** `Controller` directory plus a real per-instance `LocalClient`. |
 | `KVView` | `control/view.py` | The one derived directory *read* the scheduler needs: `prefix_lengths(block_keys)` — `{instance → leading blocks held contiguously}` — computed from the real `locate_volumes`. `PinnedKVView` fixes one snapshot for the duration of one routing decision. |
 | `LongestPrefixPolicy` | `control/_source.py` | The only part of KV routing that is a *store* question, as a real `Policy`: rank instances by how much of the requested prefix they hold (id tie-break). |

@@ -118,8 +118,11 @@ The scheduler only ever *decides*: it reads the real directory through a view
 Split by plane: `control/` decides, `data/` executes, and neither imports the
 simulator — `control/` takes a `View`, a `TransferCost` and machine facts from
 `domain`; `data/` calls torchstore APIs against a `Deployment`. Both are enforced
-by `realsim/tools/check_contract.py`. The test for which folder something belongs
-in is **does it advance the clock or move bytes?** — the decode engine sleeps and
+by `realsim/tools/check_contract.py`, which also forbids either of them from
+importing `workload/` -- that is the run's scaffolding and has no counterpart in
+production, so a type all three planes pass (`Request`) belongs in `control/`.
+The test for which folder something belongs in is **does it advance the clock or
+move bytes?** — the decode engine sleeps and
 emits tokens, so it is data; the LRU only picks victims, so it is control; a
 directory read is control even though it awaits.
 
@@ -134,6 +137,8 @@ kvcache_sim/
     view.py               #   KVView: per-instance prefix-run lengths, plus the
                           #   pinned snapshot one routing decision reads through
     _cache.py             #   per-instance LRU eviction bookkeeping (metadata)
+    request.py            #   inference Request + prefix-hash chain (str keys):
+                          #   what is decided about, and what data/ is handed
   data/                   # EXECUTES -- advances the clock, moves bytes
     serving.py            #   the per-request serving loop (a DataPlane):
                           #   queue wait, real pull, prefill charge, publish/evict,
@@ -144,7 +149,6 @@ kvcache_sim/
     store.py              #   publish / fetch / evict over a Deployment's clients,
                           #   plus KVStore.for_deployment, the one factory
   workload/               # WHAT IS SIMULATED
-    request.py            #   inference Request + prefix-hash chain (str keys)
     _generator.py         #   seeded synthetic request stream (Zipf + Poisson)
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
                           #   the wiring a run installs around it

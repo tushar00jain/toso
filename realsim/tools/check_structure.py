@@ -59,7 +59,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Sequence, Set
 
 from realsim.tools.check_contract import (
     format_violations,
@@ -156,10 +156,14 @@ def check_package_parts(root: Path = REPO_ROOT) -> List[Violation]:
     return sorted(out)
 
 
-def _import_graph(root: Path = REPO_ROOT):
-    """``module path -> set of importing module paths``, re-exports resolved."""
+def _import_graph(root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS):
+    """``module path -> set of importing module paths``, re-exports resolved.
+
+    ``pkgs`` is a parameter so a test can point the rule at a synthetic tree and
+    prove it still fires -- see ``realsim/tests/test_contract.py``.
+    """
     mods: Dict[str, Path] = {}
-    for pkg in GRAPH_PKGS:
+    for pkg in pkgs:
         for f in sorted((root / pkg).rglob("*.py")):
             if "__pycache__" in f.parts:
                 continue
@@ -204,9 +208,11 @@ def _is_test(dotted: str) -> bool:
     return "tests" in dotted.split(".") or dotted.split(".")[-1].startswith("test_")
 
 
-def check_private_naming(root: Path = REPO_ROOT) -> List[Violation]:
+def check_private_naming(
+    root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS
+) -> List[Violation]:
     """Rule 2: a module only its own folder imports is named ``_thing.py``."""
-    mods, importers = _import_graph(root)
+    mods, importers = _import_graph(root, pkgs)
     out: List[Violation] = []
     for dotted, rel in sorted(mods.items()):
         if rel.name == "__init__.py" or rel.name == "__main__.py":

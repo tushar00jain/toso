@@ -46,10 +46,22 @@ mechanically checkable, so it is checked here rather than left to review.
 Importing in the other direction is fine and expected: the data plane is handed
 the decisions.
 
+There is a second direction, for the same reason one level out:
+
+    ``*/control/`` and ``*/data/`` may not import ``*/workload/``.
+
+``control/`` and ``data/`` are the halves that would ship -- ordinary application
+code against a ``Deployment``. ``workload/`` is the run's scaffolding: what to
+simulate, which comparisons to draw, how to narrate them. It has no counterpart
+in production, so anything the shipping halves need from it is misfiled. This
+caught ``Request`` living in ``kvcache_sim/workload/`` while the scheduler, the
+serving plane and the decode engine all imported it; it belongs in ``control/``
+with the ``Plan`` and ``Completion`` it is reasoned about alongside.
+
 Scope: the simulation packages -- ``realsim/``, ``sim_common/``, ``domain/``, and
 the capability packages ``putget_sim/`` / ``dedup_sim/`` / ``kvcache_sim/`` (whose
-``control/`` folders the plane rule applies to; ``putget_sim`` has none, because
-it decides nothing). The sibling ``../torchstore`` is out of scope
+``control/`` and ``data/`` folders the plane rules apply to; ``putget_sim`` has
+neither, because it decides nothing and executes nothing). The sibling ``../torchstore`` is out of scope
 and is *not* scanned -- it owns one benign wall-clock read
 (``torchstore/logging.py::LatencyTracker`` uses ``perf_counter()`` for DEBUG-only
 elapsed display; it never affects control flow or the ``Trace``).
@@ -79,6 +91,7 @@ __all__ = [
     "CONTROL_FORBIDDEN_NAMES",
     "DATA_SEGMENT",
     "CONTROL_SEGMENT",
+    "WORKLOAD_SEGMENT",
     "PROPOSED_PKG",
     "PROPOSED_FORBIDDEN",
     "Violation",
@@ -171,6 +184,9 @@ CONTROL_FORBIDDEN_NAMES: Dict[str, str] = {
 DATA_SEGMENT = "data"
 # ...and this one marks the importing module as control.
 CONTROL_SEGMENT = "control"
+# The run's scaffolding: real code -- control/ and data/ -- may not import it,
+# because production has no workload package to import.
+WORKLOAD_SEGMENT = "workload"
 
 # The ``proposed`` package is the surface argued for upstream, so it must be
 # implementable inside torchstore with no simulator underneath it. Anything it
@@ -318,10 +334,23 @@ class _ContractVisitor(ast.NodeVisitor):
                     self._add(lineno, "data-imports-simulator",
                               f"data imports {module!r}: that is {why}")
                     return
+            if WORKLOAD_SEGMENT in module.split("."):
+                self._add(lineno, "plane-imports-workload",
+                          f"data imports {module!r}: workload/ is the run's "
+                          f"scaffolding and has no counterpart in production, so "
+                          f"a shipping plane cannot need anything from it. Move "
+                          f"the shared type down to control/")
             return
         if not self.is_control:
             return
         parts = module.split(".")
+        if WORKLOAD_SEGMENT in parts:
+            self._add(lineno, "plane-imports-workload",
+                      f"control imports {module!r}: workload/ is the run's "
+                      f"scaffolding and has no counterpart in production, so a "
+                      f"shipping plane cannot need anything from it. Define the "
+                      f"shared type in control/ instead")
+            return
         if DATA_SEGMENT in parts:
             self._add(lineno, "control-imports-data",
                       f"control imports {module!r}: a control-plane module may "

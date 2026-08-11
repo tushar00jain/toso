@@ -22,7 +22,7 @@ from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data.store import KVStore
-from kvcache_sim.workload.request import (
+from kvcache_sim.control.request import (
     block_keys_for,
     longest_prefix_run,
     Request,

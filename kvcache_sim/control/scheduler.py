@@ -54,7 +54,7 @@ from proposed import TransferCost
 
 from ._cache import LRUCache
 from ._source import LongestPrefixPolicy
-from ..workload.request import Request
+from .request import Request
 
 __all__ = [
     "DecodeLoad",

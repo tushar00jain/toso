@@ -38,7 +38,7 @@ from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, Model,
 )
 
-from ..workload.request import Request
+from ..control.request import Request
 
 __all__ = ["DecodeEngine"]
 

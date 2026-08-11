@@ -1,7 +1,5 @@
 """What is simulated: the domain model, the request stream, and the scenarios.
 
-- ``request.py`` -- the domain model: an inference ``Request`` plus prefix-hash
-  block addressing (a block key is a plain directory key).
 - ``_generator.py`` -- the seeded synthetic request stream (shared system prompt +
   per-conversation context + unique query suffix; Zipf popularity, Poisson
   arrivals).

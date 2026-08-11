@@ -1,5 +1,9 @@
 """The KV-cache control plane: everything that is decided, nothing that runs.
 
+* :mod:`~kvcache_sim.control.request` -- what is being decided *about*: an
+  inference ``Request`` plus prefix-hash block addressing (a block key is a plain
+  directory key). It sits here rather than in ``workload/`` because all three
+  planes pass it, and ``workload/`` does not exist in production;
 * :mod:`~kvcache_sim.control.scheduler` -- the serving scheduler: which instance
   prefills, pull-vs-recompute, the TTFT/TBT admission gates, where decode lands.
   These are *compute* decisions the store knows nothing about, which is why they

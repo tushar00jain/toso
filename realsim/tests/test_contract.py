@@ -139,6 +139,73 @@ def test_every_module_in_scope_actually_declares_its_surface():
     assert checked > 40, f"only {checked} modules in scope -- rule 4 is too narrow"
 
 
+def _toy_pkg(root, files):
+    """Write ``{relative path: source}`` under ``root/toy_sim`` and return it."""
+    for rel, src in files.items():
+        path = root / "toy_sim" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(src)
+    return ["toy_sim"]
+
+
+def test_structure_lint_flags_a_folder_private_module(tmp_path):
+    """Rule 2 fires: only its own folder imports it, so the name must say so."""
+    pkgs = _toy_pkg(tmp_path, {
+        "__init__.py": "",
+        "workload/__init__.py": "",
+        "workload/helper.py": "__all__ = ['go']\n\n\ndef go():\n    pass\n",
+        "workload/scenarios.py": "from .helper import go\n",
+    })
+    violations = check_structure.check_private_naming(tmp_path, pkgs)
+    assert [v.code for v in violations] == ["public-name-private-module"]
+    assert violations[0].path.endswith("helper.py")
+
+
+def test_structure_lint_accepts_an_underscored_private_module(tmp_path):
+    """The same tree, renamed: no finding."""
+    pkgs = _toy_pkg(tmp_path, {
+        "__init__.py": "",
+        "workload/__init__.py": "",
+        "workload/_helper.py": "__all__ = ['go']\n\n\ndef go():\n    pass\n",
+        "workload/scenarios.py": "from ._helper import go\n",
+    })
+    assert check_structure.check_private_naming(tmp_path, pkgs) == []
+
+
+def test_structure_lint_accepts_a_module_imported_across_folders(tmp_path):
+    """What ``kvcache_sim/control/request.py`` is: three planes pass its type."""
+    pkgs = _toy_pkg(tmp_path, {
+        "__init__.py": "",
+        "workload/__init__.py": "",
+        "control/request.py": "__all__ = ['Request']\n\n\nclass Request:\n    pass\n",
+        "data/__init__.py": "",
+        "data/serving.py": "from ..control.request import Request\n",
+    })
+    assert check_structure.check_private_naming(tmp_path, pkgs) == []
+
+
+def test_structure_lint_ignores_a_module_nothing_imports(tmp_path):
+    """Unimported is a deadness question, not a naming one -- rule 2 stays quiet."""
+    pkgs = _toy_pkg(tmp_path, {
+        "__init__.py": "",
+        "workload/__init__.py": "",
+        "workload/orphan.py": "__all__ = ['go']\n\n\ndef go():\n    pass\n",
+    })
+    assert check_structure.check_private_naming(tmp_path, pkgs) == []
+
+
+def test_private_naming_rule_actually_examines_the_tree():
+    """It would be vacuous if the import graph came back empty."""
+    mods, importers = check_structure._import_graph()
+    assert len(mods) > 50, f"only {len(mods)} modules in the graph"
+    # The real tree's known-public and known-private neighbours, both resolved.
+    assert "kvcache_sim.control.request" in mods
+    assert {i.split(".")[0] for i in importers["kvcache_sim.control.request"]} >= {
+        "kvcache_sim"
+    }
+    assert "kvcache_sim.workload._generator" in mods
+
+
 def test_structure_lint_reads_a_layout_block():
     """The README parser must actually find a block, or rule 3 is vacuous."""
     block = check_structure._layout_block(
@@ -192,7 +259,7 @@ def test_relative_imports_resolve_against_the_importing_package():
     assert resolve_module(CONTROL, 0, "realsim.mesh") == "realsim.mesh"
     assert resolve_module(CONTROL, 1, "_cache") == "kvcache_sim.control._cache"
     assert resolve_module(CONTROL, 2, "data.store") == "kvcache_sim.data.store"
-    assert resolve_module(CONTROL, 2, "workload.request") == "kvcache_sim.workload.request"
+    assert resolve_module(CONTROL, 1, "request") == "kvcache_sim.control.request"
 
 
 def test_lint_flags_control_importing_data():
@@ -227,9 +294,31 @@ def test_lint_allows_what_control_is_supposed_to_use():
         "from proposed import TransferCost\n"
         "from domain import prefill_time, MachineProfile\n"
         "from ._cache import LRUCache\n"
-        "from ..workload.request import Request\n"
+        "from .request import Request\n"
     )
     assert _codes(allowed, path=CONTROL) == set()
+
+
+def test_lint_flags_a_plane_importing_the_run_scaffolding():
+    """control/ and data/ ship; workload/ does not exist in production."""
+    for path in (CONTROL, DATA):
+        for line in (
+            "from ..workload.request import Request\n",
+            "from ..workload.scenarios import make_topology\n",
+            "import kvcache_sim.workload.scenarios\n",
+        ):
+            assert "plane-imports-workload" in _codes(line, path=path), (path, line)
+
+
+def test_workload_may_import_the_planes_it_wires():
+    """The direction that is fine: the run's scaffolding reaches for real code."""
+    src = (
+        "from ..control.scheduler import CacheAwareScheduler\n"
+        "from ..control.request import Request\n"
+        "from ..data.serving import ServingPlane\n"
+        "from ..report.summary import HotspotReport\n"
+    )
+    assert _codes(src, path="kvcache_sim/workload/scenarios.py") == set()
 
 
 def test_lint_keeps_control_out_of_the_simulator():
