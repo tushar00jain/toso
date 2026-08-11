@@ -73,8 +73,8 @@ class Dedup(Scenario):
                 Run(
                     f"cap={cap}",
                     burst,
-                    policy=DedupPolicy(fanout_cap=cap, trace=trace),
-                    plane=lambda sim, b=burst: ReadThroughPlane(
+                    control=DedupPolicy(fanout_cap=cap, trace=trace),
+                    data=lambda sim, b=burst: ReadThroughPlane(
                         sim.mesh, KEY, b.put_value
                     ),
                     profile=burst.profile,

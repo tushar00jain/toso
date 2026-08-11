@@ -193,12 +193,15 @@ plus the prefix-run read that express KV caching on a mesh.
   fetch runs after the prefill queue; if a peer evicted a planned block meanwhile,
   the read-through fetches only what remains present (the rest is recomputed) -- the
   faithful real-directory behavior.
-- **The coordinator hop is free here.** Control is a service, but under simulation it
-  is an in-process object behind the `Coordinator` port, so `schedule` costs nothing
-  and neither do the `observe_*` reports (on a coupled instance there is one per
-  decode step). A deployment pays a round trip before prefill can start, and that
-  lands in TTFT. It is the same hop for both schedulers under comparison, so the
-  cache-aware-vs-load-balance *ranking* holds; the absolute TTFTs are missing it.
-  Every other boundary in the stack has a seam that charges -- this one does not,
-  which is `GAP 6` in the design notes.
+- **The coordinator hop is free by default.** Control is a service, reached through
+  `realsim/seams/coordinator.py` — so there is now somewhere to charge the round trip,
+  but `--coordinator-rtt` defaults to `0` and every call is inline. Turn it up and it
+  is paid out and back before prefill can start: at `0.5` on the shared-prefix
+  workload, mean TTFT goes 2.56 → 4.90 and the hit rate 0.734 → 0.704, because routing
+  reads a directory snapshot one hop old and a just-published prefix is not there to
+  reuse yet. Both schedulers pay the same hop, so the comparison holds either way. Two
+  things the seam still does not model: the one-way `observe_*` sends are delivered
+  instantly (a real bus would leave control acting on a slightly stale decode picture,
+  and on a coupled instance there is one per decode step), and the recorded TTFT is
+  control's own prediction, so it moves with queueing rather than by exactly one RTT.
 ```

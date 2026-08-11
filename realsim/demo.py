@@ -103,6 +103,14 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "byte-identical (the sub-charge instants collapse). Inert when "
         "--contention is not none.",
     )
+    parser.add_argument(
+        "--coordinator-rtt", type=float, default=None, metavar="SECONDS",
+        help="one-way latency of the hop to the control plane's coordinator "
+        "service (default: 0 -- the in-process call, byte-identical to holding "
+        "the object). A request pays it out and back before prefill can start, "
+        "so a non-zero value lands in TTFT; it is a fidelity model, not "
+        "byte-identical to 0.",
+    )
     return parser
 
 
@@ -121,6 +129,7 @@ def _apply_run_flags(
         real_directory=False if args.shim_directory else None,
         contention=args.contention,
         collapse_charges=args.collapse_charges or None,
+        coordinator_rtt=args.coordinator_rtt,
     )
     if logger is None:
         configure_logging(logging.DEBUG if args.verbose else logging.INFO)

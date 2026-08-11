@@ -123,7 +123,7 @@ def test_declaring_a_scenario_executes_nothing(demo_cls):
         labels = [r.label for r in runs]
         assert all(labels) and len(set(labels)) == len(labels)
         # Nothing has been assembled: a declared Run has no Simulation yet.
-        assert all(r.plane is None or callable(r.plane) for r in runs)
+        assert all(r.data is None or callable(r.data) for r in runs)
 
 
 def test_console_renders_a_report_once():

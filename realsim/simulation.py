@@ -89,6 +89,15 @@ class Simulation:
         self.ledger = ledger if ledger is not None else Ledger()
         self.policy = policy
 
+        # The control plane reached as a service, which is the only way it is
+        # ever reached: a realsim.seams.coordinator.CoordinatorHandle set by
+        # Run.execute once the stack exists. A control plane installed in the
+        # *directory* service instead (a Policy) is reached the same way through
+        # the seam already in front of it, FakeControllerHandle, so it is absent
+        # here rather than held anywhere else. Either way no plane holds the
+        # other's object.
+        self.coordinator: Optional[Any] = None
+
         # The clock, created on first use: assembling a stack should not have the
         # side effect of standing up an event loop, and a caller may only want
         # the mesh (a test inspecting a carrier, say).

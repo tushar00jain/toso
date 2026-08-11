@@ -31,7 +31,7 @@ from ..report.summary import (
     HotspotReport,
 )
 from ._generator import make_workload
-from ._serving import BLOCK_TOKENS, KVWorkload, serving_plane
+from ._serving import BLOCK_TOKENS, coordinator, KVWorkload, serving_plane
 
 __all__ = [
     "TRACE_LIMIT",
@@ -60,10 +60,20 @@ def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     so the trace format and the metrics ledger a run reports into are chosen once
     and cannot drift between them.
     """
+    # ``coupled`` is a deployment fact (does prefill share decode's compute?), so
+    # it goes to the data plane alone; the decode settings go to both, because
+    # each plane needs them and neither may read them off the other.
+    coupled = knobs.pop("coupled", False)
     return Run(
         label,
         KVWorkload(topology, requests),
-        plane=serving_plane(kind, **knobs),
+        control=coordinator(kind, **knobs),
+        data=serving_plane(
+            coupled=coupled,
+            simulate_decode=knobs.get("simulate_decode", False),
+            max_batch=knobs.get("max_batch", 8),
+            decode_pool=knobs.get("decode_pool"),
+        ),
         profile=DEFAULT_PROFILE,
         trace=Trace(time_width=8, kind_width=7),
         ledger=Metrics(),

@@ -245,5 +245,5 @@ def test_the_scenario_holds_no_burst_loop():
     assert [r.label for r in runs] == ["baseline", "cap=1", "cap=2"]
     assert all(isinstance(r.workload, PutGetBurst) for r in runs)
     assert len({id(r.workload) for r in runs}) == 1
-    assert runs[0].policy is None and runs[0].plane is None
-    assert all(r.policy is not None and r.plane is not None for r in runs[1:])
+    assert runs[0].control is None and runs[0].data is None
+    assert all(r.control is not None and r.data is not None for r in runs[1:])

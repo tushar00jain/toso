@@ -91,21 +91,30 @@ class Coordinator(Protocol):
     other attribute, no subscript, no ``getattr``), which is the rule that would
     have caught the four crossings this replaced.
 
-    A run under simulation calls it in-process, so the round trip is free; a real
-    deployment puts an actor endpoint here and pays for it. Nothing on either side
-    changes shape when it does, which is the point.
+    The four request/response members are awaitable and the two observations are
+    not, which is the actor distinction: a **call** waits for a reply and pays a
+    round trip, a **send** is one-way and the sender does not block on it. That is
+    also why the two sends are the ones the decode engine drives -- a per-step
+    notification that blocked the stepping loop would be modelling something no
+    deployment would build.
+
+    :class:`realsim.seams.coordinator.CoordinatorHandle` is what actually stands
+    here under simulation: it wraps the scheduler, is the one place a round trip
+    is charged, and is what a Monarch endpoint would replace. The scheduler itself
+    does not implement this protocol -- its methods are ordinary sync ones -- and
+    that is the point of the handle.
     """
 
     async def schedule(self, request: Request, now: float) -> Optional["Plan"]:
         """Route one request, or ``None`` to reject it (SLO / overload)."""
 
-    def complete(self, plan: "Plan") -> "Completion":
+    async def complete(self, plan: "Plan") -> "Completion":
         """What to publish and what to evict, once prefill has finished."""
 
-    def decode_admission(self, plan: "Plan") -> bool:
+    async def decode_admission(self, plan: "Plan") -> bool:
         """May this accepted request enter its decode batch now?"""
 
-    def observe_prefill_done(self, inst: str, now: float) -> float:
+    async def observe_prefill_done(self, inst: str, now: float) -> float:
         """Report the clock the real ops reached; return the corrected queue tail."""
 
     def observe_compute_busy(self, inst: str, until: float) -> None:

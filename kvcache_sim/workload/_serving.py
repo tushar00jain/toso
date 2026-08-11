@@ -5,13 +5,17 @@ Two separate things, deliberately:
 * :class:`KVWorkload` is *the work* -- a request stream, one
   :class:`~realsim.runner.WorkItem` per request at its arrival time. It builds no
   store, no scheduler and no plane;
-* :func:`serving_plane` is the *capability wiring* -- the store, the view, the
-  scheduler and the :class:`~kvcache_sim.data.serving.ServingPlane` over them.
-  It is a factory because a plane reaches for the mesh and the ledger, neither of
-  which exists before the stack does.
+* :func:`coordinator` and :func:`serving_plane` are the *capability wiring*, one
+  per plane: the scheduler over the view, and the store plus the
+  :class:`~kvcache_sim.data.serving.ServingPlane` over it. Both are factories
+  because they reach for the view, the mesh and the ledger, none of which exists
+  before the stack does.
 
-A scenario pairs them on a :class:`~realsim.run.Run`: same workload, different
-wiring, which is exactly what "cache-aware vs load-balance" means.
+They are two functions because they are two services. The plane factory does not
+build the scheduler; it takes ``sim.coordinator``, the handle
+:meth:`realsim.run.Run.execute` put in front of whatever :func:`coordinator`
+returned. A scenario names both on a :class:`~realsim.run.Run`: same workload,
+different wiring, which is exactly what "cache-aware vs load-balance" means.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from ..data.store import KVStore
 #: Tokens per KV block. Fixed for every scenario so runs stay comparable.
 BLOCK_TOKENS = 512
 
-__all__ = ["BLOCK_TOKENS", "KVWorkload", "serving_plane"]
+__all__ = ["BLOCK_TOKENS", "coordinator", "KVWorkload", "serving_plane"]
 
 
 def _sim_block_carrier(
@@ -75,10 +79,9 @@ class KVWorkload(Workload):
         ]
 
 
-def serving_plane(
+def coordinator(
     kind: str,
     *,
-    coupled: bool = False,
     balance_threshold: float = 1.5,
     replicate: bool = True,
     capacity: Optional[int] = None,
@@ -89,13 +92,15 @@ def serving_plane(
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "off",
-) -> Callable[[Simulation], ServingPlane]:
-    """Build the factory that wires this capability onto an assembled stack.
+) -> Callable[[Simulation], object]:
+    """Build the factory for this run's **control plane**.
 
     ``kind`` is ``"cache_aware"`` (the coordinator under test) or
-    ``"load_balance"`` (the baseline). ``coupled`` says whether prefill shares the
-    decode instances' compute -- a deployment fact, so it goes to the serving
-    plane, not the scheduler.
+    ``"load_balance"`` (the baseline). A factory rather than an object because a
+    scheduler senses through ``sim.view``, which does not exist until the stack
+    does; the :class:`~realsim.run.Run` wraps what this returns in a
+    :class:`~realsim.seams.coordinator.CoordinatorHandle`, so the serving host
+    reaches it as a service.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
@@ -112,30 +117,46 @@ def serving_plane(
         early_rejection=early_rejection,
     )
 
+    def build(sim: Simulation) -> object:
+        # Control senses the same real directory the data plane writes, but only
+        # ever reads it.
+        view = KVView(sim.view.directory, sim.topology)
+        common = dict(transfer_cost=sim.transfer_cost, **knobs)
+        if kind == "cache_aware":
+            return CacheAwareScheduler(
+                view,
+                balance_threshold=balance_threshold,
+                replicate=replicate,
+                **common,
+            )
+        return LoadBalanceScheduler(view, **common)
+
+    return build
+
+
+def serving_plane(
+    *,
+    coupled: bool = False,
+    simulate_decode: bool = False,
+    max_batch: int = 8,
+    decode_pool: Optional[List[str]] = None,
+) -> Callable[[Simulation], ServingPlane]:
+    """Build the factory for this run's **data plane**.
+
+    ``coupled`` says whether prefill shares the decode instances' compute -- a
+    deployment fact, so it belongs to the serving plane, not to the scheduler.
+    The decode settings are passed here *and* to :func:`coordinator` from the one
+    scenario that declares them, rather than one reading them off the other.
+    """
+
     def build(sim: Simulation) -> ServingPlane:
         # The simulation *is* the deployment: it vends the client for an instance
         # and holds the directory. All the run adds is the block carrier.
         store = KVStore.for_deployment(
             sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
         )
-        # Control senses the same real directory the data plane writes, but only
-        # ever reads it.
-        view = KVView(sim.view.directory, sim.topology)
-        common = dict(transfer_cost=sim.transfer_cost, **knobs)
-        if kind == "cache_aware":
-            sched = CacheAwareScheduler(
-                view,
-                balance_threshold=balance_threshold,
-                replicate=replicate,
-                **common,
-            )
-        else:
-            sched = LoadBalanceScheduler(view, **common)
-        # The plane's own decode settings come from here, the same values the
-        # coordinator was built with -- not read back off the coordinator, which
-        # is a different service. One wiring site, two recipients.
         return ServingPlane(
-            store, sched, trace=sim.trace, metrics=sim.ledger,
+            store, sim.coordinator, trace=sim.trace, metrics=sim.ledger,
             coupled=coupled,
             simulate_decode=simulate_decode,
             decode_ids=sorted(decode_pool) if decode_pool else sim.ids,

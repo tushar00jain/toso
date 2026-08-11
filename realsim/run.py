@@ -10,7 +10,10 @@ story is its own cost.
 A scenario is almost never a single run -- it is a comparison. Dedup runs the
 same burst unrouted and then once per fan-out cap; kvcache runs the same request
 stream under two schedulers. What differs between those runs is not the workload,
-it is the *policy* and the *data plane*.
+it is the *control plane* and the *data plane*. A :class:`Run` names both, so
+neither is buried inside the other's factory -- kvcache used to build its
+scheduler inside the thing that built its serving plane, which hid that the two
+halves run in different places.
 
 :class:`Run` is that difference: a label, the workload, and the pieces the
 capability installs around it. :meth:`Run.execute` is the only code that turns
@@ -20,7 +23,7 @@ its own signature (``run_burst(num_readers, ...)`` vs ``run(topology, requests,
 kind, ...)``).
 
     runs = [Run("baseline", burst),
-            Run("cap=1", burst, policy=DedupPolicy(1, trace=t), plane=make_plane)]
+            Run("cap=1", burst, control=DedupPolicy(1, trace=t), data=make_plane)]
     results = [r.execute() for r in runs]
 
 :class:`Simulation` deliberately does *not* take a ``Run``. It is constructible
@@ -43,9 +46,10 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.runner import WorkItem
+from realsim.seams.coordinator import CoordinatorHandle
 from realsim.simulation import Simulation
 
-__all__ = ["Workload", "Report", "MakePlane", "Run", "Result"]
+__all__ = ["Workload", "Report", "MakeControl", "MakePlane", "Run", "Result"]
 
 
 class Workload(ABC):
@@ -88,9 +92,13 @@ class Report(ABC):
 
 
 #: Builds the capability's data plane once the stack exists. It cannot be a
-#: plain object: a plane reaches for the clock, the mesh and the ledger, none of
-#: which exist before the ``Simulation`` does.
+#: plain object: a plane reaches for the clock, the mesh, the ledger and the
+#: coordinator handle, none of which exist before the ``Simulation`` does.
 MakePlane = Callable[[Simulation], DataPlane]
+
+#: Builds the capability's control plane once the stack exists -- for a control
+#: plane that runs as its own service and needs to sense through ``sim.view``.
+MakeControl = Callable[[Simulation], Any]
 
 
 @dataclass
@@ -101,20 +109,44 @@ class Run:
         label: how this run is named in a comparison ("baseline", "cap=1").
         workload: the work to perform. Shared across the runs of a comparison,
             which is what makes the comparison mean something.
-        policy: installed in the real controller's ``locate_volumes``. ``None``
-            leaves the directory answering for itself.
-        plane: builds the capability's :class:`~proposed.plane.DataPlane` onto
-            the assembled stack. ``None`` -> no plane, the plain path.
+        control: the capability's **control plane** -- the half that decides. It
+            always runs in a service and is always reached through the seam in
+            front of that service; a data plane never holds it. What this field's
+            two forms choose is *which* service, which is a fact about where the
+            capability ships rather than a configuration:
+
+            * a :class:`~proposed.policy.Policy` runs **in the directory
+              service**, installed in the real controller's ``locate_volumes``,
+              and is reached through the seam already standing there
+              (:class:`~realsim.seams.controller_handle.FakeControllerHandle`) --
+              a caller just calls ``client.get`` and is routed. This is dedupe:
+              its whole control plane is the policy, and it must exist before the
+              mesh is built, which is why an object rather than a factory;
+            * a :data:`MakeControl` factory runs **in its own service**, built
+              over the assembled stack and fronted by a
+              :class:`~realsim.seams.coordinator.CoordinatorHandle` as
+              ``sim.coordinator``. This is kvcache: its scheduler holds every
+              instance's queue, cache and decode occupancy, so it needs
+              ``sim.view`` and cannot be built before the stack.
+
+            ``None`` leaves the directory answering for itself. (Neither seam
+            charges its hop by default: ``--coordinator-rtt`` gives the second one
+            a cost, and the client-to-controller hop the first one crosses is
+            free for every capability, including the baseline.)
+        data: builds the capability's :class:`~proposed.plane.DataPlane` onto the
+            assembled stack -- the half that executes. ``None`` -> no plane, the
+            plain path. It reaches the control plane through ``sim.coordinator``,
+            never by being handed the object.
         profile / trace / ledger: the run's target machine, event trace and
             outcome ledger. A capability with a richer outcome row passes its own
-            ``Ledger`` subclass. A policy that records into the same trace the
-            run reports needs it built here, before the stack.
+            ``Ledger`` subclass. A control plane that records into the same trace
+            the run reports needs it built here, before the stack.
     """
 
     label: str
     workload: Workload
-    policy: Optional[Policy] = None
-    plane: Optional[MakePlane] = None
+    control: Optional[Any] = None
+    data: Optional[MakePlane] = None
     profile: Optional[MachineProfile] = None
     trace: Optional[Trace] = None
     ledger: Optional[Ledger] = None
@@ -132,9 +164,10 @@ class Run:
         the scenario declaring them -- the CLI's ``--seed``, a test forcing the
         shim directory. Everything that describes the run itself is a field.
         """
+        installed = self.control if isinstance(self.control, Policy) else None
         sim = Simulation(
             self.workload.topology,
-            policy=self.policy,
+            policy=installed,
             profile=self.profile,
             trace=self.trace,
             ledger=self.ledger,
@@ -142,7 +175,12 @@ class Run:
             quiet=quiet,
             random_seed=random_seed,
         )
-        plane = self.plane(sim) if self.plane is not None else None
+        # A control plane that is not installed in the controller runs beside
+        # it, and the data plane reaches it through a handle -- the seam a
+        # deployment replaces with an actor endpoint.
+        if self.control is not None and installed is None:
+            sim.coordinator = CoordinatorHandle(self.control(sim))
+        plane = self.data(sim) if self.data is not None else None
         results = sim.run(self.workload, plane=plane)
         return Result(results=results, sim=sim, run=self)
 

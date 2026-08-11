@@ -187,19 +187,21 @@ class ServingPlane(DataPlane):
             await asyncio.sleep(plan.prefill_t)
 
         # (4) publish the computed KV blocks into the real directory; evict.
-        completion = self.coordinator.complete(plan)
+        completion = await self.coordinator.complete(plan)
         await self.store.publish(completion.instance, completion.publish)
         if completion.evict:
             await self.store.evict(completion.instance, completion.evict)
         # (5) tell control the clock the real ops reached, and (coupled only) the
         # decode timeline the same instance now carries.
         now = self._now()
-        busy_until = self.coordinator.observe_prefill_done(completion.instance, now)
+        busy_until = await self.coordinator.observe_prefill_done(
+            completion.instance, now
+        )
         if self.coupled and self.engine is not None:
             # The reply, not a read of control's queue: prefill just occupied the
             # timeline decode steps on, and only the coordinator knows the tail.
             self.engine.reserve(completion.instance, busy_until)
-        self._prefill_done(plan, completion.evict)
+        await self._prefill_done(plan, completion.evict)
 
     # -- outcome bookkeeping ---------------------------------------------- #
     def _make_accepted(self, plan: Plan) -> RequestResult:
@@ -230,7 +232,7 @@ class ServingPlane(DataPlane):
             f"compute {plan.uncached_tokens}tok, ttft {plan.ttft:.3f})",
         )
 
-    def _prefill_done(self, plan: Plan, evicted: List[str]) -> None:
+    async def _prefill_done(self, plan: Plan, evicted: List[str]) -> None:
         note = ""
         if evicted:
             note = f"; evicted {len(evicted)} blk from {plan.prefill}"
@@ -244,7 +246,7 @@ class ServingPlane(DataPlane):
             return
         # Decode-simulating path: control decides whether decode can honour the
         # TBT SLO; we perform (or skip) the admission.
-        if not self.coordinator.decode_admission(plan):
+        if not await self.coordinator.decode_admission(plan):
             result = self._pending.pop(plan.request.id)
             result.accepted = False
             result.decode_rejected = True

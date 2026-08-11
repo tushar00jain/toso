@@ -341,3 +341,37 @@ def test_new_scenarios_deterministic():
         assert a.trace.render() == b.trace.render()
         assert a.ledger.wasted_prefills == b.ledger.wasted_prefills
         assert a.ledger.mean_tbt == b.ledger.mean_tbt
+
+
+# 16. The coordinator seam: control is a service, so the hop is somewhere to
+#     charge. At the default (0) it is inline and changes nothing; given a
+#     duration it is paid out and back before prefill can start, so it lands in
+#     TTFT -- the number this capability exists to move.
+def test_coordinator_rtt_defaults_to_free_and_byte_identical():
+    baseline = run_shared_prefix(seed=1)[0]
+    with config.overrides(coordinator_rtt=0.0):
+        explicit = run_shared_prefix(seed=1)[0]
+    assert explicit.trace.render() == baseline.trace.render()
+    assert explicit.ledger.mean_ttft == baseline.ledger.mean_ttft
+
+
+def test_coordinator_rtt_lands_in_ttft_and_costs_reuse():
+    """A distant coordinator costs latency *and* hit rate.
+
+    Latency because every request pays the round trip before prefill can start,
+    and the delay compounds through the prefill queue. Hit rate because routing
+    then reads a directory snapshot one hop old, so a prefix another request has
+    just published is not there to reuse yet. The RTT has to be large enough to
+    matter against a ~4s prefill: at 0.01 nothing moves, which is its own honest
+    result about what resolution this workload can see.
+    """
+    free = run_shared_prefix(seed=1)[0]
+    with config.overrides(coordinator_rtt=0.5):
+        distant = run_shared_prefix(seed=1)[0]
+    assert distant.ledger.mean_ttft > free.ledger.mean_ttft
+    assert distant.ledger.hit_rate < free.ledger.hit_rate
+    # The comparison still holds -- both schedulers pay the same hop.
+    with config.overrides(coordinator_rtt=0.5):
+        cache_aware, load_balance = run_shared_prefix(seed=1)
+    assert cache_aware.ledger.hit_rate > load_balance.ledger.hit_rate
+    assert cache_aware.ledger.mean_ttft < load_balance.ledger.mean_ttft
