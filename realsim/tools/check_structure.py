@@ -28,6 +28,17 @@ Three rules, none of which a type system can express:
    ``__all__`` is a curated re-export list, not a mirror of its own contents --
    and so is ``__main__.py``.
 
+Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
+public. That sounds like rule 2 one level down, and it was tried: flagging every
+exported name with no consumer outside its own module produces ~70 hits, and most
+are correct as they stand -- type aliases that appear only in this module's own
+annotations (``MakePlane``, ``DecodeLoad``), rule tables that exist to be read
+(``BANNED_ALWAYS``), types a caller receives without importing
+(``KVView.pin`` -> ``PinnedKVView``), and exceptions a caller catches
+(``StorageCapacityExceeded``). A rule whose exception list is longer than its
+findings is not enforcing anything, so name-level privacy stays a review
+question. Renaming to ``_thing`` is the answer when review says so.
+
 The ``Demo`` contract is *not* checked here. ``realsim.demo.Demo`` is an ABC with
 an abstract ``scenarios()`` and a required ``name``/``description``, so a demo
 that does not declare its parts cannot be constructed -- and

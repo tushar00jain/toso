@@ -3,11 +3,13 @@
 Everything a demo needs is here -- the shared run flags, how they become process
 config, how a trace is dumped, and the parse/dispatch loop. They used to be split
 across ``cli.py`` and this module even though nothing but this module read them,
-which just meant one more file to open.
+which just meant one more file to open. They are underscored for the same reason:
+a demo declares itself and :meth:`Demo.main` applies the flags, so no caller ever
+names them.
 
 Three ``__main__.py`` files had grown the same skeleton -- a parser, the five
-shared run flags, ``apply_run_flags``, a ``_section`` helper (byte-identical in
-two of them), a ``_log_trace`` helper, a ``SCENARIOS`` dict, a run-all-or-run-one
+shared run flags, an apply-the-flags call, a ``_section`` helper (byte-identical
+in two of them), a trace-dump helper, a ``SCENARIOS`` dict, a run-all-or-run-one
 dispatch, and a ``if __name__`` tail. Nothing held those seven things in shape
 except that whoever wrote the third demo copied the second.
 
@@ -45,18 +47,12 @@ from sim_common.report import configure_logging, section
 
 from realsim.run import Report
 
-__all__ = [
-    "add_run_flags",
-    "apply_run_flags",
-    "log_trace",
-    "Console",
-    "Scenario",
-    "Demo",
-]
+__all__ = ["Console", "Scenario", "Demo"]
 
 
 # --------------------------------------------------------------------------- #
-# The run flags every demo accepts, and what they configure.
+# The run flags every demo accepts, and what they configure. Private: Demo.main
+# is the only caller, and a capability's own flags go through Demo.flags.
 #
 # The three entry points (``python -m putget_sim``, ``python -m dedup_sim``,
 # ``python -m kvcache_sim``) all take the same five, all turn them into the same
@@ -67,7 +63,7 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 
-def add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+def _add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add the run knobs every demo accepts. Returns the parser, for chaining."""
     parser.add_argument(
         "-v", "--verbose", "--debug", action="store_true", dest="verbose",
@@ -106,7 +102,7 @@ def add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
-def apply_run_flags(
+def _apply_run_flags(
     args: argparse.Namespace, logger: Optional[logging.Logger] = None
 ) -> None:
     """Set the process config from ``args``, once, and configure logging.
@@ -135,7 +131,7 @@ def apply_run_flags(
         logger.setLevel(logging.DEBUG)
 
 
-def log_trace(
+def _log_trace(
     logger: logging.Logger, trace: Any, *, limit: Optional[int] = None
 ) -> None:
     """Emit a trace at DEBUG (shown only under ``-v``).
@@ -189,7 +185,7 @@ class Console:
         Follows it with the fingerprint line when ``--fingerprint`` is set. A demo
         that prints several fingerprints per scenario labels them with ``label``.
         """
-        log_trace(self.logger, trace, limit=limit)
+        _log_trace(self.logger, trace, limit=limit)
         if config.current().fingerprint:
             self.logger.info("%s fingerprint: %s", label, trace.fingerprint())
 
@@ -258,13 +254,13 @@ class Demo(ABC):
                 + ", ".join(sorted(by_name)),
             )
         self.flags(parser)
-        add_run_flags(parser)
+        _add_run_flags(parser)
         args = parser.parse_args(list(argv) if argv is not None else None)
 
         # Set the process config once from the CLI flags (an unset flag defers to
         # the TOSO_* env / default). Every Trace, controller adapter, resource
         # registry and the transport's collapse decision reads it ambiently.
-        apply_run_flags(args, logger if self.own_logger else None)
+        _apply_run_flags(args, logger if self.own_logger else None)
 
         chosen = getattr(args, "scenario", None)
         if chosen is not None:
