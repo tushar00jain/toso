@@ -14,7 +14,10 @@ What the base view offers, and why that is all it offers
 * :meth:`holders` / :meth:`topology` / :meth:`endpoint` / :meth:`locality` --
   who holds a key and how far away they are, the two inputs every source
   decision has needed so far.
-* :meth:`now` -- the run's virtual clock.
+* :meth:`now` -- the running loop's clock, because a decision has to be timed
+  where it is *made*: a coordinator is handed a request and no timestamp, since
+  over a non-zero hop the sender's stamp is already stale and comparing it against
+  every instance's queue would read the cluster in the past.
 
 Anything more specific stays out. ``kvcache_sim`` wants leading-prefix-run
 lengths, which are a KV-cache notion (a block key chain), so that derived read is
@@ -112,5 +115,12 @@ class View:
 
     # -- clock -------------------------------------------------------------- #
     def now(self) -> float:
-        """The run's virtual time (the loop's clock -- never a wall clock)."""
+        """The running loop's clock, in seconds.
+
+        Stock ``asyncio``, and the whole of what makes this liftable: under a plain
+        loop it is ``time.monotonic()`` (real seconds), under a simulation engine
+        whose loop overrides ``time()`` it is that run's virtual seconds. Same line
+        either way -- which is why time is read here and never ``time.time()``,
+        whose value no loop controls and no run can reproduce.
+        """
         return asyncio.get_running_loop().time()
