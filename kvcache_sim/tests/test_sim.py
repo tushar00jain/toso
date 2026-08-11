@@ -406,3 +406,36 @@ def test_a_pull_is_served_by_the_peer_that_was_priced():
     _baseline, _no_repl, replicated = run_hotspot(seed=2)
     assert replicated.ledger.edges
     assert _unplanned_edges(replicated) == 0
+
+
+# 18. The source policy serves both its callers' views.
+#     The scheduler hands it a KVView (pinned, so one decision reads one
+#     snapshot); the controller can only hand it the plain View the mesh built,
+#     because a prefix run is a KV-cache notion the store has no reason to know.
+#     It used to require the first, so the ranking branch raised AttributeError on
+#     the second -- unreachable only because the controller-side call always
+#     carries a chosen source and short-circuits before touching the view.
+def test_the_source_policy_accepts_a_plain_view():
+    from kvcache_sim.control._source import LongestPrefixPolicy
+    from realsim.simulation import Simulation
+
+    topo = _make_topology(2)
+    sim = Simulation(topo)
+    keys = _block_keys_for("m0", [0, 1])
+
+    async def scenario():
+        with sim.mesh.installed():
+            empty = await LongestPrefixPolicy().select(sim.view, keys, "s0")
+            store = KVStore.for_deployment(
+                sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512)
+            )
+            await store.publish("s1", list(keys))
+            ranked = await LongestPrefixPolicy().select(sim.view, keys, "s0")
+        return empty, ranked
+
+    try:
+        empty, ranked = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+    assert empty.sources == ()                  # nobody holds it yet
+    assert ranked.sources == ("s1",)            # ...and now the holder is ranked

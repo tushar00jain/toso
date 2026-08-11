@@ -15,9 +15,11 @@ itself, through the view, and then decides.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from proposed import Policy, Selection
+
+from .view import prefix_lengths_of
 
 __all__ = ["LongestPrefixPolicy"]
 
@@ -55,8 +57,25 @@ class LongestPrefixPolicy(Policy):
         """
         if chosen is not None:
             return Selection.of([chosen])
-        counts = await view.prefix_lengths(list(keys))
+        counts = await self._prefix_runs(view, list(keys))
         if not counts:
             return Selection.of([])
         ranked = sorted(counts, key=lambda inst: (-counts[inst], inst))
         return Selection.of(ranked)
+
+    @staticmethod
+    async def _prefix_runs(view: Any, keys: Sequence[str]) -> Dict[str, int]:
+        """Per-instance prefix runs, from whichever view this caller has.
+
+        The scheduler hands a :class:`~kvcache_sim.control.view.KVView` -- usually
+        the *pinned* one, so a whole routing decision reads one directory snapshot
+        and the candidate loop cannot disagree with itself. The controller can only
+        hand the plain :class:`~proposed.view.View` it was built with, because a
+        prefix run is a KV-cache notion the store has no reason to know. So use the
+        derived read when it is offered and derive it otherwise, off one shared
+        definition rather than two.
+        """
+        pinned = getattr(view, "prefix_lengths", None)
+        if pinned is not None:
+            return await pinned(keys)
+        return prefix_lengths_of(await view.locate(keys), keys)

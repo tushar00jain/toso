@@ -23,7 +23,7 @@ from typing import AbstractSet, Dict, List, Optional, Sequence
 
 from proposed import View
 
-__all__ = ["KVView", "PinnedKVView"]
+__all__ = ["prefix_lengths_of", "KVView", "PinnedKVView"]
 
 
 def _longest_prefix_run(block_keys: Sequence[str], present: AbstractSet[str]) -> int:
@@ -41,6 +41,28 @@ def _longest_prefix_run(block_keys: Sequence[str], present: AbstractSet[str]) ->
     return n
 
 
+def prefix_lengths_of(
+    located: Dict[str, Dict[str, object]], block_keys: Sequence[str]
+) -> Dict[str, int]:
+    """``instance -> leading blocks of ``block_keys`` it holds contiguously``.
+
+    The derivation, split from the read that feeds it, because the two callers get
+    their directory answer from different places: :meth:`KVView.prefix_lengths`
+    reads it (or serves a pinned snapshot of it), while
+    :class:`~kvcache_sim.control._source.LongestPrefixPolicy` is handed a plain
+    :class:`~proposed.view.View` by the controller and has to read it itself. One
+    definition either way.
+    """
+    keys = list(block_keys)
+    if not keys:
+        return {}
+    counts: Dict[str, int] = {}
+    for inst in sorted(located.get(keys[0], {})):
+        held = {key for key in keys if inst in located.get(key, {})}
+        counts[inst] = _longest_prefix_run(keys, held)
+    return counts
+
+
 class KVView(View):
     """A :class:`~proposed.view.View` plus per-instance prefix-run lengths."""
 
@@ -54,12 +76,7 @@ class KVView(View):
         keys = list(block_keys)
         if not keys:
             return {}
-        located = await self.locate(keys)
-        counts: Dict[str, int] = {}
-        for inst in sorted(located.get(keys[0], {})):
-            held = {key for key in keys if inst in located.get(key, {})}
-            counts[inst] = _longest_prefix_run(keys, held)
-        return counts
+        return prefix_lengths_of(await self.locate(keys), keys)
 
     def pin(self, block_keys: Sequence[str]) -> "PinnedKVView":
         """A view of this one directory snapshot, for one routing decision."""
