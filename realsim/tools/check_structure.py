@@ -33,9 +33,11 @@ Six rules, none of which a type system can express:
    exceptions.
 6. **A ``data/`` module may call a control port, never read it.** The planes run
    in different services, so what passes between them has to be something a wire
-   could carry. Calling a ``Protocol`` the module imports from its sibling
-   ``control/`` is a request; reading a field off it, handing one of its bound
-   methods out as a callback, or ``getattr``-ing it are not.
+   could carry. Calling a port the module imports from its sibling ``control/`` is
+   a request; reading a field off it, handing one of its bound methods out as a
+   callback, or ``getattr``-ing it are not. A port is any imported class that is
+   not a dataclass -- the values that legitimately cross are dataclasses, and
+   reading *their* fields is the point of sending them.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -398,14 +400,29 @@ def check_name_privacy(
     return sorted(out)
 
 
-def _control_protocols(rel: Path, tree: ast.Module, mods: Dict[str, Path],
-                       trees: Dict[str, ast.Module]) -> Set[str]:
-    """Names this module imports from a sibling ``control/`` that are Protocols.
+def _is_dataclass(cls: ast.ClassDef) -> bool:
+    """True for ``@dataclass`` / ``@dataclass(...)`` on a class definition."""
+    for dec in cls.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        name = target.attr if isinstance(target, ast.Attribute) else getattr(
+            target, "id", None
+        )
+        if name == "dataclass":
+            return True
+    return False
 
-    A ``Plan`` or a ``Completion`` crossing the plane boundary is a *value* and
-    its fields are meant to be read. A ``Protocol`` is a *port*: an object living
-    in the other plane. Only the second is subject to rule 6, and the difference
-    is visible where it is declared.
+
+def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
+                   trees: Dict[str, ast.Module]) -> Set[str]:
+    """Names this module imports from a sibling ``control/`` that are *ports*.
+
+    A ``Plan``, a ``Completion`` or a ``Request`` crossing the plane boundary is a
+    *value* and its fields are meant to be read; those are dataclasses. A port is
+    an object living in the other plane, and in this codebase that is a plain
+    class -- ``Policy`` and ``Coordinator`` both, following the same convention
+    torchstore uses for ``TorchStoreStrategy``. So the discriminator is the
+    dataclass decorator, not a base: it keeps holding when a port stops being a
+    ``Protocol`` and becomes an ordinary base class.
     """
     out: Set[str] = set()
     for node in ast.walk(tree):
@@ -419,9 +436,7 @@ def _control_protocols(rel: Path, tree: ast.Module, mods: Dict[str, Path],
         }
         for alias in node.names:
             cls = defined.get(alias.name)
-            if cls is not None and any(
-                isinstance(b, ast.Name) and b.id == "Protocol" for b in cls.bases
-            ):
+            if cls is not None and not _is_dataclass(cls):
                 out.add(alias.asname or alias.name)
     return out
 
@@ -473,7 +488,7 @@ def check_plane_ports(
         if DATA_SEGMENT not in parts[:-1]:
             continue
         tree = trees[dotted]
-        ports = _control_protocols(rel, tree, mods, trees)
+        ports = _control_ports(rel, tree, mods, trees)
         if not ports:
             continue
         local, attrs = _port_names(tree, ports)

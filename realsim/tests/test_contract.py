@@ -278,9 +278,10 @@ def test_name_privacy_rule_actually_examines_the_tree():
 
 
 _PORT_CONTROL = (
-    "from typing import Protocol\n\n\n"
-    "class Coordinator(Protocol):\n"
-    "    def complete(self, plan): ...\n\n\n"
+    "from dataclasses import dataclass\n\n\n"
+    "class Coordinator:\n"
+    "    async def complete(self, plan): ...\n\n\n"
+    "@dataclass\n"
     "class Plan:\n    prefill: str\n"
 )
 
@@ -320,7 +321,7 @@ def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
         "        self.coordinator: Coordinator = coordinator\n"
         "    async def go(self, plan: Plan) -> None:\n"
         "        self.coordinator.complete(plan)\n"
-        "        await self.coordinator.schedule(plan, 0.0)\n"
+        "        await self.coordinator.schedule(plan)\n"
         "        return plan.prefill\n"
     ))
     assert check_structure.check_plane_ports(tmp_path, pkgs) == []
@@ -337,7 +338,7 @@ def test_plane_port_rule_actually_resolves_the_real_port():
     trees = {"kvcache_sim.control.scheduler": ast.parse(
         (root / mods["kvcache_sim.control.scheduler"]).read_text()
     )}
-    ports = check_structure._control_protocols(rel, tree, mods, trees)
+    ports = check_structure._control_ports(rel, tree, mods, trees)
     assert ports == {"Coordinator"}, ports
     # ...and that the plane's field is recognised as holding one.
     _local, attrs = check_structure._port_names(tree, ports)

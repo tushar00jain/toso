@@ -7,37 +7,48 @@ serializes routing decisions cluster-wide, so no serving host can hold it -- doe
 not reach it by holding the object. It reaches it the way it reaches the store:
 through a handle, over calls that carry values.
 
-:class:`CoordinatorHandle` is that handle. It wraps the control-plane object,
-presents the capability's port (kvcache's
-:class:`~kvcache_sim.control.scheduler.Coordinator`), and is the single place a
-round trip is charged. In a deployment it becomes a Monarch actor endpoint and
-nothing on either side changes shape; under simulation it is the `[S]` piece that
-was missing from the stack, which is why the hop used to cost nothing.
+:class:`CoordinatorHandle` is that handle: it wraps the control-plane object,
+mirrors whatever surface that object declares, and is the single place a round trip
+is charged. In a deployment it becomes a Monarch actor endpoint and nothing on
+either side changes shape.
+
+It names no method of its own
+----------------------------
+The surface is read off the object, exactly as a Monarch handle mirrors an actor's
+``@endpoint`` methods. That matters twice over: this module sits below every
+capability, so hard-coding one capability's method names would be the harness
+knowing what a capability decided; and a *custom* control plane with a different
+surface would otherwise be unreachable without editing this file.
 
 Calls and sends
 ---------------
-The four request/response members are awaitable and pay ``rtt`` **twice** -- once
-out, once back -- because the caller is blocked for both legs. The two
-observations are one-way sends: the sender does not wait, so they cost it
-nothing. A real bus would still deliver them ``rtt`` later, so control would act
-on a slightly stale decode picture; that lag is *not* modelled (see
-:mod:`sim_common.config`), and it is the one piece of coordinator distance this
-seam leaves out.
+Which is which is also read off the object rather than listed here:
+
+* an ``async def`` member is a **call** -- awaited, and it pays ``rtt`` twice,
+  once out and once back, because the caller is blocked for both legs;
+* a plain member is a one-way **send** -- forwarded, and free, because the sender
+  does not wait for it. A real bus would still deliver it ``rtt`` later, so control
+  would act on a slightly stale picture; that lag is *not* modelled, and it is the
+  one piece of coordinator distance this seam leaves out.
+
+So a capability states the difference where it declares its coordinator, by making
+a member awaitable or not, and both sides agree by construction.
 
 Cost
 ----
 ``rtt`` defaults to ``0.0``, which makes every call inline: awaiting a coroutine
-that never suspends does not yield to the loop, so a default run is
-byte-identical to holding the object directly -- the seam is structure, not a
-behaviour change. Set ``TOSO_COORDINATOR_RTT`` (or ``--coordinator-rtt``) to give
-the hop a duration, and it lands where it belongs: in front of every ``schedule``,
-and therefore in TTFT.
+that never suspends does not yield to the loop, so a default run is byte-identical
+to holding the object directly -- the seam is structure, not a behaviour change.
+Set ``TOSO_COORDINATOR_RTT`` (or ``--coordinator-rtt``) to give the hop a duration,
+and it lands where it belongs: in front of every routing decision, and therefore in
+TTFT. A control plane reads its own clock, so a decision made over a non-zero hop is
+made at the time the request *arrived*, not the time the sender stamped it.
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Optional, Sequence
+import inspect
+from typing import Any, Callable, Optional
 
 from sim_common import config
 
@@ -51,8 +62,7 @@ class CoordinatorHandle:
 
     Args:
         control: the control-plane object this endpoint fronts (kvcache's
-            scheduler). Its methods are ordinary sync ones; making them look like
-            a wire is this class's job, not theirs.
+            scheduler). Whatever it declares is what this handle offers.
         rtt: one-way latency of the hop. ``None`` reads the ambient
             :attr:`sim_common.config.SimConfig.coordinator_rtt`.
     """
@@ -63,34 +73,21 @@ class CoordinatorHandle:
             rtt if rtt is not None else config.current().coordinator_rtt
         )
 
-    # -- calls: the caller waits for a reply, so it pays both legs --------- #
-    async def schedule(self, request: Any, now: float) -> Any:
-        # The thunk runs on the far side, so the coordinator decides against
-        # *its own* clock at the moment the message lands -- not the stamp the
-        # sender took on the way out, which by then is a hop old. Routing that
-        # compares every instance's queue would otherwise read a past cluster.
-        return await self.hop.call(
-            lambda: self.control.schedule(request, self._clock(now))
-        )
+    def __getattr__(self, name: str) -> Callable[..., Any]:
+        """Mirror ``name`` off the wrapped control plane, across the boundary."""
+        if name.startswith("_"):
+            # Never forward dunder or private lookups: this is an endpoint, not a
+            # transparent proxy, and forwarding them breaks copy/pickle protocols.
+            raise AttributeError(name)
+        member = getattr(self.control, name)
+        if inspect.iscoroutinefunction(member):
 
-    def _clock(self, sent: float) -> float:
-        """The receiver's clock: the sender's stamp when the hop is free."""
-        return sent if not self.hop.rtt else asyncio.get_running_loop().time()
+            async def call(*args: Any, **kwargs: Any) -> Any:
+                return await self.hop.call(lambda: member(*args, **kwargs))
 
-    async def complete(self, plan: Any) -> Any:
-        return await self.hop.call(lambda: self.control.complete(plan))
+            return call
 
-    async def decode_admission(self, plan: Any) -> bool:
-        return await self.hop.call(lambda: self.control.decode_admission(plan))
+        def send(*args: Any, **kwargs: Any) -> Any:
+            return member(*args, **kwargs)
 
-    async def observe_prefill_done(self, inst: str, now: float) -> float:
-        return await self.hop.call(
-            lambda: self.control.observe_prefill_done(inst, now)
-        )
-
-    # -- sends: one-way, so the sender does not block --------------------- #
-    def observe_compute_busy(self, inst: str, until: float) -> None:
-        self.control.observe_compute_busy(inst, until)
-
-    def observe_decode_state(self, inst: str, finishes: Sequence[float]) -> None:
-        self.control.observe_decode_state(inst, finishes)
+        return send

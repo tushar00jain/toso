@@ -4,7 +4,7 @@ Both implement :class:`Coordinator`, which is the whole surface the data plane m
 touch -- and, because control runs in a coordinator service rather than on the
 serving host, the whole surface that would go on a wire::
 
-    await schedule(request, now) -> Plan | None   # None == rejected (SLO/overload)
+    await schedule(request)      -> Plan | None   # None == rejected (SLO/overload)
     complete(plan)               -> Completion    # what to publish / evict
     decode_admission(plan)       -> bool          # may it enter a decode batch
     observe_prefill_done(inst, now) -> float      # -> the corrected queue tail
@@ -58,7 +58,8 @@ corrected by observations, never a live read:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from proposed import Endpoint, Policy, Selection
 
@@ -82,15 +83,19 @@ __all__ = [
 ]
 
 
-class Coordinator(Protocol):
+class Coordinator(ABC):
     """The coordinator as the data plane may use it: values in, values out.
 
     This is the port between the two planes, and it is deliberately the *whole*
     port -- a serving host that held anything else would be reaching into another
-    service. ``realsim/tools/check_contract.py`` enforces that: a ``data/`` module
-    annotating a field with this protocol may name only these members on it (no
-    other attribute, no subscript, no ``getattr``), which is the rule that would
-    have caught the four crossings this replaced.
+    service. ``check_structure.py`` rule 6 enforces that: a ``data/`` module
+    annotating a field with this class may name only these members on it (no other
+    attribute, no subscript, no ``getattr``), which is the rule that would have
+    caught the four crossings this replaced.
+
+    Abstract, and a base class rather than a ``Protocol``, so it is the same kind
+    of thing as :class:`~proposed.policy.Policy`: a control plane declares which
+    surfaces it implements in its bases, and both answers are read the same way.
 
     The four request/response members are awaitable and the two observations are
     not, which is the actor distinction: a **call** waits for a reply and pays a
@@ -108,21 +113,33 @@ class Coordinator(Protocol):
     :class:`~proposed.policy.Policy`, because one object does both jobs.
     """
 
-    async def schedule(self, request: Request, now: float) -> Optional["Plan"]:
-        """Route one request, or ``None`` to reject it (SLO / overload)."""
+    @abstractmethod
+    async def schedule(self, request: Request) -> Optional["Plan"]:
+        """Route one request, or ``None`` to reject it (SLO / overload).
 
+        No clock is passed in. A coordinator reads its own -- ``self.view.now()``
+        -- because a request arrives when it arrives: over a non-zero hop the
+        sender's stamp is already stale, and routing that compares it against every
+        instance's queue would be reading the cluster in the past.
+        """
+
+    @abstractmethod
     async def complete(self, plan: "Plan") -> "Completion":
         """What to publish and what to evict, once prefill has finished."""
 
+    @abstractmethod
     async def decode_admission(self, plan: "Plan") -> bool:
         """May this accepted request enter its decode batch now?"""
 
+    @abstractmethod
     async def observe_prefill_done(self, inst: str, now: float) -> float:
         """Report the clock the real ops reached; return the corrected queue tail."""
 
+    @abstractmethod
     def observe_compute_busy(self, inst: str, until: float) -> None:
         """Report a decode step occupying a **coupled** instance's compute."""
 
+    @abstractmethod
     def observe_decode_state(self, inst: str, finishes: Sequence[float]) -> None:
         """Report ``inst``'s live decode batch as estimated finish times.
 
@@ -461,7 +478,8 @@ class _Base(Policy, Coordinator):
 class LoadBalanceScheduler(_Base):
     """Baseline: route to the least-loaded instance; local-only cache reuse."""
 
-    async def schedule(self, request: Request, now: float) -> Optional[Plan]:
+    async def schedule(self, request: Request) -> Optional[Plan]:
+        now = self.view.now()
         keys = list(request.block_keys)
         prompt = request.prompt_tokens
         # Consult the real directory for per-instance prefix presence; the
@@ -502,7 +520,8 @@ class CacheAwareScheduler(_Base):
         # prefix locally). Used to isolate replication's contribution in the demo.
         self.replicate = replicate
 
-    async def schedule(self, request: Request, now: float) -> Optional[Plan]:
+    async def schedule(self, request: Request) -> Optional[Plan]:
+        now = self.view.now()
         keys = list(request.block_keys)
         prompt = request.prompt_tokens
         # One directory snapshot for the whole decision: the candidate loop's

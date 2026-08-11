@@ -151,7 +151,7 @@ class ServingPlane(DataPlane):
         """Serve one request end to end (the runner already waited for arrival)."""
         request: Request = item.payload
 
-        plan = await self.coordinator.schedule(request, self._now())
+        plan = await self.coordinator.schedule(request)
         if plan is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"

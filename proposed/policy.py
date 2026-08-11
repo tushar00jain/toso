@@ -25,15 +25,15 @@ What deliberately does not go through it: compute placement, admission and SLO
 gates. Those are decisions the store knows nothing about; the moment ``select``
 answers them it becomes a union type serving neither caller.
 
-The default implementation is **naive**: every holder, in directory order --
-which is exactly the answer the real ``Controller`` already gives, so the naive
-selection is the empty one and the directory's own answer is returned untouched.
-That is what makes "no policy installed" and "``NaivePolicy`` installed"
-byte-identical runs.
+:class:`NaivePolicy` is **naive**: every holder, in directory order -- which is
+exactly the answer the real ``Controller`` already gives, so its selection is the
+empty one and the directory's own answer is returned untouched. That is what makes
+"no policy installed" and "``NaivePolicy`` installed" byte-identical runs.
 """
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import (
     Any, Awaitable, Callable, Dict, Optional, Protocol, Sequence, Tuple,
@@ -106,29 +106,22 @@ class DecisionLog(Protocol):
         ...
 
 
-class Policy:
-    """Source-selection policy. The base implementation is the naive one.
+class Policy(ABC):
+    """Source-selection policy: the interface a controller consults.
 
-    Subclass and override :meth:`select` to route; override :meth:`notice` too if
-    the routing has to wait for a source to appear.
+    Abstract, so what a policy *is* and what the naive answer *does* are two
+    things: :class:`NaivePolicy` is the implementation of "the directory answers
+    for itself". Override :meth:`notice` too if the routing has to wait for a
+    source to appear.
     """
 
-    name = "naive"
+    name = "policy"
 
+    @abstractmethod
     async def select(
         self, view: View, keys: Sequence[str], requester: str
     ) -> Selection:
-        """Rank the volumes that should serve ``keys`` for ``requester``.
-
-
-        Naive: every holder, in directory order, usable now. That is precisely
-        the real directory's own answer, so this returns the empty
-        :class:`Selection` rather than re-deriving it -- an installed
-        ``NaivePolicy`` is therefore free and byte-identical to no policy at all.
-        A caller that wants the list spelled out can read it off
-        ``view.holders(await view.locate(keys), key)``.
-        """
-        return Selection()
+        """Rank the volumes that should serve ``keys`` for ``requester``."""
 
     def notice(self, volume_id: str, keys: Sequence[str]) -> None:
         """The real directory just gained ``keys`` on ``volume_id``.
@@ -140,4 +133,17 @@ class Policy:
 
 
 class NaivePolicy(Policy):
-    """Every holder, directory order -- the default, spelled out."""
+    """Every holder, in directory order, usable now.
+
+    That is precisely the real directory's own answer, so this returns the empty
+    :class:`Selection` rather than re-deriving it -- installing it is free and
+    byte-identical to installing no policy at all. A caller that wants the list
+    spelled out can read it off ``view.holders(await view.locate(keys), key)``.
+    """
+
+    name = "naive"
+
+    async def select(
+        self, view: View, keys: Sequence[str], requester: str
+    ) -> Selection:
+        return Selection()
