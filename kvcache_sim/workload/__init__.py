@@ -6,7 +6,7 @@
   per-conversation context + unique query suffix; Zipf popularity, Poisson
   arrivals).
 - ``_serving.py`` -- ``KVWorkload`` (the request stream, a
-  ``realsim.workload.Workload``) and ``serving_plane``, the factory that wires the
+  ``realsim.run.Workload``) and ``serving_plane``, the factory that wires the
   store, view, scheduler and serving plane onto an assembled stack. Also
   ``sim_block_carrier``: what one KV block is stored as under simulation, which
   belongs to the run rather than to ``data/`` -- a real deployment stores the KV

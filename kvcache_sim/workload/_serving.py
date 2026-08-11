@@ -25,7 +25,7 @@ from proposed import Endpoint
 from realsim.runner import WorkItem
 from realsim.seams.transport import TensorDescriptor
 from realsim.simulation import Simulation
-from realsim.workload import Workload
+from realsim.run import Workload
 
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ..control.view import KVView

@@ -26,7 +26,7 @@ What it builds, top to bottom (compare the stack in the design doc):
   transport charges another.
 
 :meth:`Simulation.run` then puts a :class:`~realsim.runner.Runner` over it and
-drives a :class:`~realsim.workload.Workload`'s items on the clock. It assembles;
+drives a :class:`~realsim.run.Workload`'s items on the clock. It assembles;
 the workload supplies the work; :func:`realsim.run.execute` pairs the two.
 """
 
@@ -48,7 +48,7 @@ from realsim.mesh import Mesh
 from realsim.runner import Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from realsim.workload import Workload
+    from realsim.run import Workload
 
 __all__ = ["Simulation"]
 

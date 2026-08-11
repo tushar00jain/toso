@@ -78,11 +78,9 @@ PUBLIC_ANYWAY: Dict[str, str] = {
     "realsim/mesh.py": "named in check_contract's CONTROL_FORBIDDEN and built on "
                        "by capabilities through sim.mesh",
     "realsim/simulation.py": "the stack every capability assembles",
-    "realsim/demo.py": "the Demo/Scenario contract a __main__ declares",
-    "realsim/run.py": "Run/Result/execute -- the one way anything runs",
-    "realsim/workload.py": "the Workload contract a scenario implements",
-    "realsim/reporting.py": "the Report contract a report/ implements",
-    "realsim/cli.py": "the run flags, shared by every demo",
+    "realsim/demo.py": "the Demo/Scenario contract a __main__ declares, and the "
+                       "run flags every one of them shares",
+    "realsim/run.py": "Workload/Run/Result/Report/execute -- the run lifecycle",
     "realsim/tools/check_contract.py": "a CLI (python -m ...)",
     "realsim/tools/check_structure.py": "a CLI (python -m ...)",
     "sim_common/engine.py": "the ancestor callback DES, kept as reference",

@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from realsim.reporting import Report
-from realsim.run import Result
+from realsim.run import Report, Result
 from sim_common.report import render_tree
 
 __all__ = ["BurstReport"]

@@ -152,12 +152,11 @@ realsim/
                               #   (release_time, id) order, install the mesh once, drain
   simulation.py               # Simulation — assembles engine + mesh + directory + registry,
                               #   and runs a Workload's items on it
-  workload.py                 # Workload — the work a run performs. Assembles nothing
-  run.py                      # Run (a labelled configuration) + Result + execute():
-                              #   the one way anything runs
-  reporting.py                # Report — a finished run, as text
-  demo.py                     # Demo / Scenario / Console — a sim's command line, declared
-  cli.py                      # the run flags/logging every sim's __main__ shares
+  run.py                      # the run lifecycle in one place: Workload (the work),
+                              #   Run (one labelled configuration), execute(), Result,
+                              #   Report. The only way anything runs
+  demo.py                     # Demo / Scenario / Console — a sim's command line,
+                              #   declared; plus the run flags every one of them shares
   tools/
     check_contract.py         # concurrency-contract lint (AST checker + CLI)
     check_structure.py        # structure lint: a sim package's shape (AST + CLI)
@@ -462,7 +461,7 @@ directory handle, trace, profile, registry, install).
 ### `putget_sim/workload/put_get.py` — the capability-free fixture
 
 One origin volume on node `P` holds `W`; `m` reader volumes on distinct hosts of
-node `R` each get it. `PutGetBurst` is a `realsim.workload.Workload`: it seeds
+node `R` each get it. `PutGetBurst` is a `realsim.run.Workload`: it seeds
 `W` in `prepare()` and yields one work item per reader from `items(sim)`. It
 takes `mode=` (`"meta"` default / `"metadata"`, §7), `profile=` (the target
 `MachineProfile`, §6) and `compute_device=` (the producer's roofline device,

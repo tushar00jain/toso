@@ -85,7 +85,7 @@ def test_every_scenario_is_selectable(demo_cls):
 
 def test_console_renders_a_report_once():
     """The one summary path every demo uses."""
-    from realsim.reporting import Report
+    from realsim.run import Report
 
     class Fixed(Report):
         def render(self) -> str:

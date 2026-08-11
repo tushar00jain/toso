@@ -146,12 +146,12 @@ realsim/
                   (release_time, id) order, install the mesh once, gather, drain
   simulation.py   Simulation -- assembles engine + mesh + directory + registry,
                   and runs a Workload's items on it
-  workload.py     Workload -- the work a run performs. Assembles nothing
-  run.py          Run (one labelled configuration) + Result + execute(): the one
-                  way anything runs, so no capability wires its own stack
-  reporting.py    Report -- a finished run, as text
-  demo.py         Demo / Scenario / Console -- a sim's command line, declared
-  cli.py          the run flags/logging every sim's __main__ shares
+  run.py          the run lifecycle in one place -- Workload (the work a run
+                  performs), Run (one labelled configuration), execute(), Result,
+                  Report. The only way anything runs, so no capability wires its
+                  own stack
+  demo.py         Demo / Scenario / Console -- a sim's command line, declared,
+                  plus the run flags/logging every one of them shares
   tools/          check_contract.py: the concurrency + plane-separation lint
                   check_structure.py: the shape of a sim package
   tests/          seams smoke, determinism, contract lint, off-sim correctness,

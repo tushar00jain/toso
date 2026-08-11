@@ -35,7 +35,7 @@ import torch
 from realsim.runner import WorkItem
 from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint, TensorDescriptor
-from realsim.workload import Workload
+from realsim.run import Workload
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile, compute_time
 
 KEY = "W"

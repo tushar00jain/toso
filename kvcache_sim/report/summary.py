@@ -1,10 +1,10 @@
-"""The kvcache reports: one :class:`~realsim.reporting.Report` per comparison.
+"""The kvcache reports: one :class:`~realsim.run.Report` per comparison.
 
 Thin by design. The measurements and the table formatting live in
 :mod:`kvcache_sim.report.metrics`, which owns this capability's whole per-request
 outcome model (``Metrics`` is the run's ``Ledger``). These classes only say
 *which* runs a comparison is between, so a demo can render any of them -- and any
-other capability's -- through the same :meth:`~realsim.reporting.Report.render`.
+other capability's -- through the same :meth:`~realsim.run.Report.render`.
 
 Every one takes the scenario's results in the order its scenario returned them,
 so the positional meaning is fixed in one place: the scenario.
@@ -14,8 +14,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from realsim.reporting import Report
-from realsim.run import Result
+from realsim.run import Report, Result
 
 from .metrics import (
     render_disaggregation,

@@ -1,4 +1,11 @@
-"""One configuration to execute, and the one way to execute it.
+"""The run lifecycle, in one place.
+
+Five things, in the order they happen: what the work is (:class:`Workload`), how
+one configuration of it is described (:class:`Run`), how it is executed
+(:func:`execute`), what that produced (:class:`Result`), and how that is shown
+(:class:`Report`). They were five files; they are one, because a capability
+touches all of them for a single scenario and jumping between modules to read one
+story is its own cost.
 
 A scenario is almost never a single run -- it is a comparison. Dedup runs the
 same burst unrouted and then once per fan-out cap; kvcache runs the same request
@@ -19,18 +26,59 @@ kind, ...)``).
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
-from proposed import DataPlane, Policy
+from proposed import DataPlane, Endpoint, Policy
 from sim_common.cost_model import MachineProfile
 from sim_common.report import Ledger
 from sim_common.trace import Trace
 
+from realsim.runner import WorkItem
 from realsim.simulation import Simulation
-from realsim.workload import Workload
 
-__all__ = ["Run", "Result", "execute"]
+__all__ = ["Report", "Result", "Run", "Workload", "execute"]
+
+
+class Workload(ABC):
+    """The work a run performs. Assembles nothing, renders nothing.
+
+    Args:
+        topology: ``node_id -> Endpoint``. The node id is also its storage-volume
+            id in the real directory. Known before the stack exists, because
+            :class:`~realsim.simulation.Simulation` is built from it.
+    """
+
+    def __init__(self, topology: Dict[str, Endpoint]) -> None:
+        self.topology = topology
+
+    @abstractmethod
+    def items(self, sim: Simulation) -> Sequence[WorkItem]:
+        """The work items to release, given the assembled stack."""
+
+    async def prepare(self, sim: Simulation) -> None:
+        """Work that precedes the items on the clock. Default: nothing."""
+
+
+class Report(ABC):
+    """What a run produced, as text.
+
+    One method, so every capability's ``report/`` package exposes the same thing
+    and a demo can render any of them without knowing which capability it holds.
+    A report owns no run state: it is constructed from the results it describes
+    (and whatever scenario facts it needs, which live on the workload those
+    results carry) and answers :meth:`render`.
+
+    Not to be confused with :mod:`sim_common.report`, the *measurement* side --
+    ``Ledger``, outcome rows, the source->dest tree renderer -- that a report
+    reads from.
+    """
+
+    @abstractmethod
+    def render(self) -> str:
+        """The rendered summary, ready to log."""
+
 
 #: Builds the capability's data plane once the stack exists. It cannot be a
 #: plain object: a plane reaches for the clock, the mesh and the ledger, none of
