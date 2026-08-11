@@ -15,6 +15,9 @@ directory + **real** client/transport (via ``realsim``) under two policies:
     (``fanout_cap=1``) or tree (``fanout_cap=2``) and each unique byte crosses
     the fabric once -- 1x fabric.
 
+The comparison itself -- which runs, and how they are narrated -- is
+:class:`dedup_sim.workload.scenarios.Dedup`. This file only declares the demo.
+
 Output is routed through the ``logging`` module:
   * INFO (default): section headers, the dedup-vs-naive summary + ASCII
     source->dest diagram, the takeaway.
@@ -23,47 +26,9 @@ Output is routed through the ``logging`` module:
 
 from __future__ import annotations
 
-import argparse
+from realsim.demo import Console, Demo
 
-from realsim.demo import Console, Demo, Scenario
-
-from .report.summary import BaselineReport, DedupReport
-from .workload.scenarios import dedup_vs_baseline
-
-
-def _runs(args: argparse.Namespace):
-    """The unrouted baseline, then one routed run per fan-out cap."""
-    return dedup_vs_baseline()
-
-
-def _show(console: Console, results) -> None:
-    naive, routed = results[0], results[1:]
-    payload = naive.workload.payload_bytes
-    num_readers = naive.workload.num_readers
-    console.trace(naive.trace, label="naive run")
-
-    console.section(f"DEDUP on the REAL directory  --  {num_readers} readers get W")
-    console.info(
-        "directory: real torchstore.controller.Controller (real Trie state)"
-    )
-    console.info(
-        "payload(W): %dB   1x-union target (each unique byte once): %dB",
-        payload, payload,
-    )
-
-    for result in routed:
-        cap = int(result.label.split("=")[1])
-        topo = "chain" if cap == 1 else "tree"
-        console.section(f"dedup policy  --  fanout_cap={cap} ({topo})")
-        console.trace(result.trace, label=f"dedup(cap={cap}) run")
-        console.summary(DedupReport(result, naive, cap))
-        # 1x proven live on the real directory.
-        assert result.ledger.origin_bytes == payload
-        assert naive.ledger.origin_bytes == num_readers * payload
-
-    console.section("NAIVE baseline  --  every reader pulls from the origin")
-    console.trace(naive.trace, label="naive run")
-    console.summary(BaselineReport(naive))
+from .workload.scenarios import Dedup
 
 
 class DedupDemo(Demo):
@@ -78,7 +43,7 @@ class DedupDemo(Demo):
     )
 
     def scenarios(self):
-        return [Scenario("dedup", _runs, _show)]
+        return [Dedup()]
 
     def takeaway(self, console: Console) -> None:
         console.section("TAKEAWAY")

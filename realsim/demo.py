@@ -27,13 +27,16 @@ scenarios" a requirement rather than a convention:
     if __name__ == "__main__":
         DedupDemo().main()
 
-A scenario is two functions, not one: :attr:`Scenario.runs` declares the
-configurations and :attr:`Scenario.show` narrates the results. :meth:`Demo.main`
-is what executes, between them -- so "which simulations does this scenario run"
-is answerable by reading a function that runs nothing, and every sim executes the
-same way. Narration stays a function because a scenario's prose is genuinely
-bespoke; what it is *handed* is a :class:`Console`, so section headers, trace
-dumps and the summary line are one implementation rather than three.
+A scenario is a :class:`Scenario` subclass with two methods, not a callback:
+:meth:`Scenario.runs` declares the configurations and :meth:`Scenario.show`
+narrates the results. :meth:`Demo.main` is what executes, between them -- so
+"which simulations does this scenario run" is answerable by reading a method that
+runs nothing, and every sim executes the same way. Narration stays code because a
+scenario's prose is genuinely bespoke; what it is *handed* is a :class:`Console`,
+so section headers, trace dumps and the summary line are one implementation
+rather than three. The scenarios live in the capability's
+``workload/scenarios.py``, next to the runs they declare, which leaves a
+``__main__.py`` that is only a declaration.
 """
 
 from __future__ import annotations
@@ -41,7 +44,6 @@ from __future__ import annotations
 import argparse
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from sim_common import config
@@ -197,26 +199,41 @@ class Console:
         self.logger.info(report.render())
 
 
-@dataclass
-class Scenario:
+class Scenario(ABC):
     """One named comparison: which configurations, and how to narrate them.
 
-    The two halves are deliberately separate. :attr:`runs` *declares* -- it
-    returns :class:`~realsim.run.Run` values and executes nothing;
+    The two halves are deliberately separate methods. :meth:`runs` *declares* --
+    it returns :class:`~realsim.run.Run` values and executes nothing;
     :meth:`Demo.main` executes them, in one place, and hands the results to
-    :attr:`show`, which only prints. Before this split ``show`` did all three,
-    so every scenario silently ran a simulation somewhere inside a function
-    called "show".
+    :meth:`show`, which only prints. Before this split a scenario was one
+    callback that did all three, so every one of them silently ran simulations
+    inside a function called "show".
 
-    Args:
-        name: the CLI's positional choice for it.
-        runs: the configurations to compare, given the parsed arguments.
-        show: narrates the results, in the order ``runs`` declared them.
+    Subclass it next to the runs it declares -- a capability's
+    ``workload/scenarios.py`` -- and hand instances to
+    :meth:`Demo.scenarios`::
+
+        class Hotspot(Scenario):
+            name = "hotspot"
+
+            def runs(self, args):
+                return hotspot()
+
+            def show(self, console, results):
+                console.section("HOTSPOT: ...")
+                console.summary(HotspotReport(results))
     """
 
-    name: str
-    runs: Callable[[argparse.Namespace], Sequence[Run]]
-    show: Callable[[Console, Sequence[Result]], None]
+    #: The CLI's positional choice for this scenario.
+    name: str = ""
+
+    @abstractmethod
+    def runs(self, args: argparse.Namespace) -> Sequence[Run]:
+        """The configurations to compare. Declares; executes nothing."""
+
+    @abstractmethod
+    def show(self, console: Console, results: Sequence[Result]) -> None:
+        """Narrate the results, in the order :meth:`runs` declared them."""
 
 
 class Demo(ABC):

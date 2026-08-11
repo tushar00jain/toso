@@ -60,6 +60,19 @@ def test_every_demo_declares_its_parts(demo_cls):
     assert all(callable(s.runs) and callable(s.show) for s in scenarios)
 
 
+def test_an_incomplete_scenario_cannot_be_constructed():
+    """Scenario is an ABC too: declaring runs without narration is refused."""
+
+    class HalfDone(Scenario):
+        name = "half"
+
+        def runs(self, args):
+            return []
+
+    with pytest.raises(TypeError, match="show"):
+        HalfDone()
+
+
 def test_an_incomplete_demo_cannot_be_constructed():
     """The ABC is the enforcement; this pins that it actually refuses."""
 

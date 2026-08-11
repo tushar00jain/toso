@@ -97,7 +97,7 @@ putget_sim/
   workload/               # WHAT IS SIMULATED
     put_get.py            #   PutGetBurst, a realsim.Workload: seed W on the
                           #   origin, then m clients get it. dedup_sim reuses it
-    scenarios.py          #   the Runs to compare -- here, the single unrouted one
+    scenarios.py          #   the Burst Scenario: the single unrouted Run + narration
   report/                 # OUTCOME METRICS
     summary.py            #   BurstReport: fabric/wallclock + source->dest tree
   __main__.py             # `python -m putget_sim`: a realsim.Demo declaration

@@ -20,13 +20,15 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 
 from putget_sim.workload.put_get import KEY, PutGetBurst
-from realsim.run import Run
+from realsim.demo import Console, Scenario
+from realsim.run import Result, Run
 from sim_common.trace import Trace
 
 from ..control.routing import DedupPolicy
 from ..data.read_through import ReadThroughPlane
+from ..report.summary import BaselineReport, DedupReport
 
-__all__ = ["NUM_READERS", "FANOUT_CAPS", "dedup_vs_baseline"]
+__all__ = ["NUM_READERS", "FANOUT_CAPS", "dedup_vs_baseline", "Dedup"]
 
 #: Readers in the burst. Three is enough to show a chain and a shallow tree.
 NUM_READERS = 3
@@ -64,3 +66,41 @@ def dedup_vs_baseline(
             )
         )
     return runs
+
+
+class Dedup(Scenario):
+    """The one comparison: the same burst unrouted, then routed at each cap."""
+
+    name = "dedup"
+
+    def runs(self, args) -> List[Run]:
+        return dedup_vs_baseline()
+
+    def show(self, console: Console, results: Sequence[Result]) -> None:
+        naive, routed = results[0], results[1:]
+        payload = naive.workload.payload_bytes
+        num_readers = naive.workload.num_readers
+        console.trace(naive.trace, label="naive run")
+
+        console.section(f"DEDUP on the REAL directory  --  {num_readers} readers get W")
+        console.info(
+            "directory: real torchstore.controller.Controller (real Trie state)"
+        )
+        console.info(
+            "payload(W): %dB   1x-union target (each unique byte once): %dB",
+            payload, payload,
+        )
+
+        for result in routed:
+            cap = int(result.label.split("=")[1])
+            topo = "chain" if cap == 1 else "tree"
+            console.section(f"dedup policy  --  fanout_cap={cap} ({topo})")
+            console.trace(result.trace, label=f"dedup(cap={cap}) run")
+            console.summary(DedupReport(result, naive, cap))
+            # 1x proven live on the real directory.
+            assert result.ledger.origin_bytes == payload
+            assert naive.ledger.origin_bytes == num_readers * payload
+
+        console.section("NAIVE baseline  --  every reader pulls from the origin")
+        console.trace(naive.trace, label="naive run")
+        console.summary(BaselineReport(naive))

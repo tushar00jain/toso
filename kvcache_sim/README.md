@@ -148,8 +148,8 @@ kvcache_sim/
     _generator.py         #   seeded synthetic request stream (Zipf + Poisson)
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
                           #   the wiring a run installs around it
-    scenarios.py          #   the six comparisons, each a list of realsim.Run
-                          #   values over one request stream
+    scenarios.py          #   the six Scenarios: each declares its Runs over one
+                          #   request stream, and narrates the results
   report/                 # OUTCOME METRICS
     metrics.py            #   RequestResult rows on a sim_common Ledger + rendering
     summary.py            #   one realsim.Report per comparison, over those rows

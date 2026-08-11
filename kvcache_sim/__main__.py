@@ -8,7 +8,10 @@ For each scenario it emits:
   (a) a per-event trace  -> logged at DEBUG (shown only with -v), and
   (b) a summary comparison (cache-aware vs load-balance) -> logged at INFO.
 
-Scenarios (positional arg; omit to run all):
+Each scenario -- which runs it compares and how it narrates them -- is a
+:class:`realsim.demo.Scenario` in :mod:`kvcache_sim.workload.scenarios`. This
+file only declares the demo:
+
   * shared_prefix   -- multi-turn conversations sharing a hot system prompt; the
                        cache-aware coordinator reuses prefixes across instances.
   * eviction        -- sweep cache capacity; hit rate rises then plateaus (LRU).
@@ -22,123 +25,16 @@ Scenarios (positional arg; omit to run all):
 
 from __future__ import annotations
 
-import argparse
-from typing import List
+from realsim.demo import Console, Demo
 
-from realsim.demo import Console, Demo, Scenario
-from realsim.run import Result, Run
-
-from .report.summary import (
-    CacheVsBaselineReport,
-    DisaggregationReport,
-    EarlyRejectionReport,
-    EvictionReport,
-    HotspotReport,
+from .workload.scenarios import (
+    Disaggregation,
+    EarlyRejection,
+    Eviction,
+    Hotspot,
+    Overload,
+    SharedPrefix,
 )
-from .workload import scenarios
-
-TRACE_LIMIT = 60
-
-
-def _runs_shared_prefix(args: argparse.Namespace) -> List[Run]:
-    return scenarios.shared_prefix()
-
-
-def _shared_prefix(console: Console, results: List[Result]) -> None:
-    console.section("SHARED PREFIX: conversations sharing a hot system prompt + context")
-    console.info("directory: real torchstore.controller.Controller (off-actor)")
-    console.info("4 instances (2 nodes), 200 requests, 8 conversations, Zipf skew.")
-    console.info("Cache-aware routes same-prefix requests to the instance holding the")
-    console.info("prefix (or pulls it once), so shared prefixes are computed ~once;")
-    console.info("load-balance scatters them, recomputing prefixes on every instance.")
-    console.trace(results[0].trace, limit=TRACE_LIMIT)
-    console.summary(CacheVsBaselineReport("shared_prefix", results))
-
-
-def _runs_eviction(args: argparse.Namespace) -> List[Run]:
-    return scenarios.eviction_sweep()
-
-
-def _eviction(console: Console, results: List[Result]) -> None:
-    console.section("EVICTION: hit rate vs cache capacity (LRU)")
-    console.info("400 requests, 12 conversations. As per-instance capacity grows, the")
-    console.info("hot working set fits and the prefix hit rate rises, then plateaus")
-    console.info("(the ~30%%->~50%% shape). Too-small caches also force more KV")
-    console.info("re-fetch (fabric).")
-    console.info("")
-    console.info(EvictionReport(results).render())
-
-
-def _runs_hotspot(args: argparse.Namespace) -> List[Run]:
-    return scenarios.hotspot()
-
-
-def _hotspot(console: Console, results: List[Result]) -> None:
-    console.section("HOTSPOT: extreme skew -> hot-block replication spreads load")
-    console.info("One dominant conversation. Without replication (balance_threshold huge)")
-    console.info("the cache-aware policy piles every hot request on the single instance")
-    console.info("holding the prefix; with a moderate threshold it replicates the prefix")
-    console.info("to peers (read-through), spreading load and cutting p90 TTFT.")
-    console.trace(results[2].trace, limit=TRACE_LIMIT)
-    console.summary(HotspotReport(results))
-    console.info("(replication swaps recompute for cheap KV transfer when spreading a")
-    console.info(" hot prefix to a peer -> fewer prefill tokens, more fabric bytes.)")
-
-
-def _runs_overload(args: argparse.Namespace) -> List[Run]:
-    return scenarios.overload()
-
-
-def _overload(console: Console, results: List[Result]) -> None:
-    console.section("OVERLOAD: high arrival + TTFT SLO -> rejections")
-    console.info("300 requests at a high rate with a TTFT SLO of 6.0. Prefix reuse")
-    console.info("shortens prefill, freeing capacity, so cache-aware admits more")
-    console.info("requests (fewer rejections) than the load-balancing baseline.")
-    console.summary(CacheVsBaselineReport("overload", results))
-
-
-def _runs_disaggregation(args: argparse.Namespace) -> List[Run]:
-    return scenarios.disaggregation()
-
-
-def _disaggregation(console: Console, results: List[Result]) -> None:
-    console.section("DISAGGREGATION: dedicated decode pool protects TBT from prefill")
-    console.info("Two decode instances, VRAM cap 8, TBT target %.3f. Admission is",
-                 scenarios.DISAGG_TARGET_TBT)
-    console.info("disabled (no TBT SLO gate), so BOTH configs serve every request -- the")
-    console.info("contrast is purely the TBT-target attainment among served requests, not")
-    console.info("a rejection count. The only difference is prefill placement: disaggregated")
-    console.info("prefills on a separate pool (s0/s1) so decode (s2/s3) keeps its own")
-    console.info("compute timeline; coupled runs prefill AND decode on s2/s3, so a prefill")
-    console.info("can collide with a decode step and spike that request's inter-token gap.")
-    console.trace(results[0].trace, limit=TRACE_LIMIT)
-    console.summary(DisaggregationReport(results, scenarios.DISAGG_TARGET_TBT))
-    console.info("Attainment is the fraction of served requests whose *worst* inter-token")
-    console.info("gap stayed under the target. Disaggregation isolates decode from prefill,")
-    console.info("so served requests hold TBT; coupling lets long prefills stall decode, so")
-    console.info("a large fraction of served requests blow the target -- same load admitted.")
-
-
-def _runs_early_rejection(args: argparse.Namespace) -> List[Run]:
-    return scenarios.early_rejection()
-
-
-def _early_rejection(console: Console, results: List[Result]) -> None:
-    console.section("EARLY REJECTION: predict decode load, don't waste prefill")
-    console.info("Heavy decode load with a tight TBT SLO of %.3f. Three cache-aware runs",
-                 scenarios.EARLY_SLO_TBT)
-    console.info("differ only in the admission policy. 'off' late-checks decode load AFTER")
-    console.info("prefill and rejects on a violation -- so each rejection is a wasted")
-    console.info("prefill (compute already spent). 'early' and 'predict' both gate at")
-    console.info("routing, before prefill, so neither ever wastes prefill; here neither")
-    console.info("rejects (both admit all). The difference is decode routing: 'early' uses")
-    console.info("the current occupancy, which a slow prefill leaves reading ~empty, so it")
-    console.info("piles decode onto one instance and blows the SLO; 'predict' routes by the")
-    console.info("load foreseen at prefill completion, spreading decode so the SLO holds.")
-    console.trace(results[2].trace, limit=TRACE_LIMIT)
-    console.summary(EarlyRejectionReport(results, scenarios.EARLY_SLO_TBT))
-    console.info("(Signal: wasted prefill separates 'off' from the rest; TBT attainment")
-    console.info(" separates 'predict' (routes on predicted load) from 'early' (stale).)")
 
 
 class KVCacheDemo(Demo):
@@ -153,12 +49,12 @@ class KVCacheDemo(Demo):
 
     def scenarios(self):
         return [
-            Scenario("shared_prefix", _runs_shared_prefix, _shared_prefix),
-            Scenario("eviction", _runs_eviction, _eviction),
-            Scenario("hotspot", _runs_hotspot, _hotspot),
-            Scenario("overload", _runs_overload, _overload),
-            Scenario("disaggregation", _runs_disaggregation, _disaggregation),
-            Scenario("early_rejection", _runs_early_rejection, _early_rejection),
+            SharedPrefix(),
+            Eviction(),
+            Hotspot(),
+            Overload(),
+            Disaggregation(),
+            EarlyRejection(),
         ]
 
     def takeaway(self, console: Console) -> None:

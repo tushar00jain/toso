@@ -168,7 +168,7 @@ through `realsim`'s transport seam, and eviction is the real `notify_delete_batc
 | `ServingPlane` | `data/serving.py` | The per-request lifecycle as a `DataPlane`: queue wait → real prefix pull → prefill charge → publish/evict → decode admission → decode-done, recording TBT. Also owns **prefill/decode coupling**, which is a deployment fact, not a policy: on a coupled instance it applies each plan's reservation to the decode timeline and reports each step's end back to the scheduler. |
 | `make_workload` | `workload/_generator.py` | Seeded synthetic generator: shared system prompt + per-conversation context + unique query suffix, conversations chosen by a **Zipf** popularity law, **Poisson** arrivals. |
 | `Metrics` | `report/metrics.py` | Hit rate, compute/saved tokens, mean/p90 TTFT, fabric bytes, rejections, and decode-side TBT (`mean_tbt`, `pct_tbt`, `tbt_slo_met`, `wasted_prefills`, `decode_rejections`). |
-| scenarios | `workload/scenarios.py` | The six comparisons, each a list of `realsim.run.Run` values over one request stream. `Run.execute()` drives each one. |
+| scenarios | `workload/scenarios.py` | The six `realsim.demo.Scenario` subclasses. Each declares its `Run` values over one request stream and narrates the results; `Demo.main` executes them with `Run.execute()`. |
 
 ### The event flow
 

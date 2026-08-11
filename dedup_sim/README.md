@@ -112,8 +112,8 @@ dedup_sim/
     read_through.py       #   ReadThroughPlane: one DataPlane method -- the
                           #   reader's put, via the Deployment's client for it
   workload/               # WHAT IS SIMULATED
-    scenarios.py          #   the Runs to compare: putget_sim's put/get fixture
-                          #   unwrapped (baseline), and with the policy installed
+    scenarios.py          #   the Dedup Scenario: the Runs to compare (the fixture
+                          #   unwrapped, and with the policy installed) + narration
   report/                 # OUTCOME METRICS
     summary.py            #   DedupReport / BaselineReport: fabric summary + tree
   __main__.py             # `python -m dedup_sim`: a realsim.Demo declaration
