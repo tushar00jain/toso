@@ -10,7 +10,8 @@ surface plus one extra affordance: ``keys().filter_by_prefix(...)``.
 :class:`DictDirectory` supplies exactly that surface backed by a plain ``dict``,
 so it drops into ``Controller.keys_to_storage_volumes`` unchanged and lets every
 bit of the real ``Controller`` decision logic run over it (see
-:class:`realsim.adapters.real_controller.ShimControllerAdapter`). The only
+:class:`realsim.adapters.real_controller.RealControllerAdapter` with
+``shim=True``). The only
 behaviour it must reproduce faithfully is the trie's prefix filter; iteration
 *order* differs from the trie's DFS order, but the sims never consume directory
 order in a metric (``locate_volumes`` iterates the caller's key list, not the

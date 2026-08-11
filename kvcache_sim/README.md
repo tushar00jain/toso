@@ -201,7 +201,7 @@ plus the prefix-run read that express KV caching on a mesh.
   instances hold (a shared system prompt, anything replicated) can be a different
   locality tier than the one the TTFT prediction was built on.
 - **The coordinator hop is free by default.** Control is a service, reached through
-  `realsim/seams/coordinator.py` — so there is now somewhere to charge the round trip,
+  `realsim/seams/coordinator_handle.py` — so there is now somewhere to charge the round trip,
   but `--coordinator-rtt` defaults to `0` and every call is inline. Turn it up and it
   is paid out and back before prefill can start: at `0.5` on the shared-prefix
   workload, mean TTFT goes 2.56 → 4.90 and the hit rate 0.734 → 0.704, because routing

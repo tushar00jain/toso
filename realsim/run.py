@@ -120,7 +120,7 @@ class Run:
               mesh is built, which is why an object rather than a factory;
             * a :data:`MakeControl` factory runs **in its own service**, built
               over the assembled stack and fronted by a
-              :class:`~realsim.seams.coordinator.CoordinatorHandle` as
+              :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` as
               ``sim.coordinator_handle``. This is kvcache: its scheduler holds every
               instance's queue, cache and decode occupancy, so it needs
               ``sim.view`` and cannot be built before the stack.

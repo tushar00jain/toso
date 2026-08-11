@@ -28,7 +28,6 @@ from sim_common import config
 from realsim.adapters.real_controller import (
     make_controller_adapter,
     RealControllerAdapter,
-    ShimControllerAdapter,
 )
 from realsim.tests._burst import run_burst
 from realsim.seams.dict_directory import DictDirectory
@@ -125,7 +124,7 @@ async def _drive_surface(handle):
 
 def test_shim_handle_surface_matches_real():
     real = asyncio.run(_drive_surface(RealControllerAdapter().handle))
-    shim = asyncio.run(_drive_surface(ShimControllerAdapter().handle))
+    shim = asyncio.run(_drive_surface(RealControllerAdapter(shim=True).handle))
     assert shim == real
     # sanity on the shared expectations (guards against both being wrong together)
     assert real["missing_raises"] is True
@@ -138,7 +137,7 @@ def test_shim_handle_surface_matches_real():
 
 def test_shim_directory_is_a_dict_backing():
     real = RealControllerAdapter()
-    shim = ShimControllerAdapter()
+    shim = RealControllerAdapter(shim=True)
     # Both are the real Controller; only the directory container differs.
     assert type(real.controller).__name__ == "Controller"
     assert type(shim.controller).__name__ == "Controller"
@@ -187,7 +186,7 @@ def test_flag_defaults_to_real():
     _reset()
     try:
         assert config.current().real_directory is True
-        assert isinstance(make_controller_adapter(), RealControllerAdapter)
+        assert make_controller_adapter().shimmed is False
     finally:
         _reset()
 
@@ -195,8 +194,8 @@ def test_flag_defaults_to_real():
 def test_explicit_arg_selects_shim():
     _reset()
     try:
-        assert isinstance(make_controller_adapter(False), ShimControllerAdapter)
-        assert isinstance(make_controller_adapter(True), RealControllerAdapter)
+        assert make_controller_adapter(False).shimmed is True
+        assert make_controller_adapter(True).shimmed is False
     finally:
         _reset()
 
@@ -205,10 +204,10 @@ def test_ambient_config_selects_shim():
     _reset()
     try:
         with config.overrides(real_directory=False):
-            assert isinstance(make_controller_adapter(), ShimControllerAdapter)
+            assert make_controller_adapter().shimmed is True
         # explicit arg still wins over the ambient flag
         with config.overrides(real_directory=False):
-            assert isinstance(make_controller_adapter(True), RealControllerAdapter)
-        assert isinstance(make_controller_adapter(), RealControllerAdapter)
+            assert make_controller_adapter(True).shimmed is False
+        assert make_controller_adapter().shimmed is False
     finally:
         _reset()

@@ -104,7 +104,7 @@ class Coordinator(ABC):
     notification that blocked the stepping loop would be modelling something no
     deployment would build.
 
-    :class:`realsim.seams.coordinator.CoordinatorHandle` is what stands here under
+    :class:`realsim.seams.coordinator_handle.CoordinatorHandle` is what stands here under
     simulation: it wraps a control plane that implements this protocol, is the one
     place a round trip is charged, and is what a Monarch endpoint would replace.
     The handle satisfies this protocol *and* so does the object behind it -- the
@@ -193,7 +193,7 @@ class _Base(Policy, Coordinator):
     :class:`~proposed.policy.Policy`, so the run installs it in the directory and
     the controller consults it there (:meth:`select`); and it is a
     :class:`Coordinator`, so the run also fronts it with a
-    :class:`~realsim.seams.coordinator.CoordinatorHandle` and a serving host
+    :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` and a serving host
     reaches it as its own service. The two are one object on purpose: the peer it
     prices a pull against is the peer it later tells the directory to serve, with
     nothing threaded through the data plane to carry that between them.

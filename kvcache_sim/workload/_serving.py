@@ -100,7 +100,7 @@ def coordinator(
     lets this be a value rather than a factory the harness must call at the right
     moment. The :class:`~realsim.run.Run` installs it in the directory (it answers
     the store's routing question) *and* fronts it with a
-    :class:`~realsim.seams.coordinator.CoordinatorHandle` (it decides compute
+    :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` (it decides compute
     placement) -- one object, reached through the seam of whichever service is
     asking.
     """

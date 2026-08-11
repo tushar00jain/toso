@@ -46,7 +46,7 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
-from realsim.seams.coordinator import CoordinatorHandle
+from realsim.seams.coordinator_handle import CoordinatorHandle
 from realsim.runner import Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -70,7 +70,7 @@ class Simulation:
             * if it declares ``attach(view, transfer_cost)`` it also senses and
               prices through this stack, which only a control plane deciding more
               than the store's question needs -- so it is fronted by a
-              :class:`~realsim.seams.coordinator.CoordinatorHandle` as
+              :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` as
               :attr:`coordinator_handle` and reached as its own service.
 
             Both, for one object, is the interesting case: kvcache's coordinator

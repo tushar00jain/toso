@@ -11,6 +11,11 @@ simulator, ``proposed`` is the design being argued for.
   requester, and may withhold the answer until that volume is usable. The default
   :class:`~proposed.policy.NaivePolicy` returns the directory's own answer, so an
   installed policy changes nothing until one is written.
+* :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
+  directory surface a caller reaches (torchstore names this type but never declares
+  it: ``api.py`` annotates the spawned handle as the actor class and ``LocalClient``
+  takes it unannotated). The difference between it and torchstore's class is the
+  policy hook;
 * :mod:`proposed.view` -- :class:`~proposed.view.View`, the read-only observation
   a controller hands a policy: who holds a key, where volumes are, what time it is.
 
@@ -27,7 +32,7 @@ missing" section.
 
 # Re-export the contract surface so callers import from the package directly.
 from .cost import TransferCost
-from .deployment import Deployment
+from .deployment import Controller, Deployment
 from .plane import DataPlane
 from .policy import DecisionLog, Policy, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL
@@ -40,6 +45,7 @@ __all__ = [
     "DecisionLog",
     "View",
     "Directory",
+    "Controller",
     "Endpoint",
     "Tier",
     "TIER_LABEL",
