@@ -9,21 +9,42 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from domain import DEFAULT_PROFILE
+import torch
+
+from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
 from proposed import DataPlane, Endpoint
 from realsim.entrypoint import Workload
 from realsim.runner import WorkItem
+from realsim.seams.transport import TensorDescriptor
 from realsim.simulation import Simulation
 
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ..control.view import KVView
 from ..data.serving import ServingPlane
-from .deploy import make_store
+from ..data.store import KVStore
 
 #: Tokens per KV block. Fixed for every scenario so runs stay comparable.
 BLOCK_TOKENS = 512
 
-__all__ = ["BLOCK_TOKENS", "KVWorkload"]
+__all__ = ["BLOCK_TOKENS", "KVWorkload", "sim_block_carrier"]
+
+
+def sim_block_carrier(
+    block_tokens: int = BLOCK_TOKENS, model: Model = DEFAULT_MODEL
+):
+    """What one KV block is stored as **under simulation**.
+
+    A metadata-only carrier: a uint8 descriptor whose length *is* the block's
+    modeled byte size, so the bytes the transport charges cannot drift from the
+    bytes the scheduler predicted. Zero real storage.
+
+    This is the one piece a real deployment chooses differently -- it stores the
+    KV tensors -- which is why it lives with the run rather than in
+    :mod:`kvcache_sim.data.store`.
+    """
+    return TensorDescriptor(
+        shape=(model.block_bytes(1, block_tokens),), dtype=torch.uint8
+    )
 
 
 class KVWorkload(Workload):
@@ -77,7 +98,11 @@ class KVWorkload(Workload):
 
     def build(self, sim: Simulation) -> Tuple[DataPlane, List[WorkItem]]:
         """Build both planes onto the assembled stack."""
-        store = make_store(sim, block_tokens=BLOCK_TOKENS)
+        # The simulation *is* the deployment: it vends the client for an instance
+        # and holds the directory. All the run adds is the block carrier.
+        store = KVStore.for_deployment(
+            sim.mesh, block_tokens=BLOCK_TOKENS, carrier=sim_block_carrier()
+        )
         # Control senses the same real directory the data plane writes, but only
         # ever reads it.
         view = KVView(sim.view.directory, sim.topology)

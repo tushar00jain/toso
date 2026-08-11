@@ -19,7 +19,7 @@ for routing equals the *actual* completion time.
 * ``CacheAwareScheduler`` (cache-aware coordinator): route to minimize predicted
   TTFT using the **global** prefix-match directory, optionally pulling a remote
   prefix (whose *source* is chosen by
-  :class:`~kvcache_sim.control.source.LongestPrefixPolicy`) under a balance
+  :class:`~kvcache_sim.control._source.LongestPrefixPolicy`) under a balance
   threshold.
 
 Control plane only
@@ -52,8 +52,8 @@ from domain import (
 )
 from proposed import TransferCost
 
-from .cache import LRUCache
-from .source import LongestPrefixPolicy
+from ._cache import LRUCache
+from ._source import LongestPrefixPolicy
 from ..workload.request import Request
 
 
@@ -124,7 +124,7 @@ class _Base:
             it only to reason about admission.
         early_rejection: ``"off"`` | ``"early"`` | ``"predict"``.
         source_policy: the :class:`~proposed.policy.Policy` that ranks peers for a
-            prefix pull (default :class:`~kvcache_sim.control.source.LongestPrefixPolicy`).
+            prefix pull (default :class:`~kvcache_sim.control._source.LongestPrefixPolicy`).
     """
 
     def __init__(

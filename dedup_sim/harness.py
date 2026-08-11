@@ -34,7 +34,7 @@ from sim_common.cost_model import MachineProfile
 from sim_common.trace import Trace
 
 from dedup_sim.control.routing import DedupPolicy
-from dedup_sim.data.read_through import make_plane
+from dedup_sim.data.read_through import ReadThroughPlane
 
 __all__ = ["DEFAULT_N", "MODE_META", "MODE_METADATA", "run"]
 
@@ -73,7 +73,7 @@ def run(
         device=device,
         profile=profile,
         compute_device=compute_device,
-        make_plane=make_plane if routed else None,
+        make_plane=ReadThroughPlane if routed else None,
     )
     return run_simulation(
         workload,

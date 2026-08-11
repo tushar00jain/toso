@@ -49,9 +49,9 @@ class KVStore:
         deployment: the :class:`~proposed.deployment.Deployment` these instances
             run against; it vends the client for an instance id.
         block_tokens: tokens per KV block.
-        carrier: what one block is stored as. Supplied by the run (see
-            ``kvcache_sim/workload/deploy.py``) because it is the piece that
-            differs between a simulated run and a real one.
+        carrier: what one block is stored as. Supplied by the run because it is
+            the piece that differs between a simulated run (an allocation-free
+            descriptor) and a real one (the KV tensors).
         model: served-model :class:`~domain.llm.Model`, which sets how many bytes
             one KV block occupies. The carrier must be sized from it (see
             :attr:`block_nbytes`) so the bytes moved are the bytes
@@ -74,6 +74,38 @@ class KVStore:
         # decision, and it is the piece that differs between a simulated run
         # (an allocation-free carrier) and a real one (the KV tensors).
         self._block_carrier = carrier
+
+    @classmethod
+    def for_deployment(
+        cls,
+        deployment: Deployment,
+        *,
+        block_tokens: int,
+        carrier,
+        model: Model = DEFAULT_MODEL,
+    ) -> "KVStore":
+        """Build a store over ``deployment``, checking the block-size premise.
+
+        The one invariant worth failing loudly on: whatever a block is stored as,
+        it must occupy the bytes :meth:`~domain.llm.Model.block_bytes` predicts,
+        because that is the number the scheduler prices every fetch against. A
+        carrier that disagrees would make the sim charge for one size and route
+        on another, with nothing else noticing.
+
+        Both the deployment and the carrier are the caller's: a real one vends
+        its own client and stores the KV tensors; a simulated one vends the
+        client for an instance id and stores an allocation-free descriptor.
+        """
+        want = model.block_bytes(1, block_tokens)
+        if carrier.nbytes != want:
+            raise ValueError(
+                f"block carrier is {carrier.nbytes}B but the model predicts "
+                f"{want}B for {block_tokens} tokens: every fetch would be priced "
+                f"against the wrong byte count"
+            )
+        return cls(
+            deployment, block_tokens=block_tokens, carrier=carrier, model=model
+        )
 
     @property
     def block_nbytes(self) -> int:

@@ -83,7 +83,7 @@ def test_control_module_is_recognised_by_path():
 
 def test_relative_imports_resolve_against_the_importing_package():
     assert resolve_module(CONTROL, 0, "realsim.mesh") == "realsim.mesh"
-    assert resolve_module(CONTROL, 1, "cache") == "kvcache_sim.control.cache"
+    assert resolve_module(CONTROL, 1, "_cache") == "kvcache_sim.control._cache"
     assert resolve_module(CONTROL, 2, "data.store") == "kvcache_sim.data.store"
     assert resolve_module(CONTROL, 2, "workload.request") == "kvcache_sim.workload.request"
 
@@ -94,7 +94,7 @@ def test_lint_flags_control_importing_data():
         "from ..data.store import KVStore\n", path=CONTROL
     )
     assert "control-imports-data" in _codes(
-        "import kvcache_sim.data.decode\n", path=CONTROL
+        "import kvcache_sim.data._decode\n", path=CONTROL
     )
 
 
@@ -119,7 +119,7 @@ def test_lint_allows_what_control_is_supposed_to_use():
         "from proposed import View\n"
         "from proposed import TransferCost\n"
         "from domain import prefill_time, MachineProfile\n"
-        "from .cache import LRUCache\n"
+        "from ._cache import LRUCache\n"
         "from ..workload.request import Request\n"
     )
     assert _codes(allowed, path=CONTROL) == set()
@@ -157,7 +157,7 @@ def test_data_may_hold_decisions_but_not_the_simulator():
 def test_the_simulator_rules_do_not_apply_to_workload():
     """workload/ is where the harness is wired up, so it may name it."""
     src = "from realsim.mesh import Mesh\nfrom sim_common.trace import Trace\n"
-    assert _codes(src, path="kvcache_sim/workload/deploy.py") == set()
+    assert _codes(src, path="kvcache_sim/workload/serving.py") == set()
 
 
 def test_lint_flags_the_proposal_leaning_on_the_simulator():
@@ -166,7 +166,7 @@ def test_lint_flags_the_proposal_leaning_on_the_simulator():
         "from realsim.mesh import Mesh\n",
         "from realsim.seams.controller_handle import FakeControllerHandle\n",
         "import torchstore\n",
-        "from kvcache_sim.control.source import LongestPrefixPolicy\n",
+        "from kvcache_sim.control._source import LongestPrefixPolicy\n",
     ):
         assert "proposed-imports-simulator" in _codes(line, path=PROPOSED), line
 

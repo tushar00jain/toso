@@ -14,13 +14,14 @@ import pytest
 from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
-from kvcache_sim.control.cache import LRUCache
+from kvcache_sim.control._cache import LRUCache
 from kvcache_sim.control.view import KVView
-from kvcache_sim.workload.deploy import make_store
+from kvcache_sim.workload.serving import sim_block_carrier
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
-from kvcache_sim.data.decode import DecodeEngine
+from kvcache_sim.data._decode import DecodeEngine
+from kvcache_sim.data.store import KVStore
 from kvcache_sim.workload.request import (
     block_keys_for,
     longest_prefix_run,
@@ -66,7 +67,9 @@ def test_real_directory_prefix_presence_and_eviction():
     keys = block_keys_for("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
-    store = make_store(sim, block_tokens=512)
+    store = KVStore.for_deployment(
+        sim.mesh, block_tokens=512, carrier=sim_block_carrier(512)
+    )
     view = KVView(sim.view.directory, sim.topology)
 
     async def scenario():

@@ -15,7 +15,7 @@ from proposed import Endpoint
 from realsim.entrypoint import Result
 
 from ..harness import BLOCK_TOKENS, run
-from .generator import make_workload
+from ._generator import make_workload
 
 
 def make_topology(num: int, per_node: int = 2) -> Dict[str, Endpoint]:

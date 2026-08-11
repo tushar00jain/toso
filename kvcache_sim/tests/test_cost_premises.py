@@ -33,7 +33,8 @@ from sim_common.cost_model import DEFAULT_PROFILE, get_time, MachineProfile
 from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
-from kvcache_sim.workload.deploy import make_store
+from kvcache_sim.data.store import KVStore
+from kvcache_sim.workload.serving import sim_block_carrier
 from realsim.simulation import Simulation
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, make_topology
 
@@ -198,8 +199,11 @@ def test_predicted_block_bytes_equal_the_bytes_the_data_plane_moves():
     this pins them together for the default and for a much larger model.
     """
     for model in (DEFAULT_MODEL, REAL_MODEL):
-        cl = make_store(
-            Simulation(make_topology(2)), block_tokens=BLOCK_TOKENS, model=model
+        cl = KVStore.for_deployment(
+            Simulation(make_topology(2)).mesh,
+            block_tokens=BLOCK_TOKENS,
+            carrier=sim_block_carrier(BLOCK_TOKENS, model),
+            model=model,
         )
         assert cl.block_nbytes == model.block_bytes(1, BLOCK_TOKENS), (
             "the KV block carrier and Model.block_bytes() disagree, so every "
@@ -221,7 +225,9 @@ def test_a_real_pull_costs_what_get_time_predicted():
     keys = ["blk0"]
 
     sim = Simulation(topo)
-    cl = make_store(sim, block_tokens=BLOCK_TOKENS)
+    cl = KVStore.for_deployment(
+        sim.mesh, block_tokens=BLOCK_TOKENS, carrier=sim_block_carrier()
+    )
 
     async def scenario():
         import asyncio

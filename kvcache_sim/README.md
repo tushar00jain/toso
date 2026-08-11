@@ -129,23 +129,25 @@ kvcache_sim/
     scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator:
                           #   prefill placement, pull-vs-recompute, SLO gates,
                           #   decode placement; owns the PREDICTED prefill queue
-    source.py             #   LongestPrefixPolicy: the one store question
+    _source.py            #   LongestPrefixPolicy: the one store question
                           #   ("which peer serves this gap"), a proposed.Policy
     view.py               #   KVView: per-instance prefix-run lengths, plus the
                           #   pinned snapshot one routing decision reads through
-    cache.py              #   per-instance LRU eviction bookkeeping (metadata)
+    _cache.py             #   per-instance LRU eviction bookkeeping (metadata)
   data/                   # EXECUTES -- advances the clock, moves bytes
     serving.py            #   the per-request serving loop (a DataPlane):
                           #   queue wait, real pull, prefill charge, publish/evict,
                           #   decode admission, outcome rows. Owns prefill/decode
                           #   coupling, which is a deployment fact, not a policy
-    decode.py             #   async DecodeEngine: batched, stepped decode -> TBT
-    store.py              #   publish / fetch / evict over a Deployment's clients
+    _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT
+                          #   (underscored: nothing outside data/ drives it)
+    store.py              #   publish / fetch / evict over a Deployment's clients,
+                          #   plus KVStore.for_deployment, the one factory
   workload/               # WHAT IS SIMULATED
     request.py            #   inference Request + prefix-hash chain (str keys)
-    generator.py          #   seeded synthetic request stream (Zipf + Poisson)
-    deploy.py             #   builds the simulated Deployment (a Mesh) and picks
-                          #   the block carrier -- the run wiring data/ must not see
+    _generator.py         #   seeded synthetic request stream (Zipf + Poisson)
+    serving.py            #   KVWorkload + sim_block_carrier: what a block is
+                          #   stored as under simulation (a real one stores tensors)
     scenarios.py          #   scenario builders + the run harness that wires the
                           #   two planes and hands the requests to realsim.Runner
   report/                 # OUTCOME METRICS

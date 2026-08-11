@@ -25,7 +25,7 @@ Coupling lives here
 Whether prefill and decode contend for one instance's compute is a fact about the
 deployment, not about the policy, so this plane owns it. On a coupled instance it
 applies each accepted plan's reservation to the decode engine's timeline
-(:meth:`~kvcache_sim.data.decode.DecodeEngine.reserve`) and reports each decode
+(:meth:`~kvcache_sim.data._decode.DecodeEngine.reserve`) and reports each decode
 step's end back to the scheduler
 (:meth:`~kvcache_sim.control.scheduler._Base.observe_compute_busy`), so the
 control plane's *predicted* prefill queue tracks the timeline decode is actually
@@ -43,7 +43,7 @@ from proposed import DataPlane
 from ..control.scheduler import Plan
 from ..report.metrics import Metrics, RequestResult
 from ..workload.request import Request
-from .decode import DecodeEngine
+from ._decode import DecodeEngine
 from .store import KVStore
 
 

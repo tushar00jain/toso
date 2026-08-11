@@ -161,5 +161,7 @@ sim_common/
   cost_model.py   MachineProfile + analytic network/RAM/storage/CPU/GPU costs
   report.py       Ledger (transfer edges + byte counters + outcome rows +
                   aggregations) and the source->dest tree renderer
-  engine.py trace.py topology.py   shared DES library (reused)
+  trace.py topology.py   shared DES library (reused)
+  engine.py              the ancestor callback DES (Sim/Promise): reference only,
+                         not on the sim path and imported by nothing
 ```

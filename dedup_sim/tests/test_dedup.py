@@ -221,9 +221,9 @@ def test_readers_run_an_untouched_real_client():
     from putget_sim.workload.put_get import PutGetBurst
 
     from dedup_sim.control.routing import DedupPolicy
-    from dedup_sim.data.read_through import make_plane
+    from dedup_sim.data.read_through import ReadThroughPlane
 
-    workload = PutGetBurst(3, make_plane=make_plane)
+    workload = PutGetBurst(3, make_plane=ReadThroughPlane)
     result = run_simulation(workload, policy=DedupPolicy(fanout_cap=1))
     mesh = result.sim.mesh
 

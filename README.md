@@ -77,9 +77,10 @@ client/controller/transport), so they depend on the from-source
   is tabulated in
   [`dedup_sim/README.md`](dedup_sim/README.md#comparison-with-kvcache_sim).
 - [`sim_common/`](sim_common/) — the shared building blocks all three sims use:
-  the deterministic virtual-clock `AsyncEngine` (the sim path) plus the original
-  callback engine (`engine.py`: `Sim`/`Promise`), the locality/topology skeleton,
-  an analytic resource cost model (`cost_model.py`: `MachineProfile` +
+  the deterministic virtual-clock `AsyncEngine` (the sim path; the original
+  callback engine `engine.py` is kept as a reference and imported by nothing),
+  the locality/topology skeleton, an analytic resource cost model
+  (`cost_model.py`: `MachineProfile` +
   network/RAM/storage/CPU/GPU functions), a trace recorder, and the reporting
   helpers including `Ledger` (transfer edges, byte counters, outcome rows and the
   aggregations every report computes over them).

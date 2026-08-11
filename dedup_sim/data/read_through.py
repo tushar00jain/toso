@@ -17,7 +17,7 @@ from typing import Any
 
 from proposed import DataPlane, Deployment
 
-__all__ = ["ReadThroughPlane", "make_plane"]
+__all__ = ["ReadThroughPlane"]
 
 
 class ReadThroughPlane(DataPlane):
@@ -40,8 +40,3 @@ class ReadThroughPlane(DataPlane):
     async def after(self, item: Any, result: Any) -> None:
         """Real read-through: the reader stores the key into its own volume."""
         await self.deployment.client_for(item.id).put(self.key, self.value)
-
-
-def make_plane(deployment: Deployment, key: str, value: Any) -> ReadThroughPlane:
-    """Build the plane for a run; matches the factory shape a scenario expects."""
-    return ReadThroughPlane(deployment, key, value)

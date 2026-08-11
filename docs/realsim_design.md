@@ -178,7 +178,9 @@ putget_sim/                   # the unrouted put/get burst (repo root) — no po
 sim_common/                   # shared DES library (repo root)
   async_engine.py             # deterministic asyncio loop + virtual clock
   cost_model.py               # MachineProfile + analytic network/RAM/storage/CPU/GPU costs
-  engine.py, trace.py, topology.py, report.py   # reused as-is
+  trace.py, topology.py, report.py              # reused as-is
+  engine.py                   # the ancestor callback DES: reference only, not on
+                              #   the sim path and imported by nothing (see §5)
   tests/test_async_engine.py  # determinism / virtual-time / gather-ordering
   tests/test_cost_model.py    # cost-model arithmetic + determinism
 ```
