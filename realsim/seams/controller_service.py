@@ -132,7 +132,9 @@ class ControllerService:
             return list(c.keys_to_storage_volumes.keys())
         return c.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
 
-    # -- the control-plane call site, and the read it senses through -------- #
+    # -- the control-plane call site, and the surface's other read ---------- #
+    # ``route`` is this service's own; ``locate_raw`` is the rest of
+    # proposed.deployment.Controller, kept next to the hook it exists to avoid.
     async def route(self, keys: Sequence[str]) -> Optional[Any]:
         """Ask the installed control plane who should serve ``keys``.
 
@@ -159,9 +161,10 @@ class ControllerService:
     ) -> dict[str, dict[str, Any]]:
         """The real ``locate_volumes`` body, unrouted (the sensor read).
 
-        :class:`proposed.view.Directory` is this one method: what a ``View`` needs,
-        and deliberately not the routed read, so a policy sensing the directory
-        cannot re-enter the hook it is being called from.
+        :meth:`proposed.deployment.Controller.locate_raw` -- the one member of that
+        surface torchstore does not have yet, and what a ``View`` reads: deliberately
+        not the routed read, so a policy sensing the directory cannot re-enter the
+        hook it is being called from.
         """
         # Mirrors Controller.locate_volumes @endpoint body verbatim
         # (torchstore/controller.py, the body after the docstring):

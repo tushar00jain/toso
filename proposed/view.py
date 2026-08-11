@@ -28,60 +28,48 @@ incompatible meanings. It is left out until a caller can observe one.
 
 Construction
 ------------
-A view is built from a :class:`Directory` and a topology. ``Directory`` is declared
-here as a protocol rather than left as ``Any``: the proposal states what it needs
-from a controller instead of silently depending on the shape of whatever the
-simulator happens to pass. ``realsim`` builds one via ``Mesh.view``; a real
+A view is built from a :class:`~proposed.deployment.Controller` and a topology. The
+controller is *declared* rather than left as ``Any``: the proposal states what it
+needs from a controller instead of silently depending on the shape of whatever the
+simulator happens to pass. Only one member of that surface is used here --
+``locate_raw``, the unrouted read -- and it lives on the controller rather than in a
+narrower protocol beside it, because the object that has it is the same object that
+answers ``locate_volumes``. ``realsim`` builds one via ``Mesh.view``; a real
 controller would build one over itself.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
+from proposed.deployment import Controller
 from proposed.topology import Endpoint, locality, Tier
 
-__all__ = ["Directory", "View"]
-
-
-class Directory(Protocol):
-    """What a view needs from a controller: one unrouted directory read.
-
-    ``locate_raw`` is ``locate_volumes`` *without* the policy consultation, so a
-    policy sensing the directory does not re-enter the hook it is being called
-    from. A controller implementing this proposal needs both: the routed read
-    callers see, and this raw one it hands its own policy.
-    """
-
-    async def locate_raw(
-        self,
-        keys: Sequence[str],
-        missing_ok: bool = False,
-        require_fully_committed: bool = True,
-    ) -> Dict[str, Dict[str, Any]]:
-        ...
+__all__ = ["View"]
 
 
 class View:
     """Awaited, read-only observation of the real directory and topology.
 
     Args:
-        directory: anything satisfying :class:`Directory` -- in the simulator the
-            controller handle, in a deployment the controller itself.
+        directory: the directory service to read -- anything satisfying
+            :class:`~proposed.deployment.Controller`. In the simulator that is the
+            controller service, in a deployment the controller itself; either way
+            only :meth:`~proposed.deployment.Controller.locate_raw` is used.
         topology: ``volume_id -> Endpoint``; the volume id is the directory
             identity, the endpoint is what locality is priced against.
     """
 
     def __init__(
-        self, directory: Directory, topology: Dict[str, Endpoint]
+        self, directory: Controller, topology: Dict[str, Endpoint]
     ) -> None:
         self._directory = directory
         self._topology = dict(topology)
 
     # -- directory ---------------------------------------------------------- #
     @property
-    def directory(self) -> Directory:
+    def directory(self) -> Controller:
         """The directory this view reads, so a derived view can rebuild over it."""
         return self._directory
 

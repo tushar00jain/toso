@@ -177,7 +177,7 @@ proposed/       every contract that outlives the simulator; imports nothing
                   holders, directory order) is the default; the controller
                   consults it inside locate_volumes
   view.py         View -- awaited, read-only observation: locate, topology and
-                  locality, the clock. Built over a Directory protocol
+                  locality, the clock. Built over a Controller (locate_raw)
   deployment.py   Deployment -- how data-plane code reaches its store
   plane.py        DataPlane -- execute(item) / after(item, result), both
                   defaulting to no-op

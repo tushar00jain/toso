@@ -4,7 +4,9 @@ Both are deliberate and both can rot silently:
 
 * :class:`proposed.deployment.Controller` declares the directory surface, because
   ``proposed`` must not import torchstore -- it is what torchstore would gain, so
-  depending on it would invert the claim. The signatures are therefore a copy;
+  depending on it would invert the claim. The signatures are therefore a copy,
+  except for the members that *are* the ask (``THE_ASK``), which upstream has yet
+  to have;
 * :class:`realsim.seams.controller_handle.LocalControllerHandle` mirrors the bodies
   of ``locate_volumes`` and ``keys`` **verbatim**, because ``@endpoint`` makes them
   ``EndpointProperty`` descriptors that cannot be invoked off-actor, and torchstore
@@ -38,6 +40,21 @@ MIRRORED_BODIES = {
     "keys": "f3b003d0a74bf6e671bc2242cf2cb114",
 }
 
+#: Members of :class:`proposed.Controller` that are a copy of an upstream endpoint,
+#: and must stay spelled the way upstream spells them.
+COPIED_FROM_UPSTREAM = [
+    "keys",
+    "locate_volumes",
+    "notify_delete",
+    "notify_delete_batch",
+    "notify_put_batch",
+]
+
+#: Members that are the *ask* -- declared here because torchstore would have to gain
+#: them. ``locate_raw`` is ``locate_volumes`` with the policy hook skipped, which is
+#: what a controller hands its own policy through a ``View``.
+THE_ASK = ["locate_raw"]
+
 
 def _real(name: str):
     """The undecorated function behind a real ``@endpoint``."""
@@ -50,17 +67,17 @@ def _digest(name: str) -> str:
     ).hexdigest()[:32]
 
 
-def test_proposed_controller_declares_the_real_surface():
-    """Every member we declare exists upstream, spelled the same way."""
-    declared = [
+def _declared() -> list[str]:
+    return [
         name for name in vars(ProposedController)
         if not name.startswith("_") and callable(getattr(ProposedController, name))
     ]
-    assert sorted(declared) == [
-        "keys", "locate_volumes", "notify_delete", "notify_delete_batch",
-        "notify_put_batch",
-    ], declared
-    for name in declared:
+
+
+def test_proposed_controller_declares_the_real_surface():
+    """Every copied member exists upstream, spelled the same way."""
+    assert sorted(_declared()) == sorted(COPIED_FROM_UPSTREAM + THE_ASK), _declared()
+    for name in COPIED_FROM_UPSTREAM:
         assert name in RealController.__dict__, (
             f"proposed.Controller declares {name!r}, which the real Controller "
             f"does not have -- either it moved upstream or our copy invented it"
@@ -70,8 +87,21 @@ def test_proposed_controller_declares_the_real_surface():
         assert ours == theirs, (
             f"{name}: proposed.Controller takes {ours} and the real Controller "
             f"takes {theirs}. Upstream changed the surface; re-copy it (the "
-            f"difference between the two is meant to be the policy hook, nothing "
-            f"else)"
+            f"difference between the two is meant to be the ask, nothing else)"
+        )
+
+
+def test_the_ask_is_still_an_ask():
+    """The members upstream lacks are the proposal; say so if that changes.
+
+    A failure here is good news: torchstore grew the member, so it stops being
+    something this repo is asking for and moves into ``COPIED_FROM_UPSTREAM`` --
+    where its signature starts being checked against the real one.
+    """
+    for name in THE_ASK:
+        assert name not in RealController.__dict__, (
+            f"the real Controller now has {name!r}: move it from THE_ASK to "
+            f"COPIED_FROM_UPSTREAM and check the signature still matches ours"
         )
 
 
@@ -93,16 +123,20 @@ def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
     method instead, which is what real ``LocalClient`` code requires
     (``locate_volumes.call_one(...)``); collapsing those into methods would break
     every real caller, which is why the two are separate objects.
+
+    The handle carries every member a *caller* reaches, which is all of them but
+    ``locate_raw``: the only reader of the unrouted read is the policy running inside
+    the service, sensing through a ``View`` built over the service itself, so nothing
+    crosses the boundary the handle stands for.
     """
     service = ControllerService(RealController())
     handle = LocalControllerHandle(service)
-    declared = [n for n in vars(ProposedController) if not n.startswith("_")]
-    for name in declared:
+    for name in _declared():
         assert inspect.iscoroutinefunction(getattr(service, name)), (
             f"{name} is not a coroutine on the service: that is the surface "
             f"proposed.Controller declares, and the service is what implements it"
         )
-    for name in declared:
+    for name in [n for n in _declared() if n != "locate_raw"]:
         endpoint = getattr(handle, name)
         assert hasattr(endpoint, "call_one") and hasattr(endpoint, "call"), (
             f"{name} on the handle is not endpoint-shaped: a caller reaches an "

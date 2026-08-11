@@ -15,9 +15,11 @@ simulator, ``proposed`` is the design being argued for.
   directory surface a caller reaches (torchstore names this type but never declares
   it: ``api.py`` annotates the spawned handle as the actor class and ``LocalClient``
   takes it unannotated). The difference between it and torchstore's class is the
-  policy hook;
+  ask: the policy hook inside ``locate_volumes``, and ``locate_raw``, the same read
+  without it;
 * :mod:`proposed.view` -- :class:`~proposed.view.View`, the read-only observation
   a controller hands a policy: who holds a key, where volumes are, what time it is.
+  It reads a :class:`~proposed.deployment.Controller`, through ``locate_raw``.
 
 Import rule, enforced by ``realsim/tools/check_contract.py``: **this package may
 not import anything at all** -- not ``realsim``, not a capability, not even
@@ -36,7 +38,7 @@ from .deployment import Controller, Coordinator, Deployment
 from .plane import ControlPlane, DataPlane
 from .policy import DecisionLog, Policy, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL
-from .view import Directory, View
+from .view import View
 
 __all__ = [
     # the torchstore ask
@@ -44,7 +46,6 @@ __all__ = [
     "Selection",
     "DecisionLog",
     "View",
-    "Directory",
     "Controller",
     "Coordinator",
     "Endpoint",

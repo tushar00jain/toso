@@ -53,10 +53,12 @@ class Controller(Protocol):
     and is not restated here; annotating the handle with the actor's surface is
     the same convention torchstore already uses.
 
-    Every member below already exists on the real ``Controller``. What this surface
-    would have to *gain* is one thing, deliberately not listed: the hook that
-    consults a :class:`~proposed.policy.Policy` inside ``locate_volumes``. The
-    difference between this protocol and torchstore's class is the ask.
+    The difference between this protocol and torchstore's class *is* the ask, and
+    it is two things. One cannot be declared: ``locate_volumes`` gains a hook that
+    consults a :class:`~proposed.policy.Policy`, which changes no signature, so it
+    is stated here instead. The other can be, and is: :meth:`locate_raw`, the same
+    directory read with that hook skipped. Every other member below already exists
+    upstream, spelled the same way.
 
     A caller does not hold one of these -- it holds a :class:`ControllerHandle`.
     torchstore's ``Controller`` implements this; under simulation the two bodies
@@ -71,6 +73,25 @@ class Controller(Protocol):
         require_fully_committed: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
         """``{key -> {volume_id -> StorageInfo}}``, routed."""
+
+    async def locate_raw(
+        self,
+        keys: Sequence[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
+        """The same read, *unrouted*: no policy consulted.
+
+        A controller implementing this proposal needs both reads. This is the one it
+        hands its own policy, through a :class:`~proposed.view.View`: a policy
+        sensing the directory must see it as it *is*, and reading it back through
+        ``locate_volumes`` would re-enter the hook the policy is being called from.
+
+        It is on this surface and not a protocol of its own because the object that
+        has it is the object that answers ``locate_volumes`` -- one directory
+        service, read two ways. A caller that is not the controller's own policy has
+        no reason to reach for it.
+        """
 
     async def notify_put_batch(
         self, requests: Sequence[Any], storage_volume_id: str
