@@ -13,7 +13,7 @@ from typing import Optional
 import torch
 
 from putget_sim.workload.put_get import DEFAULT_N, MODE_META, PutGetBurst
-from realsim.run import execute, Result
+from realsim.run import Result
 
 from ..workload.scenarios import dedup_vs_baseline
 
@@ -39,4 +39,4 @@ def run(
     caps = () if fanout_cap is None else (fanout_cap,)
     runs = dedup_vs_baseline(num_readers, caps, burst=burst)
     chosen = runs[0] if fanout_cap is None else runs[1]
-    return execute(chosen, random_seed=random_seed, real_directory=real_directory)
+    return chosen.execute(random_seed=random_seed, real_directory=real_directory)

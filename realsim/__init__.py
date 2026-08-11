@@ -17,10 +17,11 @@ is here:
 * :mod:`realsim.run` -- the whole run lifecycle in one module, one role per type:
   :class:`~realsim.run.Workload` (the work, and nothing else),
   :class:`~realsim.run.Run` (a labelled configuration -- the workload plus the
-  policy and plane a capability installs around it), :func:`~realsim.run.execute`,
+  policy and plane a capability installs around it, and which knows how to
+  :meth:`~realsim.run.Run.execute` itself),
   :class:`~realsim.run.Result` (one type, for every sim) and
   :class:`~realsim.run.Report` (a finished run, as text). Every run in the repo
-  goes through ``execute``, so no capability wires a stack of its own;
+  goes through ``Run.execute``, so no capability wires a stack of its own;
 * :mod:`realsim.demo` -- :class:`~realsim.demo.Demo`, a sim's command line
   declared rather than hand-rolled, plus the run flags every one of them shares;
 * :mod:`realsim.seams` + :mod:`realsim.adapters` -- run one real client /

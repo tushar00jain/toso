@@ -2,7 +2,7 @@
 
 A scenario is a set of choices, expressed as :class:`~realsim.run.Run` values --
 how many readers, which fan-out caps, and what each configuration installs. It
-wires no clock, no mesh and no plane; :func:`realsim.run.execute` does that, the
+wires no clock, no mesh and no plane; :meth:`realsim.run.Run.execute` does that, the
 same way for every capability.
 
 This is the point of the whole exercise. Every run below shares one

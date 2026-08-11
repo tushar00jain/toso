@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 
 from realsim.demo import Console, Demo, Scenario
-from realsim.run import execute
 from sim_common.cost_model import DEFAULT_PROFILE
 
 from .report.summary import BurstReport
@@ -38,7 +37,7 @@ def _burst(console: Console, args: argparse.Namespace) -> None:
         "on the deterministic virtual-clock engine."
     )
     (run,) = burst(args.readers, n=args.elements, mode=args.mode, profile=PROFILE)
-    result = execute(run, random_seed=args.seed)
+    result = run.execute(random_seed=args.seed)
     console.trace(result.trace)
     console.summary(BurstReport(result))
     console.info(

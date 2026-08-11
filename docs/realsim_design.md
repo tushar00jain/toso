@@ -153,8 +153,8 @@ realsim/
   simulation.py               # Simulation — assembles engine + mesh + directory + registry,
                               #   and runs a Workload's items on it
   run.py                      # the run lifecycle in one place: Workload (the work),
-                              #   Run (one labelled configuration), execute(), Result,
-                              #   Report. The only way anything runs
+                              #   Run (one labelled configuration, which executes
+                              #   itself), Result, Report. The only way anything runs
   demo.py                     # Demo / Scenario / Console — a sim's command line,
                               #   declared; plus the run flags every one of them shares
   tools/

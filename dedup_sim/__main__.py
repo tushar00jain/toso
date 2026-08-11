@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 
 from realsim.demo import Console, Demo, Scenario
-from realsim.run import execute
 
 from .report.summary import BaselineReport, DedupReport
 from .workload.scenarios import dedup_vs_baseline
@@ -34,7 +33,7 @@ from .workload.scenarios import dedup_vs_baseline
 
 def _dedup(console: Console, args: argparse.Namespace) -> None:
     runs = dedup_vs_baseline()
-    results = [execute(run) for run in runs]
+    results = [run.execute() for run in runs]
     naive, routed = results[0], results[1:]
     payload = naive.workload.payload_bytes
     num_readers = naive.workload.num_readers

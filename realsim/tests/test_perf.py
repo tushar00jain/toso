@@ -106,16 +106,14 @@ def test_metadata_sim_path_carries_only_descriptors_at_scale():
 _REALSIM_SNIPPET = (
     "import resource;"
     "from putget_sim.workload.scenarios import burst;"
-    "from realsim.run import execute;"
-    "execute(burst(3, n=1024)[0]);"
+    "burst(3, n=1024)[0].execute();"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
 )
 _DEDUP_SNIPPET = (
     "import resource;"
     "from dedup_sim.workload.scenarios import dedup_vs_baseline;"
     "from putget_sim.workload.put_get import PutGetBurst;"
-    "from realsim.run import execute;"
-    "[execute(r) for r in dedup_vs_baseline(burst=PutGetBurst(3, n=1024), caps=(1,))];"
+    "[r.execute() for r in dedup_vs_baseline(burst=PutGetBurst(3, n=1024), caps=(1,))];"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
 )
 

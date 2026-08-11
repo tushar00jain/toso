@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
-from realsim.run import execute, Result, Run
+from realsim.run import Result, Run
 
 from ..workload import scenarios
 
@@ -28,12 +28,12 @@ __all__ = [
 
 def results(runs: Sequence[Run]) -> List[Result]:
     """Execute a scenario's runs, in the order it declared them."""
-    return [execute(r) for r in runs]
+    return [r.execute() for r in runs]
 
 
 def run(topology, requests, kind: str, **knobs) -> Result:
     """One ad-hoc configuration, built the same way every scenario builds one."""
-    return execute(scenarios.configure(kind, topology, requests, kind, **knobs))
+    return scenarios.configure(kind, topology, requests, kind, **knobs).execute()
 
 
 def run_shared_prefix(seed: int = 0) -> List[Result]:

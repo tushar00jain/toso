@@ -2,7 +2,7 @@
 
 Five things, in the order they happen: what the work is (:class:`Workload`), how
 one configuration of it is described (:class:`Run`), how it is executed
-(:func:`execute`), what that produced (:class:`Result`), and how that is shown
+(:meth:`Run.execute`), what that produced (:class:`Result`), and how that is shown
 (:class:`Report`). They were five files; they are one, because a capability
 touches all of them for a single scenario and jumping between modules to read one
 story is its own cost.
@@ -12,8 +12,8 @@ same burst unrouted and then once per fan-out cap; kvcache runs the same request
 stream under two schedulers. What differs between those runs is not the workload,
 it is the *policy* and the *data plane*.
 
-:class:`Run` is that difference, as data: a label, the workload, and the pieces
-the capability installs around it. :func:`execute` is the only code that turns
+:class:`Run` is that difference: a label, the workload, and the pieces the
+capability installs around it. :meth:`Run.execute` is the only code that turns
 one into a :class:`Result`, so three capabilities cannot drift in how they wire a
 stack -- which is what a per-capability ``harness.py`` used to allow, each with
 its own signature (``run_burst(num_readers, ...)`` vs ``run(topology, requests,
@@ -21,7 +21,14 @@ kind, ...)``).
 
     runs = [Run("baseline", burst),
             Run("cap=1", burst, policy=DedupPolicy(1, trace=t), plane=make_plane)]
-    results = [execute(r) for r in runs]
+    results = [r.execute() for r in runs]
+
+:class:`Simulation` deliberately does *not* take a ``Run``. It is constructible
+from a topology alone, and a dozen tests do exactly that to get an assembled
+stack -- mesh, view, transfer-cost estimate -- with nothing to run on it. A
+``Run`` requires a ``Workload``, so demanding one would make those tests invent
+work they do not perform. :meth:`Run.execute` is the seam between the two: it is
+where a capability's declaration becomes the stack's constructor arguments.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from sim_common.trace import Trace
 from realsim.runner import WorkItem
 from realsim.simulation import Simulation
 
-__all__ = ["Workload", "Report", "MakePlane", "Run", "Result", "execute"]
+__all__ = ["Workload", "Report", "MakePlane", "Run", "Result"]
 
 
 class Workload(ABC):
@@ -88,7 +95,7 @@ MakePlane = Callable[[Simulation], DataPlane]
 
 @dataclass
 class Run:
-    """One labelled configuration. Data -- executing it is :func:`execute`'s job.
+    """One labelled configuration, and the one way to carry it out.
 
     Args:
         label: how this run is named in a comparison ("baseline", "cap=1").
@@ -111,6 +118,33 @@ class Run:
     profile: Optional[MachineProfile] = None
     trace: Optional[Trace] = None
     ledger: Optional[Ledger] = None
+
+    def execute(
+        self,
+        *,
+        real_directory: Optional[bool] = None,
+        quiet: Optional[bool] = None,
+        random_seed: Optional[int] = None,
+    ) -> "Result":
+        """Assemble a stack for this configuration, drive it, return the result.
+
+        The knobs here are the ones a *caller* varies per invocation rather than
+        the scenario declaring them -- the CLI's ``--seed``, a test forcing the
+        shim directory. Everything that describes the run itself is a field.
+        """
+        sim = Simulation(
+            self.workload.topology,
+            policy=self.policy,
+            profile=self.profile,
+            trace=self.trace,
+            ledger=self.ledger,
+            real_directory=real_directory,
+            quiet=quiet,
+            random_seed=random_seed,
+        )
+        plane = self.plane(sim) if self.plane is not None else None
+        results = sim.run(self.workload, plane=plane)
+        return Result(results=results, sim=sim, run=self)
 
 
 @dataclass
@@ -146,26 +180,3 @@ class Result:
     def ledger(self) -> Ledger:
         """The run's outcome rows and transfer accounting."""
         return self.sim.ledger
-
-
-def execute(
-    run: Run,
-    *,
-    real_directory: Optional[bool] = None,
-    quiet: Optional[bool] = None,
-    random_seed: Optional[int] = None,
-) -> Result:
-    """Assemble a stack for ``run``, drive it, and return what it produced."""
-    sim = Simulation(
-        run.workload.topology,
-        policy=run.policy,
-        profile=run.profile,
-        trace=run.trace,
-        ledger=run.ledger,
-        real_directory=real_directory,
-        quiet=quiet,
-        random_seed=random_seed,
-    )
-    plane = run.plane(sim) if run.plane is not None else None
-    results = sim.run(run.workload, plane=plane)
-    return Result(results=results, sim=sim, run=run)

@@ -2,7 +2,7 @@
 
 Each function fixes a topology and a synthetic workload, then returns the
 :class:`~realsim.run.Run` values to compare -- same requests, different wiring.
-Nothing here builds a clock, a mesh or a plane: :func:`realsim.run.execute` does
+Nothing here builds a clock, a mesh or a plane: :meth:`realsim.run.Run.execute` does
 that, the same way for every capability.
 """
 

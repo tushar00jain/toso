@@ -27,7 +27,7 @@ What it builds, top to bottom (compare the stack in the design doc):
 
 :meth:`Simulation.run` then puts a :class:`~realsim.runner.Runner` over it and
 drives a :class:`~realsim.run.Workload`'s items on the clock. It assembles;
-the workload supplies the work; :func:`realsim.run.execute` pairs the two.
+the workload supplies the work; :meth:`realsim.run.Run.execute` pairs the two.
 """
 
 from __future__ import annotations

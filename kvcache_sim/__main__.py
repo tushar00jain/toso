@@ -26,7 +26,7 @@ import argparse
 from typing import List
 
 from realsim.demo import Console, Demo, Scenario
-from realsim.run import execute, Result, Run
+from realsim.run import Result, Run
 
 from .report.summary import (
     CacheVsBaselineReport,
@@ -41,7 +41,7 @@ TRACE_LIMIT = 60
 
 
 def _results(runs: List[Run]) -> List[Result]:
-    return [execute(run) for run in runs]
+    return [run.execute() for run in runs]
 
 
 def _shared_prefix(console: Console, args: argparse.Namespace) -> None:
