@@ -1,7 +1,8 @@
 """The one place the whole stack is assembled: :class:`Simulation`.
 
 Every layer the design doc draws is built here, in that order, once. A capability
-supplies only what is capability-specific -- a policy, a data plane, a workload --
+supplies only what is capability-specific -- a control plane, a data plane, a
+workload --
 and never re-stitches the stack underneath it. Before this existed each capability
 wired its own clock, ledger, mesh and runner, and the shapes drifted apart: one
 made an ``AsyncEngine`` directly and one went through ``run_sim``; one hooked
@@ -18,8 +19,8 @@ What it builds, top to bottom (compare the stack in the design doc):
   time makes sleeps free and exact;
 * the **mesh**: the real controller directory, a real volume + co-located real
   client per node, the shared resource registry, and the one shared
-  ``create_transport_buffer``. A ``policy``, if given, is installed in the real
-  ``locate_volumes`` body here;
+  ``create_transport_buffer``. A ``control`` plane that answers the store's
+  routing question is installed in the real ``locate_volumes`` body here;
 * the **view** the control plane senses through, over that same directory;
 * the **transfer-cost estimate**, from the *same* topology and profile the mesh
   charges against, so a scheduler cannot predict against one model while the
@@ -127,17 +128,18 @@ class Simulation:
         self.view: View = self.mesh.view
         self.transfer_cost = ProfileTransferCost(self.mesh.topology, self.profile)
 
-        # The second service, assembled exactly like the first: declared to this
-        # constructor, stood up here. A control plane installed in the *directory*
-        # went in through ``policy`` above and is reached through the seam already
-        # in front of it (FakeControllerHandle); one that runs on its own gets its
-        # seam here. Built last because a control plane senses through the view
-        # and prices through the transfer-cost estimate, so both must exist first.
-        # A control plane that senses through the stack says so by declaring
-        # attach() -- and that is exactly the one that decides more than the
-        # store's question, so it is also the one worth reaching as a service. A
-        # pure directory policy declares neither and gets no handle: it is reached
-        # through the seam already in front of the directory.
+        # The same ``control`` object, reached from the other side. It has already
+        # gone into the Mesh above if it answers the store's question, where the
+        # seam in front of the directory (FakeControllerHandle) consults it; what
+        # happens here is the second seam, for a control plane that also decides
+        # more than that. So: one object, two services, a handle built in one place
+        # only -- the directory's already existed.
+        #
+        # ``attach()`` is how an object says it senses through this stack, and it
+        # is exactly the objects deciding more than the store's question that need
+        # to; a pure directory policy declares none and gets no handle. It runs
+        # last because attach hands over the view and the transfer-cost estimate,
+        # so both must exist by now.
         attach = getattr(control, "attach", None) if control is not None else None
         self.coordinator_handle: Optional[Any] = None
         if attach is not None:

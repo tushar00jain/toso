@@ -99,11 +99,13 @@ class Coordinator(Protocol):
     notification that blocked the stepping loop would be modelling something no
     deployment would build.
 
-    :class:`realsim.seams.coordinator.CoordinatorHandle` is what actually stands
-    here under simulation: it wraps the scheduler, is the one place a round trip
-    is charged, and is what a Monarch endpoint would replace. The scheduler itself
-    does not implement this protocol -- its methods are ordinary sync ones -- and
-    that is the point of the handle.
+    :class:`realsim.seams.coordinator.CoordinatorHandle` is what stands here under
+    simulation: it wraps a control plane that implements this protocol, is the one
+    place a round trip is charged, and is what a Monarch endpoint would replace.
+    The handle satisfies this protocol *and* so does the object behind it -- the
+    same shape on both sides of the boundary, which is what makes the boundary
+    insertable. :class:`_Base` declares it alongside
+    :class:`~proposed.policy.Policy`, because one object does both jobs.
     """
 
     async def schedule(self, request: Request, now: float) -> Optional["Plan"]:
@@ -167,8 +169,17 @@ class Completion:
     evict: List[str]     # blocks LRU dropped, to remove from the directory
 
 
-class _Base(Policy):
+class _Base(Policy, Coordinator):
     """Shared state + prediction/commit helpers for both schedulers.
+
+    **This class does both control-plane jobs, and says so in its bases.** It is a
+    :class:`~proposed.policy.Policy`, so the run installs it in the directory and
+    the controller consults it there (:meth:`select`); and it is a
+    :class:`Coordinator`, so the run also fronts it with a
+    :class:`~realsim.seams.coordinator.CoordinatorHandle` and a serving host
+    reaches it as its own service. The two are one object on purpose: the peer it
+    prices a pull against is the peer it later tells the directory to serve, with
+    nothing threaded through the data plane to carry that between them.
 
     Args:
         view: a :class:`~kvcache_sim.control._view.KVView` -- the only way this
@@ -300,7 +311,7 @@ class _Base(Policy):
         return await self.source_policy.select(self.view or view, list(keys), requester)
 
     # -- what the data plane reports back --------------------------------- #
-    def observe_prefill_done(self, inst: str, now: float) -> float:
+    async def observe_prefill_done(self, inst: str, now: float) -> float:
         """Correct the predicted queue with the clock the real ops reached.
 
         ``schedule`` reserved this instance until the *predicted* ``done_time``;
@@ -386,7 +397,7 @@ class _Base(Policy):
             return None
         return self._commit(plan)
 
-    def decode_admission(self, plan: Plan) -> bool:
+    async def decode_admission(self, plan: Plan) -> bool:
         """May this accepted request enter its decode batch now?
 
         ``False`` when decode cannot honour the TBT SLO. In ``off`` mode this is
@@ -405,7 +416,7 @@ class _Base(Policy):
         return True
 
     # -- commit / completion --------------------------------------------- #
-    def complete(self, plan: Plan) -> Completion:
+    async def complete(self, plan: Plan) -> Completion:
         """Admit the request's blocks into its prefill instance's cache.
 
         After prefill the instance holds KV for the whole prompt, so every block
