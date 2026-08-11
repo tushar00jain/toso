@@ -1,9 +1,14 @@
-"""The kvcache scenarios: which configurations each comparison runs.
+"""The kvcache scenarios: six comparisons, each a :class:`realsim.demo.Scenario`.
 
-Each function fixes a topology and a synthetic workload, then returns the
-:class:`~realsim.run.Run` values to compare -- same requests, different wiring.
-Nothing here builds a clock, a mesh or a plane: :meth:`realsim.run.Run.execute` does
-that, the same way for every capability.
+Each one fixes a topology and a synthetic request stream, declares the
+:class:`~realsim.run.Run` values to compare -- same requests, different wiring --
+and narrates the results. Nothing here builds a clock, a mesh or a plane, and
+nothing here executes: :meth:`realsim.demo.Demo.main` does that with
+:meth:`realsim.run.Run.execute`, the same way for every capability.
+
+Each is parameterized by its seed at construction rather than by a CLI flag, so
+``SharedPrefix(seed=1).runs()`` gives a test the same configurations the demo
+shows, with no command line involved.
 """
 
 from __future__ import annotations
@@ -34,18 +39,12 @@ __all__ = [
     "make_topology",
     "subset",
     "shared_prefix_workload",
-    "shared_prefix",
     "EVICTION_CAPACITIES",
-    "eviction_sweep",
     "hotspot_workload",
-    "hotspot",
-    "overload",
     "DISAGG_TARGET_TBT",
     "DISAGG_MAX_BATCH",
-    "disaggregation",
     "EARLY_SLO_TBT",
     "EARLY_MAX_BATCH",
-    "early_rejection",
     "SharedPrefix",
     "Eviction",
     "Hotspot",
@@ -104,33 +103,10 @@ def shared_prefix_workload(seed: int = 0):
     )
 
 
-def shared_prefix(seed: int = 0) -> List[Run]:
-    """Cache-aware vs load-balance on the shared-prefix workload (ample capacity)."""
-    topo = make_topology(4)
-    reqs = shared_prefix_workload(seed)
-    return [
-        configure("cache_aware", topo, reqs, "cache_aware"),
-        configure("load_balance", topo, reqs, "load_balance"),
-    ]
-
 
 #: Per-instance cache capacities the eviction sweep walks.
 EVICTION_CAPACITIES = (2, 4, 8, 16, 32, 64, 256)
 
-
-def eviction_sweep(seed: int = 0) -> List[Run]:
-    """One cache-aware run per capacity; the report reads the hit-rate curve off
-    their ledgers. Each run is labelled with its capacity."""
-    topo = make_topology(4)
-    reqs = make_workload(
-        num_requests=400, num_conversations=12, system_blocks=2,
-        conv_base_blocks=4, query_blocks=2, zipf_s=1.05, arrival_rate=2.5,
-        block_tokens=BLOCK_TOKENS, output_tokens=64, seed=seed,
-    )
-    return [
-        configure(str(cap), topo, reqs, "cache_aware", capacity=cap)
-        for cap in EVICTION_CAPACITIES
-    ]
 
 
 def hotspot_workload(seed: int = 0):
@@ -142,31 +118,7 @@ def hotspot_workload(seed: int = 0):
     )
 
 
-def hotspot(seed: int = 0) -> List[Run]:
-    """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware."""
-    topo = make_topology(4)
-    reqs = hotspot_workload(seed)
-    return [
-        configure("baseline", topo, reqs, "load_balance"),
-        configure("no_replication", topo, reqs, "cache_aware", replicate=False),
-        configure("replication", topo, reqs, "cache_aware",
-             balance_threshold=1.2, replicate=True),
-    ]
 
-
-def overload(seed: int = 0) -> List[Run]:
-    """High arrival rate + a TTFT SLO -> some requests must be rejected."""
-    topo = make_topology(4)
-    reqs = make_workload(
-        num_requests=300, num_conversations=6, system_blocks=6,
-        conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=9.0,
-        block_tokens=BLOCK_TOKENS, output_tokens=64, seed=seed,
-    )
-    slo = 6.0
-    return [
-        configure("cache_aware", topo, reqs, "cache_aware", slo_ttft=slo),
-        configure("load_balance", topo, reqs, "load_balance", slo_ttft=slo),
-    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -178,60 +130,28 @@ DISAGG_TARGET_TBT = 5 * decode_step_time(1, DEFAULT_PROFILE)
 DISAGG_MAX_BATCH = 8
 
 
-def disaggregation(seed: int = 0) -> List[Run]:
-    """Disaggregating prefill from decode protects TBT (Mooncake's headline).
-
-    Both configs run with admission disabled (``slo_tbt=inf``, ``early_rejection=
-    "off"``) so every request is served and measured. Decode capacity is fixed (two
-    instances, ``DISAGG_MAX_BATCH`` each); the only difference is whether those two
-    instances also do prefill. Returns ``[disaggregated, coupled]``.
-    """
-    topo = make_topology(4)  # s0..s3
-    reqs = make_workload(
-        num_requests=120, num_conversations=8, system_blocks=2,
-        conv_base_blocks=2, query_blocks=1, zipf_s=1.1, arrival_rate=1.2,
-        block_tokens=BLOCK_TOKENS, output_tokens=12, seed=seed,
-    )
-    common = dict(
-        simulate_decode=True, slo_tbt=float("inf"), early_rejection="off",
-        max_batch=DISAGG_MAX_BATCH,
-    )
-    return [
-        configure("disaggregated", topo, reqs, "cache_aware",
-             prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], coupled=False,
-             **common),
-        configure("coupled", subset(topo, ["s2", "s3"]), reqs, "cache_aware",
-             coupled=True, **common),
-    ]
-
 
 # TBT SLO for the early-rejection scenario: 3 x baseline step time.
 EARLY_SLO_TBT = 3 * decode_step_time(1, DEFAULT_PROFILE)
 EARLY_MAX_BATCH = 8
 
 
-def early_rejection(seed: int = 0) -> List[Run]:
-    """Predicting decode load avoids wasting prefill (off/early/predict)."""
-    topo = make_topology(4)
-    reqs = make_workload(
-        num_requests=160, num_conversations=6, system_blocks=6,
-        conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=20.0,
-        block_tokens=BLOCK_TOKENS, output_tokens=32, seed=seed,
-    )
-    common = dict(
-        simulate_decode=True, slo_tbt=EARLY_SLO_TBT, max_batch=EARLY_MAX_BATCH
-    )
-    return [
-        configure(mode, topo, reqs, "cache_aware", early_rejection=mode, **common)
-        for mode in ("off", "early", "predict")
-    ]
-
 
 class SharedPrefix(Scenario):
+    """Cache-aware vs load-balance on the shared-prefix workload (ample capacity)."""
+
     name = "shared_prefix"
 
-    def runs(self, args) -> List[Run]:
-        return shared_prefix()
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+
+    def runs(self, args=None) -> List[Run]:
+        topo = make_topology(4)
+        reqs = shared_prefix_workload(self.seed)
+        return [
+            configure("cache_aware", topo, reqs, "cache_aware"),
+            configure("load_balance", topo, reqs, "load_balance"),
+        ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("SHARED PREFIX: conversations sharing a hot system prompt + context")
@@ -245,10 +165,25 @@ class SharedPrefix(Scenario):
 
 
 class Eviction(Scenario):
+    """One cache-aware run per capacity; the report reads the hit-rate curve off
+    their ledgers. Each run is labelled with its capacity."""
+
     name = "eviction"
 
-    def runs(self, args) -> List[Run]:
-        return eviction_sweep()
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+
+    def runs(self, args=None) -> List[Run]:
+        topo = make_topology(4)
+        reqs = make_workload(
+            num_requests=400, num_conversations=12, system_blocks=2,
+            conv_base_blocks=4, query_blocks=2, zipf_s=1.05, arrival_rate=2.5,
+            block_tokens=BLOCK_TOKENS, output_tokens=64, seed=self.seed,
+        )
+        return [
+            configure(str(cap), topo, reqs, "cache_aware", capacity=cap)
+            for cap in EVICTION_CAPACITIES
+        ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("EVICTION: hit rate vs cache capacity (LRU)")
@@ -261,10 +196,22 @@ class Eviction(Scenario):
 
 
 class Hotspot(Scenario):
+    """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware."""
+
     name = "hotspot"
 
-    def runs(self, args) -> List[Run]:
-        return hotspot()
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+
+    def runs(self, args=None) -> List[Run]:
+        topo = make_topology(4)
+        reqs = hotspot_workload(self.seed)
+        return [
+            configure("baseline", topo, reqs, "load_balance"),
+            configure("no_replication", topo, reqs, "cache_aware", replicate=False),
+            configure("replication", topo, reqs, "cache_aware",
+                 balance_threshold=1.2, replicate=True),
+        ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("HOTSPOT: extreme skew -> hot-block replication spreads load")
@@ -279,10 +226,25 @@ class Hotspot(Scenario):
 
 
 class Overload(Scenario):
+    """High arrival rate + a TTFT SLO -> some requests must be rejected."""
+
     name = "overload"
 
-    def runs(self, args) -> List[Run]:
-        return overload()
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+
+    def runs(self, args=None) -> List[Run]:
+        topo = make_topology(4)
+        reqs = make_workload(
+            num_requests=300, num_conversations=6, system_blocks=6,
+            conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=9.0,
+            block_tokens=BLOCK_TOKENS, output_tokens=64, seed=self.seed,
+        )
+        slo = 6.0
+        return [
+            configure("cache_aware", topo, reqs, "cache_aware", slo_ttft=slo),
+            configure("load_balance", topo, reqs, "load_balance", slo_ttft=slo),
+        ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("OVERLOAD: high arrival + TTFT SLO -> rejections")
@@ -293,10 +255,37 @@ class Overload(Scenario):
 
 
 class Disaggregation(Scenario):
+    """Disaggregating prefill from decode protects TBT (Mooncake's headline).
+
+    Both configs run with admission disabled (``slo_tbt=inf``, ``early_rejection=
+    "off"``) so every request is served and measured. Decode capacity is fixed (two
+    instances, ``DISAGG_MAX_BATCH`` each); the only difference is whether those two
+    instances also do prefill. Returns ``[disaggregated, coupled]``.
+    """
+
     name = "disaggregation"
 
-    def runs(self, args) -> List[Run]:
-        return disaggregation()
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+
+    def runs(self, args=None) -> List[Run]:
+        topo = make_topology(4)  # s0..s3
+        reqs = make_workload(
+            num_requests=120, num_conversations=8, system_blocks=2,
+            conv_base_blocks=2, query_blocks=1, zipf_s=1.1, arrival_rate=1.2,
+            block_tokens=BLOCK_TOKENS, output_tokens=12, seed=self.seed,
+        )
+        common = dict(
+            simulate_decode=True, slo_tbt=float("inf"), early_rejection="off",
+            max_batch=DISAGG_MAX_BATCH,
+        )
+        return [
+            configure("disaggregated", topo, reqs, "cache_aware",
+                 prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], coupled=False,
+                 **common),
+            configure("coupled", subset(topo, ["s2", "s3"]), reqs, "cache_aware",
+                 coupled=True, **common),
+        ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("DISAGGREGATION: dedicated decode pool protects TBT from prefill")
@@ -317,10 +306,27 @@ class Disaggregation(Scenario):
 
 
 class EarlyRejection(Scenario):
+    """Predicting decode load avoids wasting prefill (off/early/predict)."""
+
     name = "early_rejection"
 
-    def runs(self, args) -> List[Run]:
-        return early_rejection()
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+
+    def runs(self, args=None) -> List[Run]:
+        topo = make_topology(4)
+        reqs = make_workload(
+            num_requests=160, num_conversations=6, system_blocks=6,
+            conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=20.0,
+            block_tokens=BLOCK_TOKENS, output_tokens=32, seed=self.seed,
+        )
+        common = dict(
+            simulate_decode=True, slo_tbt=EARLY_SLO_TBT, max_batch=EARLY_MAX_BATCH
+        )
+        return [
+            configure(mode, topo, reqs, "cache_aware", early_rejection=mode, **common)
+            for mode in ("off", "early", "predict")
+        ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("EARLY REJECTION: predict decode load, don't waste prefill")

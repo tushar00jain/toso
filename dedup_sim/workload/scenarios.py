@@ -1,9 +1,10 @@
-"""The dedup scenarios: which configurations each comparison runs.
+"""The dedup scenario: one comparison, as a :class:`realsim.demo.Scenario`.
 
-A scenario is a set of choices, expressed as :class:`~realsim.run.Run` values --
-how many readers, which fan-out caps, and what each configuration installs. It
-wires no clock, no mesh and no plane; :meth:`realsim.run.Run.execute` does that, the
-same way for every capability.
+:class:`Dedup` declares its choices as :class:`~realsim.run.Run` values -- how
+many readers, which fan-out caps, and what each configuration installs -- and
+narrates the results. It wires no clock, no mesh and no plane, and it executes
+nothing; :meth:`realsim.demo.Demo.main` does that with
+:meth:`realsim.run.Run.execute`, the same way for every capability.
 
 This is the point of the whole exercise. Every run below shares one
 :class:`~putget_sim.workload.put_get.PutGetBurst` -- ordinary user code: seed
@@ -28,7 +29,7 @@ from ..control.routing import DedupPolicy
 from ..data.read_through import ReadThroughPlane
 from ..report.summary import BaselineReport, DedupReport
 
-__all__ = ["NUM_READERS", "FANOUT_CAPS", "dedup_vs_baseline", "Dedup"]
+__all__ = ["NUM_READERS", "FANOUT_CAPS", "Dedup"]
 
 #: Readers in the burst. Three is enough to show a chain and a shallow tree.
 NUM_READERS = 3
@@ -36,45 +37,51 @@ NUM_READERS = 3
 FANOUT_CAPS = (1, 2)
 
 
-def dedup_vs_baseline(
-    num_readers: int = NUM_READERS,
-    caps: Sequence[int] = FANOUT_CAPS,
-    *,
-    burst: Optional[PutGetBurst] = None,
-) -> List[Run]:
-    """The unrouted baseline, then one routed run per fan-out cap.
-
-    Returns the runs in comparison order: ``["baseline", "cap=1", "cap=2"]``.
-    """
-    burst = burst if burst is not None else PutGetBurst(num_readers)
-    runs = [Run("baseline", burst, profile=burst.profile)]
-    for cap in caps:
-        # The policy records into the same trace the run reports, and it is
-        # installed in the controller when the mesh is built -- so the trace has
-        # to exist before the stack, which is why the Run carries it.
-        trace = Trace()
-        runs.append(
-            Run(
-                f"cap={cap}",
-                burst,
-                policy=DedupPolicy(fanout_cap=cap, trace=trace),
-                plane=lambda sim, b=burst: ReadThroughPlane(
-                    sim.mesh, KEY, b.put_value
-                ),
-                profile=burst.profile,
-                trace=trace,
-            )
-        )
-    return runs
-
 
 class Dedup(Scenario):
-    """The one comparison: the same burst unrouted, then routed at each cap."""
+    """The unrouted baseline, then one routed run per fan-out cap.
+
+    Every run shares one :class:`~putget_sim.workload.put_get.PutGetBurst`, so
+    the baseline and each cap cannot differ in what they simulate. Parameterized
+    by construction rather than by a flag, so a test can ask for a narrower
+    comparison without a command line.
+    """
 
     name = "dedup"
 
-    def runs(self, args) -> List[Run]:
-        return dedup_vs_baseline()
+    def __init__(
+        self,
+        num_readers: int = NUM_READERS,
+        caps: Sequence[int] = FANOUT_CAPS,
+        *,
+        burst: Optional[PutGetBurst] = None,
+    ) -> None:
+        self.num_readers = num_readers
+        self.caps = caps
+        self.burst = burst
+
+    def runs(self, args=None) -> List[Run]:
+        """The runs in comparison order: ``["baseline", "cap=1", "cap=2"]``."""
+        burst = self.burst or PutGetBurst(self.num_readers)
+        runs = [Run("baseline", burst, profile=burst.profile)]
+        for cap in self.caps:
+            # The policy records into the same trace the run reports, and it is
+            # installed in the controller when the mesh is built -- so the trace has
+            # to exist before the stack, which is why the Run carries it.
+            trace = Trace()
+            runs.append(
+                Run(
+                    f"cap={cap}",
+                    burst,
+                    policy=DedupPolicy(fanout_cap=cap, trace=trace),
+                    plane=lambda sim, b=burst: ReadThroughPlane(
+                        sim.mesh, KEY, b.put_value
+                    ),
+                    profile=burst.profile,
+                    trace=trace,
+                )
+            )
+        return runs
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         naive, routed = results[0], results[1:]

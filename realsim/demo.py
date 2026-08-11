@@ -216,8 +216,11 @@ class Scenario(ABC):
         class Hotspot(Scenario):
             name = "hotspot"
 
-            def runs(self, args):
-                return hotspot()
+            def __init__(self, seed: int = 0):
+                self.seed = seed
+
+            def runs(self, args=None):
+                return [configure(...), configure(...)]
 
             def show(self, console, results):
                 console.section("HOTSPOT: ...")
@@ -228,8 +231,13 @@ class Scenario(ABC):
     name: str = ""
 
     @abstractmethod
-    def runs(self, args: argparse.Namespace) -> Sequence[Run]:
-        """The configurations to compare. Declares; executes nothing."""
+    def runs(self, args: Optional[argparse.Namespace] = None) -> Sequence[Run]:
+        """The configurations to compare. Declares; executes nothing.
+
+        ``args`` is the parsed command line, for a scenario whose shape a flag
+        varies. One parameterized by construction instead ignores it, so a test
+        can ask for its runs with no command line at all.
+        """
 
     @abstractmethod
     def show(self, console: Console, results: Sequence[Result]) -> None:

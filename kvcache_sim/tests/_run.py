@@ -37,28 +37,28 @@ def run(topology, requests, kind: str, **knobs) -> Result:
 
 
 def run_shared_prefix(seed: int = 0) -> List[Result]:
-    return results(scenarios.shared_prefix(seed))
+    return results(scenarios.SharedPrefix(seed).runs())
 
 
 def run_hotspot(seed: int = 0) -> List[Result]:
-    return results(scenarios.hotspot(seed))
+    return results(scenarios.Hotspot(seed).runs())
 
 
 def run_overload(seed: int = 0) -> List[Result]:
-    return results(scenarios.overload(seed))
+    return results(scenarios.Overload(seed).runs())
 
 
 def run_disaggregation(seed: int = 0) -> List[Result]:
-    return results(scenarios.disaggregation(seed))
+    return results(scenarios.Disaggregation(seed).runs())
 
 
 def run_early_rejection(seed: int = 0) -> List[Result]:
-    return results(scenarios.early_rejection(seed))
+    return results(scenarios.EarlyRejection(seed).runs())
 
 
 def run_eviction_sweep(seed: int = 0):
     """``(capacity, hit_rate, fabric_bytes)`` rows, as the report reads them."""
     return [
         (int(r.label), r.ledger.hit_rate, r.ledger.fabric_bytes)
-        for r in results(scenarios.eviction_sweep(seed))
+        for r in results(scenarios.Eviction(seed).runs())
     ]

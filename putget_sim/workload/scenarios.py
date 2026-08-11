@@ -1,9 +1,12 @@
-"""What this sim runs: one unrouted burst.
+"""What this sim runs: one unrouted burst, as a :class:`realsim.demo.Scenario`.
 
 The degenerate comparison -- a single :class:`~realsim.run.Run` with no policy
 and no data plane. That absence is the content: it is the ``m x`` baseline
 ``dedup_sim`` measures its 1x against, and ``dedup_sim`` builds its own runs over
 this same :class:`~putget_sim.workload.put_get.PutGetBurst`.
+
+Unlike the other two sims, this scenario's shape comes from the command line
+(``-m``, ``-n``, ``--mode``), so :meth:`Burst.runs` reads its ``args``.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from ..report.summary import BurstReport
 from .put_get import DEFAULT_N, MODE_META, PutGetBurst
 
-__all__ = ["NUM_READERS", "PROFILE", "burst", "Burst"]
+__all__ = ["NUM_READERS", "PROFILE", "Burst"]
 
 #: Readers in the burst, when the CLI does not say otherwise.
 NUM_READERS = 3
@@ -30,25 +33,18 @@ NUM_READERS = 3
 PROFILE = DEFAULT_PROFILE
 
 
-def burst(
-    num_readers: int = NUM_READERS,
-    *,
-    n: int = DEFAULT_N,
-    mode: str = MODE_META,
-    profile: Optional[MachineProfile] = None,
-) -> List[Run]:
-    """The one run: ``num_readers`` readers get W, with nothing installed."""
-    workload = PutGetBurst(num_readers, n=n, mode=mode, profile=profile)
-    return [Run("unrouted", workload, profile=workload.profile)]
-
 
 class Burst(Scenario):
     """The one comparison there is not: a single unrouted run."""
 
     name = "burst"
 
-    def runs(self, args) -> List[Run]:
-        return burst(args.readers, n=args.elements, mode=args.mode, profile=PROFILE)
+    def runs(self, args=None) -> List[Run]:
+        """The one run: ``args.readers`` readers get W, with nothing installed."""
+        workload = PutGetBurst(
+            args.readers, n=args.elements, mode=args.mode, profile=PROFILE
+        )
+        return [Run("unrouted", workload, profile=workload.profile)]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         (result,) = results

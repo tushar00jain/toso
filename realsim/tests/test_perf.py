@@ -105,15 +105,15 @@ def test_metadata_sim_path_carries_only_descriptors_at_scale():
 # by the shared torch/monarch import baseline, which is the point of the parity.
 _REALSIM_SNIPPET = (
     "import resource;"
-    "from putget_sim.workload.scenarios import burst;"
-    "burst(3, n=1024)[0].execute();"
+    "from realsim.tests._burst import run_burst;"
+    "run_burst(3, n=1024);"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
 )
 _DEDUP_SNIPPET = (
     "import resource;"
-    "from dedup_sim.workload.scenarios import dedup_vs_baseline;"
+    "from dedup_sim.workload.scenarios import Dedup;"
     "from putget_sim.workload.put_get import PutGetBurst;"
-    "[r.execute() for r in dedup_vs_baseline(burst=PutGetBurst(3, n=1024), caps=(1,))];"
+    "[r.execute() for r in Dedup(caps=(1,), burst=PutGetBurst(3, n=1024)).runs()];"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
 )
 

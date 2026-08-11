@@ -241,7 +241,7 @@ def test_the_scenario_holds_no_burst_loop():
     ]
     # ...and every run is literally the same workload object, one policy apart:
     # the baseline and each routed cap cannot differ in what they simulate.
-    runs = scenarios.dedup_vs_baseline()
+    runs = scenarios.Dedup().runs()
     assert [r.label for r in runs] == ["baseline", "cap=1", "cap=2"]
     assert all(isinstance(r.workload, PutGetBurst) for r in runs)
     assert len({id(r.workload) for r in runs}) == 1
