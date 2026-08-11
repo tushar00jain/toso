@@ -9,7 +9,7 @@ transfer accounting and one did not; one built its transfer-cost estimate from t
 same profile and topology as its mesh with nothing holding the two together.
 
     sim = Simulation(topology, policy=DedupPolicy())
-    results = sim.run(items, plane=my_plane)
+    results = sim.run(my_workload, plane=my_plane)
 
 What it builds, top to bottom (compare the stack in the design doc):
 
@@ -26,12 +26,13 @@ What it builds, top to bottom (compare the stack in the design doc):
   transport charges another.
 
 :meth:`Simulation.run` then puts a :class:`~realsim.runner.Runner` over it and
-drives the work items on the clock.
+drives a :class:`~realsim.workload.Workload`'s items on the clock. It assembles;
+the workload supplies the work; :func:`realsim.run.execute` pairs the two.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from proposed import DataPlane, Endpoint, Policy, View
 from sim_common.async_engine import AsyncEngine
@@ -44,7 +45,10 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
-from realsim.runner import Runner, WorkItem
+from realsim.runner import Runner
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from realsim.workload import Workload
 
 __all__ = ["Simulation"]
 
@@ -141,16 +145,15 @@ class Simulation:
     # -- driving it ---------------------------------------------------------- #
     def run(
         self,
-        items: Sequence[WorkItem],
+        workload: "Workload",
         *,
         plane: Optional[DataPlane] = None,
-        setup: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Run ``items`` on this stack; return ``item id -> result``.
+        """Run ``workload`` on this stack; return ``item id -> result``.
 
-        The plane says whether it publishes its own outcome rows and whether it
-        has work outliving the items, so neither is passed here. ``setup`` is
-        awaited before the first item is released.
+        The workload supplies the items and whatever precedes them on the clock;
+        the plane says whether it publishes its own outcome rows and whether it
+        has work outliving the items, so none of that is passed here.
 
         Closes the loop when done; a :class:`Simulation` runs once.
         """
@@ -162,10 +165,10 @@ class Simulation:
             ledger=None if plane.writes_own_outcomes else self.ledger,
             drain=plane.drain if drains else None,
         )
+        items = workload.items(self)
 
         async def _go() -> Dict[str, Any]:
-            if setup is not None:
-                await setup(self)
+            await workload.prepare(self)
             return await runner.run(items)
 
         try:

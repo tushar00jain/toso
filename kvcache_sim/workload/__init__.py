@@ -5,10 +5,12 @@
 - ``_generator.py`` -- the seeded synthetic request stream (shared system prompt +
   per-conversation context + unique query suffix; Zipf popularity, Poisson
   arrivals).
-- ``serving.py`` -- ``KVWorkload``, which builds both planes onto an assembled
-  stack, and ``sim_block_carrier``: what one KV block is stored as under
-  simulation. That choice belongs to the run, not to ``data/`` -- a real
-  deployment stores the KV tensors.
-- ``scenarios.py`` -- the scenario builders and the deterministic run harness that
-  wires a topology, a workload and a scheduler onto the shared engine.
+- ``_serving.py`` -- ``KVWorkload`` (the request stream, a
+  ``realsim.workload.Workload``) and ``serving_plane``, the factory that wires the
+  store, view, scheduler and serving plane onto an assembled stack. Also
+  ``sim_block_carrier``: what one KV block is stored as under simulation, which
+  belongs to the run rather than to ``data/`` -- a real deployment stores the KV
+  tensors.
+- ``scenarios.py`` -- the comparisons, each a list of ``realsim.run.Run`` values
+  over one request stream. It builds no clock, mesh or plane.
 """

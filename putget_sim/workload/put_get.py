@@ -28,16 +28,14 @@ virtual-time trace that is byte-identical across runs.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from proposed import DataPlane, Deployment, Policy
-from realsim.entrypoint import Result, Workload
 from realsim.runner import WorkItem
 from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint, TensorDescriptor
+from realsim.workload import Workload
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile, compute_time
 
 KEY = "W"
@@ -60,11 +58,6 @@ FLOPS_PER_ELEMENT = 2.0
 # GPU roofline. This is the modeled *target* device, independent of the meta/
 # metadata carrier the data plane uses.
 DEFAULT_COMPUTE_DEVICE = "cuda"
-
-# A factory for the capability's data plane, called with the wired mesh plus the
-# key/payload the readers move: ``(mesh, key, value) -> DataPlane``.
-MakePlane = Callable[[Deployment, str, Any], DataPlane]
-
 
 def _dtype_name(dtype: torch.dtype) -> str:
     """Cost-model dtype key for a torch dtype (``torch.float32`` -> ``float32``)."""
@@ -91,26 +84,6 @@ def _topology(num_readers: int) -> Dict[str, Endpoint]:
     return topo
 
 
-@dataclass
-class BurstResult(Result):
-    """A :class:`~realsim.entrypoint.Result` plus what the burst itself reports.
-
-    ``results``/``trace``/``ledger``/``sim`` come from the base; the rest are facts
-    about the scenario that a summary needs and the ledger does not carry.
-    """
-
-    # The ground-truth W carrier (meta tensor or descriptor); both expose
-    # ``shape``/``dtype``/``numel()``/``element_size()`` so callers can size it.
-    expected: Any
-    origin_id: str
-    num_readers: int
-
-    @property
-    def payload_bytes(self) -> int:
-        """Bytes of one W -- the 1x union a routed run drives fabric toward."""
-        return self.expected.numel() * self.expected.element_size()
-
-
 class PutGetBurst(Workload):
     """m readers get one key an origin already holds.
 
@@ -131,8 +104,10 @@ class PutGetBurst(Workload):
             used here for the producer's generate step; the stack charges every
             other cost from the same one.
         compute_device: roofline device for that generate step.
-        make_plane: builds the capability's data plane once the deployment and the
-            payload exist. ``None`` -> no plane, the unrouted baseline.
+
+    A capability that routes this burst installs its policy and data plane on the
+    :class:`~realsim.run.Run`, not here -- the workload is identical either way,
+    which is what makes the routed/unrouted comparison mean something.
     """
 
     def __init__(
@@ -145,7 +120,6 @@ class PutGetBurst(Workload):
         device: str = "meta",
         profile: Optional[MachineProfile] = None,
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
-        make_plane: Optional[MakePlane] = None,
     ) -> None:
         if mode not in (MODE_META, MODE_METADATA):
             raise ValueError(f"unknown data-plane mode {mode!r}")
@@ -154,9 +128,8 @@ class PutGetBurst(Workload):
         self.mode = mode
         self.profile = profile if profile is not None else DEFAULT_PROFILE
         self.compute_device = compute_device
-        self.make_plane = make_plane
 
-        self.topology = _topology(num_readers)
+        super().__init__(_topology(num_readers))
         self.origin_id = self.topology["p"].id  # holds W before the burst
         self.reader_ids = [f"r{i}" for i in range(num_readers)]
 
@@ -179,8 +152,13 @@ class PutGetBurst(Workload):
             self.expected = self.descriptor
         self.put_value = self.expected
 
-    def build(self, sim: Simulation) -> Tuple[Optional[DataPlane], List[WorkItem]]:
-        """One work item per reader, plus the capability's plane if it has one."""
+    @property
+    def payload_bytes(self) -> int:
+        """Bytes of one W -- the 1x union a routed run drives fabric toward."""
+        return self.expected.numel() * self.expected.element_size()
+
+    def items(self, sim: Simulation) -> List[WorkItem]:
+        """One work item per reader: bind who I am, then get the key."""
         mesh, trace = sim.mesh, sim.trace
         # Bytes served by the origin are the fabric cost a routing policy exists
         # to cut; everything else is a peer-to-peer hop.
@@ -201,30 +179,12 @@ class PutGetBurst(Workload):
 
             return call
 
-        plane = (
-            self.make_plane(mesh, KEY, self.put_value)
-            if self.make_plane is not None
-            else None
-        )
-        items = [
+        return [
             WorkItem(id=rid, release_time=0.0, run=_get(rid))
             for rid in self.reader_ids
         ]
-        return plane, items
 
-    def result(self, result: Result) -> BurstResult:
-        """Add what a burst summary needs beyond the ledger."""
-        return BurstResult(
-            results=result.results,
-            trace=result.trace,
-            ledger=result.ledger,
-            sim=result.sim,
-            expected=self.expected,
-            origin_id=self.origin_id,
-            num_readers=self.num_readers,
-        )
-
-    async def setup(self, sim: Simulation) -> None:
+    async def prepare(self, sim: Simulation) -> None:
         """Generate W on the producer's accelerator, then seed it on the origin."""
         mesh, trace = sim.mesh, sim.trace
         # The producer writes W to its co-located origin volume. This is a

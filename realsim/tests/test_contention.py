@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-from putget_sim.harness import run_burst
+from realsim.tests._burst import run_burst
 from putget_sim.workload.put_get import MODE_META, MODE_METADATA
 from sim_common import config
 

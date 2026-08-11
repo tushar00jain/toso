@@ -14,9 +14,14 @@ shaped like the other two.
 A capability package should hold only capability code; everything generic it needs
 is here:
 
-* :func:`realsim.entrypoint.run_simulation` -- the one way to run anything: hand
-  it a :class:`~realsim.entrypoint.Workload` and the run knobs. Every sim in the
-  repo goes through it;
+* the four types a sim is built from, one role each:
+  :class:`realsim.workload.Workload` (the work, and nothing else),
+  :class:`realsim.run.Run` (a labelled configuration -- the workload plus the
+  policy and plane a capability installs around it),
+  :class:`realsim.reporting.Report` (a finished run, as text) and
+  :class:`realsim.demo.Demo` (a sim's command line, declared). Every run in the
+  repo goes through :func:`realsim.run.execute`, so no capability wires a stack
+  of its own;
 * :mod:`realsim.seams` + :mod:`realsim.adapters` -- run one real client /
   controller / store off-actor;
 * :class:`realsim.mesh.Mesh` -- the multi-client wiring: real volumes, one real

@@ -150,12 +150,17 @@ realsim/
                               #   defaulting to real no-op behaviour
   runner.py                   # Runner — release work on the virtual clock in
                               #   (release_time, id) order, install the mesh once, drain
-  entrypoint.py               # run_simulation(workload, **knobs) — the one way to run
-                              #   anything; Workload + Result live here
-  simulation.py               # Simulation — assembles engine + mesh + directory + registry
+  simulation.py               # Simulation — assembles engine + mesh + directory + registry,
+                              #   and runs a Workload's items on it
+  workload.py                 # Workload — the work a run performs. Assembles nothing
+  run.py                      # Run (a labelled configuration) + Result + execute():
+                              #   the one way anything runs
+  reporting.py                # Report — a finished run, as text
+  demo.py                     # Demo / Scenario / Console — a sim's command line, declared
   cli.py                      # the run flags/logging every sim's __main__ shares
   tools/
     check_contract.py         # concurrency-contract lint (AST checker + CLI)
+    check_structure.py        # structure lint: a sim package's shape (AST + CLI)
   tests/
     test_seams.py             # smoke: put + full get + sliced get round-trip
     test_determinism.py       # byte-identical traces; shape/dtype/nbytes invariants
@@ -165,15 +170,16 @@ realsim/
     test_composability.py     # import the real-directory backend + swap proof
     test_mesh.py              # Mesh wiring, per-operation source locality, one-owner install
     test_planes.py            # the shared Policy / View / DataPlane / Runner contracts
+    test_demos.py             # every Demo declares its parts, and every scenario runs
 
 putget_sim/                   # the unrouted put/get burst (repo root) — no policy, no
                               #   data plane: the m x baseline, and the fixture the
                               #   realsim tests above drive
-  workload/put_get.py         # seed a key, then m clients get it; meta/metadata carrier +
-                              #   compute/network/storage/RAM cost exercise
-  report/summary.py           # fabric/wallclock summary + source->dest tree
-  harness.py                  # run_burst — the one place it wires onto a stack
-  __main__.py                 # `python -m putget_sim` demo entrypoint (+ --mode)
+  workload/put_get.py         # PutGetBurst, a Workload: seed a key, then m clients get
+                              #   it; meta/metadata carrier + full cost exercise
+  workload/scenarios.py       # its Runs — here, the single unrouted one
+  report/summary.py           # BurstReport: fabric/wallclock summary + source->dest tree
+  __main__.py                 # the Demo declaration (`python -m putget_sim`, + --mode)
 
 sim_common/                   # shared DES library (repo root)
   async_engine.py             # deterministic asyncio loop + virtual clock
@@ -404,7 +410,7 @@ at call time, so a consumer built *after* the mesh can claim it for accounting.
 
 This wiring is independent of the capability under test, so it does not belong to
 any one of them. It originally lived inside a burst-shaped read coordinator
-(`run_burst(readers, key)`); a capability that is not a burst — `kvcache_sim`'s
+(a burst-shaped `run_burst(readers, key)`); a capability that is not a burst — `kvcache_sim`'s
 continuous arrival stream — could not reuse it and re-derived the wiring
 underneath, duplicating the factory, the contextvar, and the per-node adapter
 construction. With `Mesh` extracted, each capability package holds only capability
@@ -453,14 +459,16 @@ directory handle, trace, profile, registry, install).
   pre-existing holder), outcome rows, and the aggregations every report computes
   over them.
 
-### `scenarios/put_get.py` — realsim's own fixture
+### `putget_sim/workload/put_get.py` — the capability-free fixture
 
 One origin volume on node `P` holds `W`; `m` reader volumes on distinct hosts of
-node `R` each get it. `build_burst(...)` / `run_burst(...)` seed `W`, run the
-readers on a fresh engine, and return a `BurstResult` (trace, ledger, results,
-expected carrier). They take `mode=` (`"meta"` default / `"metadata"`, §7),
-`profile=` (the target `MachineProfile`, §6), `compute_device=` (the producer's
-roofline device, default `"cuda"`), and optionally a `policy=` / `make_plane=`.
+node `R` each get it. `PutGetBurst` is a `realsim.workload.Workload`: it seeds
+`W` in `prepare()` and yields one work item per reader from `items(sim)`. It
+takes `mode=` (`"meta"` default / `"metadata"`, §7), `profile=` (the target
+`MachineProfile`, §6) and `compute_device=` (the producer's roofline device,
+default `"cuda"`). A policy and a data plane are *not* its arguments — a
+capability puts those on the `realsim.run.Run`, so the workload is identical
+between a routed run and the baseline.
 The scenario body is ordinary user code — a `client.put` and a gather of
 `client.get` — and installing a policy is the *only* change that turns the same
 `m×` run into a 1× one, which is exactly what `dedup_sim` does with it.

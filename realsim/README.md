@@ -97,6 +97,8 @@ capability's decisions:
   `dedup_sim` run's wall + RSS (measured in fresh subprocesses).
 - **`test_composability.py`** — imports realsim's real-directory backend
   (`RealControllerAdapter` / `FakeControllerHandle`) standalone and exercises it.
+- **`test_demos.py`** — every sim's `Demo` declares its parts (the ABC refuses
+  otherwise) and every scenario of every sim runs end to end.
 
 ## Concurrency-contract lint
 
@@ -110,6 +112,22 @@ also runs standalone:
 
 ```
 PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_contract
+```
+
+## Structure lint
+
+`realsim/tools/check_structure.py` fails the build if a sim package drifts out of
+shape: a missing part (`__main__.py`, `README.md`, `workload/`, `report/`), a
+`control/` without a `data/`, a folder-private module whose name does not say so
+(`_thing.py`), or a README layout block that names a file which does not exist —
+or omits one that does. `PUBLIC_ANYWAY` is the explicit exception list.
+
+The `Demo` contract is deliberately *not* linted: `realsim.demo.Demo` is an ABC,
+so a demo that has not declared its scenarios cannot be constructed, and
+`tests/test_demos.py` constructs and runs all three.
+
+```
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_structure
 ```
 
 ## Layout
@@ -126,20 +144,24 @@ realsim/
                   capability's data plane runs against (client_for resolves a node)
   runner.py       Runner -- release work items on the virtual clock in
                   (release_time, id) order, install the mesh once, gather, drain
-  entrypoint.py   run_simulation(workload, **knobs) -- the one way to run
-                  anything; Workload and Result live here too
-  simulation.py   Simulation -- assembles engine + mesh + directory + registry
+  simulation.py   Simulation -- assembles engine + mesh + directory + registry,
+                  and runs a Workload's items on it
+  workload.py     Workload -- the work a run performs. Assembles nothing
+  run.py          Run (one labelled configuration) + Result + execute(): the one
+                  way anything runs, so no capability wires its own stack
+  reporting.py    Report -- a finished run, as text
+  demo.py         Demo / Scenario / Console -- a sim's command line, declared
   cli.py          the run flags/logging every sim's __main__ shares
   tools/          check_contract.py: the concurrency + plane-separation lint
+                  check_structure.py: the shape of a sim package
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
                   perf guard, composability, mesh wiring, the shared plane types
 putget_sim/     the unrouted put/get burst (no policy, no data plane) -- the m x
                 baseline, and the fixture realsim's own tests drive
   workload/       put_get.py: seed a key, then m clients get it; meta/metadata
-                  carrier + full resource-cost exercise
+                  carrier + full resource-cost exercise. scenarios.py: its Runs
   report/         summary.py: fabric/wallclock summary + source->dest tree
-  harness.py      run_burst: the one place it wires onto a stack
-  __main__.py     the demo entrypoint (`python -m putget_sim`)
+  __main__.py     the Demo declaration (`python -m putget_sim`)
 proposed/       every contract that outlives the simulator; imports nothing
   policy.py       Policy.select(view, keys, requester) -> ranked sources +
                   readiness, plus notice() to open a readiness gate. Naive (all

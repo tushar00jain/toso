@@ -11,8 +11,10 @@ Laid out by role, like ``dedup_sim`` and ``kvcache_sim``:
 
 * :mod:`putget_sim.workload` -- the burst itself: a topology, an allocation-free
   payload, a ``client.put`` and a gather of ``client.get``. Ordinary user code,
-  with no policy and no coordinator in it;
-* :mod:`putget_sim.report` -- the fabric/wallclock summary and source->dest tree.
+  with no policy and no coordinator in it, plus the single
+  :class:`realsim.run.Run` that says so;
+* :mod:`putget_sim.report` -- the fabric/wallclock summary and source->dest tree,
+  as a :class:`realsim.reporting.Report`.
 
 There is no ``control/`` and no ``data/``: this capability decides nothing and
 executes nothing of its own -- that is the point. Handing the same workload a

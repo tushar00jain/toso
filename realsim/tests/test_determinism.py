@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from putget_sim.harness import run_burst
+from realsim.tests._burst import run_burst
 from putget_sim.workload.put_get import DEFAULT_N, MODE_META, MODE_METADATA
 from realsim.seams.transport import TensorDescriptor
 
@@ -61,8 +61,8 @@ def test_trace_is_byte_identical_for_fixed_seed(mode):
 def test_meta_mode_allocates_no_storage():
     # The default carrier is a real tensor with zero storage on the meta device.
     res = run_burst(num_readers=2, mode=MODE_META)
-    assert isinstance(res.expected, torch.Tensor)
-    assert res.expected.device.type == "meta"
+    assert isinstance(res.workload.expected, torch.Tensor)
+    assert res.workload.expected.device.type == "meta"
     for payload in res.results.values():
         assert isinstance(payload, torch.Tensor)
         assert payload.device.type == "meta"
@@ -74,7 +74,7 @@ def test_meta_mode_allocates_no_storage():
 def test_metadata_mode_carries_only_a_descriptor():
     # The metadata-only carrier is a descriptor -- no tensor object at all.
     res = run_burst(num_readers=2, mode=MODE_METADATA)
-    assert isinstance(res.expected, TensorDescriptor)
+    assert isinstance(res.workload.expected, TensorDescriptor)
     for payload in res.results.values():
         assert isinstance(payload, TensorDescriptor)
 
@@ -108,7 +108,7 @@ def test_invariants_hold_across_seeds(mode):
         # The fetch tree is the origin fanning out to every reader.
         srcs = {src for (src, _dst, _k) in res.ledger.edges}
         dsts = {dst for (_src, dst, _k) in res.ledger.edges}
-        assert srcs == {res.origin_id}
+        assert srcs == {res.workload.origin_id}
         assert dsts == {"volr0", "volr1", "volr2", "volr3"}
 
 

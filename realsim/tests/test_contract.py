@@ -8,7 +8,12 @@ the mesh, or a store client). The companion tests prove the checker actually
 detects each banned pattern and does not flag the sanctioned ones -- so a green
 run means the contract holds, not that the lint is asleep.
 
-See ``realsim/tools/check_contract.py`` for the full contract and its rationale.
+``test_sim_packages_keep_their_shape`` does the same for the *structure* lint:
+the parts every ``*_sim`` carries, the underscore on a folder-private module, and
+a README layout block that matches the tree.
+
+See ``realsim/tools/check_contract.py`` and ``check_structure.py`` for the full
+contracts and their rationale.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from realsim.tools.check_contract import (
     scan_default,
     scan_source,
 )
+from realsim.tools import check_structure
 
 
 def _codes(source: str, *, is_test: bool = False, path: str = "snippet.py"):
@@ -38,6 +44,54 @@ def test_sim_paths_obey_the_concurrency_contract():
         "concurrency-contract violations on the sim path:\n"
         + format_violations(violations)
     )
+
+
+# --------------------------------------------------------------------------
+# Structure: the shape of a sim package.
+# --------------------------------------------------------------------------
+
+
+def test_sim_packages_keep_their_shape():
+    """The real tree must be clean (this is the enforcing check)."""
+    violations = check_structure.check_all()
+    assert not violations, (
+        "structure violations in the sim packages:\n"
+        + format_violations(violations)
+    )
+
+
+def test_structure_lint_finds_all_three_sims():
+    """A rule that silently scanned nothing would pass forever."""
+    names = [p.name for p in check_structure.sim_packages()]
+    assert names == ["dedup_sim", "kvcache_sim", "putget_sim"]
+
+
+def test_structure_lint_flags_a_missing_part(tmp_path):
+    """A sim package without the required parts fails."""
+    (tmp_path / "toy_sim").mkdir()
+    (tmp_path / "toy_sim" / "__init__.py").write_text("")
+    codes = {v.code for v in check_structure.check_package_parts(tmp_path)}
+    assert "missing-part" in codes
+
+
+def test_structure_lint_flags_half_a_plane_split(tmp_path):
+    """control/ without data/ is a split that means nothing."""
+    pkg = tmp_path / "toy_sim"
+    for part in ("", "workload", "report", "control"):
+        (pkg / part).mkdir(parents=True, exist_ok=True)
+        (pkg / part / "__init__.py").write_text("")
+    (pkg / "__main__.py").write_text("")
+    (pkg / "README.md").write_text("")
+    codes = {v.code for v in check_structure.check_package_parts(tmp_path)}
+    assert "half-a-plane-split" in codes
+
+
+def test_structure_lint_reads_a_layout_block():
+    """The README parser must actually find a block, or rule 3 is vacuous."""
+    block = check_structure._layout_block(
+        "## Layout\n\nsome prose\n\n```\npkg/\n  thing.py\n```\n"
+    )
+    assert block is not None and "thing.py" in block
 
 
 def test_lint_flags_threading():
@@ -157,7 +211,7 @@ def test_data_may_hold_decisions_but_not_the_simulator():
 def test_the_simulator_rules_do_not_apply_to_workload():
     """workload/ is where the harness is wired up, so it may name it."""
     src = "from realsim.mesh import Mesh\nfrom sim_common.trace import Trace\n"
-    assert _codes(src, path="kvcache_sim/workload/serving.py") == set()
+    assert _codes(src, path="kvcache_sim/workload/_serving.py") == set()
 
 
 def test_lint_flags_the_proposal_leaning_on_the_simulator():

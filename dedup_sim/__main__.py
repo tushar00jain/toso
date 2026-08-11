@@ -24,107 +24,72 @@ Output is routed through the ``logging`` module:
 from __future__ import annotations
 
 import argparse
-import logging
-from typing import Optional
 
-from sim_common import config
-from realsim.cli import add_run_flags, apply_run_flags, log_trace
-from sim_common.report import section
+from realsim.demo import Console, Demo, Scenario
+from realsim.run import execute
 
-from dedup_sim.report.summary import (
-    render_baseline_summary,
-    render_dedup_summary,
-)
-from dedup_sim.workload.scenarios import NUM_READERS, run_dedup_vs_baseline
-
-logger = logging.getLogger("dedup_sim")
-
-def _section(title: str) -> None:
-    section(logger, title)
+from .report.summary import BaselineReport, DedupReport
+from .workload.scenarios import dedup_vs_baseline
 
 
-def _log_trace(trace, limit: Optional[int] = None) -> None:
-    """Dump the trace (shared). Fingerprints are labelled per run below."""
-    log_trace(logger, trace, limit=limit)
+def _dedup(console: Console, args: argparse.Namespace) -> None:
+    runs = dedup_vs_baseline()
+    results = [execute(run) for run in runs]
+    naive, routed = results[0], results[1:]
+    payload = naive.workload.payload_bytes
+    num_readers = naive.workload.num_readers
+    console.trace(naive.trace, label="naive run")
 
-
-def _dedup() -> None:
-    comparison = run_dedup_vs_baseline()
-    naive = comparison.baseline
-    payload = comparison.payload_bytes
-    if config.current().fingerprint:
-        logger.info("naive run fingerprint: %s", naive.trace.fingerprint())
-
-    _section(
-        f"DEDUP on the REAL directory  --  {comparison.num_readers} readers get W"
+    console.section(f"DEDUP on the REAL directory  --  {num_readers} readers get W")
+    console.info(
+        "directory: real torchstore.controller.Controller (real Trie state)"
     )
-    logger.info("directory: real torchstore.controller.Controller (real Trie state)")
-    logger.info("payload(W): %dB   1x-union target (each unique byte once): %dB",
-                payload, payload)
+    console.info(
+        "payload(W): %dB   1x-union target (each unique byte once): %dB",
+        payload, payload,
+    )
 
-    for cap, routed in comparison.routed:
-        _routed(cap, routed, comparison)
+    for result in routed:
+        cap = int(result.label.split("=")[1])
+        topo = "chain" if cap == 1 else "tree"
+        console.section(f"dedup policy  --  fanout_cap={cap} ({topo})")
+        console.trace(result.trace, label=f"dedup(cap={cap}) run")
+        console.summary(DedupReport(result, naive, cap))
+        # 1x proven live on the real directory.
+        assert result.ledger.origin_bytes == payload
+        assert naive.ledger.origin_bytes == num_readers * payload
 
-    _section("NAIVE baseline  --  every reader pulls from the origin")
-    _log_trace(naive.trace)
-    logger.info("(b) summary")
-    logger.info(render_baseline_summary(naive, comparison.num_readers))
-
-
-def _routed(cap: int, routed, comparison) -> None:
-    """One routed configuration: its section, trace, summary and fingerprint."""
-    naive, payload = comparison.baseline, comparison.payload_bytes
-    _section(f"dedup policy  --  fanout_cap={cap} ({'chain' if cap == 1 else 'tree'})")
-    _log_trace(routed.trace)
-    logger.info("(b) summary")
-    logger.info(render_dedup_summary(routed, naive, cap))
-    if config.current().fingerprint:
-        logger.info("dedup(cap=%d) run fingerprint: %s", cap, routed.trace.fingerprint())
-    # 1x proven live on the real directory.
-    assert routed.ledger.origin_bytes == payload
-    assert naive.ledger.origin_bytes == comparison.num_readers * payload
+    console.section("NAIVE baseline  --  every reader pulls from the origin")
+    console.trace(naive.trace, label="naive run")
+    console.summary(BaselineReport(naive))
 
 
-def _takeaway() -> None:
-    _section("TAKEAWAY")
-    logger.info("On the real directory, dedup registers each finished reader as a")
-    logger.info("read-through source (real notify_put_batch), so later readers pull")
-    logger.info("from a peer, not the origin: each unique byte crosses the fabric")
-    logger.info("ONCE (1x vs mx). Wallclock depends on fanout_cap/topology -- a chain")
-    logger.info("(cap=1) is more hops, a tree (cap=2) narrows the gap; both stay 1x.")
+class DedupDemo(Demo):
+    """The dedup demo: one burst, three policies, one comparison."""
 
+    name = "dedup_sim"
+    description = (
+        "Dedup read-routing demo on the real TorchStore directory. Runs a "
+        "synchronized read burst under the naive baseline and the dedup policy "
+        "(chain + tree), printing the fabric summary + ASCII diagram (INFO) and, "
+        "with -v, the full per-event virtual-time trace (DEBUG)."
+    )
 
-SCENARIOS = {
-    "dedup": _dedup,
-}
+    def scenarios(self):
+        return [Scenario("dedup", _dedup)]
+
+    def takeaway(self, console: Console) -> None:
+        console.section("TAKEAWAY")
+        console.info("On the real directory, dedup registers each finished reader as a")
+        console.info("read-through source (real notify_put_batch), so later readers pull")
+        console.info("from a peer, not the origin: each unique byte crosses the fabric")
+        console.info("ONCE (1x vs mx). Wallclock depends on fanout_cap/topology -- a chain")
+        console.info("(cap=1) is more hops, a tree (cap=2) narrows the gap; both stay 1x.")
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="python -m dedup_sim",
-        description="Dedup read-routing demo on the real TorchStore directory. "
-                    "Runs a synchronized read burst under the naive baseline and "
-                    "the dedup policy (chain + tree), printing the fabric summary + "
-                    "ASCII diagram (INFO) and, with -v, the full per-event "
-                    "virtual-time trace (DEBUG).",
-    )
-    parser.add_argument(
-        "scenario", nargs="?", choices=sorted(SCENARIOS),
-        help="scenario to run (default: all). one of: " + ", ".join(sorted(SCENARIOS)),
-    )
-    add_run_flags(parser)
-    args = parser.parse_args(argv)
-
-    # Set the process config once from the CLI flags (unset -> env / default);
-    # the scenarios' Traces + controller adapters + resource registry + the
-    # transport's collapse decision read it ambiently.
-    apply_run_flags(args)
-
-    if args.scenario is None:
-        _dedup()
-        _takeaway()
-    else:
-        SCENARIOS[args.scenario]()
+    """Entry point (also used by the demo smoke test)."""
+    DedupDemo().main(argv)
 
 
 if __name__ == "__main__":

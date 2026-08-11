@@ -12,7 +12,7 @@ be compared folder by folder:
   real objects: the per-request serving loop, the batched decode engine, and the
   three KV directory verbs over a :class:`realsim.mesh.Mesh`;
 * :mod:`kvcache_sim.workload` -- what is simulated (domain model, seeded request
-  generator, scenario builders + the run harness that wires the two planes);
+  generator, and the ``Run`` list each comparison executes);
 * :mod:`kvcache_sim.report` -- outcome metrics and rendering, on the shared
   :class:`sim_common.report.Ledger`.
 

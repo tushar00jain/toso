@@ -71,10 +71,14 @@ client/controller/transport), so they depend on the from-source
   All three sim packages are split the same way, **by plane** — `control/`
   decides, `data/` executes, plus `workload/` (what is simulated) and `report/`
   (outcome metrics). `putget_sim` simply has no `control/` or `data/`, which is
-  what makes it the baseline. `control/` may not import `data/`, the mesh, or a client,
-  which `realsim/tools/check_contract.py` enforces. The test for which folder
-  something belongs in: *does it advance the clock or move bytes?* The comparison
-  is tabulated in
+  what makes it the baseline. Two lints hold the shape:
+  `realsim/tools/check_contract.py` (a `control/` module may not import `data/`,
+  the mesh, or a client) and `check_structure.py` (a sim package's parts, the
+  underscore on a folder-private module, and a README layout block that matches
+  the tree). Each sim declares itself with the same four types — `Workload`,
+  `Run`, `Report`, `Demo` — so none of them wires a stack of its own. The test
+  for which folder something belongs in: *does it advance the clock or move
+  bytes?* The comparison is tabulated in
   [`dedup_sim/README.md`](dedup_sim/README.md#comparison-with-kvcache_sim).
 - [`sim_common/`](sim_common/) — the shared building blocks all three sims use:
   the deterministic virtual-clock `AsyncEngine` (the sim path; the original

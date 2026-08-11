@@ -36,7 +36,7 @@ from pathlib import Path
 
 import torch
 
-from putget_sim.harness import run_burst
+from realsim.tests._burst import run_burst
 from putget_sim.workload.put_get import MODE_META, MODE_METADATA, TensorDescriptor
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -67,14 +67,14 @@ def test_meta_sim_path_allocates_no_real_data_even_at_scale():
 
     # Carrier invariant: real tensors, but on the meta device with a null data
     # pointer -- i.e. zero real allocation.
-    assert isinstance(res.expected, torch.Tensor)
-    assert res.expected.device.type == "meta"
-    assert res.expected.data_ptr() == 0
+    assert isinstance(res.workload.expected, torch.Tensor)
+    assert res.workload.expected.device.type == "meta"
+    assert res.workload.expected.data_ptr() == 0
     for payload in res.results.values():
         assert isinstance(payload, torch.Tensor)
         assert payload.data_ptr() == 0
     # The modeled size is exact even though nothing was allocated.
-    assert res.expected.numel() * res.expected.element_size() == BIG_PAYLOAD_BYTES
+    assert res.workload.expected.numel() * res.workload.expected.element_size() == BIG_PAYLOAD_BYTES
 
     # The whole point: a 256 MiB modeled payload must not move peak RSS.
     assert after - before < RSS_HEADROOM_KB, (
@@ -89,10 +89,10 @@ def test_metadata_sim_path_carries_only_descriptors_at_scale():
     res = run_burst(num_readers=3, n=BIG_N, mode=MODE_METADATA)
     after = _maxrss_kb()
 
-    assert isinstance(res.expected, TensorDescriptor)
+    assert isinstance(res.workload.expected, TensorDescriptor)
     for payload in res.results.values():
         assert isinstance(payload, TensorDescriptor)
-    assert res.expected.nbytes == BIG_PAYLOAD_BYTES
+    assert res.workload.expected.nbytes == BIG_PAYLOAD_BYTES
     assert after - before < RSS_HEADROOM_KB
 
 
@@ -105,15 +105,17 @@ def test_metadata_sim_path_carries_only_descriptors_at_scale():
 # by the shared torch/monarch import baseline, which is the point of the parity.
 _REALSIM_SNIPPET = (
     "import resource;"
-    "from putget_sim.harness import run_burst;"
-    "run_burst(num_readers=3, n=1024);"
+    "from putget_sim.workload.scenarios import burst;"
+    "from realsim.run import execute;"
+    "execute(burst(3, n=1024)[0]);"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
 )
 _DEDUP_SNIPPET = (
     "import resource;"
-    "from dedup_sim.harness import run;"
-    "run(num_readers=3, n=1024);"
-    "run(num_readers=3, fanout_cap=1, n=1024);"
+    "from dedup_sim.workload.scenarios import dedup_vs_baseline;"
+    "from putget_sim.workload.put_get import PutGetBurst;"
+    "from realsim.run import execute;"
+    "[execute(r) for r in dedup_vs_baseline(burst=PutGetBurst(3, n=1024), caps=(1,))];"
     "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
 )
 

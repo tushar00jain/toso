@@ -1,21 +1,41 @@
-"""The kvcache scenarios: what each run simulates.
+"""The kvcache scenarios: which configurations each comparison runs.
 
-Each function fixes a topology and a synthetic workload and hands them to
-:func:`kvcache_sim.harness.run`, which does the assembling. Nothing here wires a
-plane, a scheduler or a clock -- a scenario is a set of choices, not a harness.
+Each function fixes a topology and a synthetic workload, then returns the
+:class:`~realsim.run.Run` values to compare -- same requests, different wiring.
+Nothing here builds a clock, a mesh or a plane: :func:`realsim.run.execute` does
+that, the same way for every capability.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from domain import decode_step_time, DEFAULT_PROFILE
 from proposed import Endpoint
 
-from realsim.entrypoint import Result
+from realsim.run import Run
+from sim_common.trace import Trace
 
-from ..harness import BLOCK_TOKENS, run
+from ..report.metrics import Metrics
 from ._generator import make_workload
+from ._serving import BLOCK_TOKENS, KVWorkload, serving_plane
+
+
+def configure(label: str, topology, requests, kind: str, **knobs) -> Run:
+    """One labelled configuration over ``requests``.
+
+    Every kvcache run is built here -- by the scenarios below and by the tests --
+    so the trace format and the metrics ledger a run reports into are chosen once
+    and cannot drift between them.
+    """
+    return Run(
+        label,
+        KVWorkload(topology, requests),
+        plane=serving_plane(kind, **knobs),
+        profile=DEFAULT_PROFILE,
+        trace=Trace(time_width=8, kind_width=7),
+        ledger=Metrics(),
+    )
 
 
 def make_topology(num: int, per_node: int = 2) -> Dict[str, Endpoint]:
@@ -46,28 +66,33 @@ def shared_prefix_workload(seed: int = 0):
     )
 
 
-def run_shared_prefix(seed: int = 0) -> Tuple[Result, Result]:
+def shared_prefix(seed: int = 0) -> List[Run]:
     """Cache-aware vs load-balance on the shared-prefix workload (ample capacity)."""
     topo = make_topology(4)
     reqs = shared_prefix_workload(seed)
-    cache_aware = run(topo, reqs, "cache_aware")
-    baseline = run(topo, reqs, "load_balance")
-    return cache_aware, baseline
+    return [
+        configure("cache_aware", topo, reqs, "cache_aware"),
+        configure("load_balance", topo, reqs, "load_balance"),
+    ]
 
 
-def run_eviction_sweep(seed: int = 0) -> List[Tuple[int, float, int]]:
-    """Sweep cache capacity; return ``(capacity, hit_rate, fabric_bytes)`` rows."""
+#: Per-instance cache capacities the eviction sweep walks.
+EVICTION_CAPACITIES = (2, 4, 8, 16, 32, 64, 256)
+
+
+def eviction_sweep(seed: int = 0) -> List[Run]:
+    """One cache-aware run per capacity; the report reads the hit-rate curve off
+    their ledgers. Each run is labelled with its capacity."""
     topo = make_topology(4)
     reqs = make_workload(
         num_requests=400, num_conversations=12, system_blocks=2,
         conv_base_blocks=4, query_blocks=2, zipf_s=1.05, arrival_rate=2.5,
         block_tokens=BLOCK_TOKENS, output_tokens=64, seed=seed,
     )
-    rows: List[Tuple[int, float, int]] = []
-    for cap in (2, 4, 8, 16, 32, 64, 256):
-        r = run(topo, reqs, "cache_aware", capacity=cap)
-        rows.append((cap, r.ledger.hit_rate, r.ledger.fabric_bytes))
-    return rows
+    return [
+        configure(str(cap), topo, reqs, "cache_aware", capacity=cap)
+        for cap in EVICTION_CAPACITIES
+    ]
 
 
 def hotspot_workload(seed: int = 0):
@@ -79,17 +104,19 @@ def hotspot_workload(seed: int = 0):
     )
 
 
-def run_hotspot(seed: int = 0) -> Tuple[Result, Result, Result]:
+def hotspot(seed: int = 0) -> List[Run]:
     """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware."""
     topo = make_topology(4)
     reqs = hotspot_workload(seed)
-    baseline = run(topo, reqs, "load_balance")
-    no_repl = run(topo, reqs, "cache_aware", replicate=False)
-    repl = run(topo, reqs, "cache_aware", balance_threshold=1.2, replicate=True)
-    return baseline, no_repl, repl
+    return [
+        configure("baseline", topo, reqs, "load_balance"),
+        configure("no_replication", topo, reqs, "cache_aware", replicate=False),
+        configure("replication", topo, reqs, "cache_aware",
+             balance_threshold=1.2, replicate=True),
+    ]
 
 
-def run_overload(seed: int = 0) -> Tuple[Result, Result]:
+def overload(seed: int = 0) -> List[Run]:
     """High arrival rate + a TTFT SLO -> some requests must be rejected."""
     topo = make_topology(4)
     reqs = make_workload(
@@ -98,9 +125,10 @@ def run_overload(seed: int = 0) -> Tuple[Result, Result]:
         block_tokens=BLOCK_TOKENS, output_tokens=64, seed=seed,
     )
     slo = 6.0
-    cache_aware = run(topo, reqs, "cache_aware", slo_ttft=slo)
-    baseline = run(topo, reqs, "load_balance", slo_ttft=slo)
-    return cache_aware, baseline
+    return [
+        configure("cache_aware", topo, reqs, "cache_aware", slo_ttft=slo),
+        configure("load_balance", topo, reqs, "load_balance", slo_ttft=slo),
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -112,13 +140,13 @@ DISAGG_TARGET_TBT = 5 * decode_step_time(1, DEFAULT_PROFILE)
 DISAGG_MAX_BATCH = 8
 
 
-def run_disaggregation(seed: int = 0) -> Tuple[Result, Result]:
+def disaggregation(seed: int = 0) -> List[Run]:
     """Disaggregating prefill from decode protects TBT (Mooncake's headline).
 
     Both configs run with admission disabled (``slo_tbt=inf``, ``early_rejection=
     "off"``) so every request is served and measured. Decode capacity is fixed (two
     instances, ``DISAGG_MAX_BATCH`` each); the only difference is whether those two
-    instances also do prefill. Returns ``(disaggregated, coupled)``.
+    instances also do prefill. Returns ``[disaggregated, coupled]``.
     """
     topo = make_topology(4)  # s0..s3
     reqs = make_workload(
@@ -130,15 +158,13 @@ def run_disaggregation(seed: int = 0) -> Tuple[Result, Result]:
         simulate_decode=True, slo_tbt=float("inf"), early_rejection="off",
         max_batch=DISAGG_MAX_BATCH,
     )
-    disaggregated = run(
-        topo, reqs, "cache_aware",
-        prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], coupled=False,
-        **common,
-    )
-    coupled = run(
-        subset(topo, ["s2", "s3"]), reqs, "cache_aware", coupled=True, **common
-    )
-    return disaggregated, coupled
+    return [
+        configure("disaggregated", topo, reqs, "cache_aware",
+             prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], coupled=False,
+             **common),
+        configure("coupled", subset(topo, ["s2", "s3"]), reqs, "cache_aware",
+             coupled=True, **common),
+    ]
 
 
 # TBT SLO for the early-rejection scenario: 3 x baseline step time.
@@ -146,7 +172,7 @@ EARLY_SLO_TBT = 3 * decode_step_time(1, DEFAULT_PROFILE)
 EARLY_MAX_BATCH = 8
 
 
-def run_early_rejection(seed: int = 0) -> Tuple[Result, Result, Result]:
+def early_rejection(seed: int = 0) -> List[Run]:
     """Predicting decode load avoids wasting prefill (off/early/predict)."""
     topo = make_topology(4)
     reqs = make_workload(
@@ -157,7 +183,7 @@ def run_early_rejection(seed: int = 0) -> Tuple[Result, Result, Result]:
     common = dict(
         simulate_decode=True, slo_tbt=EARLY_SLO_TBT, max_batch=EARLY_MAX_BATCH
     )
-    off = run(topo, reqs, "cache_aware", early_rejection="off", **common)
-    early = run(topo, reqs, "cache_aware", early_rejection="early", **common)
-    predict = run(topo, reqs, "cache_aware", early_rejection="predict", **common)
-    return off, early, predict
+    return [
+        configure(mode, topo, reqs, "cache_aware", early_rejection=mode, **common)
+        for mode in ("off", "early", "predict")
+    ]

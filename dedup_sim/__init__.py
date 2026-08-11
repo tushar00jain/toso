@@ -13,11 +13,13 @@ Laid out by plane, like ``kvcache_sim``:
 * :mod:`dedup_sim.data` -- the read-through put that turns a finished reader into
   a real directory source, a :class:`proposed.plane.DataPlane` overriding one
   method;
-* :mod:`dedup_sim.workload` -- the burst itself, which is ``putget_sim``'s
-  ordinary put/get fixture with the policy installed and nothing else changed;
+* :mod:`dedup_sim.workload` -- the configurations to compare, as
+  :class:`realsim.run.Run` values. Every one shares ``putget_sim``'s ordinary
+  put/get fixture; the baseline installs nothing and each routed run adds the
+  policy and the plane, so nothing else changes between them;
 * :mod:`dedup_sim.report` -- the dedup-vs-baseline fabric summary.
 
-There is no runtime package and no cost layer of its own: ``realsim``'s
+There is no harness, no runtime package and no cost layer of its own: ``realsim``'s
 ``Runner`` releases the readers and its transport seam charges the cost model.
 See ``dedup_sim/README.md`` for the folder-by-folder comparison.
 """

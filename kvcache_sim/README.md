@@ -146,13 +146,14 @@ kvcache_sim/
   workload/               # WHAT IS SIMULATED
     request.py            #   inference Request + prefix-hash chain (str keys)
     _generator.py         #   seeded synthetic request stream (Zipf + Poisson)
-    serving.py            #   KVWorkload + sim_block_carrier: what a block is
-                          #   stored as under simulation (a real one stores tensors)
-    scenarios.py          #   scenario builders + the run harness that wires the
-                          #   two planes and hands the requests to realsim.Runner
+    _serving.py           #   KVWorkload (the request stream) + serving_plane,
+                          #   the wiring a run installs around it
+    scenarios.py          #   the six comparisons, each a list of realsim.Run
+                          #   values over one request stream
   report/                 # OUTCOME METRICS
     metrics.py            #   RequestResult rows on a sim_common Ledger + rendering
-  __main__.py             # `python -m kvcache_sim [scenario] [-v]`
+    summary.py            #   one realsim.Report per comparison, over those rows
+  __main__.py             # `python -m kvcache_sim [scenario] [-v]`: a Demo
   tests/test_sim.py       # deterministic tests (real-directory + outcome assertions)
 ```
 

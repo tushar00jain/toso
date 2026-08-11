@@ -2,27 +2,39 @@
 
 from __future__ import annotations
 
+from realsim.reporting import Report
+from realsim.run import Result
 from sim_common.report import render_tree
 
-from putget_sim.workload.put_get import BurstResult
-
-__all__ = ["render_burst_summary"]
+__all__ = ["BurstReport"]
 
 
-def render_burst_summary(res: BurstResult) -> str:
-    """Render the fabric/wallclock summary + the source->dest tree."""
-    payload = res.payload_bytes
-    union = payload  # the 1x target: W crosses the fabric once
-    fabric_x = res.ledger.origin_bytes / union if union else 0.0
-    lines = [
-        f"readers: {res.num_readers}   payload(W): {payload}B   "
-        f"1x-union target: {union}B",
-        f"fabric(origin->readers): {res.ledger.origin_bytes}B ({fabric_x:.1f}x)   "
-        f"total delivered: {res.ledger.transfer_bytes}B",
-        f"wallclock: {res.ledger.wallclock:.4f}   "
-        f"readers done: {res.ledger.items_done}/{res.ledger.items_total}",
-        "source->dest (unrouted: every reader pulls the origin):",
-    ]
-    for line in render_tree(res.ledger.edges):
-        lines.append("    " + line)
-    return "\n".join(lines)
+class BurstReport(Report):
+    """The fabric/wallclock summary plus the source->dest tree.
+
+    Reads the payload facts off the run's workload rather than off a result
+    subclass: the burst already knows how big W is and how many readers wanted
+    it, so nothing needs copying.
+    """
+
+    def __init__(self, result: Result) -> None:
+        self.result = result
+
+    def render(self) -> str:
+        res, burst = self.result, self.result.workload
+        ledger = res.ledger
+        payload = burst.payload_bytes
+        union = payload  # the 1x target: W crosses the fabric once
+        fabric_x = ledger.origin_bytes / union if union else 0.0
+        lines = [
+            f"readers: {burst.num_readers}   payload(W): {payload}B   "
+            f"1x-union target: {union}B",
+            f"fabric(origin->readers): {ledger.origin_bytes}B ({fabric_x:.1f}x)   "
+            f"total delivered: {ledger.transfer_bytes}B",
+            f"wallclock: {ledger.wallclock:.4f}   "
+            f"readers done: {ledger.items_done}/{ledger.items_total}",
+            "source->dest (unrouted: every reader pulls the origin):",
+        ]
+        for line in render_tree(ledger.edges):
+            lines.append("    " + line)
+        return "\n".join(lines)

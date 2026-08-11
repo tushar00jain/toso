@@ -22,12 +22,8 @@ from collections import Counter
 import pytest
 import torch
 
-from dedup_sim.harness import (
-    DEFAULT_N,
-    MODE_META,
-    MODE_METADATA,
-    run,
-)
+from dedup_sim.tests._run import run
+from putget_sim.workload.put_get import DEFAULT_N, MODE_META, MODE_METADATA
 from realsim.seams.transport import TensorDescriptor
 from sim_common import config
 
@@ -83,12 +79,12 @@ def test_fabric_dedup_1x_independent_of_fanout_cap(mode):
 @pytest.mark.parametrize("mode", MODES)
 def test_only_one_hop_crosses_from_the_origin(mode):
     dedup = run(num_readers=5, fanout_cap=1, mode=mode)
-    origin_edges = [e for e in dedup.ledger.edges if e[0] == dedup.origin_id]
+    origin_edges = [e for e in dedup.ledger.edges if e[0] == dedup.workload.origin_id]
     assert len(origin_edges) == 1  # the single fabric hop
     # Every other transfer's source is a reader-side peer, not the origin.
-    peer_edges = [e for e in dedup.ledger.edges if e[0] != dedup.origin_id]
+    peer_edges = [e for e in dedup.ledger.edges if e[0] != dedup.workload.origin_id]
     assert len(peer_edges) == 4
-    assert all(src != dedup.origin_id for (src, _dst, _k) in peer_edges)
+    assert all(src != dedup.workload.origin_id for (src, _dst, _k) in peer_edges)
 
 
 # 5. Fan-out cap shapes the topology: cap 1 = chain, cap 2 = tree.
@@ -192,8 +188,8 @@ def test_dedup_collapse_is_deterministic():
 # 8. Allocation-free carriers survive the dedup path.
 def test_meta_mode_allocates_no_storage():
     res = run(num_readers=3, fanout_cap=1, mode=MODE_META)
-    assert isinstance(res.expected, torch.Tensor)
-    assert res.expected.device.type == "meta"
+    assert isinstance(res.workload.expected, torch.Tensor)
+    assert res.workload.expected.device.type == "meta"
     for payload in res.results.values():
         assert isinstance(payload, torch.Tensor)
         assert payload.device.type == "meta"
@@ -202,7 +198,7 @@ def test_meta_mode_allocates_no_storage():
 
 def test_metadata_mode_carries_only_a_descriptor():
     res = run(num_readers=3, fanout_cap=1, mode=MODE_METADATA)
-    assert isinstance(res.expected, TensorDescriptor)
+    assert isinstance(res.workload.expected, TensorDescriptor)
     for payload in res.results.values():
         assert isinstance(payload, TensorDescriptor)
 
@@ -217,17 +213,10 @@ def test_metadata_mode_carries_only_a_descriptor():
 #    peer registers. These two tests pin that, because it is the whole point of
 #    the change -- the 1x number alone would still pass with the monkeypatch.
 def test_readers_run_an_untouched_real_client():
-    from realsim.entrypoint import run_simulation
-    from putget_sim.workload.put_get import PutGetBurst
-
-    from dedup_sim.control.routing import DedupPolicy
-    from dedup_sim.data.read_through import ReadThroughPlane
-
-    workload = PutGetBurst(3, make_plane=ReadThroughPlane)
-    result = run_simulation(workload, policy=DedupPolicy(fanout_cap=1))
+    result = run(3, fanout_cap=1)
     mesh = result.sim.mesh
 
-    for reader_id in workload.reader_ids:
+    for reader_id in result.workload.reader_ids:
         # The one controller handle the mesh built, not a per-reader view of it.
         assert mesh.client(reader_id)._controller is mesh.handle
 
@@ -237,18 +226,24 @@ def test_the_scenario_holds_no_burst_loop():
     import ast
     import inspect
 
-    from putget_sim.workload import put_get
+    from putget_sim.workload.put_get import PutGetBurst
 
-    from dedup_sim import harness
+    from dedup_sim.workload import scenarios
 
-    tree = ast.parse(inspect.getsource(harness))
+    tree = ast.parse(inspect.getsource(scenarios))
     # The capability contributes a policy and a data plane; the burst itself is
-    # putget_sim's fixture. So the harness stages nothing of its own: no coroutine,
-    # hence no gather, no await, no execution order to get wrong.
+    # putget_sim's fixture. So the scenario stages nothing of its own: no
+    # coroutine, hence no gather, no await, no execution order to get wrong.
     assert not [
         n
         for n in ast.walk(tree)
         if isinstance(n, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor))
     ]
-    # ...and both runs are the same realsim workload, one policy apart.
-    assert harness.PutGetBurst is put_get.PutGetBurst
+    # ...and every run is literally the same workload object, one policy apart:
+    # the baseline and each routed cap cannot differ in what they simulate.
+    runs = scenarios.dedup_vs_baseline()
+    assert [r.label for r in runs] == ["baseline", "cap=1", "cap=2"]
+    assert all(isinstance(r.workload, PutGetBurst) for r in runs)
+    assert len({id(r.workload) for r in runs}) == 1
+    assert runs[0].policy is None and runs[0].plane is None
+    assert all(r.policy is not None and r.plane is not None for r in runs[1:])

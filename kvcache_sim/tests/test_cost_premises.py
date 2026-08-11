@@ -34,7 +34,7 @@ from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
 from kvcache_sim.data.store import KVStore
-from kvcache_sim.workload.serving import sim_block_carrier
+from kvcache_sim.workload._serving import sim_block_carrier
 from realsim.simulation import Simulation
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, make_topology
 

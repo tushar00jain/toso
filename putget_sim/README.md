@@ -95,12 +95,12 @@ putget_sim/
   control/                # DECIDES -- absent: no policy, that is the point
   data/                   # EXECUTES -- absent: no data plane either
   workload/               # WHAT IS SIMULATED
-    put_get.py            #   PutGetBurst: seed W on the origin, then m clients
-                          #   get it. Ordinary user code; dedup_sim reuses it
+    put_get.py            #   PutGetBurst, a realsim.Workload: seed W on the
+                          #   origin, then m clients get it. dedup_sim reuses it
+    scenarios.py          #   the Runs to compare -- here, the single unrouted one
   report/                 # OUTCOME METRICS
-    summary.py            #   fabric/wallclock summary + source->dest tree
-  harness.py              # run_burst: the one place this wires onto a stack
-  __main__.py             # `python -m putget_sim` demo (summary + ASCII + trace)
+    summary.py            #   BurstReport: fabric/wallclock + source->dest tree
+  __main__.py             # `python -m putget_sim`: a realsim.Demo declaration
 ```
 
 All the real-object plumbing — adapters, seams, mesh, runner, cost model, async

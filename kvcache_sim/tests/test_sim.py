@@ -16,7 +16,7 @@ from sim_common.async_engine import AsyncEngine, run_sim
 
 from kvcache_sim.control._cache import LRUCache
 from kvcache_sim.control.view import KVView
-from kvcache_sim.workload.serving import sim_block_carrier
+from kvcache_sim.workload._serving import sim_block_carrier
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
@@ -27,10 +27,7 @@ from kvcache_sim.workload.request import (
     longest_prefix_run,
     Request,
 )
-from kvcache_sim.workload.scenarios import (
-    DISAGG_TARGET_TBT,
-    EARLY_SLO_TBT,
-    make_topology,
+from kvcache_sim.tests._run import (
     run,
     run_disaggregation,
     run_early_rejection,
@@ -38,6 +35,11 @@ from kvcache_sim.workload.scenarios import (
     run_hotspot,
     run_overload,
     run_shared_prefix,
+)
+from kvcache_sim.workload.scenarios import (
+    DISAGG_TARGET_TBT,
+    EARLY_SLO_TBT,
+    make_topology,
     shared_prefix_workload,
 )
 
