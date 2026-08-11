@@ -47,21 +47,33 @@ class LRUCache:
                 self._clock += 1
                 self._recency[k] = self._clock
 
+    def coldest(self, n: int) -> List[str]:
+        """The ``n`` least-recently-used keys, coldest first.
+
+        Answers *which* keys would go without dropping them, for the caller that has
+        to decide how many are enough (the store asks in bytes, this counts blocks).
+        Ties break on the key, like :meth:`admit`, so the answer is deterministic.
+        """
+        ranked = sorted(self._recency, key=lambda k: (self._recency[k], k))
+        return ranked[:max(0, n)]
+
+    def drop(self, keys: List[str]) -> None:
+        """Forget ``keys`` without admitting anything: they are gone from the volume."""
+        for k in keys:
+            self._recency.pop(k, None)
+
     def admit(self, keys: List[str]) -> List[str]:
         """Insert/refresh ``keys``; evict the coldest until within capacity.
 
         Returns the list of evicted keys (so the caller can drop them from the
-        directory). Eviction ties break on the block key for determinism.
+        directory), coldest first -- the same order, by the same rule, that
+        :meth:`coldest` answers a full volume with.
         """
         for k in keys:
             self._clock += 1
             self._recency[k] = self._clock
-
-        evicted: List[str] = []
-        if self.capacity is not None:
-            while len(self._recency) > self.capacity:
-                # coldest = lowest recency; tie-break on key for determinism.
-                victim = min(self._recency, key=lambda k: (self._recency[k], k))
-                del self._recency[victim]
-                evicted.append(victim)
+        if self.capacity is None:
+            return []
+        evicted = self.coldest(len(self._recency) - self.capacity)
+        self.drop(evicted)
         return evicted

@@ -1,12 +1,16 @@
-"""Guards on the two places this repo restates torchstore instead of calling it.
+"""Guards on the places this repo restates torchstore instead of calling it.
 
-Both are deliberate and both can rot silently:
+All are deliberate and all can rot silently:
 
 * :class:`proposed.deployment.Controller` declares the directory surface, because
   ``proposed`` must not import torchstore -- it is what torchstore would gain, so
   depending on it would invert the claim. The signatures are therefore a copy,
   except for the members that *are* the ask (``THE_ASK``), which upstream has yet
   to have;
+* :class:`proposed.deployment.StorageVolume` declares the storage surface the same
+  way, and asks for nothing: every member is a copy, and each endpoint left out is
+  listed with a reason (``VOLUME_NOT_DECLARED``) so a narrower surface stays a
+  decision rather than an oversight;
 * :class:`realsim.seams.controller_handle.LocalControllerHandle` mirrors the bodies
   of ``locate_volumes`` and ``keys`` **verbatim**, because ``@endpoint`` makes them
   ``EndpointProperty`` descriptors that cannot be invoked off-actor, and torchstore
@@ -27,10 +31,14 @@ import hashlib
 import inspect
 
 from torchstore.controller import Controller as RealController
+from torchstore.storage_volume import StorageVolume as RealStorageVolume
 
 from proposed import Controller as ProposedController
+from proposed import StorageVolume as ProposedStorageVolume
 from realsim.seams.controller_handle import LocalControllerHandle
 from realsim.seams.controller_service import ControllerService
+from realsim.seams.volume_handle import LocalVolumeHandle
+from realsim.seams.volume_service import VolumeService
 
 #: Endpoints whose bodies are mirrored verbatim, and the digest of the source we
 #: mirrored. A failure here is not a bug: it means upstream edited the body and the
@@ -52,8 +60,9 @@ COPIED_FROM_UPSTREAM = [
 
 #: Members that are the *ask* -- declared here because torchstore would have to gain
 #: them. ``locate_raw`` is ``locate_volumes`` with the policy hook skipped, which is
-#: what a controller hands its own policy through a ``View``.
-THE_ASK = ["locate_raw"]
+#: what a controller hands its own policy through a ``View``; ``evict_for`` is the
+#: directory's other policy call site, asked by a storage volume that is full.
+THE_ASK = ["locate_raw", "evict_for"]
 
 
 def _real(name: str):
@@ -145,4 +154,82 @@ def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
         assert not inspect.iscoroutinefunction(endpoint), (
             f"{name} is a coroutine on the handle, i.e. the service shape -- real "
             f"client code calls {name}.call_one(...) and would break"
+        )
+
+
+# --------------------------------------------------------------------------
+# The same three guards for the storage service. Its surface is a pure copy --
+# unlike Controller, the proposal asks it to gain nothing -- so every member must
+# exist upstream, spelled the same way.
+# --------------------------------------------------------------------------
+
+#: Endpoints the real ``StorageVolume`` has that this proposal does not declare,
+#: and why. Listed rather than ignored so a member that starts being needed is a
+#: decision someone makes, not a gap nobody noticed.
+VOLUME_NOT_DECLARED = {
+    "get_meta": "the store's own metadata read; no caller in this proposal",
+    "get_id": "actor identity, which Monarch answers, not the surface",
+    "spawn": "a constructor, not an endpoint",
+    "actor_name": "a class attribute",
+}
+
+
+def _volume_declared() -> list[str]:
+    return [
+        name for name in vars(ProposedStorageVolume)
+        if not name.startswith("_")
+        and callable(getattr(ProposedStorageVolume, name))
+    ]
+
+
+def test_proposed_storage_volume_declares_the_real_surface():
+    """Every member is upstream's, and every omission is deliberate."""
+    declared = _volume_declared()
+    assert sorted(declared) == [
+        "delete", "delete_batch", "get", "handshake", "put", "reset",
+    ], declared
+    for name in declared:
+        assert name in RealStorageVolume.__dict__, (
+            f"proposed.StorageVolume declares {name!r}, which the real "
+            f"StorageVolume does not have -- it moved upstream or we invented it"
+        )
+        ours = list(
+            inspect.signature(getattr(ProposedStorageVolume, name)).parameters
+        )
+        theirs = list(
+            inspect.signature(RealStorageVolume.__dict__[name]._method).parameters
+        )
+        assert ours == theirs, (
+            f"{name}: proposed.StorageVolume takes {ours} and the real one takes "
+            f"{theirs}. Upstream changed the surface; re-copy it"
+        )
+    # Anything upstream we leave out is listed with a reason.
+    upstream = {
+        name for name, v in vars(RealStorageVolume).items()
+        if not name.startswith("_")
+    }
+    unexplained = upstream - set(declared) - set(VOLUME_NOT_DECLARED)
+    assert not unexplained, (
+        f"the real StorageVolume has {sorted(unexplained)}, which is neither "
+        f"declared nor listed in VOLUME_NOT_DECLARED with a reason"
+    )
+
+
+def test_the_volume_service_implements_it_and_the_handle_refers_to_it():
+    """Two shapes again: methods on the service, endpoints on the handle."""
+    service = VolumeService()
+    handle = LocalVolumeHandle(service)
+    for name in _volume_declared():
+        assert inspect.iscoroutinefunction(getattr(service, name)), (
+            f"{name} is not a coroutine on the service: that is the surface "
+            f"proposed.StorageVolume declares, and the service implements it"
+        )
+        endpoint = getattr(handle, name)
+        assert hasattr(endpoint, "call_one") and hasattr(endpoint, "call"), (
+            f"{name} on the handle is not endpoint-shaped: a caller reaches an "
+            f"actor method through call_one / call, not by calling it"
+        )
+        assert not inspect.iscoroutinefunction(endpoint), (
+            f"{name} is a coroutine on the handle, i.e. the service shape -- real "
+            f"client code calls {name}.call(...) and would break"
         )

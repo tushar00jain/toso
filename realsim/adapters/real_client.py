@@ -5,7 +5,7 @@ Wiring:
 - A minimal ``FakeStrategy`` provides the ``select_storage_volume`` /
   ``get_storage_volume`` surface the real client uses, returning real
   ``StorageVolumeRef`` objects whose ``.volume`` is a
-  :class:`~realsim.seams.volume_handle.FakeVolumeHandle`. We do not construct a
+  :class:`~realsim.seams.volume_handle.LocalVolumeHandle`. We do not construct a
   real ``TorchStoreStrategy`` subclass because its ``set_storage_volumes`` needs
   a live Monarch mesh (``storage_volumes.get_id.call()``); the client only ever
   calls ``select_storage_volume`` / ``get_storage_volume`` / ``transport_context``
@@ -30,7 +30,7 @@ from typing import Iterator
 
 from realsim.seams import factory
 from realsim.seams.transport import Endpoint, InMemoryTransport
-from realsim.seams.volume_handle import FakeVolumeHandle
+from realsim.seams.volume_handle import LocalVolumeHandle
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
@@ -48,13 +48,13 @@ class FakeStrategy:
     Args:
         client_volume_id: the volume id this client is co-located with (its
             ``select_storage_volume`` target).
-        volume_handles: mapping of ``volume_id -> FakeVolumeHandle``.
+        volume_handles: mapping of ``volume_id -> LocalVolumeHandle``.
     """
 
     def __init__(
         self,
         client_volume_id: str,
-        volume_handles: dict[str, FakeVolumeHandle],
+        volume_handles: dict[str, LocalVolumeHandle],
     ) -> None:
         self._client_volume_id = client_volume_id
         self._volume_handles = volume_handles
@@ -78,7 +78,7 @@ class RealClientAdapter:
 
     Args:
         controller_handle: a :class:`LocalControllerHandle`.
-        volume_handles: mapping ``volume_id -> FakeVolumeHandle``.
+        volume_handles: mapping ``volume_id -> LocalVolumeHandle``.
         client_volume_id: the volume this client is co-located with.
         topology: mapping ``volume_id -> Endpoint`` for transfer-cost locality.
         profile: optional target-machine :class:`~sim_common.cost_model.MachineProfile`
@@ -94,7 +94,7 @@ class RealClientAdapter:
         self,
         controller_handle,
         *,
-        volume_handles: dict[str, FakeVolumeHandle],
+        volume_handles: dict[str, LocalVolumeHandle],
         client_volume_id: str,
         topology: dict[str, Endpoint],
         profile: MachineProfile | None = None,

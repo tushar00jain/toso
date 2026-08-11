@@ -132,7 +132,8 @@ realsim/
     transport.py              # InMemoryTransport (subclasses real MonarchRPCTransportBuffer);
                               #   charges the cost model per put/get; re-exports Endpoint;
                               #   TensorDescriptor (metadata-only carrier)
-    volume_handle.py          # FakeVolumeHandle (mirrors StorageVolume endpoints; real InMemoryStore)
+    volume_service.py         # VolumeService (mirrors StorageVolume endpoints; real InMemoryStore)
+    volume_handle.py          # LocalVolumeHandle (an endpoint per member of it)
     controller_handle.py      # LocalControllerHandle (dispatches to a real Controller)
     factory.py                # THE create_transport_buffer substitution point + source contextvar
   adapters/                   # thin wiring that constructs the real objects off-actor
@@ -284,7 +285,7 @@ modifying any torchstore source**.
 
 ### Volume (`torchstore/storage_volume.py`)
 
-- `FakeVolumeHandle` presents `.put.call` / `.get.call_one` / `.handshake.call_one`
+- `LocalVolumeHandle` presents `.put.call` / `.get.call_one` / `.handshake.call_one`
   (plus delete/reset), each body **mirroring the real `StorageVolume` endpoint
   verbatim** — every real endpoint just delegates to `self.store`. The backing
   store is the **real `InMemoryStore`**, so `InMemoryStore.put` / `.get` /
@@ -393,7 +394,7 @@ So a **put** charges `network` (client→volume) + `storage write`; a **get** ch
 ### `mesh.py` — the shared multi-client wiring
 
 Before a scenario can express any capability it needs the same set of real
-objects: a controller adapter, a `FakeVolumeHandle` per node, a
+objects: a controller adapter, a `VolumeService` (behind a `LocalVolumeHandle`) per node, a
 `RealClientAdapter` (hence a real `LocalClient`) per node, one shared
 `ResourceRegistry`, and — because `create_transport_buffer` is a process-wide
 global — *one* transport factory shared across clients that resolves the caller's

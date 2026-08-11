@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
-__all__ = ["Controller", "Coordinator", "Deployment"]
+__all__ = ["Controller", "Coordinator", "Deployment", "StorageVolume"]
 
 
 class Controller(Protocol):
@@ -93,6 +93,22 @@ class Controller(Protocol):
         no reason to reach for it.
         """
 
+    async def evict_for(
+        self, storage_volume_id: str, need_bytes: int
+    ) -> Sequence[str]:
+        """``storage_volume_id`` is out of room: which keys should it drop?
+
+        The second thing this surface would have to gain, and the second place it
+        consults a :class:`~proposed.policy.Policy` -- the first being the routing
+        hook inside ``locate_volumes``. A storage volume knows it is full and knows
+        nothing about what is worth keeping; the directory knows who holds what and is
+        where a policy is installed, so the volume asks *here* rather than holding a
+        control plane of its own.
+
+        Answers nothing when no policy is installed, which leaves the volume to
+        refuse the put as an unbounded store always did.
+        """
+
     async def notify_put_batch(
         self, requests: Sequence[Any], storage_volume_id: str
     ) -> None:
@@ -108,6 +124,55 @@ class Controller(Protocol):
 
     async def keys(self, prefix: Optional[str] = None) -> List[str]:
         """Every registered key, or those under ``prefix``."""
+
+
+class StorageVolume(Protocol):
+    """The store's *storage* service, as a caller reaches it.
+
+    The third service in a deployment, beside :class:`Controller` (which knows who
+    holds what) and :class:`Coordinator` (which decides): the one that actually holds
+    bytes. torchstore has this class -- ``torchstore.storage_volume.StorageVolume``,
+    an actor whose endpoints each delegate to an ``InMemoryStore`` -- and, as with
+    ``Controller``, never declares the surface a caller depends on. So this is that
+    surface, written down.
+
+    Declared as **methods**, matching the actor class, for the reason given on
+    :class:`Controller`: that is where the signatures live. A caller reaches each one
+    through an endpoint (``volume.put.call_one(buffer, requests)``), which is
+    Monarch's own type and is not restated here.
+
+    Every member below already exists upstream. Two of its endpoints are deliberately
+    left out -- ``get_meta`` and ``get_id`` -- because nothing in this proposal
+    reaches for them; they are the store's own bookkeeping, and declaring a surface
+    wider than the ask would misstate the ask.
+
+    What a *deployment* would have to gain is nothing here: unlike ``Controller``,
+    this surface is complete as it stands. What the simulator adds around it --
+    per-volume residency, a byte capacity, and asking
+    :meth:`proposed.policy.Policy.evict` before refusing a put that does not fit --
+    is behaviour behind these same signatures, which is why it needs no member of its
+    own. A real volume enforcing a real disk would answer the same way.
+    """
+
+    async def put(self, transport_buffer: Any, requests: Sequence[Any]) -> None:
+        """Store what ``requests`` name, reading bytes through ``transport_buffer``."""
+
+    async def get(self, transport_buffer: Any, requests: Sequence[Any]) -> Any:
+        """Fill ``transport_buffer`` with what ``requests`` name, and return it."""
+
+    async def handshake(
+        self, transport_buffer: Any, requests: Sequence[Any]
+    ) -> List[Any]:
+        """Agree the transport for a transfer before either side moves bytes."""
+
+    async def delete(self, key: str) -> None:
+        """Drop one key's bytes."""
+
+    async def delete_batch(self, keys: List[str]) -> None:
+        """Drop several keys' bytes."""
+
+    async def reset(self) -> None:
+        """Drop everything this volume holds."""
 
 
 class Coordinator(Protocol):

@@ -13,7 +13,8 @@ It owns, for a run:
 * one controller adapter (the real ``Controller`` directory, real ``Trie`` or the
   dict shim -- see :func:`~realsim.adapters.real_controller.make_controller_adapter`)
   and its :class:`~realsim.seams.controller_handle.LocalControllerHandle`;
-* one :class:`~realsim.seams.volume_handle.FakeVolumeHandle` per node, each
+* one :class:`~realsim.seams.volume_service.VolumeService` per node (reached
+  through a :class:`~realsim.seams.volume_handle.LocalVolumeHandle`), each
   backed by a real ``InMemoryStore``;
 * one :class:`~realsim.adapters.real_client.RealClientAdapter` -- hence one real
   ``LocalClient`` -- per node, co-located with that node's volume;
@@ -52,7 +53,8 @@ from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import make_controller_adapter
 from realsim.seams import factory
 from realsim.seams.transport import Endpoint, InMemoryTransport
-from realsim.seams.volume_handle import FakeVolumeHandle
+from realsim.seams.volume_handle import LocalVolumeHandle
+from realsim.seams.volume_service import VolumeService
 from proposed import View
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from sim_common.resources import ResourceRegistry
@@ -120,9 +122,17 @@ class Mesh:
             self.controller_handle.install_policy(policy, self.view)
         # Each volume's byte capacity comes from the run's profile
         # (``storage_capacity_bytes``, default unbounded); the seam enforces it
-        # against the aggregate resident working set.
-        self.volumes: Dict[str, FakeVolumeHandle] = {
-            vid: FakeVolumeHandle(volume_id=self.topology[vid].id, profile=self.profile)
+        # against the aggregate resident working set, and asks the directory
+        # (``evict_for``) before refusing a put that does not fit -- which is why a
+        # volume is handed the controller handle, not a callback.
+        self.volumes: Dict[str, LocalVolumeHandle] = {
+            vid: LocalVolumeHandle(
+                VolumeService(
+                    volume_id=self.topology[vid].id,
+                    profile=self.profile,
+                    controller=self.controller_handle,
+                )
+            )
             for vid in self.ids
         }
         # One real LocalClient per node, co-located with that node's volume.

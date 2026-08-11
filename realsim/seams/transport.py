@@ -166,7 +166,7 @@ class InMemoryTransport(MonarchRPCTransportBuffer):
 
     Args:
         storage_volume_ref: the real ``StorageVolumeRef`` (its ``.volume`` is a
-            :class:`realsim.seams.volume_handle.FakeVolumeHandle`).
+            :class:`realsim.seams.volume_service.VolumeService`).
         src: the transferring client's endpoint.
         dst: the target volume's endpoint.
         profile: the target-machine :class:`~sim_common.cost_model.MachineProfile`

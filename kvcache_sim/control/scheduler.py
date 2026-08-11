@@ -428,7 +428,36 @@ class _Base(Policy, Coordinator):
         """Replace control's model of ``inst``'s decode batch."""
         self._decode_finishes[fact.inst] = list(fact.finishes)
 
-    # -- the store's question, answered from what we already decided ------ #
+    # -- the store's questions, answered from what we already decided ----- #
+    async def evict(
+        self, view: Any, volume_id: str, need_bytes: int
+    ) -> Sequence[str]:
+        """:class:`~proposed.policy.Policy` -- ``volume_id`` is full; what goes?
+
+        The store asks in bytes and this cache counts blocks, so the conversion is
+        here: one block's bytes come from the model this scheduler already prices
+        against, and the coldest keys are named until they cover the overshoot.
+
+        This is the *same* LRU that :class:`Published` consults after a prefill --
+        one recency order, asked at two different moments. The difference is who
+        noticed: there, a request finished on an instance we model the capacity of;
+        here, a volume that actually ran out of room said so.
+        """
+        cache = self.caches.get(volume_id)
+        if cache is None:
+            return ()
+        per_block = self.model.block_bytes(1, self.B)
+        if per_block <= 0:
+            return ()
+        # Round up: freeing a fraction of a block frees nothing.
+        wanted = -(-int(need_bytes) // per_block)
+        victims = cache.coldest(wanted)
+        # Forget them here too, or this cache would keep offering keys the volume
+        # has already dropped -- and would count them against its own capacity.
+        cache.drop(victims)
+        return victims
+
+
     async def select(
         self, view: Any, keys: Sequence[str], requester: str
     ) -> Selection:

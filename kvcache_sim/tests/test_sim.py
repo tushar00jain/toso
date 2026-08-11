@@ -531,3 +531,34 @@ def test_an_unknown_payload_is_refused_not_guessed(member, payload):
                 sim.loop.run_until_complete(result)
     finally:
         sim.loop.close()
+
+
+def test_the_scheduler_answers_a_full_volume_from_its_own_lru():
+    """The store asks in bytes; the same LRU that Published consults answers.
+
+    Both moments read one recency order -- what a request finishing admits, and what
+    a volume running out of room drops -- so a key named here is also gone from the
+    scheduler's own model of that instance.
+    """
+    sim = Simulation(_make_topology(2))
+    sched = LoadBalanceScheduler(block_tokens=512, capacity=8)
+    sched.attach(sim.view, sim.transfer_cost)
+    cold, warm = _block_keys_for("m0", [0]), _block_keys_for("m1", [0])
+    sched.caches["s0"].admit(list(cold))     # coldest: admitted first
+    sched.caches["s0"].admit(list(warm))
+    per_block = sched.model.block_bytes(1, sched.B)
+
+    try:
+        # Exactly one block's worth of overshoot -> exactly the coldest key.
+        victims = sim.loop.run_until_complete(
+            sched.evict(sim.view, "s0", per_block)
+        )
+        assert list(victims) == list(cold)
+        assert sched.caches["s0"].held() == set(warm)
+        # A fraction of a block still frees a whole one: rounded up, never down.
+        more = sim.loop.run_until_complete(sched.evict(sim.view, "s0", 1))
+        assert list(more) == list(warm)
+        # A volume this scheduler models nothing about is not its to answer for.
+        assert sim.loop.run_until_complete(sched.evict(sim.view, "nope", 1)) == ()
+    finally:
+        sim.loop.close()

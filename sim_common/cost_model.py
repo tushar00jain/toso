@@ -74,7 +74,7 @@ class MachineProfile:
         storage_capacity_bytes: byte capacity of a single storage volume,
             enforced against the aggregate resident working set on that volume
             (the sum of all bytes currently resident) by the volume seam (see
-            :class:`realsim.seams.volume_handle.FakeVolumeHandle`). Like the
+            :class:`realsim.seams.volume_service.VolumeService`). Like the
             bandwidths this is a target-hardware descriptor, not a debug knob --
             it changes the simulated result (an over-commit raises instead of
             silently fitting), so it is an explicit profile field rather than an

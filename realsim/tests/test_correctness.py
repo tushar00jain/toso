@@ -21,14 +21,18 @@ import torch
 from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import RealControllerAdapter
 from realsim.seams.transport import Endpoint
-from realsim.seams.volume_handle import FakeVolumeHandle
+from realsim.seams.volume_handle import LocalVolumeHandle
+from realsim.seams.volume_service import VolumeService
 from torchstore.transport import TensorSlice
 
 
 def _build():
     """A controller, two volumes, and producer(vol "1")/consumer(vol "0") clients."""
     controller = RealControllerAdapter()
-    volumes = {"0": FakeVolumeHandle(), "1": FakeVolumeHandle()}
+    volumes = {
+        "0": LocalVolumeHandle(VolumeService()),
+        "1": LocalVolumeHandle(VolumeService()),
+    }
     topology = {
         "0": Endpoint(id="vol0", host="hostA", node="nodeA"),  # consumer
         "1": Endpoint(id="vol1", host="hostB", node="nodeB"),  # producer
