@@ -11,12 +11,20 @@ simulator, ``proposed`` is the design being argued for.
   requester, and may withhold the answer until that volume is usable. The default
   :class:`~proposed.policy.NaivePolicy` returns the directory's own answer, so an
   installed policy changes nothing until one is written.
+* :mod:`proposed.coordinator` -- :class:`~proposed.coordinator.Coordinator`, the
+  other kind of control plane: one that runs as its own service because its
+  decision needs the cluster-wide picture no single host holds. The abstract base a
+  capability subclasses, as ``Policy`` is for the kind the controller consults.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
   directory surface a caller reaches (torchstore names this type but never declares
   it: ``api.py`` annotates the spawned handle as the actor class and ``LocalClient``
   takes it unannotated). The difference between it and torchstore's class is the
   ask: the policy hook inside ``locate_volumes``, and ``locate_raw``, the same read
-  without it;
+  without it. Beside it, :class:`~proposed.deployment.Coordinator` declares the
+  *caller's* side of the surface above -- what a reference to a running coordinator
+  offers, endpoint per member. Two shapes, so two types with one name each in their
+  own module: ``from proposed import Coordinator`` is the one you *write*, and
+  ``proposed.deployment.Coordinator`` the one you *call*;
 * :mod:`proposed.view` -- :class:`~proposed.view.View`, the read-only observation
   a controller hands a policy: who holds a key, where volumes are, what time it is.
   It reads a :class:`~proposed.deployment.Controller`, through ``locate_raw``.
@@ -33,8 +41,9 @@ missing" section.
 """
 
 # Re-export the contract surface so callers import from the package directly.
+from .coordinator import Coordinator
 from .cost import TransferCost
-from .deployment import Controller, Coordinator, Deployment
+from .deployment import Controller, Deployment
 from .plane import ControlPlane, DataPlane
 from .policy import DecisionLog, Policy, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL

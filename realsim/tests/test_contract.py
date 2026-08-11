@@ -347,16 +347,23 @@ def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
 
 
 def test_plane_port_rule_actually_resolves_the_real_port():
-    """Vacuous unless it finds kvcache's Coordinator and the plane that holds it."""
+    """Vacuous unless it finds the real Coordinator and the plane that holds it.
+
+    The port is imported from ``proposed``, not from a sibling ``control/``, so this
+    also pins the half of :func:`_control_ports` that follows a package import: were
+    it to look only at ``control/``, rule 6 would go quiet on kvcache's data plane
+    instead of failing.
+    """
     root, pkgs = check_structure.REPO_ROOT, check_structure.GRAPH_PKGS
     mods = check_structure._module_map(root, pkgs)
     import ast
 
     rel = mods["kvcache_sim.data.serving"]
     tree = ast.parse((root / rel).read_text())
-    trees = {"kvcache_sim.control.scheduler": ast.parse(
-        (root / mods["kvcache_sim.control.scheduler"]).read_text()
-    )}
+    trees = {
+        dotted: ast.parse((root / mods[dotted]).read_text())
+        for dotted in ("kvcache_sim.control.scheduler", "proposed.coordinator")
+    }
     ports = check_structure._control_ports(rel, tree, mods, trees)
     assert ports == {"Coordinator"}, ports
     # ...and that the plane's field is recognised as holding one.

@@ -113,6 +113,7 @@ from realsim.tools.check_contract import (
     CONTROL_SEGMENT,
     DATA_SEGMENT,
     format_violations,
+    PROPOSED_PKG,
     resolve_module,
     REPO_ROOT,
     Violation,
@@ -421,9 +422,33 @@ def _is_dataclass(cls: ast.ClassDef) -> bool:
     return False
 
 
+def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
+    """Control-plane surfaces ``proposed`` declares, by their marker base.
+
+    A port that outlives the simulator lives in ``proposed`` rather than in a
+    capability's ``control/`` -- :class:`proposed.coordinator.Coordinator` is one.
+    Those are found structurally, not by name: the deciding half of a capability
+    derives :class:`proposed.plane.ControlPlane`, and nothing else in the package
+    does, so that base is the discriminator. A ``View``, a ``Selection`` or a
+    ``Deployment`` is therefore not a port, which is right -- reading a field off a
+    value the other plane handed over is exactly what values are for.
+    """
+    out: Set[str] = set()
+    for dotted, tree in trees.items():
+        if dotted.split(".")[0] != PROPOSED_PKG:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(b, ast.Name) and b.id == "ControlPlane"
+                for b in node.bases
+            ):
+                out.add(node.name)
+    return out
+
+
 def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
                    trees: Dict[str, ast.Module]) -> Set[str]:
-    """Names this module imports from a sibling ``control/`` that are *ports*.
+    """Names this module imports that are *ports* into the other plane.
 
     A ``Plan``, a ``Completion`` or a ``Request`` crossing the plane boundary is a
     *value* and its fields are meant to be read; those are dataclasses. A port is
@@ -432,12 +457,27 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     torchstore uses for ``TorchStoreStrategy``. So the discriminator is the
     dataclass decorator, not a base: it keeps holding when a port stops being a
     ``Protocol`` and becomes an ordinary base class.
+
+    Two sources, because a port can outlive the simulator. A capability's own
+    ``control/`` declares the capability-specific ones; ``proposed`` declares the
+    ones that are part of the upstream ask, and a ``data/`` module reaches those by
+    package import (``from proposed import Coordinator``). Both are policed the
+    same, so moving a port from the first place to the second does not quietly stop
+    rule 6 from applying -- which is what would happen if this only looked at
+    ``control/``.
     """
     out: Set[str] = set()
+    proposed = _proposed_ports(trees)
     for node in ast.walk(tree):
         if not isinstance(node, ast.ImportFrom):
             continue
         src = resolve_module(str(rel), node.level, node.module or "")
+        if src.split(".")[0] == PROPOSED_PKG:
+            out.update(
+                alias.asname or alias.name
+                for alias in node.names if alias.name in proposed
+            )
+            continue
         if CONTROL_SEGMENT not in src.split(".") or src not in trees:
             continue
         defined = {

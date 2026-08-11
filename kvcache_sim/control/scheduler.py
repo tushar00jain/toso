@@ -1,8 +1,9 @@
 """Schedulers under test: ``LoadBalanceScheduler`` and ``CacheAwareScheduler``.
 
-Both implement :class:`Coordinator`, which is the whole surface the data plane may
-touch -- and, because control runs in a coordinator service rather than on the
-serving host, the whole surface that would go on a wire::
+Both implement :class:`~proposed.coordinator.Coordinator`, which is the whole
+surface the data plane may touch -- and, because control runs in a coordinator
+service rather than on the serving host, the whole surface that would go on a
+wire::
 
     await schedule(request)      -> Plan | None   # None == rejected (SLO/overload)
     complete(plan)               -> Completion    # what to publish / evict
@@ -58,10 +59,9 @@ corrected by observations, never a live read:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from proposed import ControlPlane, Endpoint, Policy, Selection
+from proposed import Coordinator, Endpoint, Policy, Selection
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -75,78 +75,11 @@ from ._source import LongestPrefixPolicy
 from .request import Request
 
 __all__ = [
-    "Coordinator",
     "Plan",
     "Completion",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
 ]
-
-
-class Coordinator(ControlPlane, ABC):
-    """The coordinator as the data plane may use it: values in, values out.
-
-    This is the port between the two planes, and it is deliberately the *whole*
-    port -- a serving host that held anything else would be reaching into another
-    service. ``check_structure.py`` rule 6 enforces that: a ``data/`` module
-    annotating a field with this class may name only these members on it (no other
-    attribute, no subscript, no ``getattr``), which is the rule that would have
-    caught the four crossings this replaced.
-
-    Abstract, and a base class rather than a ``Protocol``, so it is the same kind
-    of thing as :class:`~proposed.policy.Policy`: a control plane declares which
-    surfaces it implements in its bases, and both answers are read the same way.
-
-    The four request/response members are awaitable and the two observations are
-    not, which is the actor distinction: a **call** waits for a reply and pays a
-    round trip, a **send** is one-way and the sender does not block on it. That is
-    also why the two sends are the ones the decode engine drives -- a per-step
-    notification that blocked the stepping loop would be modelling something no
-    deployment would build.
-
-    :class:`realsim.seams.coordinator_handle.CoordinatorHandle` is what stands here under
-    simulation: it wraps a control plane that implements this protocol, is the one
-    place a round trip is charged, and is what a Monarch endpoint would replace.
-    The handle satisfies this protocol *and* so does the object behind it -- the
-    same shape on both sides of the boundary, which is what makes the boundary
-    insertable. :class:`_Base` declares it alongside
-    :class:`~proposed.policy.Policy`, because one object does both jobs.
-    """
-
-    @abstractmethod
-    async def schedule(self, request: Request) -> Optional["Plan"]:
-        """Route one request, or ``None`` to reject it (SLO / overload).
-
-        No clock is passed in. A coordinator reads its own -- ``self.view.now()``
-        -- because a request arrives when it arrives: over a non-zero hop the
-        sender's stamp is already stale, and routing that compares it against every
-        instance's queue would be reading the cluster in the past.
-        """
-
-    @abstractmethod
-    async def complete(self, plan: "Plan") -> "Completion":
-        """What to publish and what to evict, once prefill has finished."""
-
-    @abstractmethod
-    async def decode_admission(self, plan: "Plan") -> bool:
-        """May this accepted request enter its decode batch now?"""
-
-    @abstractmethod
-    async def observe_prefill_done(self, inst: str, now: float) -> float:
-        """Report the clock the real ops reached; return the corrected queue tail."""
-
-    @abstractmethod
-    def observe_compute_busy(self, inst: str, until: float) -> None:
-        """Report a decode step occupying a **coupled** instance's compute."""
-
-    @abstractmethod
-    def observe_decode_state(self, inst: str, finishes: Sequence[float]) -> None:
-        """Report ``inst``'s live decode batch as estimated finish times.
-
-        One entry per request currently decoding or queued there, so its length
-        is the occupancy and its values answer "still decoding at ``t``?". Sent
-        whenever the batch changes, which is the only time either answer moves.
-        """
 
 
 @dataclass
@@ -192,7 +125,7 @@ class _Base(Policy, Coordinator):
     **This class does both control-plane jobs, and says so in its bases.** It is a
     :class:`~proposed.policy.Policy`, so the run installs it in the directory and
     the controller consults it there (:meth:`select`); and it is a
-    :class:`Coordinator`, so the run also fronts it with a
+    :class:`~proposed.coordinator.Coordinator`, so the run also fronts it with a
     :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` and a serving host
     reaches it as its own service. The two are one object on purpose: the peer it
     prices a pull against is the peer it later tells the directory to serve, with

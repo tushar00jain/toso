@@ -176,6 +176,9 @@ proposed/       every contract that outlives the simulator; imports nothing
                   readiness, plus notice() to open a readiness gate. Naive (all
                   holders, directory order) is the default; the controller
                   consults it inside locate_volumes
+  coordinator.py  Coordinator -- the control plane that runs as its own service
+                  because its decision needs the cluster-wide picture: the base a
+                  capability subclasses (schedule/complete + observations)
   view.py         View -- awaited, read-only observation: locate, topology and
                   locality, the clock. Built over a Controller (locate_raw)
   deployment.py   Deployment -- how data-plane code reaches its store

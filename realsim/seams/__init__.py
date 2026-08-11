@@ -12,7 +12,8 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
 - ``controller_service.ControllerService`` -- the directory server: the real
   ``Controller``, the policy installed in it, and the endpoint bodies
 - ``coordinator_service.CoordinatorService`` -- the same for a coordinator: it
-  holds a capability's control plane and answers ``proposed.Coordinator``
+  holds a capability's control plane (a ``proposed.Coordinator``) and answers the
+  caller's surface, ``proposed.deployment.Coordinator``
 - ``controller_handle.LocalControllerHandle`` -- what a caller holds for that
   service: one endpoint per member (``locate_volumes`` / ``notify_put_batch`` /
   ``keys``), reached through ``call_one`` / ``call`` / ``broadcast``.

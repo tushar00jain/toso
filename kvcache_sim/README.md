@@ -135,7 +135,8 @@ directory read is control even though it awaits.
 kvcache_sim/
   control/                # DECIDES -- moves nothing, holds no client
     scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator,
-                          #   behind the Coordinator port the data plane calls:
+                          #   behind proposed.Coordinator, the port the data
+                          #   plane calls:
                           #   prefill placement, pull-vs-recompute, SLO gates,
                           #   decode placement; owns the PREDICTED prefill queue
                           #   and its model of the decode load

@@ -25,7 +25,7 @@ The coordinator is not on this host
 Control runs as a service holding the cluster-wide picture, so this plane reaches
 it exactly the way it reaches the store: through a port, over calls that carry
 values. That port is
-:class:`~kvcache_sim.control.scheduler.Coordinator`, and it is the *only* thing
+:class:`~proposed.coordinator.Coordinator`, and it is the *only* thing
 this module may touch on the control side -- ``check_structure.py`` rule 6 fails
 the build on a field read, a subscript or a ``getattr`` through it, because none
 of those survive the two planes being in different processes.
@@ -55,9 +55,9 @@ import asyncio
 from typing import Dict, List, Optional
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
-from proposed import DataPlane
+from proposed import Coordinator, DataPlane
 
-from ..control.scheduler import Coordinator, Plan
+from ..control.scheduler import Plan
 from ..report.metrics import Metrics, RequestResult
 from ..control.request import Request
 from ._decode import DecodeEngine
@@ -78,7 +78,7 @@ class ServingPlane(DataPlane):
     Args:
         store: the :class:`~kvcache_sim.data.store.KVStore` verbs.
         coordinator: the control plane, through its
-            :class:`~kvcache_sim.control.scheduler.Coordinator` port and nothing
+            :class:`~proposed.coordinator.Coordinator` port and nothing
             else. It decides; it never executes, and it is not on this host.
         trace: the run's shared trace.
         metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger.

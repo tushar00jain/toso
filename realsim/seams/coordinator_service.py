@@ -27,9 +27,10 @@ class CoordinatorService:
     """The deciding object, as a service reachable from another process.
 
     Args:
-        control: the capability's control plane -- kvcache's scheduler, which
-            declares the same members on its own abstract base. This service holds
-            it and forwards; it decides nothing.
+        control: the capability's control plane -- a
+            :class:`proposed.coordinator.Coordinator`, which declares these same
+            members for the side that *implements* them. This service holds it and
+            forwards; it decides nothing.
     """
 
     def __init__(self, control: Any) -> None:
