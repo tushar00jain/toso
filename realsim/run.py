@@ -46,7 +46,6 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.runner import WorkItem
-from realsim.seams.coordinator import CoordinatorHandle
 from realsim.simulation import Simulation
 
 __all__ = ["Workload", "Report", "MakeControl", "MakePlane", "Run", "Result"]
@@ -125,7 +124,7 @@ class Run:
             * a :data:`MakeControl` factory runs **in its own service**, built
               over the assembled stack and fronted by a
               :class:`~realsim.seams.coordinator.CoordinatorHandle` as
-              ``sim.coordinator``. This is kvcache: its scheduler holds every
+              ``sim.coordinator_handle``. This is kvcache: its scheduler holds every
               instance's queue, cache and decode occupancy, so it needs
               ``sim.view`` and cannot be built before the stack.
 
@@ -143,7 +142,8 @@ class Run:
             for every capability, including the baseline.)
         data: builds the capability's :class:`~proposed.plane.DataPlane` onto the
             assembled stack -- the half that executes. ``None`` -> no plane, the
-            plain path. It reaches the control plane through ``sim.coordinator``,
+            plain path. It reaches that control plane through
+            ``sim.coordinator_handle``,
             never by being handed the object.
         profile / trace / ledger: the run's target machine, event trace and
             outcome ledger. A capability with a richer outcome row passes its own
@@ -182,6 +182,7 @@ class Run:
         sim = Simulation(
             self.workload.topology,
             policy=installed,
+            control=service,
             profile=self.profile,
             trace=self.trace,
             ledger=self.ledger,
@@ -189,11 +190,6 @@ class Run:
             quiet=quiet,
             random_seed=random_seed,
         )
-        # A control plane that is not installed in the controller runs beside
-        # it, and the data plane reaches it through a handle -- the seam a
-        # deployment replaces with an actor endpoint.
-        if service is not None:
-            sim.coordinator = CoordinatorHandle(service(sim))
         plane = self.data(sim) if self.data is not None else None
         results = sim.run(self.workload, plane=plane)
         return Result(results=results, sim=sim, run=self)

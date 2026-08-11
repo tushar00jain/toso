@@ -12,7 +12,7 @@ Two separate things, deliberately:
   before the stack does.
 
 They are two functions because they are two services. The plane factory does not
-build the scheduler; it takes ``sim.coordinator``, the handle
+build the scheduler; it takes ``sim.coordinator_handle``, the handle
 :meth:`realsim.run.Run.execute` put in front of whatever :func:`coordinator`
 returned. A scenario names both on a :class:`~realsim.run.Run`: same workload,
 different wiring, which is exactly what "cache-aware vs load-balance" means.
@@ -156,7 +156,7 @@ def serving_plane(
             sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
         )
         return ServingPlane(
-            store, sim.coordinator, trace=sim.trace, metrics=sim.ledger,
+            store, sim.coordinator_handle, trace=sim.trace, metrics=sim.ledger,
             coupled=coupled,
             simulate_decode=simulate_decode,
             decode_ids=sorted(decode_pool) if decode_pool else sim.ids,

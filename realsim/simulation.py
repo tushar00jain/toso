@@ -32,7 +32,7 @@ the workload supplies the work; :meth:`realsim.run.Run.execute` pairs the two.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from proposed import DataPlane, Endpoint, Policy, View
 from sim_common.async_engine import AsyncEngine
@@ -45,6 +45,7 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
+from realsim.seams.coordinator import CoordinatorHandle
 from realsim.runner import Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -62,6 +63,13 @@ class Simulation:
         policy: optional :class:`~proposed.policy.Policy`, installed in the real
             controller's ``locate_volumes``. ``None`` leaves the directory
             answering for itself, which is what the naive policy says anyway.
+            This is a control plane that runs *in the directory service*.
+        control: optional factory for a control plane that runs as its **own**
+            service -- called with this stack once it is assembled, and fronted by
+            a :class:`~realsim.seams.coordinator.CoordinatorHandle` as
+            :attr:`coordinator_handle`. A factory rather than an object because
+            such a control plane senses through :attr:`view`, which does not exist
+            until the mesh does.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`;
             supplies every cost constant and each volume's byte capacity.
         trace: shared :class:`~sim_common.trace.Trace` (created if omitted).
@@ -77,6 +85,7 @@ class Simulation:
         topology: Dict[str, Endpoint],
         *,
         policy: Optional[Policy] = None,
+        control: Optional[Callable[["Simulation"], Any]] = None,
         profile: Optional[MachineProfile] = None,
         trace: Optional[Trace] = None,
         ledger: Optional[Ledger] = None,
@@ -88,15 +97,6 @@ class Simulation:
         self.trace = trace if trace is not None else Trace()
         self.ledger = ledger if ledger is not None else Ledger()
         self.policy = policy
-
-        # The control plane reached as a service, which is the only way it is
-        # ever reached: a realsim.seams.coordinator.CoordinatorHandle set by
-        # Run.execute once the stack exists. A control plane installed in the
-        # *directory* service instead (a Policy) is reached the same way through
-        # the seam already in front of it, FakeControllerHandle, so it is absent
-        # here rather than held anywhere else. Either way no plane holds the
-        # other's object.
-        self.coordinator: Optional[Any] = None
 
         # The clock, created on first use: assembling a stack should not have the
         # side effect of standing up an event loop, and a caller may only want
@@ -121,6 +121,16 @@ class Simulation:
         # both derived from the objects above rather than rebuilt beside them.
         self.view: View = self.mesh.view
         self.transfer_cost = ProfileTransferCost(self.mesh.topology, self.profile)
+
+        # The second service, assembled exactly like the first: declared to this
+        # constructor, stood up here. A control plane installed in the *directory*
+        # went in through ``policy`` above and is reached through the seam already
+        # in front of it (FakeControllerHandle); one that runs on its own gets its
+        # seam here. Built last because a control plane senses through the view
+        # and prices through the transfer-cost estimate, so both must exist first.
+        self.coordinator_handle: Optional[Any] = (
+            CoordinatorHandle(control(self)) if control is not None else None
+        )
 
     @property
     def loop(self) -> AsyncEngine:
