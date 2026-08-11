@@ -31,9 +31,12 @@ from .report.summary import BaselineReport, DedupReport
 from .workload.scenarios import dedup_vs_baseline
 
 
-def _dedup(console: Console, args: argparse.Namespace) -> None:
-    runs = dedup_vs_baseline()
-    results = [run.execute() for run in runs]
+def _runs(args: argparse.Namespace):
+    """The unrouted baseline, then one routed run per fan-out cap."""
+    return dedup_vs_baseline()
+
+
+def _show(console: Console, results) -> None:
     naive, routed = results[0], results[1:]
     payload = naive.workload.payload_bytes
     num_readers = naive.workload.num_readers
@@ -75,7 +78,7 @@ class DedupDemo(Demo):
     )
 
     def scenarios(self):
-        return [Scenario("dedup", _dedup)]
+        return [Scenario("dedup", _runs, _show)]
 
     def takeaway(self, console: Console) -> None:
         console.section("TAKEAWAY")

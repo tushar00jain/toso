@@ -27,11 +27,13 @@ scenarios" a requirement rather than a convention:
     if __name__ == "__main__":
         DedupDemo().main()
 
-Scenario narration stays a function. A scenario's prose is genuinely bespoke --
-which comparison it drew, what the reader should notice -- and pressing it into
-declarative fields would contort it for no gain. What that function is *handed*
-is a :class:`Console`, so section headers, trace dumps and the summary line are
-one implementation rather than three.
+A scenario is two functions, not one: :attr:`Scenario.runs` declares the
+configurations and :attr:`Scenario.show` narrates the results. :meth:`Demo.main`
+is what executes, between them -- so "which simulations does this scenario run"
+is answerable by reading a function that runs nothing, and every sim executes the
+same way. Narration stays a function because a scenario's prose is genuinely
+bespoke; what it is *handed* is a :class:`Console`, so section headers, trace
+dumps and the summary line are one implementation rather than three.
 """
 
 from __future__ import annotations
@@ -40,12 +42,12 @@ import argparse
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from sim_common import config
 from sim_common.report import configure_logging, section
 
-from realsim.run import Report
+from realsim.run import Report, Result, Run
 
 __all__ = ["Console", "Scenario", "Demo"]
 
@@ -197,16 +199,24 @@ class Console:
 
 @dataclass
 class Scenario:
-    """One named thing a demo can run.
+    """One named comparison: which configurations, and how to narrate them.
+
+    The two halves are deliberately separate. :attr:`runs` *declares* -- it
+    returns :class:`~realsim.run.Run` values and executes nothing;
+    :meth:`Demo.main` executes them, in one place, and hands the results to
+    :attr:`show`, which only prints. Before this split ``show`` did all three,
+    so every scenario silently ran a simulation somewhere inside a function
+    called "show".
 
     Args:
         name: the CLI's positional choice for it.
-        show: draws the comparison -- runs it and narrates it, given the
-            :class:`Console` and the parsed arguments.
+        runs: the configurations to compare, given the parsed arguments.
+        show: narrates the results, in the order ``runs`` declared them.
     """
 
     name: str
-    show: Callable[[Console, argparse.Namespace], None]
+    runs: Callable[[argparse.Namespace], Sequence[Run]]
+    show: Callable[[Console, Sequence[Result]], None]
 
 
 class Demo(ABC):
@@ -236,7 +246,23 @@ class Demo(ABC):
     def takeaway(self, console: Console) -> None:
         """Closing prose, printed after a run-everything pass. Default: none."""
 
+    def run_knobs(self, args: argparse.Namespace) -> Dict[str, Any]:
+        """Per-invocation knobs for :meth:`~realsim.run.Run.execute`.
+
+        For a sim whose own flags reach the engine rather than the scenario --
+        ``putget_sim``'s ``--seed``. Default: none.
+        """
+        return {}
+
     # -- the shared plumbing ------------------------------------------------- #
+    def _play(
+        self, scenario: Scenario, console: Console, args: argparse.Namespace
+    ) -> None:
+        """Declare, execute, narrate -- the three steps, visibly in that order."""
+        runs = scenario.runs(args)
+        results = [run.execute(**self.run_knobs(args)) for run in runs]
+        scenario.show(console, results)
+
     def main(self, argv: Optional[Sequence[str]] = None) -> None:
         """Parse, configure, dispatch. The same for every sim."""
         logger = logging.getLogger(self.name)
@@ -264,8 +290,8 @@ class Demo(ABC):
 
         chosen = getattr(args, "scenario", None)
         if chosen is not None:
-            by_name[chosen].show(console, args)
+            self._play(by_name[chosen], console, args)
             return
         for scenario in scenarios:
-            scenario.show(console, args)
+            self._play(scenario, console, args)
         self.takeaway(console)

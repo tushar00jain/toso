@@ -40,12 +40,11 @@ from .workload import scenarios
 TRACE_LIMIT = 60
 
 
-def _results(runs: List[Run]) -> List[Result]:
-    return [run.execute() for run in runs]
+def _runs_shared_prefix(args: argparse.Namespace) -> List[Run]:
+    return scenarios.shared_prefix()
 
 
-def _shared_prefix(console: Console, args: argparse.Namespace) -> None:
-    results = _results(scenarios.shared_prefix())
+def _shared_prefix(console: Console, results: List[Result]) -> None:
     console.section("SHARED PREFIX: conversations sharing a hot system prompt + context")
     console.info("directory: real torchstore.controller.Controller (off-actor)")
     console.info("4 instances (2 nodes), 200 requests, 8 conversations, Zipf skew.")
@@ -56,8 +55,11 @@ def _shared_prefix(console: Console, args: argparse.Namespace) -> None:
     console.summary(CacheVsBaselineReport("shared_prefix", results))
 
 
-def _eviction(console: Console, args: argparse.Namespace) -> None:
-    results = _results(scenarios.eviction_sweep())
+def _runs_eviction(args: argparse.Namespace) -> List[Run]:
+    return scenarios.eviction_sweep()
+
+
+def _eviction(console: Console, results: List[Result]) -> None:
     console.section("EVICTION: hit rate vs cache capacity (LRU)")
     console.info("400 requests, 12 conversations. As per-instance capacity grows, the")
     console.info("hot working set fits and the prefix hit rate rises, then plateaus")
@@ -67,8 +69,11 @@ def _eviction(console: Console, args: argparse.Namespace) -> None:
     console.info(EvictionReport(results).render())
 
 
-def _hotspot(console: Console, args: argparse.Namespace) -> None:
-    results = _results(scenarios.hotspot())
+def _runs_hotspot(args: argparse.Namespace) -> List[Run]:
+    return scenarios.hotspot()
+
+
+def _hotspot(console: Console, results: List[Result]) -> None:
     console.section("HOTSPOT: extreme skew -> hot-block replication spreads load")
     console.info("One dominant conversation. Without replication (balance_threshold huge)")
     console.info("the cache-aware policy piles every hot request on the single instance")
@@ -80,8 +85,11 @@ def _hotspot(console: Console, args: argparse.Namespace) -> None:
     console.info(" hot prefix to a peer -> fewer prefill tokens, more fabric bytes.)")
 
 
-def _overload(console: Console, args: argparse.Namespace) -> None:
-    results = _results(scenarios.overload())
+def _runs_overload(args: argparse.Namespace) -> List[Run]:
+    return scenarios.overload()
+
+
+def _overload(console: Console, results: List[Result]) -> None:
     console.section("OVERLOAD: high arrival + TTFT SLO -> rejections")
     console.info("300 requests at a high rate with a TTFT SLO of 6.0. Prefix reuse")
     console.info("shortens prefill, freeing capacity, so cache-aware admits more")
@@ -89,8 +97,11 @@ def _overload(console: Console, args: argparse.Namespace) -> None:
     console.summary(CacheVsBaselineReport("overload", results))
 
 
-def _disaggregation(console: Console, args: argparse.Namespace) -> None:
-    results = _results(scenarios.disaggregation())
+def _runs_disaggregation(args: argparse.Namespace) -> List[Run]:
+    return scenarios.disaggregation()
+
+
+def _disaggregation(console: Console, results: List[Result]) -> None:
     console.section("DISAGGREGATION: dedicated decode pool protects TBT from prefill")
     console.info("Two decode instances, VRAM cap 8, TBT target %.3f. Admission is",
                  scenarios.DISAGG_TARGET_TBT)
@@ -108,8 +119,11 @@ def _disaggregation(console: Console, args: argparse.Namespace) -> None:
     console.info("a large fraction of served requests blow the target -- same load admitted.")
 
 
-def _early_rejection(console: Console, args: argparse.Namespace) -> None:
-    results = _results(scenarios.early_rejection())
+def _runs_early_rejection(args: argparse.Namespace) -> List[Run]:
+    return scenarios.early_rejection()
+
+
+def _early_rejection(console: Console, results: List[Result]) -> None:
     console.section("EARLY REJECTION: predict decode load, don't waste prefill")
     console.info("Heavy decode load with a tight TBT SLO of %.3f. Three cache-aware runs",
                  scenarios.EARLY_SLO_TBT)
@@ -139,12 +153,12 @@ class KVCacheDemo(Demo):
 
     def scenarios(self):
         return [
-            Scenario("shared_prefix", _shared_prefix),
-            Scenario("eviction", _eviction),
-            Scenario("hotspot", _hotspot),
-            Scenario("overload", _overload),
-            Scenario("disaggregation", _disaggregation),
-            Scenario("early_rejection", _early_rejection),
+            Scenario("shared_prefix", _runs_shared_prefix, _shared_prefix),
+            Scenario("eviction", _runs_eviction, _eviction),
+            Scenario("hotspot", _runs_hotspot, _hotspot),
+            Scenario("overload", _runs_overload, _overload),
+            Scenario("disaggregation", _runs_disaggregation, _disaggregation),
+            Scenario("early_rejection", _runs_early_rejection, _early_rejection),
         ]
 
     def takeaway(self, console: Console) -> None:

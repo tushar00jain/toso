@@ -155,7 +155,9 @@ realsim/
                   execute() itself), Result, Report. The only way anything runs,
                   so no capability wires its own stack
   demo.py         Demo / Scenario / Console -- a sim's command line, declared,
-                  plus the run flags/logging every one of them shares
+                  plus the run flags/logging every one of them shares. A Scenario
+                  declares its Runs and narrates the Results; Demo.main is the
+                  one place that executes
   tools/          check_contract.py: the concurrency + plane-separation lint
                   check_structure.py: the shape of a sim package
   tests/          seams smoke, determinism, contract lint, off-sim correctness,

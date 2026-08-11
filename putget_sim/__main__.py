@@ -28,16 +28,21 @@ from .workload.scenarios import burst, NUM_READERS
 PROFILE = DEFAULT_PROFILE
 
 
-def _burst(console: Console, args: argparse.Namespace) -> None:
+def _runs(args: argparse.Namespace):
+    """The one configuration: no policy, no data plane."""
+    return burst(args.readers, n=args.elements, mode=args.mode, profile=PROFILE)
+
+
+def _show(console: Console, results) -> None:
+    (result,) = results
     console.section(
-        f"READ BURST: {args.readers} readers each get W over the REAL TorchStore"
+        f"READ BURST: {result.workload.num_readers} readers each get W over the "
+        f"REAL TorchStore"
     )
     console.info(
         "real client planning + real controller directory + real InMemoryStore, "
         "on the deterministic virtual-clock engine."
     )
-    (run,) = burst(args.readers, n=args.elements, mode=args.mode, profile=PROFILE)
-    result = run.execute(random_seed=args.seed)
     console.trace(result.trace)
     console.summary(BurstReport(result))
     console.info(
@@ -64,7 +69,11 @@ class PutGetDemo(Demo):
     own_logger = True
 
     def scenarios(self):
-        return [Scenario("burst", _burst)]
+        return [Scenario("burst", _runs, _show)]
+
+    def run_knobs(self, args: argparse.Namespace):
+        """``--seed`` is an engine knob, so it reaches execute(), not the scenario."""
+        return {"random_seed": args.seed}
 
     def flags(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(

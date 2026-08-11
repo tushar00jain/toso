@@ -24,7 +24,10 @@ import pytest
 from dedup_sim.__main__ import DedupDemo
 from kvcache_sim.__main__ import KVCacheDemo
 from putget_sim.__main__ import PutGetDemo
-from realsim.demo import Console, Demo, Scenario
+import argparse
+
+from realsim.demo import _add_run_flags, Console, Demo, Scenario
+from realsim.run import Run
 
 DEMOS = [PutGetDemo, DedupDemo, KVCacheDemo]
 DEMO_IDS = [d.__name__ for d in DEMOS]
@@ -53,6 +56,8 @@ def test_every_demo_declares_its_parts(demo_cls):
     # Names are the CLI's choices, so they must be distinct.
     names = [s.name for s in scenarios]
     assert len(set(names)) == len(names)
+    # Declaring and narrating are separate: every scenario supplies both.
+    assert all(callable(s.runs) and callable(s.show) for s in scenarios)
 
 
 def test_an_incomplete_demo_cannot_be_constructed():
@@ -81,6 +86,31 @@ def test_every_scenario_is_selectable(demo_cls):
         pytest.skip(f"{demo.name} has a single scenario and no positional arg")
     for scenario in scenarios:
         demo_cls().main([scenario.name])
+
+
+@pytest.mark.parametrize("demo_cls", DEMOS, ids=DEMO_IDS)
+def test_declaring_a_scenario_executes_nothing(demo_cls):
+    """``Scenario.runs`` returns configurations; only ``Demo.main`` runs them.
+
+    A declared ``Run`` has no ``Simulation`` behind it yet, so nothing has
+    touched a clock or a directory at declaration time.
+    """
+    demo = demo_cls()
+    parser = argparse.ArgumentParser()
+    demo.flags(parser)
+    _add_run_flags(parser)
+    if len(list(demo.scenarios())) > 1:
+        parser.add_argument("scenario", nargs="?")
+    args = parser.parse_args([])
+    for scenario in demo.scenarios():
+        runs = scenario.runs(args)
+        assert runs, f"{demo.name}:{scenario.name} declared no runs"
+        assert all(isinstance(r, Run) for r in runs)
+        # Labels are how a report tells the configurations apart.
+        labels = [r.label for r in runs]
+        assert all(labels) and len(set(labels)) == len(labels)
+        # Nothing has been assembled: a declared Run has no Simulation yet.
+        assert all(r.plane is None or callable(r.plane) for r in runs)
 
 
 def test_console_renders_a_report_once():

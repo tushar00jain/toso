@@ -156,7 +156,9 @@ realsim/
                               #   Run (one labelled configuration, which executes
                               #   itself), Result, Report. The only way anything runs
   demo.py                     # Demo / Scenario / Console — a sim's command line,
-                              #   declared; plus the run flags every one of them shares
+                              #   declared; plus the run flags every one shares.
+                              #   A Scenario declares Runs and narrates Results;
+                              #   Demo.main is the one place that executes
   tools/
     check_contract.py         # concurrency-contract lint (AST checker + CLI)
     check_structure.py        # structure lint: a sim package's shape (AST + CLI)
