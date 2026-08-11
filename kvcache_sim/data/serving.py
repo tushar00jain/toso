@@ -54,11 +54,11 @@ from __future__ import annotations
 import asyncio
 from typing import Dict, List, Optional
 
-from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
+from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model, prefill_time
 from proposed import Coordinator, DataPlane
 
 from ..control.scheduler import (
-    AdmitDecode, ComputeBusy, DecodeState, Plan, PrefillFinished, Published, Route,
+    AdmitDecode, ComputeBusy, DecodeState, Plan, PrefillFinished, Route,
 )
 from ..report.metrics import Metrics, RequestResult
 from ..control.request import Request
@@ -112,6 +112,11 @@ class ServingPlane(DataPlane):
         self.metrics = metrics
         self.coupled = coupled
         self.simulate_decode = simulate_decode
+        # Cost constants, for the one thing this plane has to price itself: a
+        # prefill re-priced because the reuse it was planned around is gone.
+        self.profile = profile
+        self.model = model
+        self.block_tokens = store.block_tokens
         # On the decode-simulating path acceptance is provisional until the request
         # is admitted to a decode batch (it may still be shed on the TBT SLO). We
         # stash the accepted row here and publish it once decode finishes (success)
@@ -173,37 +178,74 @@ class ServingPlane(DataPlane):
 
         tbt = self.simulate_decode
         self._trace_route(plan)
+        row = self._make_accepted(plan)
         if not tbt:
-            self.metrics.add(self._make_accepted(plan))
+            self.metrics.add(row)
         else:
-            self._pending[request.id] = self._make_accepted(plan)
+            self._pending[request.id] = row
 
         # (1) wait out the prefill queue at this instance.
         if plan.queue_wait > 0:
             await asyncio.sleep(plan.queue_wait)
         # (2) pull the remote prefix (a real client.get_batch -> real fabric cost).
+        prefill_t = plan.prefill_t
         if plan.reuse_source is not None and plan.pull_keys:
-            await self.store.fetch(plan.prefill, plan.pull_keys)
+            try:
+                await self.store.fetch(plan.prefill, plan.pull_keys)
+            except KeyError:
+                # The peer had those blocks when this was planned and does not now:
+                # a volume it shares with other requests ran out of room and control
+                # named them. Nothing is wrong -- a cache that cannot evict is not a
+                # cache -- but this plan is stale, so recompute what was going to be
+                # reused instead of failing the request.
+                prefill_t = self._recompute(plan, row)
         # (3) charge the prefill compute for the uncached suffix.
-        if plan.prefill_t > 0:
-            await asyncio.sleep(plan.prefill_t)
+        if prefill_t > 0:
+            await asyncio.sleep(prefill_t)
 
-        # (4) publish the computed KV blocks into the real directory; evict.
-        completion = await self.coordinator.decide.call_one(Published(plan))
-        await self.store.publish(completion.instance, completion.publish)
-        if completion.evict:
-            await self.store.evict(completion.instance, completion.evict)
+        # (4) publish what this host now holds and did not before: the prefix it
+        # pulled, plus the suffix it computed. Which blocks those are is not a
+        # decision and not control's to make -- it is everything past what was
+        # already local, and the plan says how much that was.
+        local_blocks = plan.match_blocks - len(plan.pull_keys)
+        fresh = list(plan.request.block_keys[local_blocks:])
+        await self.store.publish(plan.prefill, fresh)
         # (5) tell control the clock the real ops reached, and (coupled only) the
         # decode timeline the same instance now carries.
         now = self._now()
         busy_until = await self.coordinator.decide.call_one(
-            PrefillFinished(completion.instance, now)
+            PrefillFinished(plan.prefill, now)
         )
         if self.coupled and self.engine is not None:
             # The reply, not a read of control's queue: prefill just occupied the
             # timeline decode steps on, and only the coordinator knows the tail.
-            self.engine.reserve(completion.instance, busy_until)
-        await self._prefill_done(plan, completion.evict)
+            self.engine.reserve(plan.prefill, busy_until)
+        await self._prefill_done(plan)
+
+    def _recompute(self, plan: Plan, row: RequestResult) -> float:
+        """Re-price this prefill with the reuse that vanished, and say what it costs.
+
+        The remote prefix is gone, so only what this instance already held is still
+        cached: the planned match minus the blocks that were going to be pulled.
+        Corrects the row too -- the request really did compute those tokens, and a
+        hit rate that counted the plan rather than the outcome would flatter the
+        cache that dropped them.
+        """
+        local_blocks = plan.match_blocks - len(plan.pull_keys)
+        cached = min(local_blocks * self.block_tokens, plan.request.prompt_tokens)
+        uncached = plan.request.prompt_tokens - cached
+        row.cached_tokens = cached
+        row.uncached_tokens = uncached
+        row.transfer_bytes = 0
+        recomputed = prefill_time(uncached, self.profile, self.model)
+        row.ttft += recomputed - plan.prefill_t
+        self.trace.record(
+            self._now(),
+            "RESTALE",
+            f"{plan.request.id} lost {len(plan.pull_keys)}blk of reuse on "
+            f"{plan.reuse_source} (evicted); recomputing on {plan.prefill}",
+        )
+        return recomputed
 
     # -- outcome bookkeeping ---------------------------------------------- #
     def _make_accepted(self, plan: Plan) -> RequestResult:
@@ -234,10 +276,8 @@ class ServingPlane(DataPlane):
             f"compute {plan.uncached_tokens}tok, ttft {plan.ttft:.3f})",
         )
 
-    async def _prefill_done(self, plan: Plan, evicted: List[str]) -> None:
+    async def _prefill_done(self, plan: Plan) -> None:
         note = ""
-        if evicted:
-            note = f"; evicted {len(evicted)} blk from {plan.prefill}"
         if not self.simulate_decode:
             self.trace.record(
                 self._now(),

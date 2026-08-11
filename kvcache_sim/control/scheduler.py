@@ -6,11 +6,18 @@ coordinator service rather than on the serving host, the whole surface that woul
 on a wire. The *questions* are this application's, carried as values::
 
     await decide(Route(request))        -> Plan | None   # None == rejected (SLO)
-    await decide(Published(plan))       -> Completion    # what to publish / evict
     await decide(AdmitDecode(plan))     -> True | None   # may it enter a decode batch
     await decide(PrefillFinished(i, t)) -> float         # the corrected queue tail
     observe(ComputeBusy(i, until))                       # a decode step's actual end
     observe(DecodeState(i, finishes))                    # who is decoding, until when
+
+Every one of those is about *compute*: where work runs, whether it may run, and what
+the machines are doing. What becomes of the *data* -- which blocks the directory
+should hold, and which stop existing -- is not asked here. Publishing is a fact the
+serving host already has (the blocks past the reused prefix are the ones it just
+computed), and retention is a store question, asked of this object's other half:
+:meth:`_Base.evict`, which the volume reaches through the directory when it is
+actually out of room.
 
 Every argument and every return is a value. Nothing here takes a handle to a
 data-plane object, and nothing here is a field the data plane reads -- see
@@ -77,11 +84,9 @@ __all__ = [
     "Route",
     "AdmitDecode",
     "PrefillFinished",
-    "Published",
     "ComputeBusy",
     "DecodeState",
     "Plan",
-    "Completion",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
 ]
@@ -128,18 +133,6 @@ class PrefillFinished:
 
 
 @dataclass(frozen=True)
-class Published:
-    """*This plan's prefill is done -- what must the store be told?*
-
-    Answered with a :class:`Completion`: the blocks to register and the ones to
-    remove. Deciding *which* blocks survive is control's, the store calls that make
-    it true are the data plane's.
-    """
-
-    plan: "Plan"
-
-
-@dataclass(frozen=True)
 class ComputeBusy:
     """A decode step occupied a **coupled** instance's compute until ``until``."""
 
@@ -182,20 +175,6 @@ class Plan:
     pred_batch: int = 0          # predicted decode batch size at admission
 
 
-@dataclass(frozen=True)
-class Completion:
-    """What the data plane must do once a request's prefill has run.
-
-    Returned by :meth:`_Base.complete`; the cache bookkeeping behind it has
-    already happened, because *which* blocks to keep is a control decision. The
-    store calls that make it true are the data plane's.
-    """
-
-    instance: str
-    publish: List[str]   # newly-materialized blocks to register on ``instance``
-    evict: List[str]     # blocks LRU dropped, to remove from the directory
-
-
 class _Base(Policy, Coordinator):
     """Shared state + prediction/commit helpers for both schedulers.
 
@@ -212,7 +191,6 @@ class _Base(Policy, Coordinator):
         view: a :class:`~kvcache_sim.control._view.KVView` -- the only way this
             object sees the world.
         block_tokens: tokens per KV block.
-        capacity: per-instance cache capacity in blocks (``None`` = unbounded).
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
         slo_ttft / slo_tbt: admission gates.
@@ -228,7 +206,6 @@ class _Base(Policy, Coordinator):
         self,
         *,
         block_tokens: int,
-        capacity: Optional[int] = None,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
         decode_pool: Optional[List[str]] = None,
@@ -241,7 +218,6 @@ class _Base(Policy, Coordinator):
         source_policy: Optional[Any] = None,
     ) -> None:
         self.B = block_tokens
-        self.capacity = capacity
         self.profile = profile
         self.model = model
         self.source_policy = (
@@ -292,7 +268,12 @@ class _Base(Policy, Coordinator):
         self.transfer_cost = transfer_cost
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
-        self.caches = {i: LRUCache(self.capacity) for i in self.ids}
+        # Unbounded on purpose. This mirrors what the directory says each instance
+        # holds, so that :meth:`evict` can answer with the coldest of them; a bound
+        # here would drop keys the store still has and make the answer wrong. What
+        # a volume can hold is the volume's own capacity, enforced where it is
+        # known -- see :class:`realsim.seams.volume_service.VolumeService`.
+        self.caches = {i: LRUCache(None) for i in self.ids}
         # PREDICTED prefill queue tail over ALL instances (the disaggregated-
         # prefill pool may be a subset; decode may be a disjoint or overlapping
         # subset). This is control's own model of the servers, corrected by the
@@ -315,7 +296,6 @@ class _Base(Policy, Coordinator):
             Route: self._decide_route,
             AdmitDecode: self._decide_admit_decode,
             PrefillFinished: self._decide_prefill_finished,
-            Published: self._decide_published,
         }
         self._facts = {
             ComputeBusy: self._observe_compute_busy,
@@ -393,28 +373,6 @@ class _Base(Policy, Coordinator):
             self.busy_until[demand.inst] = demand.now
         return self.busy_until[demand.inst]
 
-    async def _decide_published(self, demand: Published) -> "Completion":
-        """Admit the request's blocks into its prefill instance's cache.
-
-        After prefill the instance holds KV for the whole prompt, so every block key
-        is admitted (evicting the coldest past capacity). Answers with the blocks the
-        data plane must register in the real directory (the *new* ones -- the ones
-        already cached locally are not re-put) and the ones it must remove.
-        """
-        plan = demand.plan
-        # The pull, if there was one, has happened by now: drop the routing note
-        # so a later pull to this instance cannot match a stale one.
-        self._routed = [
-            e for e in self._routed
-            if not (e[0] == plan.prefill and e[1] == tuple(plan.pull_keys))
-        ]
-        keys = list(plan.request.block_keys)
-        cache = self.caches[plan.prefill]
-        already = cache.held()
-        new_keys = [k for k in keys if k not in already]
-        evicted = cache.admit(keys)
-        return Completion(instance=plan.prefill, publish=new_keys, evict=evicted)
-
     def _observe_compute_busy(self, fact: ComputeBusy) -> None:
         """A decode step on a **coupled** instance occupied its compute.
 
@@ -429,6 +387,33 @@ class _Base(Policy, Coordinator):
         self._decode_finishes[fact.inst] = list(fact.finishes)
 
     # -- the store's questions, answered from what we already decided ----- #
+    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
+        """:class:`~proposed.policy.Policy` -- the directory registered ``keys``.
+
+        The only way this object learns what data exists anywhere. It used to learn
+        by *deciding*: the coordinator was asked what to publish and updated its own
+        model as it answered, which made control's picture of the store a thing
+        control wrote rather than a thing it was told. Now the directory says so, and
+        this records it -- for the one purpose it still keeps data state for, which
+        is answering :meth:`evict`.
+
+        """
+        cache = self.caches.get(volume_id)
+        if cache is not None:
+            cache.admit(list(keys))
+
+    def forget(self, volume_id: str, keys: Sequence[str]) -> None:
+        """:class:`~proposed.policy.Policy` -- ``volume_id`` no longer holds ``keys``.
+
+        Where the model learns what an eviction actually removed, which is not the
+        same as what this object *named*: a volume drops what it really has, and
+        never a key the put in flight is writing.
+        """
+        cache = self.caches.get(volume_id)
+        if cache is not None:
+            cache.drop(list(keys))
+
+
     async def evict(
         self, view: Any, volume_id: str, need_bytes: int
     ) -> Sequence[str]:
@@ -438,10 +423,10 @@ class _Base(Policy, Coordinator):
         here: one block's bytes come from the model this scheduler already prices
         against, and the coldest keys are named until they cover the overshoot.
 
-        This is the *same* LRU that :class:`Published` consults after a prefill --
-        one recency order, asked at two different moments. The difference is who
-        noticed: there, a request finished on an instance we model the capacity of;
-        here, a volume that actually ran out of room said so.
+        The recency this reads is the only thing the scheduler keeps about *data*,
+        and it keeps it to answer this one question. It is not an enforcer: nothing
+        here trims a cache on a schedule of its own, because noticing that a volume
+        is full is the volume's job, and it is the one that asks.
         """
         cache = self.caches.get(volume_id)
         if cache is None:
@@ -451,11 +436,11 @@ class _Base(Policy, Coordinator):
             return ()
         # Round up: freeing a fraction of a block frees nothing.
         wanted = -(-int(need_bytes) // per_block)
-        victims = cache.coldest(wanted)
-        # Forget them here too, or this cache would keep offering keys the volume
-        # has already dropped -- and would count them against its own capacity.
-        cache.drop(victims)
-        return victims
+        # Named, not dropped: what actually goes is what the volume can drop, and
+        # it says so through :meth:`forget`. Dropping here would shrink the model
+        # faster than the store shrinks, and the next answer would be drawn from a
+        # cache emptier than the volume it describes.
+        return cache.coldest(wanted)
 
 
     async def select(

@@ -83,7 +83,6 @@ def coordinator(
     *,
     balance_threshold: float = 1.5,
     replicate: bool = True,
-    capacity: Optional[int] = None,
     slo_ttft: float = float("inf"),
     slo_tbt: float = float("inf"),
     simulate_decode: bool = False,
@@ -108,7 +107,6 @@ def coordinator(
         raise ValueError(f"unknown scheduler kind {kind!r}")
     knobs = dict(
         block_tokens=BLOCK_TOKENS,
-        capacity=capacity,
         profile=DEFAULT_PROFILE,
         slo_ttft=slo_ttft,
         slo_tbt=slo_tbt,

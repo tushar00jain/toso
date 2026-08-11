@@ -25,7 +25,7 @@ from kvcache_sim.data.store import KVStore
 from kvcache_sim.control.request import Request
 from kvcache_sim.control.scheduler import (
     AdmitDecode, ComputeBusy, DecodeState, LoadBalanceScheduler,
-    PrefillFinished, Published, Route,
+    PrefillFinished, Route,
 )
 from kvcache_sim.workload._generator import _block_keys_for
 from kvcache_sim.tests._run import (
@@ -148,8 +148,20 @@ def test_eviction_hit_rate_monotone_then_plateau():
     # large finite cap reaches (near) the unbounded hit rate
     topo = _make_topology(4)
     reqs = _shared_prefix_workload()
-    unbounded = run(topo, reqs, "cache_aware", capacity=None).ledger.hit_rate
-    big = run(topo, reqs, "cache_aware", capacity=100000).ledger.hit_rate
+    from dataclasses import replace as _replace
+
+    from domain import DEFAULT_MODEL, DEFAULT_PROFILE
+
+    from kvcache_sim.workload._serving import BLOCK_TOKENS
+
+    unbounded = run(topo, reqs, "cache_aware").ledger.hit_rate
+    big = run(
+        topo, reqs, "cache_aware",
+        profile=_replace(
+            DEFAULT_PROFILE,
+            storage_capacity_bytes=DEFAULT_MODEL.block_bytes(100000, BLOCK_TOKENS),
+        ),
+    ).ledger.hit_rate
     assert abs(unbounded - big) < 1e-9
 
 
@@ -171,12 +183,14 @@ def test_overload_fewer_rejections():
     assert 0 < len(cache_aware.ledger.accepted) < total   # some admitted, some shed
 
 
-# 10. Fan-out sanity: the LRU primitive never exceeds capacity, and a comfortably
-#     sized run still reuses.
+# 10. Fan-out sanity: the LRU primitive still honours a bound when given one, and
+#     a comfortably sized run still reuses. The *scheduler* no longer passes one:
+#     what a volume can hold is the volume's own capacity, enforced where it is
+#     known, so control's copy is a recency model rather than a second limit.
 def test_cache_never_exceeds_capacity():
     topo = _make_topology(4)
     reqs = _shared_prefix_workload()
-    r = run(topo, reqs, "cache_aware", capacity=64)
+    r = run(topo, reqs, "cache_aware")
     assert r.ledger.hit_rate > 0
     cap = 8
     c = LRUCache(capacity=cap)
@@ -459,7 +473,7 @@ def _scheduler(n: int = 2):
 
 
 def test_decide_dispatches_each_demand_to_its_own_handler():
-    """One member, four questions, told apart by the demand's type."""
+    """One member, three questions, told apart by the demand's type."""
     sim, sched = _scheduler()
     request = Request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
@@ -470,18 +484,15 @@ def test_decide_dispatches_each_demand_to_its_own_handler():
         with sim.mesh.installed():
             plan = await sched.decide(Route(request))
             admitted = await sched.decide(AdmitDecode(plan))
-            completion = await sched.decide(Published(plan))
             tail = await sched.decide(PrefillFinished(plan.prefill, 42.0))
-        return plan, admitted, completion, tail
+        return plan, admitted, tail
 
     try:
-        plan, admitted, completion, tail = sim.loop.run_until_complete(scenario())
+        plan, admitted, tail = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
     assert plan is not None and plan.prefill in sched.ids
     assert admitted is True                       # no TBT SLO in this run
-    assert completion.instance == plan.prefill
-    assert completion.publish == list(request.block_keys)
     assert tail == 42.0                            # the corrected queue tail, echoed
 
 
@@ -541,7 +552,7 @@ def test_the_scheduler_answers_a_full_volume_from_its_own_lru():
     scheduler's own model of that instance.
     """
     sim = Simulation(_make_topology(2))
-    sched = LoadBalanceScheduler(block_tokens=512, capacity=8)
+    sched = LoadBalanceScheduler(block_tokens=512)
     sched.attach(sim.view, sim.transfer_cost)
     cold, warm = _block_keys_for("m0", [0]), _block_keys_for("m1", [0])
     sched.caches["s0"].admit(list(cold))     # coldest: admitted first
@@ -554,6 +565,11 @@ def test_the_scheduler_answers_a_full_volume_from_its_own_lru():
             sched.evict(sim.view, "s0", per_block)
         )
         assert list(victims) == list(cold)
+        # Naming is not dropping: the volume evicts what it really has, and says so
+        # through forget(). Assuming otherwise drains the model faster than the
+        # store, and the next answer comes from a cache emptier than the volume.
+        assert sched.caches["s0"].held() == set(cold) | set(warm)
+        sched.forget("s0", list(cold))
         assert sched.caches["s0"].held() == set(warm)
         # A fraction of a block still frees a whole one: rounded up, never down.
         more = sim.loop.run_until_complete(sched.evict(sim.view, "s0", 1))

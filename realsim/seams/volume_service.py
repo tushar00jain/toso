@@ -58,13 +58,18 @@ import torch
 
 from realsim.seams.transport import _nbytes
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
+from proposed import StorageFull
 from torchstore.storage_volume import InMemoryStore
 
 __all__ = ["StorageCapacityExceeded", "VolumeService"]
 
 
-class StorageCapacityExceeded(Exception):
+class StorageCapacityExceeded(StorageFull):
     """Raised when a put would push a volume's resident bytes past its capacity.
+
+    A :class:`proposed.deployment.StorageFull` with the numbers attached: the
+    contract says "no room", this says how much of it there was.
+
 
     The volume's byte capacity comes from the run's
     :class:`~sim_common.cost_model.MachineProfile`
@@ -239,4 +244,11 @@ class VolumeService:
             await self.store.delete(key)
             self._forget(key)
             projected -= freed
+        if victims:
+            # The bytes are gone, so the directory must stop saying this volume has
+            # them -- otherwise a later read is routed here for something that was
+            # dropped. Told over the same handle the room was asked for.
+            await self._controller.notify_delete_batch.call_one(
+                {self.volume_id: victims}
+            )
         return projected

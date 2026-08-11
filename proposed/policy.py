@@ -132,6 +132,19 @@ class Policy(ControlPlane, ABC):
         withheld until a planned peer registers opens its readiness gate here.
         """
 
+    def forget(self, volume_id: str, keys: Sequence[str]) -> None:
+        """The real directory just *lost* ``keys`` on ``volume_id``.
+
+        The other half of :meth:`notice`, and called the same way: by the controller,
+        on every real deregistration (``notify_delete_batch``). Default: nothing.
+
+        A policy that models what a volume holds needs both halves or its model
+        drifts -- and it drifts in the direction that matters, because the answer it
+        gives to :meth:`evict` is drawn from that model. Being told what was really
+        dropped is also why a policy must not assume its own answer was carried out:
+        a volume evicts what it actually has, which may be less than it was offered.
+        """
+
     async def evict(
         self, view: View, volume_id: str, need_bytes: int
     ) -> Sequence[str]:

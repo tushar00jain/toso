@@ -13,9 +13,10 @@ shows, with no command line involved.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Dict, List, Sequence
 
-from domain import decode_step_time, DEFAULT_PROFILE
+from domain import decode_step_time, DEFAULT_MODEL, DEFAULT_PROFILE
 from proposed import Endpoint
 
 from realsim.demo import Console, Scenario
@@ -36,6 +37,7 @@ from ._serving import BLOCK_TOKENS, coordinator, KVWorkload, serving_plane
 __all__ = [
     "TRACE_LIMIT",
     "EVICTION_CAPACITIES",
+    "KV_BLOCKS_PER_INSTANCE",
     "DISAGG_TARGET_TBT",
     "DISAGG_MAX_BATCH",
     "EARLY_SLO_TBT",
@@ -64,6 +66,13 @@ def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     # it goes to the data plane alone; the decode settings go to both, because
     # each plane needs them and neither may read them off the other.
     coupled = knobs.pop("coupled", False)
+    # A per-run machine, so a scenario can give its volumes a different capacity.
+    # The default is finite: a serving instance's KV memory is a real bound, and a
+    # cache that cannot run out of room is not one -- the eviction it never performs
+    # would flatter every hit rate here. It is *store* capacity because that is
+    # where the blocks are; a store in general is unbounded, which is why this
+    # belongs to the capability and not to the profile every sim shares.
+    profile = knobs.pop("profile", _KV_INSTANCE_PROFILE)
     return Run(
         label,
         KVWorkload(topology, requests),
@@ -77,7 +86,7 @@ def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
             max_batch=knobs.get("max_batch", 8),
             decode_pool=knobs.get("decode_pool"),
         ),
-        profile=DEFAULT_PROFILE,
+        profile=profile,
         trace=Trace(time_width=8, kind_width=7),
         ledger=Metrics(),
     )
@@ -113,7 +122,22 @@ def _shared_prefix_workload(seed: int = 0):
 
 
 #: Per-instance cache capacities the eviction sweep walks.
-EVICTION_CAPACITIES = (2, 4, 8, 16, 32, 64, 256)
+#: What one serving instance sets aside for KV, in blocks. Chosen where the
+#: eviction sweep below has already plateaued: large enough that capacity is not
+#: what any other scenario is measuring, finite because the hardware is.
+KV_BLOCKS_PER_INSTANCE = 256
+_KV_INSTANCE_PROFILE = replace(
+    DEFAULT_PROFILE,
+    storage_capacity_bytes=DEFAULT_MODEL.block_bytes(
+        KV_BLOCKS_PER_INSTANCE, BLOCK_TOKENS
+    ),
+)
+
+# In blocks, converted to the volume's byte capacity. The smallest must still fit
+# one request's own blocks: a volume now enforces a real limit rather than a model
+# one, so a put that cannot fit even after evicting everything is refused, not
+# absorbed. The largest prompt here is system(2) + conversation(4) + query(2).
+EVICTION_CAPACITIES = (8, 16, 32, 64, 128, 256)
 
 
 
@@ -189,7 +213,15 @@ class Eviction(Scenario):
             block_tokens=BLOCK_TOKENS, output_tokens=64, seed=self.seed,
         )
         return [
-            _configure(str(cap), topo, reqs, "cache_aware", capacity=cap)
+            _configure(
+                str(cap), topo, reqs, "cache_aware",
+                profile=replace(
+                    DEFAULT_PROFILE,
+                    storage_capacity_bytes=DEFAULT_MODEL.block_bytes(
+                        cap, BLOCK_TOKENS
+                    ),
+                ),
+            )
             for cap in EVICTION_CAPACITIES
         ]
 

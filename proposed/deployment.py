@@ -32,7 +32,25 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
-__all__ = ["Controller", "Coordinator", "Deployment", "StorageVolume"]
+__all__ = [
+    "Controller", "Coordinator", "Deployment", "StorageFull", "StorageVolume",
+]
+
+
+class StorageFull(Exception):
+    """A volume refused a write because it has no room for it.
+
+    Part of the storage surface, not of a simulator: a bounded volume can always
+    be asked for more than it has, and a caller has to be able to tell "there was
+    no room" from a bug. Declared here so a data plane can catch it without
+    importing whatever is enforcing the bound.
+
+    It is raised only when the volume has already asked what to drop
+    (:meth:`proposed.policy.Policy.evict`) and still cannot fit the write -- so
+    catching it means *this data does not fit anywhere on this volume*, not
+    *try again later*. A cache fill answers that by not caching; a durable write
+    has to fail.
+    """
 
 
 class Controller(Protocol):
@@ -155,7 +173,11 @@ class StorageVolume(Protocol):
     """
 
     async def put(self, transport_buffer: Any, requests: Sequence[Any]) -> None:
-        """Store what ``requests`` name, reading bytes through ``transport_buffer``."""
+        """Store what ``requests`` name, reading bytes through ``transport_buffer``.
+
+        Raises :class:`StorageFull` if the write does not fit and could not be made
+        to fit; nothing lands in that case.
+        """
 
     async def get(self, transport_buffer: Any, requests: Sequence[Any]) -> Any:
         """Fill ``transport_buffer`` with what ``requests`` name, and return it."""

@@ -124,6 +124,12 @@ class ControllerService:
         for storage_volume_id, keys in volume_to_keys.items():
             for key in keys:
                 c._notify_delete(key, storage_volume_id, missing_ok=True)
+        # The directory just lost those keys. A policy modelling what a volume
+        # holds is told, the same way it is told about a registration (default:
+        # nothing) -- without this its model only ever grows.
+        if self._policy is not None:
+            for storage_volume_id, keys in volume_to_keys.items():
+                self._policy.forget(storage_volume_id, keys)
 
     async def evict_for(
         self, storage_volume_id: str, need_bytes: int

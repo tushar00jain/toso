@@ -44,7 +44,7 @@ missing" section.
 # Re-export the contract surface so callers import from the package directly.
 from .coordinator import Coordinator
 from .cost import TransferCost
-from .deployment import Controller, Deployment, StorageVolume
+from .deployment import Controller, Deployment, StorageFull, StorageVolume
 from .plane import ControlPlane, DataPlane
 from .policy import DecisionLog, Policy, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL
@@ -59,6 +59,7 @@ __all__ = [
     "Controller",
     "Coordinator",
     "StorageVolume",
+    "StorageFull",
     "Endpoint",
     "Tier",
     "TIER_LABEL",

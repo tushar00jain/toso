@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from proposed import Deployment
+from proposed import Deployment, StorageFull
 
 from domain import DEFAULT_MODEL, Model
 
@@ -121,17 +121,28 @@ class KVStore:
         return self._block_carrier.nbytes
 
     # -- real data-plane ops (presence + fabric cost) --------------------- #
-    async def publish(self, inst: str, keys: List[str]) -> None:
+    async def publish(self, inst: str, keys: List[str]) -> bool:
         """Publish ``keys`` on ``inst`` via a real metadata-only ``put_batch``.
 
         Writes the ``(shape, dtype)`` carrier into ``inst``'s real store (co-located
         -> zero fabric) and registers ``key -> volume`` in the real directory. No
         real tensor is allocated.
+
+        A **cache fill**, so it is allowed to fail: ``False`` when the instance has
+        no room for these blocks even after evicting what it could. A KV cache that
+        cannot fit something does not cache it -- the request has already been
+        served, and the only loss is that nobody reuses this prefix. Letting the
+        store refuse and treating that as fatal would make a bounded cache unusable
+        the moment one request's working set exceeded a volume.
         """
         if not keys:
-            return
+            return True
         entries = {k: self._block_carrier for k in keys}
-        await self.deployment.client_for(inst).put_batch(entries)
+        try:
+            await self.deployment.client_for(inst).put_batch(entries)
+        except StorageFull:
+            return False
+        return True
 
     async def fetch(self, inst: str, keys: List[str]) -> None:
         """Pull ``keys`` into ``inst`` via a real ``get_batch`` (charges fabric).
