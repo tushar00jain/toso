@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from proposed import Endpoint, Policy, Selection
+from proposed import ControlPlane, Endpoint, Policy, Selection
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 
-class Coordinator(ABC):
+class Coordinator(ControlPlane, ABC):
     """The coordinator as the data plane may use it: values in, values out.
 
     This is the port between the two planes, and it is deliberately the *whole*

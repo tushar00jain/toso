@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from proposed import DataPlane, Endpoint, Policy, View
+from proposed import ControlPlane, DataPlane, Endpoint, Policy, View
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
     DEFAULT_PROFILE,
@@ -135,15 +135,14 @@ class Simulation:
         # more than that. So: one object, two services, a handle built in one place
         # only -- the directory's already existed.
         #
-        # ``attach()`` is how an object says it senses through this stack, and it
-        # is exactly the objects deciding more than the store's question that need
-        # to; a pure directory policy declares none and gets no handle. It runs
-        # last because attach hands over the view and the transfer-cost estimate,
-        # so both must exist by now.
-        attach = getattr(control, "attach", None) if control is not None else None
+        # Every control plane is a proposed.ControlPlane, so it is attached by
+        # type rather than by sniffing for the method, and it runs last because
+        # attach hands over the view and the transfer-cost estimate. The handle is
+        # built for all of them; a control plane that runs only in the directory
+        # is simply never asked for it.
         self.coordinator_handle: Optional[Any] = None
-        if attach is not None:
-            attach(self.view, self.transfer_cost)
+        if isinstance(control, ControlPlane):
+            control.attach(self.view, self.transfer_cost)
             self.coordinator_handle = CoordinatorHandle(control)
 
     @property

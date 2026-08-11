@@ -4,6 +4,8 @@ A capability's control plane returns a decision; something has to turn that
 decision into store calls. That something is small and has the same shape in
 every capability, so it is one two-method type:
 
+* :class:`ControlPlane` -- the deciding half's one lifecycle member: knobs at
+  construction, the stack's ports at :meth:`ControlPlane.attach`;
 * :meth:`DataPlane.execute` -- the work *around* the transfer. The transfer
   itself is an ordinary client call, so the default adds nothing and simply runs
   the work item's own call;
@@ -26,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["DataPlane"]
+__all__ = ["ControlPlane", "DataPlane"]
 
 
 class DataPlane:
@@ -61,3 +63,27 @@ class DataPlane:
 
         Called once, after every item's coroutine has returned. Default: nothing.
         """
+
+
+class ControlPlane:
+    """What a capability's *deciding* half looks like to a harness.
+
+    The sibling of :class:`DataPlane`, and as capability-agnostic: it says nothing
+    about what is decided, only how such an object is brought up. Construct it with
+    its knobs, and it is handed the stack's ports once those exist --
+    :meth:`attach` -- because a control plane senses through a
+    :class:`~proposed.view.View` and prices through a
+    :class:`~proposed.cost.TransferCost`, neither of which a caller has before the
+    store is assembled.
+
+    That two-phase shape is torchstore's own: ``TorchStoreStrategy`` takes its
+    knobs at construction and receives the cluster later through
+    ``set_storage_volumes``.
+
+    The default is real behaviour, not a stub: a control plane that decides from
+    what it is asked -- a :class:`~proposed.policy.Policy` handed a view per call --
+    needs no ports of its own and inherits this no-op.
+    """
+
+    def attach(self, view: Any, transfer_cost: Any) -> None:
+        """Receive the ports this control plane senses and prices through."""

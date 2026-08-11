@@ -33,7 +33,7 @@ missing" section.
 # Re-export the contract surface so callers import from the package directly.
 from .cost import TransferCost
 from .deployment import Controller, Deployment
-from .plane import DataPlane
+from .plane import ControlPlane, DataPlane
 from .policy import DecisionLog, Policy, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL
 from .view import Directory, View
@@ -52,6 +52,7 @@ __all__ = [
     "locality",
     # ports the application depends on
     "Deployment",
+    "ControlPlane",
     "DataPlane",
     "TransferCost",
 ]

@@ -39,6 +39,7 @@ from typing import (
     Any, Awaitable, Callable, Dict, Optional, Protocol, Sequence, Tuple,
 )
 
+from proposed.plane import ControlPlane
 from proposed.view import View
 
 __all__ = ["Ready", "Selection", "DecisionLog", "Policy", "NaivePolicy"]
@@ -106,7 +107,7 @@ class DecisionLog(Protocol):
         ...
 
 
-class Policy(ABC):
+class Policy(ControlPlane, ABC):
     """Source-selection policy: the interface a controller consults.
 
     Abstract, so what a policy *is* and what the naive answer *does* are two
