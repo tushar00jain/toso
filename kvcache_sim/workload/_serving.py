@@ -7,8 +7,8 @@ Two separate things, deliberately:
   store, no scheduler and no plane;
 * :func:`serving_plane` is the *capability wiring* -- the store, the view, the
   scheduler and the :class:`~kvcache_sim.data.serving.ServingPlane` over them.
-  It is a factory because a plane reaches for the clock, the mesh and the ledger,
-  none of which exist before the stack does.
+  It is a factory because a plane reaches for the mesh and the ledger, neither of
+  which exists before the stack does.
 
 A scenario pairs them on a :class:`~realsim.run.Run`: same workload, different
 wiring, which is exactly what "cache-aware vs load-balance" means.
@@ -132,7 +132,7 @@ def serving_plane(
         else:
             sched = LoadBalanceScheduler(view, **common)
         return ServingPlane(
-            sim.loop, store, sched, trace=sim.trace, metrics=sim.ledger,
+            store, sched, trace=sim.trace, metrics=sim.ledger,
             coupled=coupled, max_batch=max_batch,
         )
 

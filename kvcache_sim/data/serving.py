@@ -56,8 +56,9 @@ class ServingPlane(DataPlane):
 
     """Runs one request's lifecycle against the real store.
 
+    The running loop's ``time()`` is the only clock (virtual under simulation).
+
     Args:
-        loop: the virtual-clock loop (its ``time()`` is the only clock).
         store: the :class:`~kvcache_sim.data.store.KVStore` verbs.
         scheduler: the control-plane scheduler (decides; never executes).
         trace: the run's shared trace.
@@ -69,7 +70,6 @@ class ServingPlane(DataPlane):
 
     def __init__(
         self,
-        loop,
         store: KVStore,
         scheduler,
         *,
@@ -80,7 +80,6 @@ class ServingPlane(DataPlane):
         profile=None,
         model=None,
     ) -> None:
-        self.loop = loop
         self.store = store
         self.scheduler = scheduler
         self.trace = trace
@@ -94,7 +93,6 @@ class ServingPlane(DataPlane):
         self.engine: Optional[DecodeEngine] = None
         if getattr(scheduler, "tbt_enabled", False):
             self.engine = DecodeEngine(
-                loop,
                 scheduler.decode_ids,
                 max_batch=max_batch,
                 profile=profile if profile is not None else scheduler.profile,
@@ -111,7 +109,7 @@ class ServingPlane(DataPlane):
             scheduler.attach_decode_load(self.engine)
 
     def _now(self) -> float:
-        return self.loop.time()
+        return asyncio.get_running_loop().time()
 
     async def drain(self) -> None:
         """Keep the loop running until the last decode token is emitted."""

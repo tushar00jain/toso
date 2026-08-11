@@ -57,9 +57,10 @@ class _Active:
 class DecodeEngine:
     """Drives batched, stepped decode for a set of decode instances.
 
+    The clock and task creation come from the running event loop (under
+    simulation its clock is virtual, so a step costs no wall time).
+
     Args:
-        loop: the run's event loop (for the clock and task creation). Under
-            simulation its clock is virtual, so a step costs no wall time.
         decode_ids: the decode instance ids.
         max_batch: VRAM cap on a decode batch.
         profile: target-machine profile driving :func:`decode_step_time`.
@@ -74,7 +75,6 @@ class DecodeEngine:
 
     def __init__(
         self,
-        loop: asyncio.AbstractEventLoop,
         decode_ids: List[str],
         *,
         max_batch: int,
@@ -83,7 +83,6 @@ class DecodeEngine:
         on_finish: Optional[Callable[[Request, float], None]] = None,
         on_compute_busy: Optional[Callable[[str, float], None]] = None,
     ) -> None:
-        self.loop = loop
         self.ids = sorted(decode_ids)
         self.max_batch = max_batch
         self.profile = profile
@@ -148,7 +147,9 @@ class DecodeEngine:
                 self.on_finish(request, 0.0)
             return
         a = _Active(
-            request=request, remaining=remaining, last_token_time=self.loop.time()
+            request=request,
+            remaining=remaining,
+            last_token_time=asyncio.get_running_loop().time(),
         )
         if len(self.batch[inst]) < self.max_batch:
             self.batch[inst].append(a)
@@ -161,19 +162,22 @@ class DecodeEngine:
         task = self._step_task[inst]
         if (task is not None and not task.done()) or not self.batch[inst]:
             return
-        self._step_task[inst] = self.loop.create_task(self._run_steps(inst))
+        self._step_task[inst] = asyncio.get_running_loop().create_task(
+            self._run_steps(inst)
+        )
 
     async def _run_steps(self, inst: str) -> None:
         """Emit tokens one step at a time until ``inst``'s batch drains."""
+        loop = asyncio.get_running_loop()
         while self.batch[inst]:
             members = list(self.batch[inst])       # frozen for this step
             dt = decode_step_time(len(members), self.profile, self.model)
-            start = max(self.loop.time(), self.compute_busy[inst])
+            start = max(loop.time(), self.compute_busy[inst])
             step_end = start + dt
             self.compute_busy[inst] = step_end
             if self.on_compute_busy is not None:
                 self.on_compute_busy(inst, step_end)
-            await asyncio.sleep(step_end - self.loop.time())
+            await asyncio.sleep(step_end - loop.time())
             self._step_complete(inst, members, step_end)
 
     async def drain(self) -> None:

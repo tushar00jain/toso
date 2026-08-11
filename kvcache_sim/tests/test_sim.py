@@ -206,7 +206,7 @@ def _run_decode_batch(n: int):
     loop = AsyncEngine()
     res = {}
     eng = DecodeEngine(
-        loop, ["s0"], max_batch=8,
+        ["s0"], max_batch=8,
         on_finish=lambda r, tbt: res.__setitem__(r.id, tbt),
     )
 
