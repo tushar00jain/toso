@@ -63,10 +63,11 @@ class _ControllerEndpoint:
 class FakeControllerHandle:
     """In-process stand-in for a ``Controller`` actor handle.
 
-    Exposes :class:`proposed.deployment.Controller`'s surface the way a Monarch
-    handle does -- an endpoint object per method -- so the argument lists live
-    there and :class:`_ControllerEndpoint` supplies the ``call`` / ``call_one``
-    that Monarch's ``Endpoint`` supplies in a deployment.
+    Implements :class:`proposed.deployment.ControllerHandle`: an endpoint object
+    per method of :class:`proposed.deployment.Controller`, which is the shape a
+    caller holds and the reason this class is a *handle* and not a controller.
+    :class:`_ControllerEndpoint` supplies the ``call`` / ``call_one`` that Monarch's
+    ``Endpoint`` supplies in a deployment; the argument lists live on ``Controller``.
 
     Args:
         controller: a real ``Controller`` instance (constructed off-actor and
@@ -80,8 +81,9 @@ class FakeControllerHandle:
         self.controller = controller
         # One hop shared by every endpoint: they are all the same boundary.
         self.hop = hop if hop is not None else ServiceHop()
-        # One endpoint per method of :class:`proposed.deployment.Controller`,
-        # since that is what a handle exposes rather than the methods themselves.
+        # One endpoint per method of proposed.deployment.Controller: that is
+        # proposed.deployment.ControllerHandle, the shape real LocalClient code
+        # requires (``locate_volumes.call_one(...)``), not the methods themselves.
         self.locate_volumes = _ControllerEndpoint(self._locate_volumes, self.hop)
         self.notify_put_batch = _ControllerEndpoint(self._notify_put_batch, self.hop)
         self.keys = _ControllerEndpoint(self._keys, self.hop)

@@ -27,6 +27,7 @@ import inspect
 from torchstore.controller import Controller as RealController
 
 from proposed import Controller as ProposedController
+from proposed import ControllerHandle
 from realsim.seams.controller_handle import FakeControllerHandle
 
 #: Endpoints whose bodies are mirrored verbatim, and the digest of the source we
@@ -84,14 +85,27 @@ def test_the_mirrored_bodies_are_still_the_ones_we_mirrored():
         )
 
 
-def test_the_handle_offers_exactly_that_surface():
-    """The seam a caller reaches is the surface, endpoint by endpoint."""
+def test_the_seam_implements_the_handle_and_not_the_service():
+    """Two shapes, and the seam is the caller's one.
+
+    ``FakeControllerHandle`` is a handle, so it offers an endpoint per method --
+    which is what real ``LocalClient`` code requires
+    (``locate_volumes.call_one(...)``). It deliberately does *not* implement
+    :class:`proposed.Controller`: that is the service surface, and collapsing the
+    endpoints into methods would break every real caller.
+    """
     handle = FakeControllerHandle(RealController())
-    for name in vars(ProposedController):
-        if name.startswith("_"):
-            continue
+    declared = [n for n in ControllerHandle.__annotations__]
+    assert sorted(declared) == sorted(
+        n for n in vars(ProposedController) if not n.startswith("_")
+    ), "the handle type and the service surface must name the same members"
+    for name in declared:
         endpoint = getattr(handle, name)
         assert hasattr(endpoint, "call_one") and hasattr(endpoint, "call"), (
             f"{name} on the handle is not endpoint-shaped: a caller reaches an "
             f"actor method through call_one / call, not by calling it"
+        )
+        assert not inspect.iscoroutinefunction(endpoint), (
+            f"{name} is a coroutine on the handle, i.e. the service shape -- real "
+            f"client code calls {name}.call_one(...) and would break"
         )
