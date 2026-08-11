@@ -147,7 +147,6 @@ kvcache_sim/
                           #   pinned snapshot one routing decision reads through
                           #   (underscored: the coordinator builds its own, so
                           #   nothing outside control/ names this)
-    _cache.py             #   per-instance LRU eviction bookkeeping (metadata)
     request.py            #   inference Request, carrying its prefix-hash chain
                           #   (str keys): what is decided about, and what data/
                           #   is handed

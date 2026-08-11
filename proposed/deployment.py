@@ -45,8 +45,8 @@ class StorageFull(Exception):
     no room" from a bug. Declared here so a data plane can catch it without
     importing whatever is enforcing the bound.
 
-    It is raised only when the volume has already asked what to drop
-    (:meth:`proposed.policy.Policy.evict`) and still cannot fit the write -- so
+    It is raised only when the volume has already made what room it could and
+    still cannot fit the write -- so
     catching it means *this data does not fit anywhere on this volume*, not
     *try again later*. A cache fill answers that by not caching; a durable write
     has to fail.
@@ -111,22 +111,6 @@ class Controller(Protocol):
         no reason to reach for it.
         """
 
-    async def evict_for(
-        self, storage_volume_id: str, need_bytes: int
-    ) -> Sequence[str]:
-        """``storage_volume_id`` is out of room: which keys should it drop?
-
-        The second thing this surface would have to gain, and the second place it
-        consults a :class:`~proposed.policy.Policy` -- the first being the routing
-        hook inside ``locate_volumes``. A storage volume knows it is full and knows
-        nothing about what is worth keeping; the directory knows who holds what and is
-        where a policy is installed, so the volume asks *here* rather than holding a
-        control plane of its own.
-
-        Answers nothing when no policy is installed, which leaves the volume to
-        refuse the put as an unbounded store always did.
-        """
-
     async def notify_put_batch(
         self, requests: Sequence[Any], storage_volume_id: str
     ) -> None:
@@ -166,10 +150,10 @@ class StorageVolume(Protocol):
 
     What a *deployment* would have to gain is nothing here: unlike ``Controller``,
     this surface is complete as it stands. What the simulator adds around it --
-    per-volume residency, a byte capacity, and asking
-    :meth:`proposed.policy.Policy.evict` before refusing a put that does not fit --
-    is behaviour behind these same signatures, which is why it needs no member of its
-    own. A real volume enforcing a real disk would answer the same way.
+    per-volume residency, a byte capacity, and evicting its coldest before refusing
+    a put that does not fit -- is behaviour behind these same signatures, which is
+    why it needs no member of its own beyond :meth:`touch`. A real volume enforcing a
+    real disk would answer the same way.
     """
 
     async def put(self, transport_buffer: Any, requests: Sequence[Any]) -> None:
@@ -186,6 +170,19 @@ class StorageVolume(Protocol):
         self, transport_buffer: Any, requests: Sequence[Any]
     ) -> List[Any]:
         """Agree the transport for a transfer before either side moves bytes."""
+
+    async def touch(self, keys: List[str]) -> None:
+        """Report a read of ``keys`` that did not come through this volume.
+
+        The one member here torchstore does not have, and the only thing the store
+        needs in order to evict well: a volume can only see the accesses that reach
+        it, so a caller reading data it already holds -- a serving instance reusing
+        its own KV -- leaves no trace, and the volume drops exactly the blocks being
+        reused. Nothing moves and nothing is charged; this is recency, not a read.
+
+        A deployment where every hit goes through the store does not need it. This
+        exists because that is not the only shape a cache has.
+        """
 
     async def delete(self, key: str) -> None:
         """Drop one key's bytes."""
@@ -250,6 +247,19 @@ class Deployment(Protocol):
         A deployment that runs one node per process ignores the argument and
         returns its own client. A harness running many nodes in one process
         resolves the node and attributes the work to it.
+        """
+        ...
+
+    def volume_handle(self, node_id: str) -> Any:
+        """A reference to ``node_id``'s storage volume: the calls a caller makes.
+
+        Untyped for the same reason as :attr:`controller_handle` -- what a caller
+        holds is a reference, whose shape Monarch declares. Read the argument lists
+        off :class:`StorageVolume`.
+
+        Here so a data plane can tell its *own* volume something the store cannot
+        observe (``touch``). Reaching another node's volume through this would be
+        going around the client, which is what the client is for.
         """
         ...
 

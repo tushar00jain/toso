@@ -49,7 +49,6 @@ class LocalControllerHandle:
         self.locate_volumes = LocalEndpoint(service.locate_volumes, self.hop)
         self.notify_put_batch = LocalEndpoint(service.notify_put_batch, self.hop)
         self.keys = LocalEndpoint(service.keys, self.hop)
-        self.evict_for = LocalEndpoint(service.evict_for, self.hop)
         self.notify_delete = LocalEndpoint(service.notify_delete, self.hop)
         self.notify_delete_batch = LocalEndpoint(
             service.notify_delete_batch, self.hop

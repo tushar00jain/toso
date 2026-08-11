@@ -132,44 +132,6 @@ class Policy(ControlPlane, ABC):
         withheld until a planned peer registers opens its readiness gate here.
         """
 
-    def forget(self, volume_id: str, keys: Sequence[str]) -> None:
-        """The real directory just *lost* ``keys`` on ``volume_id``.
-
-        The other half of :meth:`notice`, and called the same way: by the controller,
-        on every real deregistration (``notify_delete_batch``). Default: nothing.
-
-        A policy that models what a volume holds needs both halves or its model
-        drifts -- and it drifts in the direction that matters, because the answer it
-        gives to :meth:`evict` is drawn from that model. Being told what was really
-        dropped is also why a policy must not assume its own answer was carried out:
-        a volume evicts what it actually has, which may be less than it was offered.
-        """
-
-    async def evict(
-        self, view: View, volume_id: str, need_bytes: int
-    ) -> Sequence[str]:
-        """``volume_id`` needs ``need_bytes`` freed: which keys should go?
-
-        Asked by the *store*, at the one moment it knows it is out of room -- a put
-        that would push a volume past its capacity. Which copies are worth keeping is
-        not something the store can answer: it sees bytes, not what a caller will
-        want next. So it asks, drops what it is told, and lets the put land.
-
-        Default: nothing to drop, which leaves the store to refuse the put as it does
-        with no policy installed. A capability that models per-volume residency
-        (``kvcache_sim``'s LRU) overrides this and returns its coldest keys.
-
-        The answer is advisory in one direction only: naming a key the volume does
-        not hold is harmless, but naming too few to fit the put leaves the store to
-        refuse it. Answering is not a promise that the store *had* to ask -- the same
-        keys may already have been dropped for another reason.
-
-        This is the half of write placement that exists today. The other half --
-        *where* a new copy should go, so the store asks before writing rather than
-        when it is already full -- has no seam yet, and the two belong together: you
-        cannot choose where a copy lands without choosing what it displaces.
-        """
-        return ()
 
 
 class NaivePolicy(Policy):

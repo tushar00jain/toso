@@ -187,7 +187,14 @@ class ServingPlane(DataPlane):
         # (1) wait out the prefill queue at this instance.
         if plan.queue_wait > 0:
             await asyncio.sleep(plan.queue_wait)
-        # (2) pull the remote prefix (a real client.get_batch -> real fabric cost).
+        # (2) the prefix this instance already had is a read the store never sees,
+        # so tell it: the volume evicts on what it has observed.
+        local_blocks = plan.match_blocks - len(plan.pull_keys)
+        if local_blocks:
+            await self.store.reuse(
+                plan.prefill, list(plan.request.block_keys[:local_blocks])
+            )
+        # ...then pull the remote prefix (a real get_batch -> real fabric cost).
         prefill_t = plan.prefill_t
         if plan.reuse_source is not None and plan.pull_keys:
             try:
@@ -207,7 +214,6 @@ class ServingPlane(DataPlane):
         # pulled, plus the suffix it computed. Which blocks those are is not a
         # decision and not control's to make -- it is everything past what was
         # already local, and the plan says how much that was.
-        local_blocks = plan.match_blocks - len(plan.pull_keys)
         fresh = list(plan.request.block_keys[local_blocks:])
         await self.store.publish(plan.prefill, fresh)
         # (5) tell control the clock the real ops reached, and (coupled only) the

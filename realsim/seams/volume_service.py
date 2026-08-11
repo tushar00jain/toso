@@ -31,15 +31,14 @@ would have to gain:
   put's modeled bytes are read off the *landed* value with the same
   :func:`realsim.seams.transport._nbytes` helper the transport charges its fabric
   with; residency and fabric accounting therefore agree.
-* **Capacity, and who to ask about it.** When the backing
+* **Capacity, and making room.** When the backing
   ``MachineProfile.storage_capacity_bytes`` is finite, a put that would exceed it
-  *asks* for room -- ``controller.evict_for.call_one(...)``, over the same handle
-  every other caller reaches the directory through -- and refuses only if there is
-  nobody to ask or too little was freed. That ask is the point: this object is the
-  one that knows it is full, and the last one able to say what is worth keeping.
-  It goes through a handle rather than a callback because it is a call to another
-  service: declared in :class:`proposed.deployment.Controller`, endpoint-shaped, and
-  charged the directory hop like any other.
+  evicts this volume's coldest keys (:mod:`realsim.seams._retention`) and refuses
+  only if that still does not fit. Local, because recency of *this* volume's data is
+  the one thing this object cannot be wrong about -- asking a cluster-wide service
+  would be a round trip to be told what is already here. What it does need the
+  directory for is afterwards: the bytes are gone, so it says so, over the handle it
+  holds.
 
 With the default ``math.inf`` capacity neither the check nor the ask ever fires and
 the residency bookkeeping changes no behaviour, so the historical path stays
@@ -59,6 +58,7 @@ import torch
 from realsim.seams.transport import _nbytes
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from proposed import StorageFull
+from realsim.seams._retention import LeastRecentlyUsed
 from torchstore.storage_volume import InMemoryStore
 
 __all__ = ["StorageCapacityExceeded", "VolumeService"]
@@ -122,6 +122,7 @@ class VolumeService:
         volume_id: str = "",
         profile: MachineProfile | None = None,
         controller: Any | None = None,
+        retention: Any | None = None,
     ) -> None:
         self.store: InMemoryStore = store if store is not None else InMemoryStore()
         self.volume_id = volume_id
@@ -132,6 +133,9 @@ class VolumeService:
         self._resident_by_key: dict[str, int] = {}
         self.resident_bytes: int = 0
         self.peak_resident_bytes: int = 0
+        # How this volume picks its own victims. Swappable, because which key
+        # should go is a policy and holding the bytes is not.
+        self._retention = retention if retention is not None else LeastRecentlyUsed()
 
     @property
     def capacity_bytes(self) -> float:
@@ -141,6 +145,12 @@ class VolumeService:
     def _forget(self, key: str) -> None:
         """Drop a key's resident bytes (a real delete removed it from the store)."""
         self.resident_bytes -= self._resident_by_key.pop(key, 0)
+        self._retention.forget(key)
+
+    def _use(self, keys) -> None:
+        """Mark ``keys`` as just accessed, with the bytes they now occupy."""
+        for key in keys:
+            self._retention.note(key, self._resident_by_key.get(key))
 
     def _stored_nbytes(self, value: Any) -> int:
         """Modeled bytes of a value as ``InMemoryStore`` stores it.
@@ -196,11 +206,23 @@ class VolumeService:
                 self.volume_id, self.capacity_bytes, self.resident_bytes, attempted
             )
         self._resident_by_key.update(new_by_key)
+        self._use(keys)
         self.resident_bytes = projected
         self.peak_resident_bytes = max(self.peak_resident_bytes, self.resident_bytes)
 
     async def get(self, transport_buffer, requests):
+        self._use(r.key for r in requests)
         return await self.store.get(transport_buffer, requests)
+
+    async def touch(self, keys: list) -> None:
+        """Report a read of ``keys`` that did not come through this volume.
+
+        Nothing moves and nothing is charged: the caller already had the bytes. What
+        it buys is recency -- a cache whose hits bypass the store would otherwise
+        look untouched to the one object deciding what to drop, and it would drop
+        exactly the blocks being reused.
+        """
+        self._use(k for k in keys if k in self._resident_by_key)
 
     async def handshake(self, transport_buffer, requests):
         return await self.store.handshake(transport_buffer, requests)
@@ -234,9 +256,8 @@ class VolumeService:
         if self._controller is None:
             return projected
         need = int(projected - self.capacity_bytes)
-        answer = await self._controller.evict_for.call_one(self.volume_id, need)
         victims = [
-            key for key in answer
+            key for key in self._retention.victims(need)
             if key in self._resident_by_key and key not in incoming
         ]
         for key in victims:

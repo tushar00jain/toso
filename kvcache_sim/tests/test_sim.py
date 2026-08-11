@@ -14,7 +14,6 @@ import pytest
 from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
-from kvcache_sim.control._cache import LRUCache
 from kvcache_sim.control._view import KVView, _longest_prefix_run
 from kvcache_sim.workload._serving import _sim_block_carrier
 from realsim.simulation import Simulation
@@ -94,21 +93,10 @@ def test_real_directory_prefix_presence_and_eviction():
     assert ok
 
 
-# 3. LRU cache: bounded size + deterministic eviction of the coldest.
-def test_lru_capacity_bound_and_eviction():
-    c = LRUCache(capacity=2)
-    assert c.admit(["a"]) == []
-    assert c.admit(["b"]) == []
-    c.touch(["a"])                              # a now most-recent
-    evicted = c.admit(["d"])                     # over capacity -> evict coldest (b)
-    assert evicted == ["b"]
-    assert len(c) == 2 and "a" in c and "d" in c and "b" not in c
+# 3. LRU now lives in the volume -- recency of a node's own data is the one thing
+#    that node cannot be wrong about -- and is covered by
+#    realsim/tests/test_storage_capacity.py.
 
-
-def test_lru_unbounded_never_evicts():
-    c = LRUCache(capacity=None)
-    assert c.admit([str(i) for i in range(100)]) == []
-    assert len(c) == 100
 
 
 # 4. Determinism: same seed -> byte-identical trace + identical metrics.
@@ -187,16 +175,6 @@ def test_overload_fewer_rejections():
 #     a comfortably sized run still reuses. The *scheduler* no longer passes one:
 #     what a volume can hold is the volume's own capacity, enforced where it is
 #     known, so control's copy is a recency model rather than a second limit.
-def test_cache_never_exceeds_capacity():
-    topo = _make_topology(4)
-    reqs = _shared_prefix_workload()
-    r = run(topo, reqs, "cache_aware")
-    assert r.ledger.hit_rate > 0
-    cap = 8
-    c = LRUCache(capacity=cap)
-    for i in range(200):
-        c.admit([f"k{i}"])
-        assert len(c) <= cap
 
 
 # 11. Decode-step cost (from the cost model): baseline at batch 1, clamped below,
@@ -544,37 +522,3 @@ def test_an_unknown_payload_is_refused_not_guessed(member, payload):
         sim.loop.close()
 
 
-def test_the_scheduler_answers_a_full_volume_from_its_own_lru():
-    """The store asks in bytes; the same LRU that Published consults answers.
-
-    Both moments read one recency order -- what a request finishing admits, and what
-    a volume running out of room drops -- so a key named here is also gone from the
-    scheduler's own model of that instance.
-    """
-    sim = Simulation(_make_topology(2))
-    sched = LoadBalanceScheduler(block_tokens=512)
-    sched.attach(sim.view, sim.transfer_cost)
-    cold, warm = _block_keys_for("m0", [0]), _block_keys_for("m1", [0])
-    sched.caches["s0"].admit(list(cold))     # coldest: admitted first
-    sched.caches["s0"].admit(list(warm))
-    per_block = sched.model.block_bytes(1, sched.B)
-
-    try:
-        # Exactly one block's worth of overshoot -> exactly the coldest key.
-        victims = sim.loop.run_until_complete(
-            sched.evict(sim.view, "s0", per_block)
-        )
-        assert list(victims) == list(cold)
-        # Naming is not dropping: the volume evicts what it really has, and says so
-        # through forget(). Assuming otherwise drains the model faster than the
-        # store, and the next answer comes from a cache emptier than the volume.
-        assert sched.caches["s0"].held() == set(cold) | set(warm)
-        sched.forget("s0", list(cold))
-        assert sched.caches["s0"].held() == set(warm)
-        # A fraction of a block still frees a whole one: rounded up, never down.
-        more = sim.loop.run_until_complete(sched.evict(sim.view, "s0", 1))
-        assert list(more) == list(warm)
-        # A volume this scheduler models nothing about is not its to answer for.
-        assert sim.loop.run_until_complete(sched.evict(sim.view, "nope", 1)) == ()
-    finally:
-        sim.loop.close()

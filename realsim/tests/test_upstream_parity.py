@@ -60,9 +60,8 @@ COPIED_FROM_UPSTREAM = [
 
 #: Members that are the *ask* -- declared here because torchstore would have to gain
 #: them. ``locate_raw`` is ``locate_volumes`` with the policy hook skipped, which is
-#: what a controller hands its own policy through a ``View``; ``evict_for`` is the
-#: directory's other policy call site, asked by a storage volume that is full.
-THE_ASK = ["locate_raw", "evict_for"]
+#: what a controller hands its own policy through a ``View``.
+THE_ASK = ["locate_raw"]
 
 
 def _real(name: str):
@@ -182,13 +181,20 @@ def _volume_declared() -> list[str]:
     ]
 
 
+#: The volume's half of the ask: declared here because a store that evicts well
+#: needs it and torchstore has no equivalent. A volume sees only the accesses that
+#: reach it, so a cache whose hits are served from data the caller already holds
+#: leaves no trace on the object deciding what to drop.
+VOLUME_THE_ASK = ["touch"]
+
+
 def test_proposed_storage_volume_declares_the_real_surface():
-    """Every member is upstream's, and every omission is deliberate."""
+    """Every copied member is upstream's, and every omission is deliberate."""
     declared = _volume_declared()
-    assert sorted(declared) == [
+    assert sorted(declared) == sorted([
         "delete", "delete_batch", "get", "handshake", "put", "reset",
-    ], declared
-    for name in declared:
+    ] + VOLUME_THE_ASK), declared
+    for name in [n for n in declared if n not in VOLUME_THE_ASK]:
         assert name in RealStorageVolume.__dict__, (
             f"proposed.StorageVolume declares {name!r}, which the real "
             f"StorageVolume does not have -- it moved upstream or we invented it"
@@ -208,6 +214,10 @@ def test_proposed_storage_volume_declares_the_real_surface():
         name for name, v in vars(RealStorageVolume).items()
         if not name.startswith("_")
     }
+    for name in VOLUME_THE_ASK:
+        assert name not in RealStorageVolume.__dict__, (
+            f"the real StorageVolume now has {name!r}: it has stopped being an ask"
+        )
     unexplained = upstream - set(declared) - set(VOLUME_NOT_DECLARED)
     assert not unexplained, (
         f"the real StorageVolume has {sorted(unexplained)}, which is neither "

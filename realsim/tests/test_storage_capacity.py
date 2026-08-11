@@ -18,10 +18,9 @@ Gates:
 * a real delete frees space -- resident drops and a put that would otherwise
   exceed capacity then fits (peak stays a run-lifetime high-water mark);
 * determinism -- the same run reproduces the same resident / peak values;
-* asking before refusing -- a full volume asks the directory
-  (``proposed.deployment.Controller.evict_for``, answered by the installed
-  ``Policy``) which keys to drop, over the same handle every other caller reaches
-  it through, and refuses only if nobody answers or too little is freed.
+* evicting before refusing -- a full volume drops its own least-recently-used
+  keys, tells the directory they are gone, and refuses only if that still does not
+  make room.
 
 Run from the repo root::
 
@@ -40,7 +39,6 @@ from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import RealControllerAdapter
 from putget_sim.workload.put_get import DEFAULT_N, PutGetBurst
 from realsim.run import Run
-from proposed import Policy, Selection
 from realsim.seams.transport import Endpoint
 from realsim.seams.volume_handle import LocalVolumeHandle
 from realsim.seams.volume_service import StorageCapacityExceeded, VolumeService
@@ -219,33 +217,9 @@ def test_resident_tracking_is_deterministic():
 # --------------------------------------------------------------------------
 
 
-def _evicting(victims, log=None):
-    """A Policy whose only opinion is which keys to drop."""
-
-    class _P(Policy):
-        name = "evicting"
-
-        async def select(self, view, keys, requester):
-            return Selection()
-
-        async def evict(self, view, volume_id, need_bytes):
-            if log is not None:
-                log.append((volume_id, need_bytes))
-            return victims
-
-    return _P()
-
-
-async def _put_over_capacity(policy, *, wired=True, keys=("A", "B", "C")):
-    """Fill a two-payload volume, then put one more with ``policy`` installed.
-
-    Drives the whole declared path -- ``volume -> controller handle -> service ->
-    policy`` -- rather than a stand-in callback, because the point of the handle is
-    that the ask is a call to another service.
-    """
+async def _put_over_capacity(policy=None, *, wired=True, keys=("A", "B", "C")):
+    """Fill a two-payload volume, then put one more and let it make room."""
     controller = RealControllerAdapter()
-    if policy is not None:
-        controller.handle.install_policy(policy, None)
     profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES * 2)
     topology = {"0": Endpoint(id="vol0", host="hA", node="nA")}
     svc = VolumeService(
@@ -266,77 +240,24 @@ async def _put_over_capacity(policy, *, wired=True, keys=("A", "B", "C")):
     return svc
 
 
-def test_the_volume_asks_before_refusing_and_the_put_then_fits():
-    """A policy that names a victim turns a refusal into an eviction."""
-    asked: list[tuple[str, int]] = []
-    svc = asyncio.run(_put_over_capacity(_evicting(["A"], asked)))
-    # Asked once, for its own id and exactly the overshoot -- not for everything.
-    assert asked == [("vol0", PAYLOAD_BYTES)]
-    # A left, C landed, and the accounting is exact rather than reset.
-    assert svc.resident_bytes == PAYLOAD_BYTES * 2
-    assert sorted(svc.store.kv) == ["B", "C"]
+def test_a_full_volume_evicts_its_own_coldest():
+    """Plain LRU is local knowledge: the volume needs nobody's help to apply it."""
+    svc = asyncio.run(_put_over_capacity())
+    assert sorted(svc.store.kv) == ["B", "C"]      # A was the coldest, and went
 
 
-def test_an_answer_that_frees_too_little_still_refuses():
-    """Eviction is not a licence to over-commit: the put is still rejected."""
-    with pytest.raises(StorageCapacityExceeded):
-        asyncio.run(_put_over_capacity(_evicting([])))
 
 
 def test_a_key_this_put_is_writing_is_never_evicted():
     """Freeing the bytes the caller is about to add would drop the new value."""
-    svc = asyncio.run(_put_over_capacity(_evicting(["C", "A"])))
-    assert sorted(svc.store.kv) == ["B", "C"]  # C survived, A was taken instead
+    svc = asyncio.run(_put_over_capacity(keys=("A", "B", "A")))
+    assert sorted(svc.store.kv) == ["A", "B"]
 
 
-def test_no_policy_installed_is_the_historical_refusal():
-    """The directory answers nothing, so the volume refuses as it always did."""
+def test_a_volume_with_no_directory_cannot_report_what_it_dropped():
+    """Eviction is local, but telling the directory is not: without a handle the
+    volume has nobody to tell, so it refuses rather than drop silently."""
     with pytest.raises(StorageCapacityExceeded):
-        asyncio.run(_put_over_capacity(None))
+        asyncio.run(_put_over_capacity(wired=False))
 
 
-def test_a_volume_with_no_directory_to_ask_also_refuses():
-    """And a volume built without a controller has nobody to ask at all."""
-    with pytest.raises(StorageCapacityExceeded):
-        asyncio.run(_put_over_capacity(_evicting(["A"]), wired=False))
-
-
-def test_the_mesh_asks_the_installed_policy():
-    """The wiring: a full volume reaches the run's own Policy, not a stub.
-
-    Vacuous if the mesh captured ``None`` at construction -- which it would, since
-    volumes are built before a policy is installed -- so this pins that the hook
-    reads the policy off the service at call time.
-    """
-    from proposed import Policy, Selection
-    from realsim.simulation import Simulation
-
-    asked: list[tuple[str, int]] = []
-
-    class EvictingPolicy(Policy):
-        name = "evicting"
-
-        async def select(self, view, keys, requester):
-            return Selection()
-
-        async def evict(self, view, volume_id, need_bytes):
-            asked.append((volume_id, need_bytes))
-            return ["A"]
-
-    profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES * 2)
-    topology = {"0": Endpoint(id="vol0", host="hA", node="nA")}
-    sim = Simulation(topology, control=EvictingPolicy(), profile=profile)
-
-    async def scenario():
-        with sim.mesh.installed():
-            # client_for binds the source endpoint the transport prices against.
-            for key in ("A", "B", "C"):
-                await sim.mesh.client_for("0").put(key, _meta_payload())
-
-    try:
-        sim.loop.run_until_complete(scenario())
-    finally:
-        sim.loop.close()
-
-    assert asked == [("vol0", PAYLOAD_BYTES)], asked
-    assert sorted(sim.mesh.volumes["0"].service.store.kv) == ["B", "C"]

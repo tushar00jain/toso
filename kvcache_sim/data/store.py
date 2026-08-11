@@ -144,6 +144,19 @@ class KVStore:
             return False
         return True
 
+    async def reuse(self, inst: str, keys: List[str]) -> None:
+        """Tell ``inst``'s volume it just served ``keys`` from what it already had.
+
+        A local prefix hit never reaches the store -- the instance has the blocks, so
+        nothing is fetched and nothing is charged. The volume is the one deciding
+        what to drop when it fills up, and on its own evidence those blocks look
+        untouched, so it would drop the hottest prefix in the run. This is the read
+        it could not see.
+        """
+        if not keys:
+            return
+        await self.deployment.volume_handle(inst).touch.call_one(list(keys))
+
     async def fetch(self, inst: str, keys: List[str]) -> None:
         """Pull ``keys`` into ``inst`` via a real ``get_batch`` (charges fabric).
 

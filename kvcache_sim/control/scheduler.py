@@ -75,7 +75,6 @@ from domain import (
 )
 from proposed import TransferCost
 
-from ._cache import LRUCache
 from ._view import KVView
 from ._source import LongestPrefixPolicy
 from .request import Request
@@ -236,7 +235,6 @@ class _Base(Policy, Coordinator):
         self.transfer_cost: Optional[TransferCost] = None
         self.topo: Dict[str, Endpoint] = {}
         self.ids: List[str] = []
-        self.caches: Dict[str, LRUCache] = {}
         self.busy_until: Dict[str, float] = {}
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
@@ -268,12 +266,6 @@ class _Base(Policy, Coordinator):
         self.transfer_cost = transfer_cost
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
-        # Unbounded on purpose. This mirrors what the directory says each instance
-        # holds, so that :meth:`evict` can answer with the coldest of them; a bound
-        # here would drop keys the store still has and make the answer wrong. What
-        # a volume can hold is the volume's own capacity, enforced where it is
-        # known -- see :class:`realsim.seams.volume_service.VolumeService`.
-        self.caches = {i: LRUCache(None) for i in self.ids}
         # PREDICTED prefill queue tail over ALL instances (the disaggregated-
         # prefill pool may be a subset; decode may be a disjoint or overlapping
         # subset). This is control's own model of the servers, corrected by the
@@ -387,60 +379,6 @@ class _Base(Policy, Coordinator):
         self._decode_finishes[fact.inst] = list(fact.finishes)
 
     # -- the store's questions, answered from what we already decided ----- #
-    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
-        """:class:`~proposed.policy.Policy` -- the directory registered ``keys``.
-
-        The only way this object learns what data exists anywhere. It used to learn
-        by *deciding*: the coordinator was asked what to publish and updated its own
-        model as it answered, which made control's picture of the store a thing
-        control wrote rather than a thing it was told. Now the directory says so, and
-        this records it -- for the one purpose it still keeps data state for, which
-        is answering :meth:`evict`.
-
-        """
-        cache = self.caches.get(volume_id)
-        if cache is not None:
-            cache.admit(list(keys))
-
-    def forget(self, volume_id: str, keys: Sequence[str]) -> None:
-        """:class:`~proposed.policy.Policy` -- ``volume_id`` no longer holds ``keys``.
-
-        Where the model learns what an eviction actually removed, which is not the
-        same as what this object *named*: a volume drops what it really has, and
-        never a key the put in flight is writing.
-        """
-        cache = self.caches.get(volume_id)
-        if cache is not None:
-            cache.drop(list(keys))
-
-
-    async def evict(
-        self, view: Any, volume_id: str, need_bytes: int
-    ) -> Sequence[str]:
-        """:class:`~proposed.policy.Policy` -- ``volume_id`` is full; what goes?
-
-        The store asks in bytes and this cache counts blocks, so the conversion is
-        here: one block's bytes come from the model this scheduler already prices
-        against, and the coldest keys are named until they cover the overshoot.
-
-        The recency this reads is the only thing the scheduler keeps about *data*,
-        and it keeps it to answer this one question. It is not an enforcer: nothing
-        here trims a cache on a schedule of its own, because noticing that a volume
-        is full is the volume's job, and it is the one that asks.
-        """
-        cache = self.caches.get(volume_id)
-        if cache is None:
-            return ()
-        per_block = self.model.block_bytes(1, self.B)
-        if per_block <= 0:
-            return ()
-        # Round up: freeing a fraction of a block frees nothing.
-        wanted = -(-int(need_bytes) // per_block)
-        # Named, not dropped: what actually goes is what the volume can drop, and
-        # it says so through :meth:`forget`. Dropping here would shrink the model
-        # faster than the store shrinks, and the next answer would be drawn from a
-        # cache emptier than the volume it describes.
-        return cache.coldest(wanted)
 
 
     async def select(
@@ -538,8 +476,6 @@ class _Base(Policy, Coordinator):
                 (plan.prefill, tuple(plan.pull_keys), plan.reuse_source)
             )
         self.busy_until[plan.prefill] = plan.done_time
-        matched = list(plan.request.block_keys[: plan.match_blocks])
-        self.caches[plan.prefill].touch(matched)
         if self.early_rejection == "predict" and self.tbt_enabled:
             now = self.view.now()
             self._inflight = [e for e in self._inflight if e[0] >= now]

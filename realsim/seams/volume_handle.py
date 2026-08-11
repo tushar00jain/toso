@@ -58,6 +58,7 @@ class LocalVolumeHandle:
         self.put = LocalEndpoint(service.put, self.hop)
         self.get = LocalEndpoint(service.get, self.hop)
         self.handshake = LocalEndpoint(service.handshake, self.hop)
+        self.touch = LocalEndpoint(service.touch, self.hop)
         self.delete = LocalEndpoint(service.delete, self.hop)
         self.delete_batch = LocalEndpoint(service.delete_batch, self.hop)
         self.reset = LocalEndpoint(service.reset, self.hop)

@@ -122,9 +122,9 @@ class Mesh:
             self.controller_handle.install_policy(policy, self.view)
         # Each volume's byte capacity comes from the run's profile
         # (``storage_capacity_bytes``, default unbounded); the seam enforces it
-        # against the aggregate resident working set, and asks the directory
-        # (``evict_for``) before refusing a put that does not fit -- which is why a
-        # volume is handed the controller handle, not a callback.
+        # against the aggregate resident working set, evicting its own coldest
+        # before refusing a put that does not fit. It is handed the controller
+        # handle so it can tell the directory what it dropped.
         self.volumes: Dict[str, LocalVolumeHandle] = {
             vid: LocalVolumeHandle(
                 VolumeService(
@@ -179,6 +179,10 @@ class Mesh:
         """
         self.bind_source(node_id)
         return self.client(node_id)
+
+    def volume_handle(self, node_id: str) -> Any:
+        """:class:`proposed.deployment.Deployment` -- ``node_id``'s volume."""
+        return self.volumes[node_id]
 
     @property
     def controller_handle(self) -> Any:
