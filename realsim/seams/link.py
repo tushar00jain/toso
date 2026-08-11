@@ -94,12 +94,25 @@ class LocalEndpoint:
         return await self._hop.call(lambda: self._fn(*args, **kwargs))
 
     def broadcast(self, *args: Any, **kwargs: Any) -> None:
-        """Send it one-way, without waiting -- for a member that returns nothing."""
+        """Send it one-way: the sender does not wait, and pays no hop.
+
+        A service member is a coroutine, so "does not wait" means running it to
+        completion here without suspending the sender -- which is what one-way
+        delivery amounts to when the receiver is in this process. A member that
+        *would* suspend cannot be sent this way: firing it off would need a task,
+        and a task reorders the run, so this raises instead of quietly changing
+        when things happen.
+        """
         out = self._fn(*args, **kwargs)
-        if inspect.isawaitable(out):
-            out.close()
-            raise TypeError(
-                "broadcast is one-way, but this member is awaitable: a member that "
-                "answers has to be reached with call_one / call so the caller pays "
-                "the round trip it is waiting for"
-            )
+        if not inspect.isawaitable(out):
+            return
+        try:
+            out.send(None)
+        except StopIteration:
+            return
+        out.close()
+        raise TypeError(
+            "broadcast is one-way, but this member suspends: sending it without "
+            "waiting would need a task, and a task changes the order the run "
+            "executes in. Reach it with call_one / call instead"
+        )

@@ -47,6 +47,7 @@ from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
 from realsim.seams.coordinator_handle import CoordinatorHandle
+from realsim.seams.coordinator_service import CoordinatorService
 from realsim.runner import Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -143,7 +144,7 @@ class Simulation:
         self.coordinator_handle: Optional[Any] = None
         if isinstance(control, ControlPlane):
             control.attach(self.view, self.transfer_cost)
-            self.coordinator_handle = CoordinatorHandle(control)
+            self.coordinator_handle = CoordinatorHandle(CoordinatorService(control))
 
     @property
     def loop(self) -> AsyncEngine:

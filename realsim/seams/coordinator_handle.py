@@ -7,18 +7,18 @@ serializes routing decisions cluster-wide, so no serving host can hold it -- doe
 not reach it by holding the object. It reaches it the way it reaches the store:
 through a handle, over calls that carry values.
 
-:class:`CoordinatorHandle` is that handle: it wraps the control-plane object,
-mirrors whatever surface that object declares, and is the single place a round trip
-is charged. In a deployment it becomes a Monarch actor endpoint and nothing on
+:class:`CoordinatorHandle` is that handle: it refers to a
+:class:`realsim.seams.coordinator_service.CoordinatorService` -- the server side,
+which holds the deciding object -- and is the single place a round trip is charged. In a deployment it becomes a Monarch actor endpoint and nothing on
 either side changes shape.
 
-It names no method of its own
-----------------------------
-The surface is read off the object, exactly as a Monarch handle mirrors an actor's
-``@endpoint`` methods. That matters twice over: this module sits below every
-capability, so hard-coding one capability's method names would be the harness
-knowing what a capability decided; and a *custom* control plane with a different
-surface would otherwise be unreachable without editing this file.
+One endpoint per member of the surface
+--------------------------------------
+The members are :class:`proposed.deployment.Coordinator`'s, so naming them here is
+not the harness knowing what a capability decided -- it is the harness knowing the
+port, which lives in ``proposed`` exactly so that both sides can be written without
+either knowing the other. Same as
+:class:`realsim.seams.controller_handle.LocalControllerHandle` and its five.
 
 Calls and sends
 ---------------
@@ -60,26 +60,33 @@ __all__ = ["CoordinatorHandle"]
 
 
 class CoordinatorHandle:
-    """A control plane reached as a service, not held as an object.
+    """A reference to a :class:`CoordinatorService` living in this process.
 
     Args:
-        control: the control-plane object this endpoint fronts (kvcache's
-            scheduler). Whatever it declares is what this handle offers.
+        service: the coordinator service this refers to.
         rtt: one-way latency of the hop. ``None`` reads the ambient
             :attr:`sim_common.config.SimConfig.coordinator_rtt`.
     """
 
-    def __init__(self, control: Any, *, rtt: Optional[float] = None) -> None:
-        self.control = control
+    def __init__(self, service: Any, *, rtt: Optional[float] = None) -> None:
+        self.service = service
         self.hop = ServiceHop(
             rtt if rtt is not None else config.current().coordinator_rtt
         )
+        self.schedule = LocalEndpoint(service.schedule, self.hop)
+        self.complete = LocalEndpoint(service.complete, self.hop)
+        self.decode_admission = LocalEndpoint(service.decode_admission, self.hop)
+        self.observe_prefill_done = LocalEndpoint(
+            service.observe_prefill_done, self.hop
+        )
+        self.observe_compute_busy = LocalEndpoint(
+            service.observe_compute_busy, self.hop
+        )
+        self.observe_decode_state = LocalEndpoint(
+            service.observe_decode_state, self.hop
+        )
 
-    def __getattr__(self, name: str) -> LocalEndpoint:
-        """Mirror ``name`` off the wrapped control plane, as an endpoint."""
-        if name.startswith("_"):
-            # Never forward dunder or private lookups: this is a reference to a
-            # service, not a transparent proxy, and forwarding them breaks
-            # copy/pickle protocols.
-            raise AttributeError(name)
-        return LocalEndpoint(getattr(self.control, name), self.hop)
+    @property
+    def control(self) -> Any:
+        """The deciding object behind the service, for tests asserting on it."""
+        return self.service.control

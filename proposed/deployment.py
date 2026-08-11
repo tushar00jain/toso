@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
-__all__ = ["Controller", "Deployment"]
+__all__ = ["Controller", "Coordinator", "Deployment"]
 
 
 class Controller(Protocol):
@@ -87,6 +87,56 @@ class Controller(Protocol):
 
     async def keys(self, prefix: Optional[str] = None) -> List[str]:
         """Every registered key, or those under ``prefix``."""
+
+
+class Coordinator(Protocol):
+    """A control plane that runs as its own service, as a caller reaches it.
+
+    The mirror of :class:`Controller`, for the other service a caller talks to.
+    Where that one is a directory torchstore already has, this one is a coordinator
+    an application spawns: it holds the cluster-wide picture a single host cannot --
+    every instance's queue, cache and load -- and serializes the decisions that read
+    it.
+
+    Every member is ``async``, like :class:`Controller`'s -- a service handles a
+    message, and whether the *sender* waits for the answer is the sender's choice
+    (``call_one`` versus ``broadcast``), not something the surface decides.
+
+    Declared as methods, like :class:`Controller`, because that is where the
+    signatures live. A caller holds a reference rather than the object, so the call
+    goes through an endpoint (``schedule.call_one(request)``,
+    ``observe_decode_state.broadcast(...)``); upstream that reference is Monarch's
+    handle over an ``Actor`` carrying one ``@endpoint`` per member below, each
+    forwarding to the plain object -- decorate the shim, not the deciding logic, or
+    its members become ``EndpointProperty`` descriptors that cannot be invoked
+    off-actor. That tax is on display in
+    :mod:`realsim.seams.controller_service`, which exists because torchstore
+    decorated ``Controller``'s own methods.
+
+    The payloads are ``Any`` for the reason given at the top of this module: a
+    request, a plan and a completion are the application's types, and this package
+    cannot import an application any more than it can import torchstore.
+    """
+
+    async def schedule(self, request: Any) -> Optional[Any]:
+        """Decide what to do with ``request``; ``None`` rejects it."""
+
+    async def complete(self, plan: Any) -> Any:
+        """What the executing half must do once it has carried ``plan`` out."""
+
+    async def decode_admission(self, plan: Any) -> bool:
+        """Whether the accepted ``plan`` may enter the stage it is queued for."""
+
+    async def observe_prefill_done(self, inst: str, now: float) -> float:
+        """Report the clock the real work reached; answer with the corrected model."""
+
+    async def observe_compute_busy(self, inst: str, until: float) -> None:
+        """Report a resource occupied until ``until``."""
+
+    async def observe_decode_state(
+        self, inst: str, finishes: Sequence[float]
+    ) -> None:
+        """Report what is still running on ``inst``, as finish estimates."""
 
 
 class Deployment(Protocol):
