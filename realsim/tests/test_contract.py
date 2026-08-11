@@ -312,6 +312,25 @@ def test_structure_lint_flags_every_way_data_read_the_control_port(tmp_path):
     assert [v.lineno for v in violations] == [7, 8, 9, 11]
 
 
+def test_structure_lint_accepts_the_endpoint_form(tmp_path):
+    """``port.member.call_one(...)`` is the call, not a field read.
+
+    A handle to a service offers an endpoint per member and the caller picks how to
+    send -- Monarch's shape. The member read is half of a call, so rule 6 has to
+    accept it, or the honest spelling would be the one it flags.
+    """
+    pkgs = _port_pkg(tmp_path / "e", (
+        "from ..control.sched import Coordinator, Plan\n\n\n"
+        "class Plane:\n"
+        "    def __init__(self, coordinator: Coordinator) -> None:\n"
+        "        self.coordinator: Coordinator = coordinator\n"
+        "    async def go(self, plan: Plan) -> None:\n"
+        "        await self.coordinator.complete.call_one(plan)\n"
+        "        self.coordinator.observe.broadcast(plan)\n"
+    ))
+    assert check_structure.check_plane_ports(tmp_path / "e", pkgs) == []
+
+
 def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
     """A call is a request; a dataclass that crossed is meant to be read."""
     pkgs = _port_pkg(tmp_path, (

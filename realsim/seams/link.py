@@ -29,7 +29,7 @@ import asyncio
 import inspect
 from typing import Any, Callable
 
-__all__ = ["ServiceHop"]
+__all__ = ["ServiceHop", "LocalEndpoint"]
 
 
 class ServiceHop:
@@ -63,3 +63,43 @@ class ServiceHop:
             out = await out
         await self.leg()
         return out
+
+
+class LocalEndpoint:
+    """One method of a service, reached the way Monarch reaches one.
+
+    A caller never invokes a service's method: ``@endpoint`` makes it an
+    ``Endpoint``, and the caller picks how to send -- ``call_one`` for one actor,
+    ``call`` for a mesh, ``broadcast`` for one-way. This is that surface for a
+    service in this process, and the reason both handles in this package are
+    endpoint-shaped: a seam that offered plain methods would be a shape Monarch
+    does not have, so swapping in a real handle would mean editing every caller.
+
+    :meth:`call_one` and :meth:`call` pay the hop **twice** -- out and back, because
+    the caller is blocked for both legs. :meth:`broadcast` pays nothing: it is
+    one-way, so the sender does not wait. What a real bus would still charge is the
+    *delivery* lag, which this seam does not model.
+    """
+
+    def __init__(self, fn: Callable[..., Any], hop: "ServiceHop") -> None:
+        self._fn = fn
+        self._hop = hop
+
+    async def call_one(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke it on a single actor and wait for the answer."""
+        return await self._hop.call(lambda: self._fn(*args, **kwargs))
+
+    async def call(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke it on every actor in a mesh and wait."""
+        return await self._hop.call(lambda: self._fn(*args, **kwargs))
+
+    def broadcast(self, *args: Any, **kwargs: Any) -> None:
+        """Send it one-way, without waiting -- for a member that returns nothing."""
+        out = self._fn(*args, **kwargs)
+        if inspect.isawaitable(out):
+            out.close()
+            raise TypeError(
+                "broadcast is one-way, but this member is awaitable: a member that "
+                "answers has to be reached with call_one / call so the caller pays "
+                "the round trip it is waiting for"
+            )

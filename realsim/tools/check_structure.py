@@ -34,8 +34,10 @@ Six rules, none of which a type system can express:
 6. **A ``data/`` module may call a control port, never read it.** The planes run
    in different services, so what passes between them has to be something a wire
    could carry. Calling a port the module imports from its sibling ``control/`` is
-   a request; reading a field off it, handing one of its bound methods out as a
-   callback, or ``getattr``-ing it are not. A port is any imported class that is
+   a request -- as is reading a member and invoking a send mode on it
+   (``port.member.call_one(...)``), which is the shape a Monarch handle has.
+   Reading a field for its value, handing a bound method out as a callback, or
+   ``getattr``-ing it are not. A port is any imported class that is
    not a dataclass -- the values that legitimately cross are dataclasses, and
    reading *their* fields is the point of sending them.
 
@@ -124,6 +126,7 @@ __all__ = [
     "GRAPH_PKGS",
     "PUBLIC_ANYWAY",
     "PUBLIC_NAMES",
+    "SEND_MODES",
     "sim_packages",
     "check_package_parts",
     "check_private_naming",
@@ -168,6 +171,12 @@ PUBLIC_ANYWAY: Dict[str, str] = {
     "sim_common/diverge.py": "a divergence-bisection tool for debugging a run",
     "sim_common/config.py": "the ambient run config every leaf reads",
 }
+
+#: How a caller may reach a member of a service it holds a reference to: Monarch's
+#: modes (``monarch._src.actor.endpoint.Endpoint``), mirrored by
+#: :class:`realsim.seams.link.LocalEndpoint`. Rule 6 accepts a member read followed
+#: by one of these, because that pair *is* the call.
+SEND_MODES = frozenset({"call", "call_one", "broadcast", "choose", "stream"})
 
 #: Public *names* nothing outside their module uses, public on purpose (rule 5).
 #: Keyed ``<repo-relative module>:<name>``. The distinction being drawn is
@@ -506,6 +515,16 @@ def check_plane_ports(
             )
 
         called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        # ``port.member.call_one(...)`` is a call, not a field read: a handle to a
+        # service offers an endpoint per member and the caller picks how to send,
+        # which is Monarch's shape (see realsim.seams.link.LocalEndpoint). The
+        # member read is sanctioned exactly when a send mode is invoked on it.
+        endpoint_reads = {
+            id(n.value) for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute)
+            and n.attr in SEND_MODES
+            and id(n) in called
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                     and node.func.id == "getattr" and node.args \
@@ -516,14 +535,16 @@ def check_plane_ports(
                     "this host's to inspect, and a default hides that it moved",
                 ))
             elif isinstance(node, ast.Attribute) and is_port(node.value) \
-                    and id(node) not in called:
+                    and id(node) not in called \
+                    and id(node) not in endpoint_reads:
                 out.append(Violation(
                     str(rel), node.lineno, "data-reads-control-port",
                     f"reads {node.attr!r} off a control port instead of calling "
-                    f"it. Control is a different service: a field read (or a "
-                    f"bound method handed out as a callback) is not something a "
-                    f"wire can carry -- add it to the protocol as a call, or "
-                    f"have the run wire the value into this plane directly",
+                    f"it or sending to it ({', '.join(sorted(SEND_MODES))}). "
+                    f"Control is a different service: a field read (or a bound "
+                    f"method handed out as a callback) is not something a wire can "
+                    f"carry -- add it to the port as a member, or have the run "
+                    f"wire the value into this plane directly",
                 ))
     return sorted(out)
 

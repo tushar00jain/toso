@@ -27,32 +27,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from realsim.seams.link import ServiceHop
+from realsim.seams.link import LocalEndpoint, ServiceHop
 
 __all__ = ["LocalControllerHandle"]
-
-
-class _ControllerEndpoint:
-    """One method of the service, as a caller reaches it.
-
-    Mimics a Monarch endpoint's ``.call`` / ``.call_one`` awaitable surface, and
-    pays the hop -- reaching the directory is a round trip, so every endpoint goes
-    through the shared :class:`~realsim.seams.link.ServiceHop`. At the default
-    ``rtt`` of 0 that is inline and changes nothing, which is why it went unnoticed
-    that this boundary -- crossed by every capability on every directory read, and
-    by every consultation of a policy installed there -- was the one seam charging
-    nothing.
-    """
-
-    def __init__(self, fn: Callable[..., Any], hop: ServiceHop) -> None:
-        self._fn = fn
-        self._hop = hop
-
-    async def call(self, *args: Any, **kwargs: Any) -> Any:
-        return await self._hop.call(lambda: self._fn(*args, **kwargs))
-
-    async def call_one(self, *args: Any, **kwargs: Any) -> Any:
-        return await self._hop.call(lambda: self._fn(*args, **kwargs))
 
 
 class LocalControllerHandle:
@@ -69,11 +46,11 @@ class LocalControllerHandle:
         self.service = service
         # One hop shared by every endpoint: they are all the same boundary.
         self.hop = hop if hop is not None else ServiceHop()
-        self.locate_volumes = _ControllerEndpoint(service.locate_volumes, self.hop)
-        self.notify_put_batch = _ControllerEndpoint(service.notify_put_batch, self.hop)
-        self.keys = _ControllerEndpoint(service.keys, self.hop)
-        self.notify_delete = _ControllerEndpoint(service.notify_delete, self.hop)
-        self.notify_delete_batch = _ControllerEndpoint(
+        self.locate_volumes = LocalEndpoint(service.locate_volumes, self.hop)
+        self.notify_put_batch = LocalEndpoint(service.notify_put_batch, self.hop)
+        self.keys = LocalEndpoint(service.keys, self.hop)
+        self.notify_delete = LocalEndpoint(service.notify_delete, self.hop)
+        self.notify_delete_batch = LocalEndpoint(
             service.notify_delete_batch, self.hop
         )
 

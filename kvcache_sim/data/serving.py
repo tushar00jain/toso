@@ -135,11 +135,11 @@ class ServingPlane(DataPlane):
     # -- what this host tells the coordinator about its decode side -------- #
     def _decode_state(self, inst: str, finishes: List[float]) -> None:
         """Forward a changed decode batch. The engine reports here, not there."""
-        self.coordinator.observe_decode_state(inst, finishes)
+        self.coordinator.observe_decode_state.broadcast(inst, finishes)
 
     def _compute_busy(self, inst: str, until: float) -> None:
         """Forward a coupled instance's occupied compute timeline."""
-        self.coordinator.observe_compute_busy(inst, until)
+        self.coordinator.observe_compute_busy.broadcast(inst, until)
 
     async def drain(self) -> None:
         """Keep the loop running until the last decode token is emitted."""
@@ -151,7 +151,7 @@ class ServingPlane(DataPlane):
         """Serve one request end to end (the runner already waited for arrival)."""
         request: Request = item.payload
 
-        plan = await self.coordinator.schedule(request)
+        plan = await self.coordinator.schedule.call_one(request)
         if plan is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"
@@ -187,14 +187,14 @@ class ServingPlane(DataPlane):
             await asyncio.sleep(plan.prefill_t)
 
         # (4) publish the computed KV blocks into the real directory; evict.
-        completion = await self.coordinator.complete(plan)
+        completion = await self.coordinator.complete.call_one(plan)
         await self.store.publish(completion.instance, completion.publish)
         if completion.evict:
             await self.store.evict(completion.instance, completion.evict)
         # (5) tell control the clock the real ops reached, and (coupled only) the
         # decode timeline the same instance now carries.
         now = self._now()
-        busy_until = await self.coordinator.observe_prefill_done(
+        busy_until = await self.coordinator.observe_prefill_done.call_one(
             completion.instance, now
         )
         if self.coupled and self.engine is not None:
@@ -246,7 +246,7 @@ class ServingPlane(DataPlane):
             return
         # Decode-simulating path: control decides whether decode can honour the
         # TBT SLO; we perform (or skip) the admission.
-        if not await self.coordinator.decode_admission(plan):
+        if not await self.coordinator.decode_admission.call_one(plan):
             result = self._pending.pop(plan.request.id)
             result.accepted = False
             result.decode_rejected = True

@@ -22,23 +22,26 @@ surface would otherwise be unreachable without editing this file.
 
 Calls and sends
 ---------------
-Which is which is also read off the object rather than listed here:
+Every member comes back as a :class:`~realsim.seams.link.LocalEndpoint`, so the
+*caller* chooses how to send, exactly as it would with Monarch:
 
-* an ``async def`` member is a **call** -- awaited, and it pays ``rtt`` twice,
-  once out and once back, because the caller is blocked for both legs;
-* a plain member is a one-way **send** -- forwarded, and free, because the sender
-  does not wait for it. A real bus would still deliver it ``rtt`` later, so control
+* ``schedule.call_one(request)`` -- a call, awaited, paying the hop twice because
+  the caller is blocked out and back;
+* ``observe_decode_state.broadcast(inst, finishes)`` -- one-way, free, because the
+  sender does not wait. A real bus would still deliver it ``rtt`` later, so control
   would act on a slightly stale picture; that lag is *not* modelled, and it is the
   one piece of coordinator distance this seam leaves out.
 
-So a capability states the difference where it declares its coordinator, by making
-a member awaitable or not, and both sides agree by construction.
+That is why the surface is endpoints and not methods. A handle offering methods
+would be a shape Monarch does not have, so swapping in a real actor handle would
+mean editing every caller -- and "the `[S]` piece disappears and nothing changes
+shape" is the claim this package is making.
 
 Cost
 ----
 ``rtt`` defaults to ``0.0``, which makes every call inline: awaiting a coroutine
 that never suspends does not yield to the loop, so a default run is byte-identical
-to holding the object directly -- the seam is structure, not a behaviour change.
+to calling the object directly -- the seam is structure, not a behaviour change.
 Set ``TOSO_COORDINATOR_RTT`` (or ``--coordinator-rtt``) to give the hop a duration,
 and it lands where it belongs: in front of every routing decision, and therefore in
 TTFT. A control plane reads its own clock, so a decision made over a non-zero hop is
@@ -47,12 +50,11 @@ made at the time the request *arrived*, not the time the sender stamped it.
 
 from __future__ import annotations
 
-import inspect
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from sim_common import config
 
-from realsim.seams.link import ServiceHop
+from realsim.seams.link import LocalEndpoint, ServiceHop
 
 __all__ = ["CoordinatorHandle"]
 
@@ -73,21 +75,11 @@ class CoordinatorHandle:
             rtt if rtt is not None else config.current().coordinator_rtt
         )
 
-    def __getattr__(self, name: str) -> Callable[..., Any]:
-        """Mirror ``name`` off the wrapped control plane, across the boundary."""
+    def __getattr__(self, name: str) -> LocalEndpoint:
+        """Mirror ``name`` off the wrapped control plane, as an endpoint."""
         if name.startswith("_"):
-            # Never forward dunder or private lookups: this is an endpoint, not a
-            # transparent proxy, and forwarding them breaks copy/pickle protocols.
+            # Never forward dunder or private lookups: this is a reference to a
+            # service, not a transparent proxy, and forwarding them breaks
+            # copy/pickle protocols.
             raise AttributeError(name)
-        member = getattr(self.control, name)
-        if inspect.iscoroutinefunction(member):
-
-            async def call(*args: Any, **kwargs: Any) -> Any:
-                return await self.hop.call(lambda: member(*args, **kwargs))
-
-            return call
-
-        def send(*args: Any, **kwargs: Any) -> Any:
-            return member(*args, **kwargs)
-
-        return send
+        return LocalEndpoint(getattr(self.control, name), self.hop)
