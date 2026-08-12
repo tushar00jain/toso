@@ -184,6 +184,18 @@ class Plan:
     pred_tbt: float = 0.0        # predicted time-between-tokens at admission
     pred_batch: int = 0          # predicted decode batch size at admission
 
+    @property
+    def local_blocks(self) -> int:
+        """Blocks the prefill host already held: the match, minus what it pulls.
+
+        Derived rather than a field because it is not a decision -- it falls out of
+        two that were already taken, and the data plane needs it three times over
+        (the reuse to report, the suffix to publish, the prefix to fall back on when
+        a planned pull turns out to be gone). Three copies of one subtraction that
+        all have to agree, with nothing checking that they do.
+        """
+        return self.match_blocks - len(self.pull_keys)
+
 
 class _Base(Policy, Coordinator):
     """Shared state + prediction/commit helpers for both schedulers.

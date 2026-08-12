@@ -244,10 +244,9 @@ class ServingHost:
         await self.prefill.wait_turn(plan.queue_wait)
         # (2) the prefix this host already had is a read the store never sees,
         # so tell it: the volume evicts on what it has observed.
-        local_blocks = plan.match_blocks - len(plan.pull_keys)
-        if local_blocks:
+        if plan.local_blocks:
             await self.store.reuse(
-                self.me, list(plan.request.block_keys[:local_blocks])
+                self.me, list(plan.request.block_keys[:plan.local_blocks])
             )
         # ...then pull the remote prefix (a real get_batch -> real fabric cost).
         uncached = plan.uncached_tokens
@@ -270,7 +269,7 @@ class ServingHost:
         # pulled, plus the suffix it computed. Which blocks those are is not a
         # decision and not control's to make -- it is everything past what was
         # already local, and the plan says how much that was.
-        fresh = list(plan.request.block_keys[local_blocks:])
+        fresh = list(plan.request.block_keys[plan.local_blocks:])
         # A cache fill is allowed to fail -- the request has already been served and
         # the only loss is that nobody reuses this prefix. Recorded rather than
         # dropped, because "cached" and "tried to cache and had no room" are exactly
@@ -298,8 +297,9 @@ class ServingHost:
         hit rate that counted the plan rather than the outcome would flatter the
         cache that dropped them.
         """
-        local_blocks = plan.match_blocks - len(plan.pull_keys)
-        cached = min(local_blocks * self.block_tokens, plan.request.prompt_tokens)
+        cached = min(
+            plan.local_blocks * self.block_tokens, plan.request.prompt_tokens
+        )
         uncached = plan.request.prompt_tokens - cached
         row.cached_tokens = cached
         row.uncached_tokens = uncached
@@ -346,9 +346,7 @@ class ServingHost:
         note = "" if published else " -- NOT cached, no room on the volume"
         # What was published is what this host did not already have: the blocks it
         # pulled plus the suffix it computed, not the request's whole chain.
-        stored = len(plan.request.block_keys) - (
-            plan.match_blocks - len(plan.pull_keys)
-        )
+        stored = len(plan.request.block_keys) - plan.local_blocks
         if not self.models_decode:
             self.trace.record(
                 self._now(),
