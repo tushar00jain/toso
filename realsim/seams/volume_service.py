@@ -257,20 +257,29 @@ class VolumeService:
         # peak_resident_bytes is a run-lifetime high-water mark; reset does not
         # lower it.
 
-    # -- asking the control plane for room ---------------------------------- #
+    # -- making room, and telling the directory what went ------------------- #
     async def _ask_for_room(self, projected: int, incoming: set) -> int:
-        """Ask the directory for room, drop what it names, return the new total.
+        """Make room for the overshoot, drop what the ranking names, return the new total.
+
+        Nobody is *asked*: which of this volume's keys is coldest is the one thing
+        this volume cannot be wrong about, so the victims come from its own
+        ``_retention`` ranking. The directory is only *told*, afterwards -- which is
+        why its absence means this cannot proceed at all rather than evicting
+        silently: bytes dropped without a deregistration would leave the directory
+        routing later reads here for data that is gone.
 
         Never asks for more than the overshoot, and never drops a key this very put
         is writing -- freeing bytes the caller is about to re-add would be a wasted
-        round trip at best and, on an overwrite, would drop the new value.
+        round trip at best and, on an overwrite, would drop the new value. That
+        exclusion goes *into* the ranking rather than filtering its answer, so the
+        bytes of a skipped key are never counted toward the need.
         """
         if self._controller is None:
             return projected
         need = int(projected - self.capacity_bytes)
         victims = [
-            key for key in self._retention.victims(need)
-            if key in self._resident_by_key and key not in incoming
+            key for key in self._retention.victims(need, exclude=incoming)
+            if key in self._resident_by_key
         ]
         for key in victims:
             freed = self._resident_by_key.get(key, 0)

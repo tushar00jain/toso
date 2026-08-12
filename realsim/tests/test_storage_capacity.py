@@ -367,6 +367,45 @@ def test_a_key_this_put_is_writing_is_never_evicted():
     assert sorted(svc.store.kv) == ["A", "B"]
 
 
+def test_a_key_this_put_is_writing_does_not_count_as_room_it_freed():
+    """The excluded key is skipped by the ranking, not filtered out of its answer.
+
+    Growing the coldest key asks for one payload's room. The key being written is
+    never a victim -- but if that exclusion is applied *after* the scan, the
+    ranking still hands it back first, counts its bytes toward the need and stops
+    there; the caller then filters it away, frees nothing, and refuses a put that
+    "B" had exactly enough room for.
+    """
+
+    async def _grow_the_coldest_key():
+        controller = RealControllerAdapter()
+        profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES * 2)
+        svc = VolumeService(
+            volume_id="0", profile=profile, controller=controller.handle
+        )
+        producer = RealClientAdapter(
+            controller.handle,
+            volume_handles={"0": LocalVolumeHandle(svc)},
+            client_volume_id="0",
+            topology={"0": Endpoint(id="vol0", host="hA", node="nA")},
+            profile=profile,
+        )
+        with producer.installed():
+            await producer.client.put("A", _meta_payload())
+            await producer.client.put("B", _meta_payload())
+            # "A" is the coldest key, and is the one being overwritten -- by a
+            # value one payload bigger than the one it replaces.
+            await producer.client.put(
+                "A", torch.empty(DEFAULT_N * 2, dtype=torch.float32, device="meta")
+            )
+        return svc
+
+    svc = asyncio.run(_grow_the_coldest_key())
+    # "B" was the only droppable key, and dropping it is what made room.
+    assert sorted(svc.store.kv) == ["A"]
+    assert svc.resident_bytes == PAYLOAD_BYTES * 2
+
+
 def test_a_volume_with_no_directory_cannot_report_what_it_dropped():
     """Eviction is local, but telling the directory is not: without a handle the
     volume has nobody to tell, so it refuses rather than drop silently."""

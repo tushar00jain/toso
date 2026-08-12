@@ -9,9 +9,10 @@ that stores the data.
 This is the store's own, and deliberately not a control-plane decision: recency of a
 volume's data is the one thing that volume cannot be wrong about, and asking a
 cluster-wide service for it would be a round trip to be told what is already local.
-:meth:`proposed.policy.Policy.evict` remains the way a control plane *overrides*
-this, for the decisions it can make and a volume cannot -- that a key has three other
-copies, that one is about to be read, that a version is dead.
+A control plane has no say here today: :class:`~proposed.policy.Policy` declares
+``select`` and ``notice`` and nothing else, so the decisions a volume cannot make --
+that a key has three other copies, that one is about to be read, that a version is
+dead -- have nowhere to be expressed. That gap is real and left visible.
 
 Deterministic by construction: recency is a monotonic counter, never a clock, and
 ties break on the key.
@@ -26,7 +27,7 @@ it.)
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Container, Dict, Iterable, List
 
 __all__ = ["LeastRecentlyUsed"]
 
@@ -55,17 +56,28 @@ class LeastRecentlyUsed:
         self._used.pop(key, None)
         self._bytes.pop(key, None)
 
-    def victims(self, need_bytes: int) -> List[str]:
+    def victims(
+        self, need_bytes: int, exclude: Container[str] = frozenset()
+    ) -> List[str]:
         """Coldest first, enough of them to free ``need_bytes``.
 
         Stops as soon as the total covers the need: a volume asked for one block's
         room should lose one block, not its whole working set.
+
+        ``exclude`` names keys the caller will not drop -- the ones the very put
+        asking for room is writing. They are skipped here rather than filtered out
+        of the answer, because filtering afterwards would already have counted their
+        bytes toward ``need_bytes`` and stopped the scan early: the caller would be
+        handed a short list, free less than it asked for, and refuse a put for which
+        a real victim existed.
         """
         victims: List[str] = []
         freed = 0
         for key in sorted(self._used, key=lambda k: (self._used[k], k)):
             if freed >= need_bytes:
                 break
+            if key in exclude:
+                continue
             victims.append(key)
             freed += self._bytes.get(key, 0)
         return victims
