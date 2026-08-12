@@ -9,13 +9,34 @@ workload), two runs produce byte-identical traces and identical metrics.
 through the ledger's shared aggregations (sum / mean / nearest-rank percentile /
 fraction) -- the arithmetic is not re-implemented per capability.
 
+Why this is a collector, not a row a host carries
+-------------------------------------------------
+One request is served by two machines: one prefills it and publishes its KV, and
+(under disaggregation) a different one fetches that KV back and decodes it. Each
+knows a disjoint half of the outcome -- the first knows the routing decision, the
+reuse and whether the publish fit; the second knows what the handoff cost and what
+inter-token gaps the batch produced -- and neither can be asked about the other's.
+
+The serving plane used to resolve that by *shipping the row*: the prefill host
+built a :class:`RequestResult`, held it, and handed it to the decode host along
+with the request, so whoever finished the request reported all of it. That is a
+measurement object crossing a process boundary for no reason but bookkeeping, and
+it is the shape that made a host need a reference to another host.
+
+So the join lives here instead, which is where every real system puts it: hosts
+emit what they observed, keyed by request id, and the collector assembles the row.
+:meth:`Metrics.add` is the first writer (the prefill host, or the routing host on a
+rejection) and :meth:`Metrics.handed_off` / :meth:`Metrics.decoded` are the second
+(the decode host), each amending the row the first created. They fail loudly on an
+id nobody opened, because a decode with no prefill is a wiring bug, not a metric.
+
 The generic event recorder lives in ``sim_common.trace.Trace``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from sim_common.report import Ledger
 
@@ -32,7 +53,12 @@ __all__ = [
 
 @dataclass
 class RequestResult:
-    """Per-request outcome (one row of the metrics table)."""
+    """Per-request outcome (one row of the metrics table).
+
+    Written by two hosts, in two passes -- see the module docstring. The fields
+    down to ``published`` are the prefill host's; the three after it are the decode
+    host's, and stay at their defaults for a run that does not model decode.
+    """
 
     id: str
     accepted: bool
@@ -47,6 +73,10 @@ class RequestResult:
     decode_rejected: bool = False    # shed at decode admission (TBT SLO)
     wasted_prefill: bool = False     # prefill was spent, then decode rejected
     published: bool = True           # the prefix this request computed was cached
+    # -- the decode host's half -------------------------------------------- #
+    decode: str = ""                 # the instance that actually decoded it
+    handoff_bytes: int = 0           # KV pulled out of the store to decode here
+    handoff_missed: bool = False     # ...or the chain was gone and none was
 
 
 def _accepted(r: RequestResult) -> bool:
@@ -54,8 +84,62 @@ def _accepted(r: RequestResult) -> bool:
 
 
 class Metrics(Ledger):
-    """Aggregate outcome metrics for one scheduler run."""
+    """Aggregate outcome metrics for one scheduler run.
 
+    Also the run's **collector**: the one place a request's two halves meet, since
+    the host that prefilled it and the host that decoded it never speak. See the
+    module docstring for why the join is here rather than in a row that travels.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # id -> the row, so a second writer finds it without rescanning the table.
+        # A plain index over ``rows``, not a second copy: the values *are* the rows.
+        self._by_id: Dict[str, RequestResult] = {}
+
+    # -- recording, by whichever host observed it -------------------------- #
+    def add(self, row: Any) -> None:
+        """Open a request's row (the routing host, or the host that prefilled it)."""
+        super().add(row)
+        self._by_id[row.id] = row
+
+    def _open(self, request_id: str) -> RequestResult:
+        """The row ``request_id`` was opened with, or a loud failure.
+
+        Loud because the alternative is a decode-side measurement quietly landing
+        nowhere: every path that reaches a decode host went through a prefill host
+        that opened the row first, so a miss is a wiring bug in the redirect chain
+        and not a request that happens to have no prefill half.
+        """
+        row = self._by_id.get(request_id)
+        if row is None:
+            raise KeyError(
+                f"no outcome row open for {request_id!r}: a decode host is "
+                f"reporting on a request no prefill host recorded"
+            )
+        return row
+
+    def handed_off(
+        self, request_id: str, decode: str, nbytes: int, *, missed: bool = False
+    ) -> None:
+        """The decode host pulled this request's KV out of the store to run it.
+
+        ``missed`` says the chain was not there to pull -- the publish did not fit,
+        or a volume dropped it in between -- so nothing moved and the request is
+        decoding on KV this model does not account for. Counted rather than hidden:
+        it is exactly the signal that a run's cache is too small for the store to
+        be a credible handoff.
+        """
+        row = self._open(request_id)
+        row.decode = decode
+        row.handoff_bytes = nbytes
+        row.handoff_missed = missed
+
+    def decoded(self, request_id: str, tbt: float) -> None:
+        """The decode host emitted this request's last token at ``tbt`` worst gap."""
+        self._open(request_id).tbt = tbt
+
+    # -- aggregation -------------------------------------------------------- #
     @property
     def results(self) -> List[RequestResult]:
         """The per-request rows, in the order they were finalized."""
@@ -90,6 +174,23 @@ class Metrics(Ledger):
     def fabric_bytes(self) -> int:
         """Cross-instance KV bytes moved to reuse remote prefixes."""
         return self.total("transfer_bytes", _accepted)
+
+    @property
+    def handoff_bytes(self) -> int:
+        """KV bytes pulled out of the store by decode hosts.
+
+        Kept apart from :attr:`fabric_bytes` because the two answer different
+        questions and only one of them is a choice. A prefix pull is reuse the
+        coordinator elected to buy instead of recomputing; a handoff is the price of
+        decoding somewhere other than where the prompt was prefilled, which
+        disaggregation pays on every single request and cannot decline.
+        """
+        return self.total("handoff_bytes", _accepted)
+
+    @property
+    def handoff_misses(self) -> int:
+        """Handoffs that found no KV in the store (see :meth:`handed_off`)."""
+        return self.count(lambda r: r.handoff_missed)
 
     @property
     def mean_ttft(self) -> float:
@@ -163,9 +264,13 @@ def render_disaggregation(disagg: Metrics, coupled: Metrics,
     """Render the coupled-vs-disaggregated TBT comparison block.
 
     Both configs serve the same load (the ``served/total`` row makes clear neither
-    rejects), so the story is entirely in the TBT columns: disaggregation keeps
-    decode on its own timeline (batch-sized TBT, target held ~100%), coupling lets
-    prefills collide with decode steps (a fraction of served requests miss). The
+    rejects), so the story is in the TBT columns and in what each pays for them.
+    Disaggregation keeps decode on its own timeline, so no prefill collides with a
+    decode step; coupling lets them collide. But a decode host that did not prefill
+    the prompt has to fetch its KV back out of the store, and the ``KV handoff
+    bytes`` row is that bill -- the one a design that hands the request to its
+    decode host as a method call does not show, and the reason the attainment
+    columns are closer together than the coupling story alone would predict. The
     ``target`` is met per-request on the *worst* inter-token gap observed.
     """
     def pct(x: float) -> str:
@@ -182,6 +287,10 @@ def render_disaggregation(disagg: Metrics, coupled: Metrics,
         f"{pct(coupled.tbt_slo_met(target)):>15}",
         f"  {'mean TBT':22}{disagg.mean_tbt:>15.3f}{coupled.mean_tbt:>15.3f}",
         f"  {'p90 TBT':22}{disagg.pct_tbt(90):>15.3f}{coupled.pct_tbt(90):>15.3f}",
+        f"  {'KV handoff bytes':22}{disagg.handoff_bytes:>15}"
+        f"{coupled.handoff_bytes:>15}",
+        f"  {'handoff misses':22}{disagg.handoff_misses:>15}"
+        f"{coupled.handoff_misses:>15}",
     ])
 
 

@@ -105,12 +105,22 @@ class SimConfig:
     # lag of one-way sends is not modelled (see the handles' docstrings).
     coordinator_rtt: float = 0.0
     controller_rtt: float = 0.0
-    # ``host_rtt`` is the fourth boundary: one serving host reaching another, which
-    # a request crosses when it arrives somewhere other than the host that should
-    # prefill it, and again when its prefill host hands it to its decode host.
+    # ``client_rtt`` is the fourth boundary: a client reaching a serving host. It
+    # used to be ``host_rtt``, one serving host reaching another, and it was
+    # renamed rather than kept because the boundary it named stopped existing:
+    # kvcache's serving hosts no longer call each other at all. A request is
+    # *redirected* -- the host it lands on answers with the host that should
+    # prefill it, that host answers with the host that will decode it, and the
+    # client makes each of those calls itself -- so the round trips a redirect
+    # costs are client<->host ones, and there are three of them per request where
+    # a peer-forwarding design had one client call and two internal hops.
     # Same contract as the two above -- ``0.0`` keeps a hop inline and the run
-    # byte-identical, and a non-zero value is an opt-in fidelity model.
-    host_rtt: float = 0.0
+    # byte-identical, and a non-zero value is an opt-in fidelity model. Note what
+    # it does *not* move: the TTFT this capability records is control's own
+    # prediction, made before any of these hops is paid, so client latency shows
+    # up in the run's wall clock and in later requests' queue waits rather than in
+    # the TTFT column.
+    client_rtt: float = 0.0
 
 
 _current = SimConfig()
@@ -153,9 +163,9 @@ def _from_env() -> dict:
     controller_rtt = os.environ.get("TOSO_CONTROLLER_RTT")
     if controller_rtt is not None:
         out["controller_rtt"] = float(controller_rtt)
-    host_rtt = os.environ.get("TOSO_HOST_RTT")
-    if host_rtt is not None:
-        out["host_rtt"] = float(host_rtt)
+    client_rtt = os.environ.get("TOSO_CLIENT_RTT")
+    if client_rtt is not None:
+        out["client_rtt"] = float(client_rtt)
     return out
 
 

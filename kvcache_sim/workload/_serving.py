@@ -11,21 +11,31 @@ Two separate things, deliberately:
   factories because they reach for the view, the mesh and the ledger, none of
   which exists before the stack does.
 
-Four things a deployment would not need are built here, because in a deployment
+Three things a deployment would not need are built here, because in a deployment
 they are not built at all. One is
 :class:`~kvcache_sim.workload._accelerator.SimulatedAccelerator`: what a forward
 pass costs and how it is made to take that long is the run's answer under
 simulation and the model's in production, so the capability is handed a port and
-this supplies the implementation. One is the peer references a host reaches another host
-through -- in production a handle to a remote actor, here a
-:class:`~realsim.seams.link.LocalEndpoint` pair over a
-:class:`~realsim.seams.link.ServiceHop`, so the boundary is charged. The other two
-are the load balancer: :func:`_affinity` decides which host a request lands on and
-:class:`_LoadBalancer` hands it there. Production has a client SDK, an ingress proxy
+this supplies the implementation. The other two are the client: :func:`_affinity`
+decides which host a request lands on and :class:`_Client` takes it there and
+follows the redirects it gets back. Production has a client SDK, an ingress proxy
 or DNS doing that, none of which is part of the serving system -- which is why they
 are here rather than in ``data/``, whose test for membership is whether a thing
 advances the clock or moves bytes, and whose contents are what would lift into a
 deployment unchanged.
+
+The client is where the request's itinerary lives
+-------------------------------------------------
+A serving host answers with an *address* rather than acting on it: the host a
+request lands on says which host should prefill it, and that host says which host
+will decode it (see :mod:`kvcache_sim.data.serving`). Somebody has to walk that
+chain, and it is the same somebody who walks a ``307`` -- the client. So
+:class:`_Client` makes three calls per request where the old wiring made one and
+let the hosts call each other twice, and it reaches each host through a
+:class:`~realsim.seams.link.LocalEndpoint` over a shared
+:class:`~realsim.seams.link.ServiceHop`, so those three round trips are charged
+(:attr:`sim_common.config.SimConfig.client_rtt`, ``0.0`` by default, which keeps a
+hop inline and the run byte-identical).
 
 They are two functions because they are two services. The plane factory does not
 build the scheduler; it takes ``sim.coordinator_handle``, the handle
@@ -36,7 +46,7 @@ different wiring, which is exactly what "cache-aware vs load-balance" means.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 from zlib import crc32
 
 import torch
@@ -146,24 +156,29 @@ def coordinator(
     return LoadBalanceScheduler(**knobs)
 
 
-class _LocalHostHandle:
-    """A reference to another serving host, endpoint-shaped and hop-charged.
+class _ServingEndpoints:
+    """One serving host as a **client** reaches it: endpoint-shaped, hop-charged.
 
-    What a host holds for a peer, standing in for Monarch's handle over that
-    host's actor: one :class:`~realsim.seams.link.LocalEndpoint` per member a peer
-    may call, over a shared :class:`~realsim.seams.link.ServiceHop`. Reaching
-    another host is a boundary like reaching the directory or the coordinator, and
-    is charged like one -- free by default (``host_rtt`` is ``0.0``), so a run that
-    does not ask for the fidelity is byte-identical.
+    Standing in for whatever a client SDK holds for a serving instance -- a
+    connection, a stub, a Monarch handle over its actor -- as one
+    :class:`~realsim.seams.link.LocalEndpoint` per member, over a shared
+    :class:`~realsim.seams.link.ServiceHop`. A client is off the box, so reaching a
+    host is a boundary like reaching the directory or the coordinator and is
+    charged like one: free by default, so a run that does not ask for the fidelity
+    is byte-identical.
 
-    Only the two members a *peer* calls are exposed. ``receive`` is not one of
-    them: a request arrives from a client, and a host that could hand another host
-    an unrouted request would be a second router.
+    All three of a host's members are here, because the client calls all three --
+    that is what a redirect chain is. Nothing else in the run holds one of these:
+    hosts do not, which is the whole point of the redirect model. This class
+    replaces the peer handle a host used to be given, and it is deliberately not
+    the same object under a new name: what changed is not the shape of the
+    reference but *who* is entitled to hold one.
     """
 
     def __init__(self, host: ServingHost, hop: ServiceHop) -> None:
-        self.serve = LocalEndpoint(host.serve, hop)
-        self.admit_decode = LocalEndpoint(host.admit_decode, hop)
+        self.route = LocalEndpoint(host.route, hop)
+        self.prefill = LocalEndpoint(host.prefill, hop)
+        self.decode = LocalEndpoint(host.decode, hop)
 
 
 def _affinity(ids: List[str]) -> Callable[[Request], str]:
@@ -171,7 +186,7 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
 
     The load balancer a deployment has and a simulation has to stand in for. Client
     affinity rather than round robin because it is what a real front end does with
-    a session id, and because it is the arrival policy that forwards least: a
+    a session id, and because it is the arrival policy redirected least: a
     conversation's requests share a prefix, so the host that served the last one is
     usually the host that should serve the next.
 
@@ -191,41 +206,72 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
     return landed
 
 
-class _LoadBalancer:
-    """Which host a request lands on, and handing it there. Not a serving decision.
+class _Client:
+    """The thing outside the cluster that submits a request and follows redirects.
 
     Stands in for what a deployment already has in front of its hosts -- a client
     SDK doing client-side balancing, an ingress proxy, DNS -- and therefore for
-    something that is deleted rather than moved when this ships. It holds no
-    policy of its own beyond ``landed``, and it never asks where a request should
-    *run*: that is the coordinator's answer, and the host it delivers to will go
-    and get it.
+    something that is deleted rather than moved when this ships. It holds no policy
+    of its own beyond ``landed``, and it never asks where a request should *run*:
+    it asks a host, and does what it is told.
+
+    Three legs, which is the whole object::
+
+        plan   = await hosts[landed(request)].route(request)   # "prefill is B"
+        decode = await hosts[plan.prefill].prefill(plan)       # "decode is C"
+        await hosts[decode].decode(plan)
+
+    Note what it carries and what it does not. It carries the
+    :class:`~kvcache_sim.control.scheduler.Plan` -- a value the coordinator issued,
+    which is exactly the kind of thing a client is handed and hands back (a routing
+    token, a session ticket) and which nothing here reads for a decision. It does
+    *not* carry a measurement row: each host records its own half into the run's
+    ledger, and the client never learns the outcome, because a client that had to
+    be told the hit rate would be part of the serving system.
+
+    It also does not second-guess an address. ``prefill`` answers with the decode
+    host rather than the client reading ``plan.decode``, because the plan is what
+    control *predicted* and the prefill host may have been refused the admission
+    since -- ``None`` means the journey ends here, and the host that ended it has
+    already said why in the ledger.
 
     Args:
-        hosts: ``instance id -> ServingHost``. Held as objects rather than
-            references because this is outside every host -- the client side of
-            the deployment -- and so pays no hop that every scheduler would not
-            pay equally.
+        hosts: ``instance id -> _ServingEndpoints``. References, not objects: a
+            client is off the box, so each of the three legs is a charged round
+            trip rather than a free method call.
         landed: which host a request arrives at.
+        drains: ``instance id -> ServingHost.drain``, the one thing that is not a
+            request. Draining is the harness waiting for the simulated cluster to
+            go quiet, not a client operation, so it is not on the endpoints and
+            pays no hop: a real client simply closes its connection and leaves the
+            hosts to finish.
     """
 
     def __init__(
         self,
-        hosts: Dict[str, ServingHost],
+        hosts: Dict[str, _ServingEndpoints],
         landed: Callable[[Request], str],
+        drains: Dict[str, Callable[[], Awaitable[None]]],
     ) -> None:
         self.hosts = hosts
         self.landed = landed
+        self.drains = drains
 
-    async def deliver(self, item) -> None:
-        """Hand the request to whichever host it arrived at."""
+    async def submit(self, item) -> None:
+        """Take one request through as many hosts as it is redirected to."""
         request: Request = item.payload
-        await self.hosts[self.landed(request)].receive(request)
+        plan = await self.hosts[self.landed(request)].route.call_one(request)
+        if plan is None:
+            return  # refused at the door; the host that refused recorded it
+        decode = await self.hosts[plan.prefill].prefill.call_one(plan)
+        if decode is None:
+            return  # nothing after prefill: no decode modelled, or it was shed
+        await self.hosts[decode].decode.call_one(plan)
 
     async def drain(self) -> None:
         """Every host's decode has to finish before the run is over."""
-        for instance in sorted(self.hosts):
-            await self.hosts[instance].drain()
+        for instance in sorted(self.drains):
+            await self.drains[instance]()
 
 
 def serving_plane(
@@ -260,12 +306,8 @@ def serving_plane(
         store = KVStore(
             sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
         )
-        hop = ServiceHop(config.current().host_rtt)
+        hop = ServiceHop(config.current().client_rtt)
         hosts: Dict[str, ServingHost] = {}
-        handles: Dict[str, _LocalHostHandle] = {}
-
-        def peers(instance: str) -> Any:
-            return handles[instance]
 
         prefills = set(prefill_pool) if prefill_pool else set(sim.ids)
         decodes = (set(decode_pool) if decode_pool else set(sim.ids)) if simulate_decode else set()
@@ -279,7 +321,6 @@ def serving_plane(
             prefill_compute = compute if coupled else accelerator()
             hosts[instance] = ServingHost(
                 instance, store, sim.coordinator_handle,
-                peers=peers,
                 trace=sim.trace, metrics=sim.ledger,
                 prefill=(
                     PrefillEngine(prefill_compute)
@@ -291,18 +332,20 @@ def serving_plane(
                 ),
                 models_decode=simulate_decode,
             )
-        # After every host exists, because a handle names one: the lookup is
-        # deferred through ``peers`` so the cycle is closed by the time anyone
-        # calls, and no host holds another host's object.
-        for instance, host in hosts.items():
-            handles[instance] = _LocalHostHandle(host, hop)
-        balancer = _LoadBalancer(hosts, _affinity(sorted(sim.ids)))
+        # The endpoints exist only on the client side, so there is no cycle to
+        # close: every host was fully constructed above, knowing nothing about any
+        # other, and this loop just gives the client a way to reach each of them.
+        client = _Client(
+            {i: _ServingEndpoints(h, hop) for i, h in sorted(hosts.items())},
+            _affinity(sorted(sim.ids)),
+            {i: h.drain for i, h in sorted(hosts.items())},
+        )
         # What the runner drives is a dispatcher, not a plane: the executing half
         # of this capability is the hosts, and there are several. The rows are
         # published at rejection, at acceptance, or when the last decode token
         # lands -- never one per item, so the harness must not write them.
         return ItemDispatch(
-            balancer.deliver, on_drain=balancer.drain, writes_own_outcomes=True
+            client.submit, on_drain=client.drain, writes_own_outcomes=True
         )
 
     return build

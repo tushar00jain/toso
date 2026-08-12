@@ -346,6 +346,12 @@ class Disaggregation(Scenario):
         console.info("gap stayed under the target. Disaggregation isolates decode from prefill,")
         console.info("so served requests hold TBT; coupling lets long prefills stall decode, so")
         console.info("a large fraction of served requests blow the target -- same load admitted.")
+        console.info("What isolation costs is the handoff row: a decode host that did not")
+        console.info("prefill the prompt fetches its whole KV chain back out of the store, which")
+        console.info("is a real transfer on the clock and the reason both columns pay it here")
+        console.info("(coupled picks a decode host by load, not by who prefilled). It delays")
+        console.info("every request without widening any inter-token gap, so it moves the run's")
+        console.info("wall clock and the batches that form, not the TBT columns directly.")
 
 
 class EarlyRejection(Scenario):

@@ -245,11 +245,11 @@ def test_a_request_is_served_by_its_plan_host_not_the_host_it_landed_on():
 
     Arrival is client affinity -- a load balancer's answer, made without looking
     at the cache -- so most requests land somewhere other than the host holding
-    their prefix, and the host they land on forwards them. If arrival decided
+    their prefix, and the host they land on redirects them. If arrival decided
     placement instead, cache-aware routing would be measuring its own load
     balancer.
 
-    The two counts have to agree: one forward is traced for exactly the requests
+    The two counts have to agree: one redirect is traced for exactly the requests
     whose serving host is not their arrival host.
     """
     from kvcache_sim.workload._serving import _affinity
@@ -263,11 +263,11 @@ def test_a_request_is_served_by_its_plan_host_not_the_host_it_landed_on():
         row for row in result.ledger.accepted
         if row.prefill != landed(by_id[row.id])
     ]
-    forwards = [
-        line for line in result.trace.render().splitlines() if " FWD " in line
+    redirects = [
+        line for line in result.trace.render().splitlines() if " REDIR " in line
     ]
     assert moved, "every request happened to land on its own prefill host"
-    assert len(moved) == len(forwards)
+    assert len(moved) == len(redirects)
     # ...and affinity is a function of the conversation alone, so a conversation's
     # requests all land together however their prefixes differ.
     for request in reqs:
@@ -378,6 +378,110 @@ def test_early_rejection_avoids_wasted_prefill():
     # 'early' (stale current-occupancy snapshot) cannot.
     assert (predict.ledger.tbt_slo_met(EARLY_SLO_TBT)
             > early.ledger.tbt_slo_met(EARLY_SLO_TBT))
+
+
+# 13b. The handoff between prefill and decode goes through the STORE.
+#      A decode host that did not prefill the prompt holds none of its KV, so it
+#      has to fetch the chain back out -- a real get_batch, priced like every other
+#      transfer. This used to be a method call on the peer object, i.e. free, which
+#      flattered disaggregation by exactly the cost that dominates a real
+#      prefill/decode-disaggregated deployment.
+def test_the_decode_host_fetches_its_kv_out_of_the_store():
+    disagg, coupled = run_disaggregation()
+    for result in (disagg, coupled):
+        ledger = result.ledger
+        assert ledger.handoff_bytes > 0
+        # Nothing went missing: if it had, the transfer would be uncharged and the
+        # bytes above would be understating what the run actually needs to move.
+        assert ledger.handoff_misses == 0
+        for row in ledger.accepted:
+            assert row.decode, f"{row.id} decoded nowhere"
+
+    # A host that prefilled the request decodes it on KV it already holds, so it
+    # pays nothing and reports no handoff -- the store's own rule for a local hit,
+    # the same one the prefill side follows through ``reuse``. Charging it would
+    # bill a storage read for KV that never left, and would report it in a column
+    # that means "this crossed a host boundary".
+    for row in coupled.ledger.accepted:
+        crossed = row.prefill != row.decode
+        assert (row.handoff_bytes > 0) is crossed, row.id
+    assert any(row.prefill == row.decode for row in coupled.ledger.accepted), (
+        "coupled never decoded on the prefill host, so the free path is untested"
+    )
+
+    # In the disaggregated run the pools are disjoint, so *every* request's KV
+    # really crossed a host boundary -- and the crossing is a transport transfer
+    # the mesh charged, not an accounting line this package invented. Both decode
+    # instances are the destination of one, which no run could produce before:
+    # nothing ever fetched into the decode pool, because nothing had to.
+    into = {dst for _src, dst, _label in disagg.ledger.edges}
+    assert {"s2", "s3"} <= into
+    for row in disagg.ledger.accepted:
+        assert row.prefill in ("s0", "s1")
+        assert row.decode in ("s2", "s3")
+
+
+# 13c. ...and the two halves of that row were written by two hosts that never
+#      spoke. The prefill host recorded the routing decision and the publish; the
+#      decode host recorded the handoff and the inter-token gaps. Neither was
+#      handed the other's row -- the ledger is the collector, and the join is by
+#      request id. A single row carrying both halves is what proves the join ran.
+#      Read off the disaggregated run, where the pools are disjoint so every
+#      request really was written by two different hosts.
+def test_each_host_records_its_own_half_of_a_request():
+    disagg, _coupled = run_disaggregation()
+    joined = [
+        row for row in disagg.ledger.accepted
+        if row.prefill and row.decode and row.prefill != row.decode
+    ]
+    assert len(joined) == len(disagg.ledger.accepted)
+    for row in joined:
+        assert row.ttft > 0          # the prefill host's half
+        assert row.handoff_bytes > 0  # the decode host's half
+        assert row.tbt > 0            # ...and the decode host's again, later
+
+
+# 13d. Nothing on a serving host can reach another serving host. The redirect
+#      model's whole structural claim, so it is asserted and not just described:
+#      a host answers with an *address*, and the client -- which is run wiring, not
+#      capability code -- is what walks it. A ``peers`` argument coming back would
+#      fail the first half; a host stashing a peer's bound method would fail the
+#      second.
+def test_a_serving_host_cannot_reach_another_serving_host():
+    import inspect
+
+    from kvcache_sim.data.serving import ServingHost
+    from kvcache_sim.workload._serving import BLOCK_TOKENS
+
+    accepted = set(inspect.signature(ServingHost.__init__).parameters) - {"self"}
+    assert accepted == {
+        "me", "store", "coordinator", "trace", "metrics", "prefill", "decode",
+        "models_decode",
+    }
+
+    sim = Simulation(_make_topology(2))
+    store = KVStore(
+        sim.mesh, block_tokens=BLOCK_TOKENS,
+        carrier=_sim_block_carrier(BLOCK_TOKENS),
+    )
+    hosts = {
+        i: ServingHost(
+            i, store, sim.coordinator_handle, trace=sim.trace, metrics=sim.ledger
+        )
+        for i in sim.ids
+    }
+    try:
+        for host in hosts.values():
+            for name, held in vars(host).items():
+                assert not isinstance(held, ServingHost), name
+                # A bound method of another host is the same reference wearing a
+                # callable's clothes, which is how the decode handoff used to work.
+                owner = getattr(held, "__self__", None)
+                assert owner is None or owner is host or not isinstance(
+                    owner, ServingHost
+                ), name
+    finally:
+        sim.loop.close()
 
 
 # 14b. Divergence gate: the opt-in dict-shim directory yields byte-identical
@@ -494,6 +598,35 @@ def test_coordinator_rtt_lands_in_ttft_and_costs_reuse():
         cache_aware, load_balance = run_shared_prefix(seed=1)
     assert cache_aware.ledger.hit_rate > load_balance.ledger.hit_rate
     assert cache_aware.ledger.mean_ttft < load_balance.ledger.mean_ttft
+
+
+# 16b. The client seam: a request is redirected, so the round trips it pays are
+#      client<->host ones and there are three of them (route, prefill, decode).
+#      There is no host-to-host hop left to charge, which is why ``host_rtt``
+#      became ``client_rtt`` rather than being deleted.
+def test_client_rtt_defaults_to_free_and_byte_identical():
+    baseline = run_shared_prefix(seed=1)[0]
+    with config.overrides(client_rtt=0.0):
+        explicit = run_shared_prefix(seed=1)[0]
+    assert explicit.trace.render() == baseline.trace.render()
+    assert explicit.ledger.mean_ttft == baseline.ledger.mean_ttft
+
+
+def test_a_distant_client_delays_the_request_and_costs_reuse():
+    """Three round trips per request, paid before each leg can start.
+
+    The same two effects the coordinator hop has, for the same reason: the delay
+    pushes a request further down the prefill queue, and routing runs against a
+    directory snapshot taken later, by which time the queue it is predicting
+    against has moved. It does *not* land in TTFT by one RTT -- TTFT here is
+    control's prediction, made before any hop is paid -- so what moves is the
+    queueing that prediction is built on.
+    """
+    free = run_shared_prefix(seed=1)[0]
+    with config.overrides(client_rtt=0.5):
+        distant = run_shared_prefix(seed=1)[0]
+    assert distant.ledger.mean_ttft > free.ledger.mean_ttft
+    assert distant.ledger.hit_rate < free.ledger.hit_rate
 
 
 # 17. The peer that serves a pull is the peer the coordinator priced.

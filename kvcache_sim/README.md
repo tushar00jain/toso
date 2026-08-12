@@ -77,7 +77,11 @@ python -m kvcache_sim --help            # usage + valid scenario names
 - **disaggregation** — batched decode under a TBT target. A dedicated decode pool (its
   own compute timeline) protects served-request TBT from prefill interference;
   coupling prefill and decode on the same instances lets a prefill collide with a
-  decode step, so a fraction of the *same* served load blows the target.
+  decode step, so a fraction of the *same* served load blows the target. What it also
+  shows, since the KV handoff goes through the store, is the bill: every request pays
+  a real `get_batch` of its whole block chain to reach the host that decodes it, and
+  the `KV handoff bytes` row is what that costs. See the honesty note on where that
+  cost does and does not land.
 - **early_rejection** — heavy decode load under a tight TBT SLO, comparing admission
   policies `off`/`early`/`predict`. `off` late-checks decode load after prefill and so
   wastes prefill on rejects; `early`/`predict` gate before prefill (no waste), but only
@@ -94,6 +98,34 @@ The tests are deterministic: they assert on block presence in the **real
 directory** (publish → `locate_volumes` → evict), on the outcome (hit rate, compute,
 eviction bounds, rejections, TBT), and on byte-identical traces across runs -- never
 on wall-clock timing.
+
+## A request is redirected, not forwarded
+
+No serving host calls another serving host. A host answers with an *address* and the
+client goes there:
+
+```
+client -> A          "serve this"
+A      -> client     "prefill is B"     # A asks the coordinator; A does not call B
+client -> B          B prefills, publishes its KV blocks to the store
+B      -> client     "decode is C"
+client -> C          C fetches that KV back out of the store, decodes, finishes
+```
+
+Three consequences, and they are the reason for the shape:
+
+- **A host's whole outward surface is the store and the coordinator.** There is no
+  peer lookup and nothing to wire up after all the hosts exist. `workload/_serving.py`
+  holds the client that walks the chain, which is where a client belongs.
+- **No measurement row crosses a host boundary.** Each host records what *it* did into
+  the run's ledger (`report/metrics.py`), keyed by request id, and the ledger joins the
+  two halves — the prefill host's routing/reuse/publish facts and the decode host's
+  handoff and inter-token gaps. Shipping a half-filled `RequestResult` from one host to
+  another was telemetry pretending to be a payload.
+- **The store *is* the handoff.** A decode host that did not prefill the prompt has
+  none of its KV, so it fetches the whole block chain with a real `get_batch`, priced
+  by the same cost model as every other transfer. That is the dominant cost in a real
+  prefill/decode-disaggregated system, and it used to be a free method call.
 
 ## The user-facing entry point mirrors the store
 
@@ -154,10 +186,13 @@ kvcache_sim/
                           #   (str keys): what is decided about, and what data/
                           #   is handed
   data/                   # EXECUTES -- advances the clock, moves bytes
-    serving.py            #   one ServingHost per instance: the router role every
-                          #   host plays, then -- for the ones it serves -- the real
-                          #   pull, the publish and the decode handoff. Holds the
-                          #   engines below; runs neither itself
+    serving.py            #   one ServingHost per instance, as three things a
+                          #   client asks it: route (which host should prefill
+                          #   this -- answered with an address, not a forward),
+                          #   prefill (real pull, compute, publish -> answered
+                          #   with the decode host's address) and decode (fetch
+                          #   the KV back out of the store, then batch it). No
+                          #   host holds a reference to another host
     _compute.py           #   Accelerator: the port an engine runs its work on --
                           #   what it costs and making it take that long. Both
                           #   engines get one; the SAME one is what coupling means
@@ -176,7 +211,9 @@ kvcache_sim/
                           #   by a roofline and a sleep. The one piece of the
                           #   compute story a deployment replaces outright
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
-                          #   the wiring a run installs around it
+                          #   the wiring a run installs around it, incl. the
+                          #   client that submits a request and follows the two
+                          #   redirects it gets back
     scenarios.py          #   the six Scenarios: each declares its Runs over one
                           #   request stream, and narrates the results
   report/                 # OUTCOME METRICS
@@ -233,4 +270,39 @@ plus the prefix-run read that express KV caching on a mesh.
   queue waits but never directly in the TTFT column. Recording a measured TTFT instead
   would fix that and would also fold in fetch-vs-prediction divergence -- a different
   decision, not made.
-```
+- **The KV handoff is real, but it lands in neither headline column.** The decode host
+  fetches the request's whole block chain through the real `get_batch`, so the bytes,
+  the fabric time and the storage/RAM staging are all charged — and then land nowhere
+  the disaggregation table looks directly. Not in TTFT, which is control's prediction
+  made before any of it happens; and not in TBT, which is measured *between* decode
+  tokens, while the handoff finishes before the first one. What it does move is *when*
+  a request joins its decode batch, which changes who is batched with whom and
+  therefore everybody's step times — so the numbers shift, indirectly (`mean TBT`
+  0.028 → 0.029 disaggregated, 0.162 → 0.159 coupled), and the early-rejection
+  scenario shifts a lot more, because later admissions mean a lower occupancy at each
+  admission check. Folding the handoff into TBT instead was tried: the first token
+  comes from the prefill host, so the transfer arguably *is* an inter-token gap. It
+  takes both disaggregation columns to `0.0%` attainment against a target of five
+  decode steps, which is a one-off migration swamping a per-token metric rather than a
+  finding, and it is not how the disaggregation literature measures either
+  (DistServe/Mooncake put KV migration in TTFT and keep TPOT for decode cadence). So:
+  charged on the clock, reported in its own column. What is genuinely missing is an
+  end-to-end latency measurement (arrival → last token), which is where the handoff
+  would show up honestly. That column does not exist yet; adding it is the obvious
+  next thing and is not part of this change.
+- **A handoff can find nothing, and the run says so rather than pretending.** The
+  publish before it is allowed to fail (a full volume) and a volume may drop a block
+  in between, and `get_batch` is all-or-nothing, so either shows up as the whole
+  handoff missing. The store holds the only copy in this model, so the truthful
+  consequence would be that the request dies — but re-deriving KV on a decode-only
+  host is a second serving path that does not exist here, so instead the request
+  decodes, no transfer is charged, and `handoff misses` counts it. A non-zero count in
+  that column means the run's cache is too small for the store to be a credible
+  handoff, not that a request failed.
+- **The client hops are free by default**, and are the only hops a request's journey
+  now has besides the coordinator's and the directory's: `TOSO_CLIENT_RTT` prices one
+  client↔host round trip, and a request makes three of them (route, prefill, decode).
+  It replaces the old `TOSO_HOST_RTT`, which priced a host-to-host forward — a boundary
+  that no longer exists, because hosts do not call each other. Same caveat as the
+  directory hop: TTFT is a prediction made before any of it is paid, so client latency
+  shows up in the wall clock and in later requests' queue waits, not in the TTFT column.
