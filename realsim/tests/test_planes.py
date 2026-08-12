@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 import torch
 
 from realsim.mesh import Mesh
@@ -258,20 +259,27 @@ def test_runner_releases_in_time_then_id_order_and_records_rows():
     assert ledger.wallclock == 5.0
 
 
-def test_runner_awaits_the_drain_before_returning():
-    drained: list[float] = []
+def test_the_runner_waits_for_an_item_and_for_nothing_else():
+    """The gather is the whole wait: there is no drain pass behind it.
+
+    ``ItemDispatch`` used to take an ``on_drain`` awaited after every item, and
+    the one capability that passed it was covering for a request whose decode
+    outlived its own coroutine. That was fixed where it belonged (the decode leg
+    now answers at the last token), and the hook was deleted rather than left for
+    the next capability to reach for -- so this asserts both halves: an item that
+    takes time is waited for, and the dispatch has nowhere to hang work that is
+    not an item's.
+    """
+    mesh = Mesh(_topology())
 
     async def call():
-        return None
-
-    async def drain():
         await asyncio.sleep(3.0)
-        drained.append(asyncio.get_running_loop().time())
+        return asyncio.get_running_loop().time()
 
-    mesh = Mesh(_topology())
-    runner = Runner(mesh, dispatch=ItemDispatch(on_drain=drain))
-    run_sim(runner.run([WorkItem(id="i0", run=call)]))
-    assert drained == [3.0]
+    results, _ = run_sim(Runner(mesh).run([WorkItem(id="i0", run=call)]))
+    assert results == {"i0": 3.0}      # the clock the item's own coroutine saw
+    with pytest.raises(TypeError):
+        ItemDispatch(on_drain=call)
 
 
 def test_runner_installs_the_mesh_exactly_once_and_releases_it():

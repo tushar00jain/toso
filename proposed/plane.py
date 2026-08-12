@@ -25,8 +25,11 @@ import; it did not hide the dependency, and nobody outside a harness could have
 implemented them.
 
 They were never the capability's contract, they were the runner's, so they live
-with the runner now (``realsim.runner.ItemDispatch``). What is left is the one
-thing a capability genuinely declares, and it names a requester rather than an
+with the runner now (``realsim.runner.ItemDispatch``) -- all but ``drain()``,
+which turned out not to be anybody's: the one run with work outliving its items
+had a request whose decode leg answered too early, and fixing that left nothing to
+drain. What is left here is the
+one thing a capability genuinely declares, and it names a requester rather than an
 item, so a deployment can implement it.
 
 Also absent, and for a different reason: any per-operation hook to *shape* a

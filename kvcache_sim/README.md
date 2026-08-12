@@ -83,9 +83,10 @@ python -m kvcache_sim --help            # usage + valid scenario names
   coupling prefill and decode on the same instances lets a prefill collide with a
   decode step, so a fraction of the *same* served load blows the target. What it also
   shows, since the KV handoff goes through the store, is the bill: every request pays
-  a real `get_batch` of its whole block chain to reach the host that decodes it, and
-  the `KV handoff bytes` row is what that costs. See the honesty note on where that
-  cost does and does not land.
+  a real `get_batch` of its whole block chain to reach the host that decodes it, the
+  `KV handoff bytes` row is what that moves and the `end-to-end` rows are what it
+  costs. Read together they are the actual trade — the disaggregated column wins every
+  per-token metric and loses the wall clock.
 - **early_rejection** — heavy decode load under a tight TBT SLO, comparing admission
   policies `off`/`early`/`predict`. `off` late-checks decode load after prefill and so
   wastes prefill on rejects; `early`/`predict` gate before prefill (no waste), but only
@@ -114,9 +115,10 @@ A      -> client     "prefill is B"     # A asks the coordinator; A does not cal
 client -> B          B prefills, publishes its KV blocks to the store
 B      -> client     "decode is C"
 client -> C          C fetches that KV back out of the store, decodes, finishes
+C      -> client     "done"             # at the LAST token, not at admission
 ```
 
-Three consequences, and they are the reason for the shape:
+Four consequences, and they are the reason for the shape:
 
 - **A host's whole outward surface is the store and the coordinator.** There is no
   peer lookup and nothing to wire up after all the hosts exist. `workload/_serving.py`
@@ -130,6 +132,12 @@ Three consequences, and they are the reason for the shape:
   none of its KV, so it fetches the whole block chain with a real `get_batch`, priced
   by the same cost model as every other transfer. That is the dominant cost in a real
   prefill/decode-disaggregated system, and it used to be a free method call.
+- **The client is still there at the last token, so it can time the request.** The
+  decode leg returns when the request finishes, not when it is admitted to a batch, so
+  the client stamps `now - arrival` onto the row — the one measurement no host can
+  make, since it spans both of them. That also deleted the run's drain plumbing: decode
+  no longer outlives the coroutine that asked for it, so the harness has nothing left
+  to wait for after the requests.
 
 ## The user-facing entry point mirrors the store
 
@@ -279,26 +287,39 @@ plus the prefix-run read that express KV caching on a mesh.
   queue waits but never directly in the TTFT column. Recording a measured TTFT instead
   would fix that and would also fold in fetch-vs-prediction divergence -- a different
   decision, not made.
-- **The KV handoff is real, but it lands in neither headline column.** The decode host
+- **The KV handoff lands in one column, and it had to be built.** The decode host
   fetches the request's whole block chain through the real `get_batch`, so the bytes,
-  the fabric time and the storage/RAM staging are all charged — and then land nowhere
-  the disaggregation table looks directly. Not in TTFT, which is control's prediction
-  made before any of it happens; and not in TBT, which is measured *between* decode
-  tokens, while the handoff finishes before the first one. What it does move is *when*
-  a request joins its decode batch, which changes who is batched with whom and
-  therefore everybody's step times — so the numbers shift, indirectly (`mean TBT`
-  0.028 → 0.029 disaggregated, 0.162 → 0.159 coupled), and the early-rejection
-  scenario shifts a lot more, because later admissions mean a lower occupancy at each
-  admission check. Folding the handoff into TBT instead was tried: the first token
+  the fabric time and the storage/RAM staging are all charged — and none of it reaches
+  either per-token column. Not TTFT, which is control's prediction made before any of
+  it happens; not TBT, which is measured *between* decode tokens while the handoff
+  finishes before the first one. It used to land nowhere at all: the cost that
+  dominates a prefill/decode-disaggregated deployment was paid on the clock and
+  reported in no table, visible only as an indirect nudge to *when* requests joined
+  their batches. The `mean/p90 end-to-end` rows are the fix — arrival to last token,
+  measured by the client, the only interval that contains the handoff by construction.
+  On the disaggregation scenario it is **~32% of the mean** (1.269 charged vs 0.860
+  with the transfer made free), against ~1% for the coupled run, which mostly decodes
+  where it prefilled and pays nothing. It is also enough to flip the comparison:
+  disaggregation wins TBT (0.029 vs 0.146) and *loses* end-to-end (1.269 vs 1.126),
+  which is the trade a dedicated decode pool actually makes.
+  Folding the handoff into TBT instead was tried: the first token
   comes from the prefill host, so the transfer arguably *is* an inter-token gap. It
   takes both disaggregation columns to `0.0%` attainment against a target of five
   decode steps, which is a one-off migration swamping a per-token metric rather than a
   finding, and it is not how the disaggregation literature measures either
   (DistServe/Mooncake put KV migration in TTFT and keep TPOT for decode cadence). So:
-  charged on the clock, reported in its own column. What is genuinely missing is an
-  end-to-end latency measurement (arrival → last token), which is where the handoff
-  would show up honestly. That column does not exist yet; adding it is the obvious
-  next thing and is not part of this change.
+  charged on the clock, its bytes in their own column, its time in end-to-end.
+- **End-to-end is measured only where there is a last token to measure to.** The four
+  prefill-only scenarios (`shared_prefix`, `eviction`, `hotspot`, `overload`) do not
+  model decode, so the client's walk ends at prefill completion; stamping *that* under
+  the same name would make one column mean two different intervals depending on the
+  scenario. It is left unstamped and those tables do not offer the column. Nor is a
+  rejected request given one: it has no last token either, at either gate.
+  Two things the number does include, deliberately, because a caller pays them: the
+  client↔host round trips (free by default) and the queueing behind other requests.
+  One thing it does not: a *queue delay a request would have seen in a real front
+  end*, since arrivals here are released onto the clock rather than shaped by a load
+  balancer's own backlog.
 - **A handoff can find nothing, and the run says so rather than pretending.** The
   publish before it is allowed to fail (a full volume) and a volume may drop a block
   in between, and `get_batch` is all-or-nothing, so either shows up as the whole

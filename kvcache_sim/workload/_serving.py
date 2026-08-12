@@ -39,6 +39,13 @@ let the hosts call each other twice, and it reaches each host through a
 (:attr:`sim_common.config.SimConfig.client_rtt`, ``0.0`` by default, which keeps a
 hop inline and the run byte-identical).
 
+Walking the chain is also what makes the client the only thing that can time the
+request end to end, so it does: the last leg returns at the last token, and the
+client stamps ``now - request.arrival`` onto the row. That replaced a drain pass
+the run used to need -- when decode outlived the request's coroutine, something
+had to keep the loop alive for the tail, and nothing was left holding the request
+to measure it.
+
 They are two functions because they are two services. The plane factory does not
 build the scheduler; it takes ``sim.coordinator_handle``, the handle
 :meth:`realsim.run.Run.execute` put in front of whatever :func:`coordinator`
@@ -48,7 +55,8 @@ different wiring, which is exactly what "cache-aware vs load-balance" means.
 
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Dict, List, Optional
+import asyncio
+from typing import Callable, Dict, List, Optional
 from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
@@ -66,6 +74,7 @@ from ..data._decode import DecodeEngine
 from ..data._prefill import PrefillEngine
 from ..data.serving import ServingHost
 from ..data.store import KVStore
+from ..report.metrics import Metrics
 
 # ``BLOCK_TOKENS`` is imported rather than declared: how much of a prompt one KV
 # block covers is the engine's cache-page size, so it lives with the accelerator
@@ -200,19 +209,36 @@ class _Client:
     of its own beyond ``landed``, and it never asks where a request should *run*:
     it asks a host, and does what it is told.
 
-    Three legs, which is the whole object::
+    Three legs, which is nearly the whole object::
 
         plan   = await hosts[landed(request)].route(request)   # "prefill is B"
         decode = await hosts[plan.prefill].prefill(plan)       # "decode is C"
-        await hosts[decode].decode(plan)
+        await hosts[decode].decode(plan)                       # ...returns at the
+                                                               # last token
+        metrics.completed(request.id, now - request.arrival)
 
-    Note what it carries and what it does not. It carries the
-    :class:`~kvcache_sim.control.scheduler.Plan` -- a value the coordinator issued,
-    which is exactly the kind of thing a client is handed and hands back (a routing
-    token, a session ticket) and which nothing here reads for a decision. It does
-    *not* carry a measurement row: each host records its own half into the run's
-    ledger, and the client never learns the outcome, because a client that had to
-    be told the hit rate would be part of the serving system.
+    The last line is the rest of it, and it is the one measurement this object is
+    entitled to make. A client does not learn the hit rate or the handoff bytes --
+    each host records its own half of those into the run's ledger, and a client
+    that had to be told them would be part of the serving system. But how long the
+    request took is not a fact about a host: it spans two of them and the
+    redirects between, so the only participant present at both ends is the caller,
+    which is also who a latency SLO is written for. Server-side timing and
+    client-side timing are different numbers in every real deployment, and this is
+    the client-side one.
+
+    That the stamp is even possible is what the decode leg's shape now buys. It
+    used to answer at *admission* -- the batch stepped on afterwards as its own
+    task -- so this coroutine returned long before the last token and the run
+    needed a separate drain pass to keep the loop alive for the tail. Now the leg
+    answers when the request is done, so waiting for the answer and waiting for
+    the run to finish are the same act, and the drain is gone rather than
+    replaced.
+
+    Note what it carries. The :class:`~kvcache_sim.control.scheduler.Plan` -- a
+    value the coordinator issued, which is exactly the kind of thing a client is
+    handed and hands back (a routing token, a session ticket) and which nothing
+    here reads for a decision.
 
     It also does not second-guess an address. ``prefill`` answers with the decode
     host rather than the client reading ``plan.decode``, because the plan is what
@@ -225,25 +251,30 @@ class _Client:
             client is off the box, so each of the three legs is a charged round
             trip rather than a free method call.
         landed: which host a request arrives at.
-        drains: ``instance id -> ServingHost.drain``, the one thing that is not a
-            request. Draining is the harness waiting for the simulated cluster to
-            go quiet, not a client operation, so it is not on the endpoints and
-            pays no hop: a real client simply closes its connection and leaves the
-            hosts to finish.
+        metrics: the run's ledger, written to exactly once per *completed*
+            request and never read. Not a hop: the stamp is taken on this side of
+            the wire and reporting it is the harness collecting what the client
+            already knew, not a call the client makes into the cluster.
     """
 
     def __init__(
         self,
         hosts: Dict[str, _ServingEndpoints],
         landed: Callable[[Request], str],
-        drains: Dict[str, Callable[[], Awaitable[None]]],
+        metrics: Metrics,
     ) -> None:
         self.hosts = hosts
         self.landed = landed
-        self.drains = drains
+        self.metrics = metrics
 
     async def submit(self, item) -> None:
-        """Take one request through as many hosts as it is redirected to."""
+        """Take one request through as many hosts as it is redirected to.
+
+        Returns when the request is finished, which for a run that models decode
+        means its last token has landed. Every early return is a journey that
+        ended, not one abandoned: the host that ended it recorded why, and neither
+        leaves anything decoding behind this coroutine.
+        """
         request: Request = item.payload
         plan = await self.hosts[self.landed(request)].route.call_one(request)
         if plan is None:
@@ -252,11 +283,13 @@ class _Client:
         if decode is None:
             return  # nothing after prefill: no decode modelled, or it was shed
         await self.hosts[decode].decode.call_one(plan)
-
-    async def drain(self) -> None:
-        """Every host's decode has to finish before the run is over."""
-        for instance in sorted(self.drains):
-            await self.drains[instance]()
+        # Stamped only here, on the one path where a last token exists. A refused
+        # request has no end-to-end latency and a prefill-only run has no last
+        # token, so both leave the field at its default rather than reporting a
+        # shorter interval under the same name.
+        self.metrics.completed(
+            request.id, asyncio.get_running_loop().time() - request.arrival
+        )
 
 
 def serving_plane(
@@ -327,14 +360,17 @@ def serving_plane(
         client = _Client(
             {i: _ServingEndpoints(h, hop) for i, h in sorted(hosts.items())},
             _affinity(sorted(sim.ids)),
-            {i: h.drain for i, h in sorted(hosts.items())},
+            sim.ledger,
         )
         # What the runner drives is a dispatcher, not a plane: the executing half
         # of this capability is the hosts, and there are several. The rows are
         # published at rejection, at acceptance, or when the last decode token
         # lands -- never one per item, so the harness must not write them.
-        return ItemDispatch(
-            client.submit, on_drain=client.drain, writes_own_outcomes=True
-        )
+        #
+        # Nothing to drain after the items, either, and that is a property of the
+        # client above rather than an omission: its coroutine now lives until its
+        # request's last token, so the runner's ``gather`` over every item is
+        # already a wait for every decode batch to empty.
+        return ItemDispatch(client.submit, writes_own_outcomes=True)
 
     return build

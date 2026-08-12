@@ -42,7 +42,7 @@ client/controller/transport), so they depend on the from-source
   real `locate_volumes`, naive by default), `View` (the read-only observation a
   policy is handed), `DataPlane` (what a capability does after a transfer lands)
   and `Runner` + `ItemDispatch` (release work on the clock, install the mesh once,
-  drain). `Mesh` is the
+  gather). `Mesh` is the
   multi-client wiring the capability sims build on — per-node volumes + real
   clients, one directory, one resource registry, and the single shared transport
   factory — so a capability package holds only capability code. It runs

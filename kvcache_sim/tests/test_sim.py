@@ -9,6 +9,8 @@ per-instance clients on the shared deterministic async engine.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from sim_common import config
@@ -320,12 +322,17 @@ def test_decode_step_time_shape():
 
 # 12. Batching raises TBT: a solo request decodes at the batch=1 baseline; several
 #     requests co-batched at the same instant each observe a strictly larger gap.
-def _run_decode_batch(n: int):
+def _run_decode_batch(n: int, output_tokens: int = 6):
     """Admit ``n`` requests at t=0 on one host; return {id -> worst TBT}.
 
     Drives the decode engine against a bare clock: it needs no store, no
     directory and no topology, so assembling a Simulation would build a mesh for
     nothing. One engine is one host's decode side, so there is no instance to name.
+
+    Waiting is done the way the serving host waits -- on the completions ``admit``
+    answers with -- rather than through an engine-level drain, which no longer
+    exists precisely because every admitted request already has somebody holding
+    it.
     """
     loop = AsyncEngine()
     res = {}
@@ -336,12 +343,13 @@ def _run_decode_batch(n: int):
     )
 
     async def drive():
-        for i in range(n):
+        await asyncio.gather(*[
             eng.admit(
                 Request(id=f"r{i}", arrival=0.0, block_keys=("m0|0",),
-                        prompt_tokens=512, output_tokens=6)
+                        prompt_tokens=512, output_tokens=output_tokens)
             )
-        await eng.drain()
+            for i in range(n)
+        ])
 
     try:
         loop.run_until_complete(drive())
@@ -357,6 +365,29 @@ def test_batching_raises_tbt():
     batched = _run_decode_batch(4)
     assert min(batched.values()) >= decode_step_time(2, DEFAULT_PROFILE)
     assert min(batched.values()) > solo["r0"]
+
+
+# 12b. A batch always drains, including the part of it that never fit.
+#      Over the VRAM cap, so four of the twelve start in ``pending`` and can only
+#      run once a slot frees. This is the one place the "every admitted request
+#      finishes" claim could fail structurally rather than by arithmetic -- a
+#      queued request whose promotion never came would be a caller parked
+#      forever, which is a hung run rather than a failed assertion. Waiting on all
+#      twelve completions at once is exactly the shape twelve client coroutines
+#      have.
+def test_a_request_that_did_not_fit_the_batch_still_finishes():
+    finished = _run_decode_batch(12)      # max_batch=8 inside the helper
+    assert len(finished) == 12
+    assert all(tbt > 0 for tbt in finished.values())
+
+
+# 12c. A request with no decode step to run is retired inside ``admit``, and its
+#      caller is released on the same clock instant rather than waiting for a step
+#      loop that will never start. The prefill produced the first token, so
+#      ``output_tokens=1`` leaves nothing for decode to do.
+def test_a_request_with_no_decode_tokens_finishes_immediately():
+    finished = _run_decode_batch(3, output_tokens=1)
+    assert finished == {"r0": 0.0, "r1": 0.0, "r2": 0.0}
 
 
 # 13. Disaggregation protects served-request TBT from prefill interference.
@@ -427,6 +458,185 @@ def test_the_decode_host_fetches_its_kv_out_of_the_store():
     for row in disagg.ledger.accepted:
         assert row.prefill in ("s0", "s1")
         assert row.decode in ("s2", "s3")
+
+
+# 13e. The decode leg answers at the LAST TOKEN, and every path through it
+#      answers. Both halves matter and only one of them is a feature: a leg that
+#      answered early left the run needing a drain pass and left no coroutine on
+#      the request to time it, while a leg that never answers is a client parked
+#      forever -- a hung run rather than a failed test, which is the worst shape a
+#      bug can take here. So the paths are enumerated rather than sampled through
+#      a scenario.
+def _plan(request: Request, *, prefill: str, decode: str):
+    """A minimal accepted plan. This exercises the decode leg, not the router."""
+    from kvcache_sim.control.scheduler import Plan
+
+    return Plan(
+        request=request, prefill=prefill, decode=decode, match_blocks=0,
+        cached_tokens=0, uncached_tokens=request.prompt_tokens, reuse_source=None,
+        transfer_bytes=0, queue_wait=0.0, ttft=0.0, done_time=0.0, decode_done=0.0,
+    )
+
+
+def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
+                published: bool = True, engine: bool = True):
+    """Walk one request's decode leg on ``s1``; report when it answered.
+
+    Returns ``(answered_at, events, row)`` -- the sim clock when
+    :meth:`ServingHost.decode` returned, the host's own trace lines as
+    ``{kind: [time]}`` (it writes a HANDOFF when the KV lands and a DECODE when
+    the last token does), and the ledger row the two halves were joined into.
+
+    A real coordinator is wired in because a decode batch *reports itself*: the
+    host forwards every batch change to control, so a stub ``None`` would fail on
+    the first admission rather than on anything this is testing.
+    """
+    from kvcache_sim.data.serving import ServingHost
+    from kvcache_sim.report.metrics import Metrics, RequestResult
+
+    sim = Simulation(
+        _make_topology(2),
+        control=LoadBalanceScheduler(
+            block_tokens=BLOCK_TOKENS, simulate_decode=True
+        ),
+        ledger=Metrics(),
+    )
+    store = KVStore(sim.mesh)
+    keys = list(_block_keys_for("m0", [0, 1]))
+    request = Request(
+        id="r0", arrival=0.0, block_keys=tuple(keys),
+        prompt_tokens=2 * BLOCK_TOKENS, output_tokens=output_tokens,
+    )
+    host = ServingHost(
+        "s1", store, sim.coordinator_handle, trace=sim.trace, metrics=sim.ledger,
+        decode=(
+            DecodeEngine(SimulatedAccelerator(), max_batch=8) if engine else None
+        ),
+        models_decode=engine,
+    )
+
+    async def scenario():
+        with sim.mesh.installed():
+            if published:
+                await store.publish(prefill, keys, _kv(len(keys)))
+            # The prefill host opens the row; here there is no prefill host, so the
+            # test stands in for it -- the decode side amends, it never creates.
+            sim.ledger.add(RequestResult(id=request.id, accepted=True))
+            await host.decode(_plan(request, prefill=prefill, decode="s1"))
+            return asyncio.get_running_loop().time()
+
+    try:
+        answered_at = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+    events: dict = {}
+    for t, kind, _msg in sim.trace.events:
+        events.setdefault(kind, []).append(t)
+    return answered_at, events, sim.ledger.results[0]
+
+
+def test_the_decode_leg_answers_when_the_last_token_lands():
+    """The ordinary path: KV fetched from the host that prefilled it, then steps."""
+    answered_at, events, row = _decode_leg(output_tokens=6)
+    assert len(events["DECODE"]) == 1
+    # Answered at the last token -- not at admission, which is where the KV
+    # landed and where this used to return.
+    assert answered_at == events["DECODE"][0]
+    # ...and the five steps between the two really ran (6 output tokens, the
+    # first of which prefill produced).
+    steps = 5 * decode_step_time(1, DEFAULT_PROFILE)
+    assert answered_at - events["HANDOFF"][0] == pytest.approx(steps)
+    assert row.tbt > 0                       # ...and the row was written first
+    assert row.handoff_bytes > 0
+
+
+@pytest.mark.parametrize("case,kwargs", [
+    # Nothing to decode: retired inside ``admit``, on the instant it arrived.
+    ("no decode tokens", dict(output_tokens=1)),
+    # The chain was gone (or never cached). The request still decodes -- see the
+    # handoff-miss honesty note -- so it still has to finish.
+    ("handoff missed", dict(published=False)),
+    # The decode host is the prefill host: nothing is fetched, nothing charged.
+    ("decodes where it prefilled", dict(prefill="s1")),
+])
+def test_every_decode_path_answers_at_its_last_token(case, kwargs):
+    answered_at, events, _row = _decode_leg(**kwargs)
+    assert len(events["DECODE"]) == 1, case
+    assert answered_at == events["DECODE"][0], case
+
+
+def test_a_host_with_no_decode_engine_answers_without_waiting():
+    """The one early answer left, and it is not a decode that was skipped.
+
+    A run that does not model decode never sends a client here at all (prefill
+    answers ``None`` and the journey ends), so this is the defensive case: a host
+    asked to decode with no engine has no last token coming, and waiting for one
+    would be waiting forever. It answers the moment the KV is there, which is as
+    far as it can honestly get.
+    """
+    answered_at, events, row = _decode_leg(engine=False)
+    assert "DECODE" not in events
+    assert answered_at == events["HANDOFF"][0]
+    assert row.tbt == 0.0
+
+
+# 13f. What the client measures, and what it refuses to measure.
+def test_the_client_times_every_served_request_end_to_end():
+    """Arrival to last token, on the row, for exactly the requests that finished.
+
+    Also the termination proof at scenario scale: every one of these runs returns,
+    and a run where any client were parked on a token that never came would not.
+    """
+    disagg, coupled = run_disaggregation()
+    for result in (disagg, coupled):
+        rows = result.ledger.accepted
+        assert rows and len(rows) == len(result.ledger.results)
+        for row in rows:
+            # Strictly after arrival, and strictly after the gaps it contains --
+            # end-to-end spans the whole request, not one leg of it.
+            assert row.latency > 0, row.id
+            assert row.latency > row.tbt, row.id
+        assert result.ledger.mean_latency > 0
+        assert result.ledger.pct_latency(90) >= result.ledger.mean_latency * 0.5
+
+    # A request that was shed has no last token, so it gets no fabricated
+    # duration -- and, more to the point, no waiter: 'off' rejects 22 requests
+    # after their prefill, and the run still ends.
+    off, _early, _predict = run_early_rejection()
+    shed = [r for r in off.ledger.results if r.decode_rejected]
+    assert shed, "no request was shed, so the assertion would be vacuous"
+    assert all(r.latency == 0.0 for r in shed)
+    assert all(r.latency > 0.0 for r in off.ledger.accepted)
+
+
+def test_a_run_that_does_not_model_decode_reports_no_end_to_end():
+    """No last token, so no end-to-end latency -- rather than a shorter one.
+
+    The client's walk ends at prefill in these runs, and stamping *that* under the
+    same name would mean the column measured two different intervals depending on
+    the scenario. So it is left unstamped, and the prefill-side reports do not
+    offer the column.
+    """
+    cache_aware, _baseline = run_shared_prefix()
+    assert cache_aware.ledger.accepted
+    assert all(r.latency == 0.0 for r in cache_aware.ledger.results)
+    assert cache_aware.ledger.mean_latency == 0.0
+
+
+def test_the_kv_handoff_is_visible_in_end_to_end_and_nowhere_else():
+    """The column exists for this: disaggregation wins TBT and loses the wall clock.
+
+    The disaggregated run moves ~3.5x the KV of the coupled one (disjoint pools,
+    so every request's chain crosses a host boundary), and it is charged for it on
+    the clock. None of that reaches TTFT, which control predicted before any of it
+    happened, or TBT, which is measured between tokens the transfer finishes
+    before. So the run with the *better* per-token behaviour is the slower one end
+    to end, and this is the only pair of columns that can say so.
+    """
+    disagg, coupled = run_disaggregation()
+    assert disagg.ledger.handoff_bytes > 3 * coupled.ledger.handoff_bytes
+    assert disagg.ledger.mean_tbt < coupled.ledger.mean_tbt
+    assert disagg.ledger.mean_latency > coupled.ledger.mean_latency
 
 
 # 13c. ...and the two halves of that row were written by two hosts that never

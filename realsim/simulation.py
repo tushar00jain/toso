@@ -193,8 +193,8 @@ class Simulation:
         """Run ``workload`` on this stack; return ``item id -> result``.
 
         The workload supplies the items and whatever precedes them on the clock;
-        the dispatch says whether it publishes its own outcome rows and whether it
-        has work outliving the items, so none of that is passed here.
+        the dispatch says how an item is run and whether it publishes its own
+        outcome rows, so neither is passed here.
 
         Closes the loop when done; a :class:`Simulation` runs once.
         """

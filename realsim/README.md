@@ -31,7 +31,7 @@ the allocation-free data plane, the policy seam, and the concurrency contract.
   `locate_volumes`, naive by default), `View` (the read-only observation a policy
   is handed), `DataPlane` (what a capability does after a transfer lands) and
   `Runner` + `ItemDispatch` (release work items on the virtual clock, install the
-  mesh once, drain).
+  mesh once, gather).
 - **Virtual clock:** every resource cost advances time via `asyncio.sleep` on
   `sim_common.async_engine.AsyncEngine`, so the run is free and deterministic.
 
@@ -151,7 +151,7 @@ realsim/
                   one shared transport factory. It is also the Deployment a
                   capability's data plane runs against (client_for resolves a node)
   runner.py       Runner -- release work items on the virtual clock in
-                  (release_time, id) order, install the mesh once, gather, drain
+                  (release_time, id) order, install the mesh once, gather
   simulation.py   Simulation -- assembles engine + mesh + directory + registry,
                   and runs a Workload's items on it
   run.py          the run lifecycle in one place -- Workload (the work a run

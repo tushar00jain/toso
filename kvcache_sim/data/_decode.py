@@ -31,6 +31,19 @@ therefore takes none.
 Async & deterministic: decode runs as a coroutine on the shared run's event loop,
 one step at a time, each booked on and awaited through the accelerator. Clocks are
 the loop's virtual time; no wall-clock, no randomness.
+
+Admission answers with a completion
+-----------------------------------
+The step loop is a task, so it outlives the call that fed it -- but that is a fact
+about *how* the batch is driven, not a licence for the request to outlive its
+caller. :meth:`DecodeEngine.admit` hands back a future resolved when that request
+emits its last token, so the caller can wait for the thing it asked for. It used to
+return at admission and nothing else waited either, which cost two things: the run
+needed a drain hook purely to keep the loop alive for a tail nobody was holding,
+and no coroutine was still on the request when its last token landed, so nothing
+was in a position to measure arrival-to-last-token. Both are gone: the drain hook
+is deleted and the client stamps the latency
+(:mod:`kvcache_sim.workload._serving`).
 """
 
 from __future__ import annotations
@@ -52,6 +65,11 @@ class _Active:
     request: Request
     remaining: int              # decode tokens still to generate (output - first)
     last_token_time: float      # sim time of its previous token (init: join time)
+    #: Resolved when this request's last token lands. Whoever admitted the request
+    #: is parked on it, which is why it is a field of the slot rather than a
+    #: registry beside the batch: a request cannot be in the batch without one, and
+    #: cannot leave the batch without it being resolved.
+    done: "asyncio.Future"
     tbt_max: float = 0.0        # worst inter-token gap observed so far
     tokens: int = 0             # decode tokens emitted so far
 
@@ -68,7 +86,11 @@ class DecodeEngine:
             prefill engine's when the two are modelled as contending.
         max_batch: VRAM cap on this host's decode batch.
         on_finish: called ``(request, tbt_max)`` when a request emits its last
-            token.
+            token. Telemetry, not control flow: the *caller* learns that its
+            request finished from the future :meth:`admit` gave it, and this tells
+            the owning host what the gaps were so it can write its half of the
+            row. One listener, no return value, and it runs first (see
+            :meth:`_finish`).
         on_compute_busy: called ``(until)`` every time a step occupies this
             host's compute timeline. The host passes this only when it is
             **coupled**, i.e. prefill shares that timeline; a disaggregated host
@@ -126,22 +148,48 @@ class DecodeEngine:
         ])
 
     # -- lifecycle -------------------------------------------------------- #
-    def admit(self, request: Request) -> None:
-        """Enter ``request`` into this host's decode batch at the current sim time.
+    def admit(self, request: Request) -> "asyncio.Future":
+        """Enter ``request`` into this host's decode batch; answer when it is done.
 
         The first token was produced by prefill (TTFT); decode generates the
         remaining ``output_tokens - 1``. A request with <= 1 output token needs no
         decode and finishes immediately.
+
+        The answer is a future resolved when this request emits its **last**
+        token, and it is the reason admission is not fire-and-forget any more.
+        Decode used to outlive its caller: ``admit`` returned as soon as the
+        request had a slot, the step loop ran on as a separate task, and the run
+        needed a drain hook to keep the loop alive for the tail nobody was waiting
+        on. Nobody was waiting on it because nobody *could*: the request's caller
+        had already returned, so no coroutine was in a position to stamp how long
+        the whole thing took. Handing back the completion is what lets the caller
+        be that coroutine, and the drain hook was deleted in the same change.
+
+        Not a callback, though this class has two of those. ``on_finish`` and
+        ``on_state`` are *telemetry* -- one listener, the owning host, told about
+        an event it did not initiate. This is the answer to a specific request the
+        caller made, one per admission, and a caller that had to filter a
+        broadcast for its own id would be reassembling a return value by hand.
+
+        Both ways out of here resolve it exactly once, and both do it *after*
+        ``on_finish`` has run -- see :meth:`_finish`. A step task that dies
+        resolves every outstanding one with the exception rather than leaving a
+        caller parked forever (:meth:`_abandon`).
         """
+        loop = asyncio.get_running_loop()
+        done: "asyncio.Future" = loop.create_future()
         remaining = max(0, request.output_tokens - 1)
         if remaining == 0:
-            if self.on_finish is not None:
-                self.on_finish(request, 0.0)
-            return
+            # Never in the batch, so never in a step: retired here, on the same
+            # clock instant it arrived. The caller still gets a future rather than
+            # a special case, and awaiting an already-resolved one costs nothing.
+            self._finish(request, 0.0, done)
+            return done
         a = _Active(
             request=request,
             remaining=remaining,
-            last_token_time=asyncio.get_running_loop().time(),
+            last_token_time=loop.time(),
+            done=done,
         )
         if len(self.batch) < self.max_batch:
             self.batch.append(a)
@@ -149,6 +197,27 @@ class DecodeEngine:
             self.pending.append(a)  # VRAM full: wait counts against TBT
         self._report()
         self._ensure_stepping()
+        return done
+
+    def _finish(self, request: Request, tbt: float, done: "asyncio.Future") -> None:
+        """Retire one request: report it, then release whoever admitted it.
+
+        The order is the whole reason this is a method and not two lines at each
+        of its two call sites. ``on_finish`` is how this host's half of the
+        request's row reaches the run's ledger (the inter-token gaps); the future
+        is what the caller is parked on, and a caller released first could read
+        that row before the half it just spent the whole decode waiting for was
+        written into it. Nothing today reads the row that early, which is exactly
+        why the ordering has to be stated somewhere rather than held by luck.
+
+        ``set_result`` is unguarded on purpose: a second retirement of the same
+        request raises :class:`asyncio.InvalidStateError` here rather than
+        silently overwriting a measurement, and that is a batch-accounting bug
+        worth a traceback.
+        """
+        if self.on_finish is not None:
+            self.on_finish(request, tbt)
+        done.set_result(None)
 
     def _ensure_stepping(self) -> None:
         """Start the decode-step loop unless one is already running."""
@@ -159,29 +228,43 @@ class DecodeEngine:
 
     async def _run_steps(self) -> None:
         """Emit tokens one step at a time until the batch drains."""
-        while self.batch:
-            members = list(self.batch)             # frozen for this step
-            # Booked before it is waited for, so the end can be announced to a
-            # prefill sharing this accelerator while there is still time to
-            # schedule around it.
-            step_end = self.compute.claim_step(len(members))
-            if self.on_compute_busy is not None:
-                self.on_compute_busy(step_end)
-            await self.compute.wait_until(step_end)
-            self._step_complete(members, step_end)
+        try:
+            while self.batch:
+                members = list(self.batch)             # frozen for this step
+                # Booked before it is waited for, so the end can be announced to a
+                # prefill sharing this accelerator while there is still time to
+                # schedule around it.
+                step_end = self.compute.claim_step(len(members))
+                if self.on_compute_busy is not None:
+                    self.on_compute_busy(step_end)
+                await self.compute.wait_until(step_end)
+                self._step_complete(members, step_end)
+        except BaseException as exc:      # noqa: BLE001 -- re-raised below
+            self._abandon(exc)
+            raise
 
-    async def drain(self) -> None:
-        """Await all in-flight decode steps so every request finalizes.
+    def _abandon(self, exc: BaseException) -> None:
+        """Fail everything this engine will now never finish.
 
-        The request coroutines finish at prefill completion, but decode continues
-        afterwards on its own step task; the host calls this so the loop keeps
-        running until the last token of the last request is emitted.
+        Nothing in the step loop is expected to raise, and if that stays true this
+        never runs. It exists because of what the alternative failure mode is:
+        this task is the only thing that resolves an admitted request's future,
+        and a caller parked on a future nobody will ever resolve does not fail --
+        it hangs, and takes the whole run with it, with the original exception
+        swallowed into a task nobody joins. An error that surfaces as "the
+        simulation never terminated" is the worst shape a bug can have here.
+
+        So a dying loop hands its exception to every caller waiting on it, which
+        turns a hang into a traceback at the point that cares. The batch is
+        cleared with it: those requests are not decoding, and leaving them listed
+        would have the next :meth:`admit` start a step loop over slots whose
+        futures are already resolved.
         """
-        while True:
-            task = self._step_task
-            if task is None or task.done():
-                return
-            await task
+        for a in self.batch + self.pending:
+            if not a.done.done():
+                a.done.set_exception(exc)
+        self.batch.clear()
+        self.pending.clear()
 
     def _step_complete(self, members: List[_Active], step_end: float) -> None:
         """Emit one token for each member; retire finished; promote pending."""
@@ -195,8 +278,7 @@ class DecodeEngine:
             a.tokens += 1
             if a.remaining == 0:
                 self.batch.remove(a)
-                if self.on_finish is not None:
-                    self.on_finish(a.request, a.tbt_max)
+                self._finish(a.request, a.tbt_max, a.done)
         # A freed VRAM slot admits the next queued request (still counting its wait).
         while self.pending and len(self.batch) < self.max_batch:
             self.batch.append(self.pending.pop(0))

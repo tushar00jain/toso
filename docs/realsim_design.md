@@ -151,7 +151,9 @@ realsim/
                               #   after(requester, result), defaulting to real
                               #   no-op behaviour
   runner.py                   # Runner — release work on the virtual clock in
-                              #   (release_time, id) order, install the mesh once, drain
+                              #   (release_time, id) order, install the mesh once,
+                              #   gather (there is no drain pass; an item's own
+                              #   coroutine is the whole wait)
   simulation.py               # Simulation — assembles engine + mesh + directory + registry,
                               #   and runs a Workload's items on it
   run.py                      # the run lifecycle in one place: Workload (the work),
@@ -450,11 +452,16 @@ directory handle, trace, profile, registry, install).
   it; a plain fetch and `kvcache_sim` do not. It names a *requester* rather than a
   work item so a deployment can implement it: the run-shaped members it used to
   carry (`execute` / `drain` / `writes_own_outcomes`) were the runner's contract
-  wearing the capability's name, and are now `realsim.runner.ItemDispatch`.
+  wearing the capability's name, and the two that survived are now
+  `realsim.runner.ItemDispatch`. `drain` did not survive: its only caller was a
+  decode batch outliving the request that fed it, which was a bug in the request's
+  leg rather than a phase a run needs.
 - **`Runner`.** The generic half of the two private drivers this replaced: order
   work by `(release_time, id)`, install the mesh's shared transport factory
-  **once**, release each item at its time and gather, drain whatever outlives them
-  (a batched decode loop), and record one ledger row per item. The shared factory
+  **once**, release each item at its time and gather, and record one ledger row
+  per item. Nothing is awaited after the gather — work outliving every item's
+  coroutine is work nobody is waiting for, so the capability that had some (a
+  batched decode loop) was changed to hold onto it instead. The shared factory
   is what lets concurrent clients each charge the right locality: the process-wide
   transport global is replaced by one factory that reads the calling client's
   source endpoint from a `ContextVar` bound per task (`asyncio` copies the context

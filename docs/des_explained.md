@@ -66,7 +66,7 @@ one directory, and the meta / metadata-only payload carriers — lives in
 | `Policy.select(view, keys, requester)` | Which volume serves these keys for this requester, and **when** it is usable (ranked sources + an optional readiness gate). Naive — every holder, directory order — is the default, and is exactly what the real directory answers unaided. Consulted *inside* the real `locate_volumes`, so a scenario that just calls `client.get(K)` is routed without knowing a policy exists; an app that wants to *price* alternatives calls it itself. |
 | `View` | The read-only observation a policy is handed: `locate`, topology/locality, the virtual clock. Awaited reads, no mutation. |
 | `DataPlane` | One member — `after(requester, result)`: what a capability does once a transfer has landed, defaulting to real no-op behaviour. Moving the bytes is an ordinary client call, so no interface declares it. Named by requester, not work item, so a deployment can implement it — how a *run* is driven is `realsim.runner.ItemDispatch`. |
-| `Runner` | Releases work items on the virtual clock in `(release_time, id)` order, installs the mesh once, gathers, drains. |
+| `Runner` | Releases work items on the virtual clock in `(release_time, id)` order, installs the mesh once, gathers. The gather is the whole wait — there is no drain phase behind it. |
 
 Both sims `import realsim` and add only their own decision + execution code. So
 does [`putget_sim`](../putget_sim/), which is not a capability at all: it is the

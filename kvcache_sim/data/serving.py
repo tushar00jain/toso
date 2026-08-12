@@ -17,6 +17,8 @@ not call the host it named. The client does::
     client -> B          B prefills and publishes its KV blocks to the store
     B      -> client     "decode is C"           (another redirect)
     client -> C          C fetches that KV back out of the store, decodes, finishes
+    C      -> client     "done" -- after the last token, which is what makes the
+                         client's arrival-to-last-token stamp mean anything
 
 This used to be two host-to-host RPCs: ``A`` called ``B.serve(plan)`` and ``B``
 called ``C.admit_decode(request, row)``. Both are gone, and with them the
@@ -76,8 +78,9 @@ The lifecycle, once a host is prefilling:
 
 8. fetch the request's KV out of the store (a **real** ``get_batch``, and under
    disaggregation the dominant cost of the request);
-9. admit it to the decode batch and record its inter-token gaps when the last
-   token lands.
+9. admit it to the decode batch, record its inter-token gaps when the last token
+   lands -- and only then answer the client, which is what lets the client stamp
+   arrival-to-last-token and what removed the drain hook the run used to need.
 
 Simplification (documented in SPEC): a block becomes reusable at prefill
 *completion*, not while in flight, so two requests racing for the same brand-new
@@ -214,19 +217,6 @@ class ServingHost:
             if self.coupled:
                 self.decode_engine.on_compute_busy = self._compute_busy
 
-    @property
-    def block_tokens(self) -> int:
-        """Tokens per KV block, as this host's prefill accelerator lays them out.
-
-        Read through the engine rather than held, because the block size is the
-        thing that cuts the KV into blocks -- it used to come from the store, which
-        was told it a second time and could disagree with the accelerator about how
-        much of a prompt a reused block covers.
-
-        A host that does not prefill has no answer, and needs none: the one caller
-        is :meth:`_recompute`, which re-prices a prefill this host is running.
-        """
-        return self.prefill_engine.block_tokens
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
@@ -239,11 +229,6 @@ class ServingHost:
     def _compute_busy(self, until: float) -> None:
         """Forward this host's occupied compute timeline (coupled only)."""
         self.coordinator.observe.broadcast(ComputeBusy(self.me, until))
-
-    async def drain(self) -> None:
-        """Keep the loop running until this host's last decode token is emitted."""
-        if self.decode_engine is not None:
-            await self.decode_engine.drain()
 
     # -- leg 1: the router role, which every host plays -------------------- #
     async def route(self, request: Request) -> Optional[Plan]:
@@ -378,7 +363,8 @@ class ServingHost:
         cache that dropped them.
         """
         cached = min(
-            plan.local_blocks * self.block_tokens, plan.request.prompt_tokens
+            plan.local_blocks * self.prefill_engine.block_tokens,
+            plan.request.prompt_tokens,
         )
         uncached = plan.request.prompt_tokens - cached
         row.cached_tokens = cached
@@ -462,7 +448,40 @@ class ServingHost:
 
     # -- leg 3: decode, on a host that has to go and get the KV ------------ #
     async def decode(self, plan: Plan) -> None:
-        """The client brought a prefilled request here. Fetch its KV and decode it.
+        """The client brought a prefilled request here. Fetch its KV, decode, finish.
+
+        Returns when the request's **last token** has been emitted, not when it
+        entered the batch. It used to return at admission -- the step loop runs as
+        its own task, so there was nothing stopping it -- and the shape that fell
+        out of that was wrong twice over. The run needed a drain hook (a
+        ``ServingHost.drain`` calling into the engine, wired through the harness)
+        purely to keep the event loop alive for a tail no coroutine was holding;
+        and because the client had already walked away, nothing was still on the
+        request when it finished, so nothing could say how long the whole thing
+        took. The request's own leg is the honest place to wait: a serving
+        endpoint that answers before the answer exists is not answering.
+
+        What that buys is the measurement this method's cost had been falling
+        through. The ``get_batch`` below lands in neither headline column -- not
+        TTFT, which is control's prediction made before any of it happens, and not
+        TBT, which is measured between decode tokens while this finishes before
+        the first of them -- so the dominant cost of a disaggregated deployment
+        was charged on the clock and reported nowhere. It is inside
+        arrival-to-last-token by construction, and the client stamps that once
+        this returns (:mod:`kvcache_sim.workload._serving`).
+
+        Waiting cannot deadlock, and the paths are worth naming because a client
+        parked on a token that never comes would hang the whole run rather than
+        fail it. A request refused at :meth:`route` or at the decode admission
+        never reaches this method -- the client stops at the ``None``. A request
+        with <= 1 output token has no decode step to run and is retired inside
+        :meth:`~kvcache_sim.data._decode.DecodeEngine.admit`, on the clock instant
+        it arrived. A request whose handoff found no KV still admits, because it
+        still decodes. A queued request enters the batch as a slot frees, and the
+        batch always frees slots because every member's ``remaining`` falls by one
+        per step. And a host with no engine at all returns below without waiting,
+        which is a run that does not model decode rather than a decode that was
+        skipped.
 
         Under disaggregation none of this request's KV is on this host: another
         machine computed it and published it to the store, so getting it is a real
@@ -514,8 +533,8 @@ class ServingHost:
         says nothing about per-token behaviour. So the handoff is charged on the
         clock -- it delays this request and everything queued behind it -- and it is
         reported as its own quantity rather than folded into a column it would
-        drown. What that leaves genuinely missing is an end-to-end latency
-        measurement; the README says so.
+        drown, with the end-to-end column above as the place it does land in a
+        latency.
 
         A missing block is possible and is not fatal here. The publish is allowed to
         fail (a full volume) and a volume may drop a block between the publish and
@@ -537,36 +556,40 @@ class ServingHost:
             # handoff of nothing -- there was no transfer to make.
             await self.store.reuse(self.me, keys)
             self.metrics.handed_off(request.id, self.me, 0)
-            if self.decode_engine is not None:
-                self.decode_engine.admit(request)
-            return
-        try:
-            kv = await self.store.fetch(self.me, keys)
-        except KeyError:
-            self.trace.record(
-                self._now(),
-                "NOKV",
-                f"{request.id} handoff from {plan.prefill} to {self.me} found no "
-                f"{len(keys)}blk chain in the store (evicted or never cached); "
-                f"decoding without charging a transfer",
-            )
-            self.metrics.handed_off(request.id, self.me, 0, missed=True)
         else:
-            # Measured off the KV that arrived, not predicted from a block size
-            # this host was told once: the same tensors the transport just charged
-            # for are the ones counted here, so the reported handoff cannot drift
-            # from the charged one. Not read back off the ledger either -- that is
-            # the run's collector and mixes every host's transfers together.
-            nbytes = sum(b.numel() * b.element_size() for b in kv)
-            self.trace.record(
-                self._now(),
-                "HANDOFF",
-                f"{request.id} {plan.prefill} -> {self.me} "
-                f"({len(keys)}blk, {nbytes}B of KV)",
-            )
-            self.metrics.handed_off(request.id, self.me, nbytes)
-        if self.decode_engine is not None:
-            self.decode_engine.admit(request)
+            try:
+                kv = await self.store.fetch(self.me, keys)
+            except KeyError:
+                self.trace.record(
+                    self._now(),
+                    "NOKV",
+                    f"{request.id} handoff from {plan.prefill} to {self.me} found "
+                    f"no {len(keys)}blk chain in the store (evicted or never "
+                    f"cached); decoding without charging a transfer",
+                )
+                self.metrics.handed_off(request.id, self.me, 0, missed=True)
+            else:
+                # Measured off the KV that arrived, not predicted from a block size
+                # this host was told once: the same tensors the transport just
+                # charged for are the ones counted here, so the reported handoff
+                # cannot drift from the charged one. Not read back off the ledger
+                # either -- that is the run's collector and mixes every host's
+                # transfers together.
+                nbytes = sum(b.numel() * b.element_size() for b in kv)
+                self.trace.record(
+                    self._now(),
+                    "HANDOFF",
+                    f"{request.id} {plan.prefill} -> {self.me} "
+                    f"({len(keys)}blk, {nbytes}B of KV)",
+                )
+                self.metrics.handed_off(request.id, self.me, nbytes)
+        # The one place this method can answer without the request having
+        # finished, and it is not a decode that was skipped -- it is a run whose
+        # decode side is not modelled reaching a host that has no engine. There is
+        # no last token coming, so waiting for one would be waiting forever.
+        if self.decode_engine is None:
+            return
+        await self.decode_engine.admit(request)
 
     def _decode_done(self, request: Request, tbt: float) -> None:
         """Finalize a request once its last decode token is emitted.

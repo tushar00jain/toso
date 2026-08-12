@@ -30,6 +30,14 @@ rejection) and :meth:`Metrics.handed_off` / :meth:`Metrics.decoded` are the seco
 (the decode host), each amending the row the first created. They fail loudly on an
 id nobody opened, because a decode with no prefill is a wiring bug, not a metric.
 
+There is a third writer, and it is not a host: :meth:`Metrics.completed` is the
+**client's**, and carries the one number no host can produce. A request's end-to-end
+latency spans both machines and the redirects between them, so the only participant
+present at both ends of it is the thing outside the cluster that walked the chain --
+which is also who a latency SLO is written for. That it can be written at all is
+recent: the decode leg used to answer at admission, so by the time the last token
+landed the client had long returned.
+
 The generic event recorder lives in ``sim_common.trace.Trace``.
 """
 
@@ -55,9 +63,11 @@ __all__ = [
 class RequestResult:
     """Per-request outcome (one row of the metrics table).
 
-    Written by two hosts, in two passes -- see the module docstring. The fields
-    down to ``published`` are the prefill host's; the three after it are the decode
-    host's, and stay at their defaults for a run that does not model decode.
+    Written by two hosts and a client, in three passes -- see the module docstring.
+    The fields down to ``published`` are the prefill host's; the three after it are
+    the decode host's, and stay at their defaults for a run that does not model
+    decode; ``latency`` is the client's, for the same reason it can only be the
+    client's -- it spans both hosts.
     """
 
     id: str
@@ -77,6 +87,12 @@ class RequestResult:
     decode: str = ""                 # the instance that actually decoded it
     handoff_bytes: int = 0           # KV pulled out of the store to decode here
     handoff_missed: bool = False     # ...or the chain was gone and none was
+    # -- and the client's ---------------------------------------------------- #
+    #: Arrival to last token, measured by the client that walked the chain. Stays
+    #: 0.0 where there is no last token to wait for: a run that does not model
+    #: decode ends the client's walk at prefill, so it has no end-to-end latency
+    #: rather than a shorter one, and its reports do not offer the column.
+    latency: float = 0.0
 
 
 def _accepted(r: RequestResult) -> bool:
@@ -138,6 +154,22 @@ class Metrics(Ledger):
     def decoded(self, request_id: str, tbt: float) -> None:
         """The decode host emitted this request's last token at ``tbt`` worst gap."""
         self._open(request_id).tbt = tbt
+
+    def completed(self, request_id: str, latency: float) -> None:
+        """The client saw this request's last token ``latency`` after it arrived.
+
+        The client's own stopwatch, and deliberately not a subtraction this class
+        performs from timestamps the hosts reported: the interval that matters is
+        the one the caller experienced, redirects and hops included, and a
+        collector reassembling it from two hosts' clocks would be reporting a
+        number nobody observed.
+
+        Called only for a request that actually finished decoding, which is why
+        there is no ``rejected``/``no last token`` variant: a request refused at
+        either gate has no end-to-end latency, and its row is already marked
+        ``accepted=False`` and excluded from every aggregate below.
+        """
+        self._open(request_id).latency = latency
 
     # -- aggregation -------------------------------------------------------- #
     @property
@@ -209,6 +241,27 @@ class Metrics(Ledger):
         """Return the ``pct`` percentile TBT over accepted requests."""
         return self.percentile("tbt", pct, _accepted)
 
+    @property
+    def mean_latency(self) -> float:
+        """Mean arrival-to-last-token over accepted requests, as the client saw it.
+
+        The measured counterpart to :attr:`mean_ttft`, which is control's
+        *prediction* -- and the only column here that a cost charged between the
+        two halves of a request can land in. The KV handoff is the case that
+        motivated it: a real ``get_batch`` of the whole block chain, charged on
+        the clock, invisible to TTFT (predicted before it happens) and to TBT
+        (measured after it finishes).
+
+        Zero for a run that does not model decode, where nothing stamps it -- see
+        :attr:`RequestResult.latency`. Reading it off such a run is reading an
+        absence, so the prefill-side reports do not show it.
+        """
+        return self.mean("latency", _accepted)
+
+    def pct_latency(self, pct: float) -> float:
+        """Return the ``pct`` percentile end-to-end latency over accepted requests."""
+        return self.percentile("latency", pct, _accepted)
+
     def tbt_slo_met(self, slo: float) -> float:
         """Fraction of accepted requests whose TBT met ``slo`` (1.0 if none)."""
         return self.fraction(lambda r: r.tbt <= slo, _accepted)
@@ -272,6 +325,13 @@ def render_disaggregation(disagg: Metrics, coupled: Metrics,
     decode host as a method call does not show, and the reason the attainment
     columns are closer together than the coupling story alone would predict. The
     ``target`` is met per-request on the *worst* inter-token gap observed.
+
+    The end-to-end rows are where that bill is paid in *time* rather than bytes,
+    and they are the reason this table is the one place the column had to appear.
+    Every other number here is measured inside one host: TTFT is control's
+    prediction from before the handoff, TBT is the decode cadence from after it.
+    Arrival to last token is the only interval that contains it -- so a run that
+    moves three and a half times the KV can no longer look free.
     """
     def pct(x: float) -> str:
         return f"{100.0 * x:.1f}%"
@@ -287,6 +347,10 @@ def render_disaggregation(disagg: Metrics, coupled: Metrics,
         f"{pct(coupled.tbt_slo_met(target)):>15}",
         f"  {'mean TBT':22}{disagg.mean_tbt:>15.3f}{coupled.mean_tbt:>15.3f}",
         f"  {'p90 TBT':22}{disagg.pct_tbt(90):>15.3f}{coupled.pct_tbt(90):>15.3f}",
+        f"  {'mean end-to-end':22}{disagg.mean_latency:>15.3f}"
+        f"{coupled.mean_latency:>15.3f}",
+        f"  {'p90 end-to-end':22}{disagg.pct_latency(90):>15.3f}"
+        f"{coupled.pct_latency(90):>15.3f}",
         f"  {'KV handoff bytes':22}{disagg.handoff_bytes:>15}"
         f"{coupled.handoff_bytes:>15}",
         f"  {'handoff misses':22}{disagg.handoff_misses:>15}"
@@ -299,9 +363,18 @@ def render_early_rejection(off: Metrics, early: Metrics, predict: Metrics,
     """Render the off/early/predict early-rejection table.
 
     Columns: wasted prefills (compute spent then decode-rejected), decode
-    rejections, accepted (decoded) count, and TBT-SLO attainment. ``off`` wastes
-    prefill; ``early``/``predict`` never do (they reject before prefill) -- but only
-    ``predict`` also holds the SLO, since it routes decode by *predicted* load.
+    rejections, accepted (decoded) count, TBT-SLO attainment, and what the client
+    actually waited. ``off`` wastes prefill; ``early``/``predict`` never do (they
+    reject before prefill) -- but only ``predict`` also holds the SLO, since it
+    routes decode by *predicted* load.
+
+    End-to-end is here as well as in the disaggregation table because this
+    comparison is the one where the per-token metric and the wait can disagree:
+    an admission policy that spreads decode holds the inter-token gap by keeping
+    batches small, which is a longer queue somewhere for somebody. The row says
+    whether that trade shows up in what a caller experienced. Note what it does
+    *not* average over: a rejected request has no end-to-end latency at all, so
+    ``off``'s column describes the requests it kept, not the ones it shed.
     """
     def pct(x: float) -> str:
         return f"{100.0 * x:.1f}%"
@@ -316,6 +389,7 @@ def render_early_rejection(off: Metrics, early: Metrics, predict: Metrics,
         row("decode rejections", lambda m: m.decode_rejections),
         row("accepted (decoded)", lambda m: len(m.accepted)),
         row("TBT SLO attainment", lambda m: pct(m.tbt_slo_met(slo))),
+        row("mean end-to-end", lambda m: f"{m.mean_latency:.3f}"),
     ])
 
 

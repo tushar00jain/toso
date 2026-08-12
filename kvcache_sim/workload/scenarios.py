@@ -350,8 +350,11 @@ class Disaggregation(Scenario):
         console.info("prefill the prompt fetches its whole KV chain back out of the store, which")
         console.info("is a real transfer on the clock and the reason both columns pay it here")
         console.info("(coupled picks a decode host by load, not by who prefilled). It delays")
-        console.info("every request without widening any inter-token gap, so it moves the run's")
-        console.info("wall clock and the batches that form, not the TBT columns directly.")
+        console.info("every request without widening any inter-token gap, so it shows up in")
+        console.info("neither TBT column -- it shows up end to end, which the client measures")
+        console.info("from arrival to last token and which is ~a third of the disaggregated")
+        console.info("column. That is the trade, and it changes sign: disaggregation wins every")
+        console.info("per-token number here and loses the wall clock to pay for it.")
 
 
 class EarlyRejection(Scenario):
