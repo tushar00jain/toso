@@ -43,6 +43,7 @@ from realsim.seams.transport import Endpoint
 from realsim.seams.volume_handle import LocalVolumeHandle
 from realsim.seams.volume_service import StorageCapacityExceeded, VolumeService
 from sim_common.cost_model import DEFAULT_PROFILE
+from torchstore.transport.buffers import TransportCache
 
 # One default-N float32 payload (DEFAULT_N elements x 4 bytes) -- the burst's W.
 PAYLOAD_BYTES = DEFAULT_N * 4
@@ -198,6 +199,43 @@ def test_delete_frees_space_allows_subsequent_put():
     asyncio.run(_put_delete_put())
 
 
+async def _reset_then_refill() -> VolumeService:
+    """Fill a volume, reset it, fill it again, then push it over capacity."""
+    controller = RealControllerAdapter()
+    profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES * 2)
+    topology = {"0": Endpoint(id="vol0", host="hA", node="nA")}
+    svc = VolumeService(volume_id="0", profile=profile, controller=controller.handle)
+    producer = RealClientAdapter(
+        controller.handle,
+        volume_handles={"0": LocalVolumeHandle(svc)},
+        client_volume_id="0",
+        topology=topology,
+        profile=profile,
+    )
+    with producer.installed():
+        for key in ("A", "B"):
+            await producer.client.put(key, _meta_payload())
+    await svc.reset()
+    assert svc.resident_bytes == 0
+    # A fresh working set under different names, then one payload too many.
+    with producer.installed():
+        for key in ("X", "Y", "Z"):
+            await producer.client.put(key, _meta_payload())
+    return svc
+
+
+def test_a_reset_volume_can_still_make_room():
+    """Reset empties the ranking too, or it ranks a working set that is gone.
+
+    The keys a reset dropped are *colder* than anything written afterwards, so a
+    ranking that still knows them names them first when the volume next needs
+    room. They free nothing -- they are not there -- and the put is refused
+    although there was a real victim available all along.
+    """
+    svc = asyncio.run(_reset_then_refill())
+    assert sorted(svc.store.kv) == ["Y", "Z"]  # X was the coldest one that existed
+
+
 # --------------------------------------------------------------------------
 # Determinism: the same run reproduces the same resident / peak values.
 # --------------------------------------------------------------------------
@@ -223,12 +261,15 @@ def test_resident_tracking_is_deterministic():
 # --------------------------------------------------------------------------
 
 
-async def _put_over_capacity(policy=None, *, wired=True, keys=("A", "B", "C")):
+async def _put_over_capacity(
+    policy=None, *, wired=True, keys=("A", "B", "C"), setup=None
+):
     """Fill a two-payload volume, then put one more and let it make room.
 
     Returns ``(volume service, controller adapter)`` so a caller can check the
     directory as well as the store -- an eviction is not done until the directory
-    has stopped saying this volume holds the key.
+    has stopped saying this volume holds the key. ``setup`` is handed the volume
+    before the puts, for per-key state the eviction is supposed to release.
     """
     controller = RealControllerAdapter()
     profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES * 2)
@@ -245,6 +286,8 @@ async def _put_over_capacity(policy=None, *, wired=True, keys=("A", "B", "C")):
         topology=topology,
         profile=profile,
     )
+    if setup is not None:
+        setup(svc)
     with producer.installed():
         for key in keys:
             await producer.client.put(key, _meta_payload())
@@ -271,6 +314,51 @@ def test_the_directory_is_told_what_was_evicted():
     assert list(directory["B"]) == ["0"]           # what is still held, still listed
 
 
+
+
+class _KeyedCache(TransportCache):
+    """A per-key transport cache, like the shared-memory and process-group ones.
+
+    Stands in for whatever a real transport registers per key in the volume's
+    ``TransportContext``. What matters is only that it is keyed by store key, so
+    the entry names a resource that has to be released when the key goes.
+    """
+
+    def __init__(self) -> None:
+        self.entries: set[str] = set()
+
+    def delete(self, keys: set[str]) -> None:
+        self.entries -= keys
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+
+def test_an_evicted_key_releases_what_a_deleted_key_releases():
+    """Eviction is a delete, so it goes through the volume's delete.
+
+    Dropping the value and the resident bytes is only two thirds of it: the key's
+    transport-cache entry names a live resource (a shared-memory segment, a
+    process group), and leaving it behind leaks that resource for a key nobody
+    can ask for again. The eviction path used to open-code the other two steps
+    and miss this one.
+    """
+
+    async def _evict_then_delete():
+        svc, _controller = await _put_over_capacity(
+            setup=lambda vol: vol.store.transport_context.get(
+                _KeyedCache
+            ).entries.update({"A", "B"})
+        )
+        cache = svc.store.transport_context.get(_KeyedCache)
+        # "A" was the coldest and was evicted to make room for "C".
+        assert sorted(svc.store.kv) == ["B", "C"]
+        assert cache.entries == {"B"}, "the evicted key's entry outlived it"
+        # ...and the ordinary delete does exactly what that eviction did.
+        await svc.delete("B")
+        assert cache.entries == set()
+
+    asyncio.run(_evict_then_delete())
 
 
 def test_a_key_this_put_is_writing_is_never_evicted():

@@ -18,8 +18,10 @@ ties break on the key.
 
 Folder-private, because the volume is the only thing that picks victims and a caller
 wanting different behaviour passes its own object rather than subclassing this one:
-the surface is ``note`` / ``forget`` / ``victims``, and nothing about it is this
-module's to own.
+the surface is ``note`` / ``forget`` / ``victims`` / ``held``, and nothing about it is
+this module's to own. (``held`` is how the volume tells a ranking that everything it
+knows about is gone -- a reset -- without the ranking having to own a second verb for
+it.)
 """
 
 from __future__ import annotations

@@ -247,6 +247,13 @@ class VolumeService:
         self.store.reset()
         self._resident_by_key.clear()
         self.resident_bytes = 0
+        # The ranking is keyed by the keys that just went, so it has to hear about
+        # them too. Left alone it goes on ranking a working set that no longer
+        # exists, and those ghosts are *colder* than anything real -- so the next
+        # full volume picks them as its victims, frees nothing, and refuses a put
+        # it had room for.
+        for key in list(self._retention.held()):
+            self._retention.forget(key)
         # peak_resident_bytes is a run-lifetime high-water mark; reset does not
         # lower it.
 
@@ -267,8 +274,13 @@ class VolumeService:
         ]
         for key in victims:
             freed = self._resident_by_key.get(key, 0)
-            await self.store.delete(key)
-            self._forget(key)
+            # The volume's own delete endpoint, not an open-coded copy of part of
+            # it: an evicted key has to release everything a deleted key releases,
+            # and the per-key transport state is easy to forget. Dropping the
+            # value while keeping that entry leaks the resource it names -- a
+            # shared-memory segment, a process group -- for a key nobody can ask
+            # for any more.
+            await self.delete(key)
             projected -= freed
         if victims:
             # The bytes are gone, so the directory must stop saying this volume has
