@@ -80,16 +80,22 @@ python -m kvcache_sim --help            # usage + valid scenario names
 
 ## The scenarios
 
-- **shared_prefix** — many conversations share a hot system prompt + per-conversation
-  context. Cache-aware routes same-prefix requests to the instance holding the prefix
-  (or pulls it once), so shared prefixes are computed ~once; load-balance scatters
-  them and recomputes. Higher hit rate, less prefill compute, lower TTFT.
+- **shared_prefix** — multi-turn conversations sharing a hot system prompt +
+  per-tenant context. Cache-aware routes a turn to the instance holding that
+  conversation's history (or pulls it once), so a dialogue is prefilled ~once;
+  load-balance scatters the turns and recomputes the whole history. Higher hit rate,
+  much less prefill compute, lower TTFT — and the gap widens with turn depth, because
+  what a miss costs is the conversation so far.
 - **eviction** — sweeps per-instance cache capacity and prints the hit-rate curve: it
-  rises as the hot working set fits, then plateaus. Too-small caches can't even hold
-  a full prefix ⇒ no reuse.
-- **hotspot** — one dominant conversation (extreme Zipf skew). Compares load-balance
+  rises as the hot working set fits, then plateaus. The sweep starts at 48 blocks
+  because a conversation's last turn is a 29-block chain and a volume below that
+  cannot hold one request's own working set.
+- **hotspot** — one dominant tenant (extreme Zipf skew). Compares load-balance
   vs cache-aware **without** replication vs **with** replication. Replication lowers
-  prefill compute and p90 TTFT at the cost of KV fabric bytes.
+  prefill compute at the cost of KV fabric bytes. It no longer also lowers p90 TTFT:
+  a dominant *tenant* is many dialogues with their own growing histories, which
+  cache-aware routing already scatters, so there is no pile left to spread. The
+  scenario says so where it prints.
 - **overload** — high arrival rate with a TTFT SLO. Prefix reuse shortens prefill,
   freeing capacity, so cache-aware sheds fewer requests than load-balance.
 - **disaggregation** — batched decode under a TBT target. A dedicated decode pool (its
@@ -258,9 +264,12 @@ kvcache_sim/
                           #   of what a block is or how big one is -- that is the
                           #   accelerator's, which produces them
   workload/               # WHAT IS SIMULATED
-    _generator.py         #   seeded synthetic request stream (Zipf + Poisson),
-                          #   incl. each prompt's tensor and the prefix-hash chain
-                          #   (str keys) generated beside it
+    _generator.py         #   seeded synthetic stream of multi-turn Conversations
+                          #   (Zipf over turn depth, Poisson dialogue starts,
+                          #   exponential think time), incl. each prompt's tensor
+                          #   and the prefix-hash chain (str keys) generated
+                          #   beside it. Turn N+1's chain is turn N's chain plus
+                          #   turn N's continuation keys plus a new message
     _accelerator.py       #   SimulatedAccelerator: the Accelerator port, answered
                           #   by a roofline, a sleep, one zero-storage meta tensor
                           #   per KV block at the size the scheduler priced, and
@@ -268,10 +277,10 @@ kvcache_sim/
                           #   TOKEN_DTYPE, and the single-server queue that makes
                           #   a forward pass wait for the device. The one piece of
                           #   the compute story a deployment replaces outright
-    _serving.py           #   KVWorkload (the request stream) + serving_plane,
-                          #   the wiring a run installs around it, incl. the
-                          #   client that submits a request and follows the two
-                          #   redirects it gets back
+    _serving.py           #   KVWorkload (one work item per conversation) +
+                          #   serving_plane, the wiring a run installs around it,
+                          #   incl. the client that walks a dialogue's turns one
+                          #   at a time and follows the two redirects each gets
     scenarios.py          #   the six Scenarios: each declares its Runs over one
                           #   request stream, and narrates the results
   report/                 # OUTCOME METRICS
@@ -295,9 +304,49 @@ plus the prefix-run read that express KV caching on a mesh.
 
 ## Honesty notes
 
+- **The workload is multi-turn, and that is a closed loop.** A work item is a
+  *conversation*, not a request: turn N+1's prompt is turn N's prompt plus turn N's
+  **output** plus a new user message, so it cannot be submitted until turn N has
+  answered, and the client walks a dialogue's turns one at a time with a think-time
+  pause between them. The runner's `gather` gives concurrency across conversations;
+  turns within one are strictly serial. Three consequences worth stating up front.
+  (1) The reusable prefix **grows** and contains generated tokens, so the KV a decode
+  host publishes under `Request.continuation_keys` is now looked up and hit — ~15% of
+  every matched block in the prefill-side scenarios and ~30% in the decode-side ones.
+  (2) Only a conversation's first turn has an arrival this workload can state; every
+  later one arrives when the run says it does. What stays fixed by the seed alone is
+  *which* turns exist, what they contain and how long each user pauses, which is what
+  keeps "same workload, different wiring" a fair comparison.
+  (3) The offered load is now **paced by the system**: at most one request per open
+  dialogue can be in flight, and anything that slows a turn down delays its successor.
+  Two scenario claims did not survive that and are withdrawn where they print
+  (hotspot's replication win, early_rejection's predicted-vs-stale decode routing);
+  both needed a burst a closed loop cannot offer. A related surprise: adding a
+  coordinator or client hop now *lowers* mean TTFT on the prefill-side workload,
+  because it throttles the load faster than it lengthens a queue. The hop's cost is
+  measured end to end instead, which is the interval that contains it.
 - This optimizes **prefix reuse / TTFT / TBT under a cost model**; absolute numbers
   are arbitrary units. Read the scenarios for *relative* wins (cache-aware vs
   load-balance) and *shapes* (hit rate vs capacity), not throughput claims.
+- **A refused turn does not end its conversation.** The user is told no and the next
+  turn is offered anyway, as though the refused one had been served. Ending the
+  dialogue instead is what a discouraged user does, but it makes *which requests
+  exist* depend on the policy under test, and a rejection count is only worth
+  anything when both columns are shedding from the same offered load. What the
+  simplification costs is one block of query and one of output in the next turn's
+  prompt that a real transcript would not carry — an over-charge, never an invented
+  reuse, since a refused turn published nothing and the prefix run stops there.
+- **A batch bigger than the volume desynchronizes the directory.** A publish is one
+  `put_batch`, and torchstore registers a batch's keys *after* every one has landed,
+  while the volume evicts and reports its evictions key by key as they land. A volume
+  with less slack than the batch is writing therefore drops a key out of the batch it
+  is still landing, reports that drop before the key was ever registered, and is then
+  registered for it anyway — so the directory names a volume for blocks it threw away.
+  It is self-healing in behaviour (the later read raises and the request recomputes,
+  the `RESTALE` path) and not in the directory. Closing it means changing when a batch
+  is registered, which is upstream of this repo; the eviction sweep's floor keeps the
+  scenarios out of that regime, and `test_the_directory_and_the_volumes_agree_on_who_holds_what`
+  is what noticed.
 - Blocks become reusable at prefill **completion**, not while in flight; with spaced
   arrivals the difference is small.
 - A remote pull is routed on the directory snapshot at the request's arrival, but the
@@ -425,12 +474,11 @@ plus the prefix-run read that express KV caching on a mesh.
   instants, and nearly all of it is the *chain* rather than the generation (which is
   one block per request at this block size). The four prefill-only scenarios are
   byte-identical, because a run that does not model decode never reaches a decode
-  host. Two limits, stated rather than fixed: the generation's bytes are charged when
-  it ends rather than as it grows (a publish inside the step loop would stall every
-  other batch member and invent a TBT effect the hardware does not have), and nothing
-  in this workload ever *looks up* a continuation key — a real multi-turn front end
-  submits turn N+1 as prompt + turn N's output + a new query, and the generator here
-  does not splice a previous turn's output in.
+  host. One limit remains, stated rather than fixed: the generation's bytes are
+  charged when it ends rather than as it grows (a publish inside the step loop would
+  stall every other batch member and invent a TBT effect the hardware does not have).
+  The other one — that nothing in this workload ever *looked up* a continuation key —
+  is closed; see the multi-turn bullet below.
 - **End-to-end is measured only where there is a last token to measure to.** The four
   prefill-only scenarios (`shared_prefix`, `eviction`, `hotspot`, `overload`) do not
   model decode, so the client's walk ends at prefill completion; stamping *that* under

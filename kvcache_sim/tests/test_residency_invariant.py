@@ -55,6 +55,31 @@ object, so no store, transport or directory instrumentation anywhere could have
 seen it -- but a decode host still had to be holding the chain, because it
 decoded, and this derivation says so from the outcome row alone.
 
+What multi-turn changed, and what it did not
+--------------------------------------------
+A request is now a **turn** of a conversation, and turn N+1's chain is turn N's
+chain plus the keys turn N's *generation* left behind plus a new message
+(:mod:`kvcache_sim.workload._generator`). Two consequences, and the second is the
+reason nothing above had to be rewritten.
+
+Blocks a decode host generated are now blocks a *prefill* host attends over on the
+next turn -- so the same key is legitimately implied on two hosts by two different
+facts, one from each side of the derivation. The pairs are a set and replication
+was already in scope (see below), so that composes: a generated block held by the
+decode host that made it and by the prefill host that reused it is two pairs, both
+told, both true.
+
+And the prefill side's sentence -- "it ran a forward pass over the whole prompt,
+so it held every block of the chain" -- did not need a clause added for generated
+blocks, because it was never phrased in terms of where a block came from. That is
+worth stating rather than noticing: a derivation written from the physics ("a
+forward pass attends over its whole prompt") extended itself to a workload it
+predates, where one written from the call sites ("a prefill publishes what it
+computed") would have had to be amended.
+:func:`test_the_prefill_side_now_carries_generated_blocks` pins that it is really
+exercised, since a derivation that silently covered nothing new would look
+identical from here.
+
 Against that: the set of keys each volume was ever **told about** -- every key of
 every ``put`` that reached it, recorded by :class:`_RecordingVolume` for the
 duration of the run.
@@ -64,7 +89,7 @@ capacity decision that belongs to the volume, is already reported
 (:attr:`~kvcache_sim.report.metrics.RequestResult.published`,
 :attr:`~kvcache_sim.report.metrics.RequestResult.decode_unpublished`), and is
 supposed to drop things -- the eviction sweep's smallest capacity ends the run
-holding 32 of the 992 keys it was handed, and a resident-set comparison would
+holding 134 of the 1195 keys it was handed, and a resident-set comparison would
 fail there for the most ordinary reason there is. What must never happen is that
 the volume was never given the chance to decide. "Was told" is exactly that line,
 and it is where the four bugs sit: in each of them the volume was not told.
@@ -93,7 +118,13 @@ the same event: a decode host that never published is absent from the directory
 *and* absent from the volume, and the two agree perfectly about a host that is
 holding an entire block chain. It catches the opposite failure -- an entry that
 outlived its bytes, an eviction that deregistered without deleting -- which is
-worth having and is not the recurring one.
+worth having and is not the recurring one -- and it has now caught one, which is
+why it is worth keeping a check whose stated purpose is not this module's. Growing
+the workload made a publish bigger than a small volume's slack, the volume evicted
+a key out of the very ``put_batch`` that was landing it, reported the drop before
+the batch was registered, and was registered for it anyway. See the note beside
+``EVICTION_CAPACITIES`` in :mod:`kvcache_sim.workload.scenarios` for why that is an
+ordering hole upstream of this repo rather than something the sweep can fix.
 
 **Instrumenting the seams KV physically flows through** (``KVStore.fetch``, the
 prefill and decode engines) and asserting a publish follows. Closer, and it would
@@ -457,6 +488,47 @@ def test_the_decode_side_actually_contributes_something_to_check():
             f"{result.label}: every decoded block was already held by its "
             f"prefill host, so this run cannot demonstrate the invariant"
         )
+
+
+def test_the_prefill_side_now_carries_generated_blocks():
+    """The multi-turn half of the derivation, and that it is not vacuous.
+
+    A conversation's later turns walk through the blocks its earlier turns
+    generated, so a host that prefills turn N+1 holds KV that a *generation*
+    produced -- keys named by
+    :meth:`~kvcache_sim.control.request.Request.continuation_keys`, which before
+    the workload grew could only ever be implied on a decode host. Both halves are
+    checked: that such keys are in the prefill side's implied set at all, and that
+    at least one of them is implied on a host that did **not** decode the turn that
+    made it, which is the case that only a chain crossing turns can produce.
+
+    Without this, a workload change that quietly stopped splicing generated keys
+    into later turns would leave every assertion above green while the thing they
+    are supposed to be reconciling had gone away.
+    """
+    def generated(keys):
+        return {k for k in keys if k.rsplit("|", 1)[1].startswith("g")}
+
+    for scenario in SCENARIOS:
+        for result in _runs(scenario):
+            prefill_side = _prefill_side(result)
+            decode_side = _decode_side(result)
+            carried = {
+                host: generated(keys) for host, keys in prefill_side.items()
+            }
+            assert any(carried.values()), (
+                f"{scenario.name}/{result.label}: no prefill host is implied to "
+                f"hold a single generated block, so later turns are not walking "
+                f"earlier turns' output and the workload is single-turn again"
+            )
+            elsewhere = {
+                host: keys - decode_side.get(host, set())
+                for host, keys in carried.items()
+            }
+            assert any(elsewhere.values()), (
+                f"{scenario.name}/{result.label}: every generated block a prefill "
+                f"host holds was also decoded there, so nothing crossed turns"
+            )
 
 
 def test_the_invariant_catches_a_decode_host_that_holds_kv_silently():

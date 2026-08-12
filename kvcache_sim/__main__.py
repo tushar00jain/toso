@@ -15,12 +15,14 @@ file only declares the demo:
   * shared_prefix   -- multi-turn conversations sharing a hot system prompt; the
                        cache-aware coordinator reuses prefixes across instances.
   * eviction        -- sweep cache capacity; hit rate rises then plateaus (LRU).
-  * hotspot         -- extreme skew; hot-block replication spreads load, cuts p90.
+  * hotspot         -- extreme skew; hot-block replication trades recompute for
+                       KV transfer (it no longer also cuts p90 -- see its show()).
   * overload        -- high arrival + TTFT SLO; reuse => fewer rejections.
   * disaggregation  -- dedicated decode pool holds the TBT SLO; coupling prefill
                        into decode stalls it (Mooncake's headline).
-  * early_rejection -- predicting decode load avoids wasting prefill (off/early/
-                       predict) while still meeting the TBT SLO.
+  * early_rejection -- gating decode admission at routing avoids wasting prefill
+                       (off/early/predict). The TBT half of that comparison does
+                       not survive a self-pacing workload -- see its show().
 """
 
 from __future__ import annotations
@@ -62,15 +64,25 @@ class KVCacheDemo(Demo):
         console.info("A cache-aware coordinator over TorchStore's existing volumes+transport")
         console.info("turns shared prefixes into cluster-wide reuse: higher hit rate, less")
         console.info("prefill compute, and lower TTFT than load-balancing that only reuses a")
-        console.info("local cache. LRU eviction bounds the cache (hit rate vs capacity is the")
-        console.info("sizing knob); hot-block replication spreads skew; SLO admission sheds")
-        console.info("overload. All of it is control-plane policy over the same data plane.")
+        console.info("local cache. The workload is multi-turn -- turn N+1 is turn N's prompt")
+        console.info("plus turn N's OUTPUT plus a new message -- so the reusable prefix grows")
+        console.info("with the conversation and a miss costs more the deeper the dialogue is,")
+        console.info("which is why the gap is wide. It also means the KV a decode host")
+        console.info("GENERATES is looked up and hit by the next turn rather than written and")
+        console.info("forgotten. LRU eviction bounds the cache (hit rate vs capacity is the")
+        console.info("sizing knob); hot-block replication trades recompute for KV transfer;")
+        console.info("SLO admission sheds overload. All of it is control-plane policy over the")
+        console.info("same data plane.")
         console.info("On the decode side the same coordinator bounds time-between-tokens:")
         console.info("disaggregating decode onto its own pool keeps a prefill from colliding")
-        console.info("with a decode step (TBT target ~100%% vs a large fraction of the SAME")
-        console.info("served load missing when coupled), and predicting decode load at")
-        console.info("admission avoids spending prefill on requests that can't be decoded in")
-        console.info("SLO while routing decode by foreseen load -- no wasted prefill, SLO held.")
+        console.info("with a decode step (TBT target ~100% vs a large fraction of the SAME")
+        console.info("served load missing when coupled), and gating decode admission at routing")
+        console.info("avoids spending prefill on requests that cannot be decoded in SLO.")
+        console.info("Two claims this demo used to make no longer hold on a workload that paces")
+        console.info("itself, and each says so where it is shown: replication no longer cuts")
+        console.info("p90 TTFT (hotspot), and predicted-load decode routing no longer separates")
+        console.info("from stale-occupancy routing (early_rejection). Both needed a burst that")
+        console.info("a closed loop cannot offer, and neither has been retuned to hide it.")
 
 
 def main(argv=None) -> None:

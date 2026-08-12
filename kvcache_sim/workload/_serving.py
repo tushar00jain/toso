@@ -2,9 +2,9 @@
 
 Two separate things, deliberately:
 
-* :class:`KVWorkload` is *the work* -- a request stream, one
-  :class:`~realsim.runner.WorkItem` per request at its arrival time. It builds no
-  store, no scheduler and no plane;
+* :class:`KVWorkload` is *the work* -- a stream of conversations, one
+  :class:`~realsim.runner.WorkItem` per conversation at its first turn's arrival
+  time. It builds no store, no scheduler and no plane;
 * :func:`coordinator` and :func:`serving_plane` are the *capability wiring*, one
   per plane: the scheduler over the view, and the store plus one
   :class:`~kvcache_sim.data.serving.ServingHost` per instance over it. Both are
@@ -25,6 +25,11 @@ ingress proxy or DNS doing that, none of which is part of the serving system --
 which is why they are here rather than in ``data/``, whose test for membership is
 whether a thing advances the clock or moves bytes, and whose contents are what
 would lift into a deployment unchanged.
+
+The client stands in for a fourth thing that a deployment does not have on any of
+its machines either: the **user**. A conversation's turns are serial because a
+reply cannot be written before the answer arrives, so somebody has to hold the
+dialogue open between them, and it is the caller.
 
 The client is where the request's itinerary lives
 -------------------------------------------------
@@ -56,6 +61,7 @@ different wiring, which is exactly what "cache-aware vs load-balance" means.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Callable, Dict, List, Optional
 from zlib import crc32
 
@@ -87,21 +93,49 @@ __all__ = ["BLOCK_TOKENS", "coordinator", "KVWorkload", "serving_plane"]
 
 
 class KVWorkload(Workload):
-    """A request stream over a set of serving instances.
+    """A stream of **conversations** over a set of serving instances.
 
-    One work item per request, released at its arrival time. Which scheduler
-    serves them is not this object's business -- see :func:`serving_plane`.
+    One work item per conversation, released when its *first* turn arrives. Which
+    scheduler serves them is not this object's business -- see
+    :func:`serving_plane`.
+
+    One item per conversation rather than per request, because a conversation is a
+    closed loop: turn N+1 is turn N's prompt plus turn N's output plus a new
+    message, so it cannot be submitted until turn N has answered, and a user
+    cannot type a reply to an answer they have not seen. The item is therefore the
+    dialogue and the client walks its turns in order (:class:`_Client`), which
+    leaves :meth:`realsim.runner.Runner.run`'s ``gather`` giving concurrency
+    *across* conversations while turns *within* one stay strictly serial. Nothing
+    in the harness had to learn about any of this: a work item was always allowed
+    to be a coroutine that lives a while, and the client only became able to hold
+    one open to its last token when the decode leg started answering there.
+
+    The consequence worth naming is that only the first turn has a release time.
+    Every later turn arrives when the run says it does, so a run's arrival process
+    is now partly its own output -- see :mod:`kvcache_sim.workload._generator`.
     """
 
-    def __init__(self, topology: Dict[str, Endpoint], requests) -> None:
+    def __init__(self, topology: Dict[str, Endpoint], conversations) -> None:
         super().__init__(topology)
-        self.requests = requests
+        self.conversations = list(conversations)
+
+    @property
+    def requests(self) -> List[Request]:
+        """Every turn of every conversation, flattened, in dialogue order.
+
+        What a reader of the *outcome* wants: the ledger has one row per request,
+        so anything reconciling rows against the work that produced them (the
+        residency invariant, the tests that check where a request was served) needs
+        the requests, not the dialogues holding them. Derived rather than stored,
+        so there is one list of turns and it lives on the conversations.
+        """
+        return [r for c in self.conversations for r in c.requests]
 
     def items(self, sim: Simulation) -> List[WorkItem]:
-        """One item per request; the serving plane runs each one's lifecycle."""
+        """One item per conversation; the client walks that dialogue's turns."""
         return [
-            WorkItem(id=r.id, release_time=r.arrival, payload=r)
-            for r in self.requests
+            WorkItem(id=c.id, release_time=c.arrival, payload=c)
+            for c in self.conversations
         ]
 
 
@@ -184,6 +218,13 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
     conversation's requests share a prefix, so the host that served the last one is
     usually the host that should serve the next.
 
+    ``request.conversation`` is the **tenant**, not the individual dialogue, and
+    that is what makes the sentence above true twice over now: a tenant's dialogues
+    all open with the same per-tenant context, and each dialogue's own growing
+    history belongs to exactly one tenant, so keeping a tenant together keeps both
+    on one volume. Routing per dialogue would scatter the shared opening across
+    every instance and buy nothing back.
+
     Note what it deliberately does *not* do: it never looks at the block keys. An
     arrival policy that routed by cache contents would be doing the coordinator's
     job with none of the coordinator's information, and the comparison this whole
@@ -201,7 +242,7 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
 
 
 class _Client:
-    """The thing outside the cluster that submits a request and follows redirects.
+    """The thing outside the cluster that holds a conversation and follows redirects.
 
     Stands in for what a deployment already has in front of its hosts -- a client
     SDK doing client-side balancing, an ingress proxy, DNS -- and therefore for
@@ -209,7 +250,13 @@ class _Client:
     of its own beyond ``landed``, and it never asks where a request should *run*:
     it asks a host, and does what it is told.
 
-    Three legs, which is nearly the whole object::
+    It stands in for one more thing, and that one has no server-side counterpart at
+    all: the **user**. A conversation is a turn, an answer, a pause, and another
+    turn, and the only participant present for all four is the caller. So
+    :meth:`submit` is a loop over a dialogue's turns and :meth:`_turn` is the
+    single-request walk that used to be the whole object.
+
+    Three legs per turn, which is nearly the rest of it::
 
         plan = await hosts[landed(request)].route(request)      # "prefill is B"
         decode, first = await hosts[plan.prefill].prefill(plan)  # "decode is C"
@@ -277,14 +324,45 @@ class _Client:
         self.metrics = metrics
 
     async def submit(self, item) -> None:
-        """Take one request through as many hosts as it is redirected to.
+        """Walk one conversation: pause, submit a turn, wait for it, repeat.
 
-        Returns when the request is finished, which for a run that models decode
-        means its last token has landed. Every early return is a journey that
-        ended, not one abandoned: the host that ended it recorded why, and neither
-        leaves anything decoding behind this coroutine.
+        The whole of the multi-turn model on this side, and it is a ``for`` loop
+        with an ``await`` in it. Turn N+1's prompt *contains* turn N's answer, so
+        it cannot exist until turn N has one; a client that submitted the two
+        concurrently would be a client that knew what the model was going to say.
+        The pause in front of each turn is the user reading and typing
+        (:class:`~kvcache_sim.workload._generator.Turn`), and it is slept here
+        rather than scheduled by the runner because when it *starts* is when the
+        previous answer landed, which nothing outside this coroutine knows.
+
+        The arrival stamped on each turn is taken here, for the same reason: what
+        the generator could state was the instant the turn would arrive if the
+        system answered instantly, and what a latency has to be measured from is
+        when the request really entered. The two agree exactly for a conversation's
+        first turn.
+
+        A refused turn does not end the conversation. The user was told no, and
+        the model of a user this workload has does not retry and does not give up
+        -- see the generator for why the alternative (ending the dialogue) makes a
+        rejection count incomparable between the two configurations a scenario is
+        rejecting differently.
         """
-        request: Request = item.payload
+        conversation = item.payload
+        loop = asyncio.get_running_loop()
+        for turn in conversation.turns:
+            if turn.think:
+                await asyncio.sleep(turn.think)
+            await self._turn(replace(turn.request, arrival=loop.time()))
+
+    async def _turn(self, request: Request) -> None:
+        """Take one turn through as many hosts as it is redirected to.
+
+        Returns when the turn is finished, which for a run that models decode
+        means its last token has landed -- which is also what makes it safe for
+        :meth:`submit` to treat this as "the user now has the answer". Every early
+        return is a journey that ended, not one abandoned: the host that ended it
+        recorded why, and neither leaves anything decoding behind this coroutine.
+        """
         plan = await self.hosts[self.landed(request)].route.call_one(request)
         if plan is None:
             return  # refused at the door; the host that refused recorded it

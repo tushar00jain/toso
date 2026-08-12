@@ -42,10 +42,14 @@ from kvcache_sim.tests._run import (
 )
 from kvcache_sim.workload.scenarios import (
     DISAGG_TARGET_TBT,
-    EARLY_SLO_TBT,
     _make_topology,
     _shared_prefix_workload,
 )
+
+
+#: The run's own block geometry, for tests that have to count blocks the way the
+#: accelerator does (a partial trailing block is a block).
+_GEOMETRY = SimulatedAccelerator(block_tokens=BLOCK_TOKENS)
 
 
 def _kv(count: int, block_tokens: int = BLOCK_TOKENS):
@@ -57,6 +61,19 @@ def _kv(count: int, block_tokens: int = BLOCK_TOKENS):
     own, so a test can never publish a block of a size the run would not.
     """
     return SimulatedAccelerator(block_tokens=block_tokens).kv_blocks(count)
+
+
+def _turns(conversations) -> list:
+    """Every turn of every conversation, flattened, in dialogue order.
+
+    :func:`~kvcache_sim.workload._generator.make_workload` answers with
+    conversations now, because a request is a *turn* of one and turn N+1 cannot be
+    submitted until turn N has answered. Most assertions below are about requests,
+    so this is the same flattening
+    :attr:`~kvcache_sim.workload._serving.KVWorkload.requests` performs -- written
+    once here rather than as a comprehension at each call site.
+    """
+    return [turn.request for c in conversations for turn in c.turns]
 
 
 def _request(**kwargs) -> Request:
@@ -108,16 +125,73 @@ def test_a_request_refuses_a_prompt_that_is_not_the_length_it_claims():
 #     prompt *shapes* and different content share no keys, which is exactly what a
 #     shape-derived "hash" would get wrong.
 def test_block_keys_are_generated_not_derived_from_the_prompt():
-    a, b = make_workload(
+    # ``max_turns=1`` makes every draw its own one-turn dialogue, which is the
+    # single-shot shape this claim is about: two prompts of identical length and
+    # different content. A second turn would be longer than the first, so the
+    # shapes would differ for a reason that has nothing to do with hashing.
+    a, b = _turns(make_workload(
         num_requests=2, num_conversations=2, system_blocks=1, conv_base_blocks=1,
-        query_blocks=1, block_tokens=BLOCK_TOKENS, seed=7,
-    )
+        query_blocks=1, block_tokens=BLOCK_TOKENS, max_turns=1, seed=7,
+    ))
     assert a.prompt.shape == b.prompt.shape       # identical shapes...
     assert a.block_keys[-1] != b.block_keys[-1]   # ...and distinct queries
     # The prompt is real, exactly sized and free to hold -- and has no ids in it,
     # which is why the keys cannot come from it.
     assert a.prompt.device.type == "meta"
     assert a.prompt.numel() == a.prompt_tokens
+
+
+# 1c-ii. A conversation is turns, and turn N+1 *is* turn N plus what came back
+#        plus what the user said next. This is the whole multi-turn claim, checked
+#        on the stream rather than through a run: the reusable prefix grows
+#        monotonically and the thing in the middle of the growth is the previous
+#        turn's own generated-KV keys, taken from the previous turn's own
+#        ``continuation_keys`` rather than spelled out again here.
+def test_a_turn_is_the_previous_turn_plus_its_output_plus_a_new_message():
+    conversations = make_workload(
+        num_requests=40, num_conversations=3, system_blocks=2, conv_base_blocks=3,
+        query_blocks=2, block_tokens=BLOCK_TOKENS, output_tokens=64, max_turns=6,
+        seed=5,
+    )
+    assert sum(len(c.turns) for c in conversations) == 40   # every turn accounted
+    assert max(len(c.turns) for c in conversations) <= 6    # ...and bounded
+    multi = [c for c in conversations if len(c.turns) > 1]
+    assert multi, "no conversation has a second turn, so nothing here is tested"
+
+    generated = _GEOMETRY.blocks_for(64 - 1)
+    for conversation in conversations:
+        first = conversation.turns[0].request
+        assert len(first.block_keys) == 2 + 3 + 2          # system + base + query
+        assert conversation.turns[0].think == 0.0          # its arrival is the item's
+        for before, after in zip(conversation.turns, conversation.turns[1:]):
+            previous, current = before.request, after.request
+            history = previous.block_keys + previous.continuation_keys(generated)
+            # The growing prefix, exactly: everything the previous turn was, then
+            # everything it produced, then the two blocks of the new message.
+            assert current.block_keys[:len(history)] == history
+            assert len(current.block_keys) == len(history) + 2
+            assert current.prompt_tokens == len(current.block_keys) * BLOCK_TOKENS
+            assert current.prompt.numel() == current.prompt_tokens
+            assert after.think > 0.0                       # a user paused to read
+        # ...and all of them belong to the same conversation as far as a front end
+        # that routes on a session id is concerned.
+        assert len({t.request.conversation for t in conversation.turns}) == 1
+
+
+def test_the_conversation_stream_is_a_property_of_the_seed_alone():
+    """Same seed, same stream -- and it does not depend on how a run goes.
+
+    The arrival of turn N+1 is emergent (it waits for turn N's answer), so the one
+    thing that has to stay fixed is *which* turns exist, what they contain and how
+    long each user pauses. That is what makes "same workload, different wiring"
+    still a fair comparison between a scenario's configurations, and it is checked
+    on the generated stream because the stream is where it is decided.
+    """
+    kwargs = dict(
+        num_requests=60, num_conversations=4, block_tokens=BLOCK_TOKENS, seed=11
+    )
+    assert make_workload(**kwargs) == make_workload(**kwargs)
+    assert make_workload(**{**kwargs, "seed": 12}) != make_workload(**kwargs)
 
 
 # 1d. The chain continues past the prompt, because the sequence does. Generated
@@ -278,16 +352,16 @@ def test_eviction_hit_rate_monotone_then_plateau():
     assert hrs[-1] > hrs[0]
     # large finite cap reaches (near) the unbounded hit rate
     topo = _make_topology(4)
-    reqs = _shared_prefix_workload()
+    convs = _shared_prefix_workload()
     from dataclasses import replace as _replace
 
     from domain import DEFAULT_MODEL, DEFAULT_PROFILE
 
     from kvcache_sim.workload._serving import BLOCK_TOKENS
 
-    unbounded = run(topo, reqs, "cache_aware").ledger.hit_rate
+    unbounded = run(topo, convs, "cache_aware").ledger.hit_rate
     big = run(
-        topo, reqs, "cache_aware",
+        topo, convs, "cache_aware",
         profile=_replace(
             DEFAULT_PROFILE,
             storage_capacity_bytes=DEFAULT_MODEL.block_bytes(100000, BLOCK_TOKENS),
@@ -313,12 +387,12 @@ def test_a_prefix_that_does_not_fit_is_reported_as_not_cached():
 
     from kvcache_sim.workload._serving import BLOCK_TOKENS
 
-    topo, reqs = _make_topology(4), _shared_prefix_workload()
+    topo, convs = _make_topology(4), _shared_prefix_workload()
     one_block = DEFAULT_MODEL.block_bytes(1, BLOCK_TOKENS)
 
     def _at(capacity_bytes: int):
         return run(
-            topo, reqs, "cache_aware",
+            topo, convs, "cache_aware",
             profile=_replace(
                 DEFAULT_PROFILE, storage_capacity_bytes=capacity_bytes
             ),
@@ -351,10 +425,11 @@ def test_a_request_is_served_by_its_plan_host_not_the_host_it_landed_on():
     """
     from kvcache_sim.workload._serving import _affinity
 
-    topo, reqs = _make_topology(4), _shared_prefix_workload()
-    result = run(topo, reqs, "cache_aware")
+    topo, convs = _make_topology(4), _shared_prefix_workload()
+    result = run(topo, convs, "cache_aware")
 
     landed = _affinity(sorted(topo))
+    reqs = _turns(convs)
     by_id = {r.id: r for r in reqs}
     moved = [
         row for row in result.ledger.accepted
@@ -373,11 +448,37 @@ def test_a_request_is_served_by_its_plan_host_not_the_host_it_landed_on():
     assert all(landed(r) == homes[r.conversation] for r in reqs)
 
 
-# 8. Hotspot: replication lowers TTFT and prefill compute vs recompute-only,
-#    at the cost of KV fabric bytes.
-def test_hotspot_replication_helps():
+# 8. Hotspot: replication trades recompute for KV transfer. It used to also lower
+#    TTFT, and on a multi-turn workload it no longer does -- see the docstring.
+def test_hotspot_replication_trades_recompute_for_transfer():
+    """What replication buys, and what it stopped buying when prefixes started growing.
+
+    Two of the three claims are unchanged and are the mechanism: ``replicate=False``
+    never pulls, replication does, and the run that pulls recomputes strictly fewer
+    prompt tokens. That is the trade the scenario exists to show and it is robust
+    across seeds.
+
+    The third -- that replication also *lowers* TTFT by spreading a hot prefix over
+    peers -- is gone, and the assertion for it is not weakened here but replaced,
+    because the phenomenon it measured is gone rather than smaller. The old
+    workload's "one dominant conversation" was one fixed prefix that every one of
+    that conversation's requests shared, so the cache-aware policy really did pile
+    all of them on the single instance holding it and replication really did spread
+    them. A multi-turn dominant *tenant* is many dialogues, each with its own
+    growing history, and the cache-aware policy already scatters them across
+    instances by following those histories -- there is no pile left to spread. What
+    is shared between them is only the opening, which is a shrinking fraction of a
+    conversation that grows, and pulling it now means pulling a long chain rather
+    than a fixed dozen blocks. So replication's TTFT effect is noise: it wins on
+    some seeds and loses on others, and this asserts what is left, which is that
+    both cache-aware configurations beat the load-balancing baseline by a wide
+    margin. See the report in the scenario's ``show()`` for the claim that had to
+    be withdrawn.
+    """
     baseline, no_repl, repl = run_hotspot()
-    assert repl.ledger.mean_ttft <= no_repl.ledger.mean_ttft <= baseline.ledger.mean_ttft
+    # Routing to the history still dominates, whether or not it is replicated.
+    assert repl.ledger.mean_ttft < baseline.ledger.mean_ttft
+    assert no_repl.ledger.mean_ttft < baseline.ledger.mean_ttft
     assert repl.ledger.compute_tokens <= no_repl.ledger.compute_tokens
     assert no_repl.ledger.fabric_bytes == 0     # replicate=False never pulls
     assert repl.ledger.fabric_bytes > 0         # replication moves KV once per spread
@@ -492,18 +593,45 @@ def test_disaggregation_protects_tbt():
             > coupled.ledger.tbt_slo_met(DISAGG_TARGET_TBT))
 
 
-# 14. Early rejection avoids wasted prefill; prediction routes decode better.
+# 14. Early rejection avoids wasted prefill. The second half of this scenario --
+#     that 'predict' also holds the TBT SLO where 'early' cannot -- did not survive
+#     a closed-loop workload; see the docstring.
 def test_early_rejection_avoids_wasted_prefill():
+    """Gating before prefill never wastes it. Gating on *foreseen* load: no longer
+    separable here.
+
+    The first claim is the scenario's structural one and is untouched: 'off' asks
+    about decode load after the prefill has been computed, so every refusal it
+    issues is compute already spent, and 'early'/'predict' ask at routing and
+    therefore cannot waste any.
+
+    The second claim -- 'predict' routes decode by the load foreseen at prefill
+    completion and so holds the SLO where 'early' reads a stale, near-empty
+    occupancy and piles decode onto one instance -- required a burst, and a
+    conversation-per-item workload cannot offer one. At most one request per open
+    dialogue can be in flight, because a user cannot send turn N+1 before turn N
+    answers, so this scenario's 160 requests arrive as ~22 concurrent conversations
+    rather than as an arrival stream at rate 20. With decode occupancy never far
+    from what a stale snapshot reports, the two policies route almost identically:
+    across four seeds the attainment gap is noise and its sign changes. Asserting a
+    direction here would be asserting a seed.
+
+    This is not a scenario whose numbers moved; it is a scenario whose *mechanism*
+    is not exercised by a workload that paces itself. Restoring it means offering
+    the concurrency its constants intended -- many more, shorter conversations --
+    and no constant change tried so far restores it robustly across seeds, so it is
+    reported as an open item rather than tuned into looking fixed.
+    """
     off, early, predict = run_early_rejection()
     # 'off' late-checks decode load after prefill -> some prefills are wasted.
     assert off.ledger.wasted_prefills > 0
-    # 'early'/'predict' gate before prefill -> never waste it.
+    assert off.ledger.decode_rejections == off.ledger.wasted_prefills
+    # 'early'/'predict' gate before prefill -> never waste it, and here neither
+    # rejects at all, so they serve strictly more of the offered load.
     assert early.ledger.wasted_prefills == 0
     assert predict.ledger.wasted_prefills == 0
-    # Only 'predict' routes decode by foreseen load, so it holds the TBT SLO where
-    # 'early' (stale current-occupancy snapshot) cannot.
-    assert (predict.ledger.tbt_slo_met(EARLY_SLO_TBT)
-            > early.ledger.tbt_slo_met(EARLY_SLO_TBT))
+    assert len(early.ledger.accepted) > len(off.ledger.accepted)
+    assert len(predict.ledger.accepted) > len(off.ledger.accepted)
 
 
 # 13b. The handoff between prefill and decode goes through the STORE.
@@ -816,16 +944,26 @@ def test_decode_residency_is_zero_where_decode_is_not_modelled():
 
 
 def test_a_run_that_models_decode_pays_for_it_in_blocks():
-    """And the amount is the deployment's, not a constant.
+    """And the amount is the deployment's *and the conversation's*, not a constant.
 
-    Disaggregation decodes every request away from where it was prefilled, so
-    every request drags its whole chain across and then generates on top of it:
-    120 requests x (5-block prompt chain + 1 block for 11 generated positions).
-    Coupling decodes most requests where the KV already is, so most of them pay
-    only for what they generated -- same load, a third of the residency.
+    Disaggregation decodes every request away from where it was prefilled, so every
+    request drags its whole chain across and then generates on top of it. What
+    changed is that "its whole chain" is no longer one number: turn 1 of a dialogue
+    is 5 blocks and turn 8 is 19, because turn N+1 carries turn N's prompt, turn N's
+    output and a new message. So the expected total is summed off the workload
+    rather than written as ``120 x (5 + 1)`` -- and it has to be, since a constant
+    here would have to be re-derived by hand every time a conversation's shape
+    changes, which is exactly how a test stops describing anything.
+
+    Coupling still decodes most requests where the KV already is, so most of them
+    pay only for what they generated.
     """
     disagg, coupled = run_disaggregation()
-    assert disagg.ledger.decode_blocks == 120 * (5 + 1)
+    generated = _GEOMETRY.blocks_for(12 - 1)     # output_tokens=12 in that scenario
+    expected = sum(
+        len(r.block_keys) + generated for r in disagg.workload.requests
+    )
+    assert disagg.ledger.decode_blocks == expected
     assert 0 < coupled.ledger.decode_blocks < disagg.ledger.decode_blocks
 
 
@@ -914,6 +1052,124 @@ def test_the_kv_handoff_is_visible_in_end_to_end_and_nowhere_else():
     assert disagg.ledger.mean_latency > coupled.ledger.mean_latency
 
 
+# 13h. The payoff the multi-turn workload exists to create: a prefix match that
+#      lands on blocks a *generation* produced. Every one of these keys is a
+#      ``|g<i>`` continuation key -- a key that can only exist because some turn
+#      generated tokens after that exact prompt -- and until conversations grew,
+#      the run published them and nothing ever asked for one.
+def _generated_hits(result) -> tuple:
+    """``(matched blocks, of which generated, matched past the last turn's prompt)``.
+
+    Derived from the ledger and the workload rather than from a new column: what a
+    row records is how many prompt *tokens* were served from cache, and blocks are
+    that over the block size, so the matched run is the request's own leading keys
+    and whether one of them is a generated key is a property of the key.
+
+    The third number is the strict one. A generated key can be published by two
+    different things -- the decode host that made the KV, or the *next* turn's
+    prefill host, which recomputes it as part of the uncached suffix and publishes
+    what it computed -- so a hit on any generated key does not by itself say
+    decode's publish was ever read. A match that runs *past the previous turn's
+    whole prompt chain* does: the block at that position is the previous turn's own
+    output, and at the moment this turn is routed the only thing that can have
+    published it is the host that generated it.
+    """
+    requests = {r.id: r for r in result.workload.requests}
+    previous = {}
+    for conversation in result.workload.conversations:
+        for i, turn in enumerate(conversation.turns):
+            previous[turn.request.id] = (
+                len(conversation.turns[i - 1].request.block_keys) if i else 0
+            )
+    matched = generated = fresh = 0
+    for row in result.ledger.accepted:
+        keys = requests[row.id].block_keys[:row.cached_tokens // BLOCK_TOKENS]
+        matched += len(keys)
+        generated += sum(1 for k in keys if k.rsplit("|", 1)[1].startswith("g"))
+        if previous[row.id] and len(keys) > previous[row.id]:
+            fresh += 1
+    return matched, generated, fresh
+
+
+def test_a_later_turn_reuses_the_kv_an_earlier_turn_generated():
+    """Generated KV is read, not merely written -- in every scenario.
+
+    The claim this replaces was a caveat in
+    :meth:`kvcache_sim.control.request.Request.continuation_keys`: the entries a
+    decode host published were findable and nothing looked for them, so publishing
+    cost capacity and bought no hit rate. A conversation's turn N+1 walks turn N's
+    generated keys on its way to its own new message, so those entries are now
+    matched -- ~15% of every matched block in the prefill-side scenarios and ~30%
+    in the decode-side ones, where the run also gets a *second* turn's worth of
+    growth out of them.
+    """
+    for result in (*run_shared_prefix(), *run_disaggregation()):
+        matched, generated, _fresh = _generated_hits(result)
+        assert matched > 0
+        assert generated > 0, f"{result.label}: no matched block was generated KV"
+        # Not a rounding error's worth: a meaningful share of the reuse.
+        assert generated > 0.05 * matched, result.label
+
+
+def test_only_a_decode_hosts_publish_can_serve_the_previous_turns_output():
+    """...and in a run that models decode, that publish is read.
+
+    The strict version of the test above, and the one that closes the loop this
+    task opened. A turn that matches *past* the previous turn's whole prompt is
+    matching the previous turn's generated block, and at that instant the only
+    host that has ever written that key is the host that decoded the previous turn
+    -- the next prefill has not run yet. So a non-zero count here is a decode
+    host's publish being read by a later request, which is the thing the model
+    could not do at all before.
+
+    Zero in a run that does not model decode, and that is the control rather than a
+    gap: nothing generated, so nobody published that block, and the prefix run
+    stops one block short of it every time. Turn N+1's prefill then computes it and
+    publishes it, which is why the *loose* count above is non-zero even there.
+    """
+    for result in run_disaggregation():
+        _matched, _generated, fresh = _generated_hits(result)
+        assert fresh > 0, (
+            f"{result.label}: no turn ever matched the previous turn's generated "
+            f"block, so the decode side's publish is still write-only"
+        )
+    for result in run_shared_prefix():
+        assert _generated_hits(result)[2] == 0
+
+
+def test_a_conversations_turns_are_strictly_serial():
+    """Turn N+1 is not routed until turn N's last token has landed.
+
+    The structural half of multi-turn, and the reason one work item is a whole
+    dialogue: turn N+1's prompt contains turn N's answer, so a run that overlapped
+    them would be routing a request built out of tokens that did not exist yet.
+    Read off the trace, because that is where both instants are: the DECODE line
+    is written when a request's last token is emitted and the ROUTE line when the
+    next one is placed.
+    """
+    result = run_disaggregation()[0]
+    routed, decoded = {}, {}
+    for t, kind, msg in result.trace.events:
+        request_id = msg.split()[0]
+        if kind == "ROUTE":
+            routed.setdefault(request_id, t)
+        elif kind == "DECODE":
+            decoded[request_id] = t
+    overlapped = 0
+    for conversation in result.workload.conversations:
+        for before, after in zip(conversation.turns, conversation.turns[1:]):
+            done = decoded[before.request.id]
+            started = routed[after.request.id]
+            assert started >= done, (
+                f"{conversation.id}: {after.request.id} was routed at {started}, "
+                f"before {before.request.id} finished at {done}"
+            )
+            # ...and the user's pause is inside that gap, not skipped.
+            assert started >= done + after.think - 1e-9
+            overlapped += 1
+    assert overlapped > 0, "no conversation has two turns, so nothing was checked"
+
+
 # 13c. ...and the two halves of that row were written by two hosts that never
 #      spoke. The prefill host recorded the routing decision and the publish; the
 #      decode host recorded the handoff and the inter-token gaps. Neither was
@@ -942,12 +1198,12 @@ def test_each_host_records_its_own_half_of_a_request():
 #      read back out of the request that asked.
 @pytest.mark.parametrize("asked", [1, 5])
 def test_the_client_counts_the_tokens_the_two_legs_produced(asked):
-    reqs = make_workload(
+    convs = make_workload(
         num_requests=6, num_conversations=2, system_blocks=1, conv_base_blocks=1,
         query_blocks=1, block_tokens=BLOCK_TOKENS, output_tokens=asked, seed=3,
     )
     ledger = run(
-        _make_topology(2), reqs, "cache_aware",
+        _make_topology(2), convs, "cache_aware",
         simulate_decode=True, max_batch=4,
     ).ledger
     assert ledger.accepted
@@ -1091,20 +1347,29 @@ def test_coordinator_rtt_defaults_to_free_and_byte_identical():
     assert explicit.ledger.mean_ttft == baseline.ledger.mean_ttft
 
 
-def test_coordinator_rtt_lands_in_ttft_and_costs_reuse():
-    """A distant coordinator costs latency *and* hit rate.
+def test_coordinator_rtt_lands_in_the_wait_and_costs_reuse():
+    """A distant coordinator costs the caller time *and* hit rate.
 
-    Latency because every request pays the round trip before prefill can start,
-    and the delay compounds through the prefill queue. Hit rate because routing
-    then reads a directory snapshot one hop old, so a prefix another request has
-    just published is not there to reuse yet. The RTT has to be large enough to
-    matter against a ~4s prefill: at 0.01 nothing moves, which is its own honest
-    result about what resolution this workload can see.
+    Time because every leg of every turn pays the round trip, and hit rate because
+    routing then reads a directory snapshot one hop old, so a prefix another
+    request has just published is not there to reuse yet.
+
+    Measured end to end, on a decode-modelling run, and that is the change. This
+    used to assert on ``mean_ttft`` over the shared-prefix workload, and under a
+    multi-turn workload that assertion is not merely fragile -- it is false, and
+    for a reason worth stating rather than routing around. TTFT here is control's
+    *predicted* queue-plus-prefill, and a conversation is a closed loop: delay a
+    turn and its successor arrives later too, so a slower system is offered less
+    work per second and its queues are shorter. Mean TTFT on that workload
+    therefore *falls* monotonically as the hop grows (1.86 -> 1.56 -> 1.42 at
+    0 / 0.5 / 2.0), which is the textbook closed-loop response and not the hop
+    getting cheaper. Arrival-to-last-token is the interval that actually contains
+    the hop, and it is the one a caller experiences, so it is what is asserted.
     """
-    free = run_shared_prefix(seed=1)[0]
+    free = run_disaggregation(seed=0)[0]
     with config.overrides(coordinator_rtt=0.5):
-        distant = run_shared_prefix(seed=1)[0]
-    assert distant.ledger.mean_ttft > free.ledger.mean_ttft
+        distant = run_disaggregation(seed=0)[0]
+    assert distant.ledger.mean_latency > free.ledger.mean_latency
     assert distant.ledger.hit_rate < free.ledger.hit_rate
     # The comparison still holds -- both schedulers pay the same hop.
     with config.overrides(coordinator_rtt=0.5):
@@ -1126,19 +1391,18 @@ def test_client_rtt_defaults_to_free_and_byte_identical():
 
 
 def test_a_distant_client_delays_the_request_and_costs_reuse():
-    """Three round trips per request, paid before each leg can start.
+    """Three round trips per turn, paid before each leg can start.
 
-    The same two effects the coordinator hop has, for the same reason: the delay
-    pushes a request further down the prefill queue, and routing runs against a
-    directory snapshot taken later, by which time the queue it is predicting
-    against has moved. It does *not* land in TTFT by one RTT -- TTFT here is
-    control's prediction, made before any hop is paid -- so what moves is the
-    queueing that prediction is built on.
+    The same two effects the coordinator hop has and measured the same way, for
+    the reason the test above spells out: TTFT is a prediction made before any hop
+    is paid, and on a self-pacing workload it moves the wrong way anyway. What the
+    hops are inside is the caller's own interval, and three of them per turn at
+    0.5s put ~1.5s into it.
     """
-    free = run_shared_prefix(seed=1)[0]
+    free = run_disaggregation(seed=0)[0]
     with config.overrides(client_rtt=0.5):
-        distant = run_shared_prefix(seed=1)[0]
-    assert distant.ledger.mean_ttft > free.ledger.mean_ttft
+        distant = run_disaggregation(seed=0)[0]
+    assert distant.ledger.mean_latency > free.ledger.mean_latency + 1.5
     assert distant.ledger.hit_rate < free.ledger.hit_rate
 
 

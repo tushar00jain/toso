@@ -168,15 +168,19 @@ through `realsim`'s transport seam, and eviction is the real `notify_delete_batc
 | `LoadBalanceScheduler` / `CacheAwareScheduler` | `control/scheduler.py` | The two policies (async). Load-balance: least-loaded instance, local-only cache. Cache-aware: route to minimize predicted TTFT using the **global** prefix directory; optionally pull a remote prefix under a balance threshold (which read-through-replicates the destination); LRU-evict on completion; SLO-reject. With `simulate_decode`, also picks a decode instance by *predicted* batch and applies the `early_rejection` admission mode. Decides only: it holds a *predicted* prefill queue and is told what actually happened. |
 | `ServingHost` | `data/serving.py` | One serving instance: its cache, its decode batch, its compute. Three members, one per leg of a **redirect** — `route` (the coordinator says which host should prefill this; the answer is handed back, not acted on), `prefill` (real prefix pull → submit the forward pass, which waits for the device → real publish → answer with the **first token** and the decode host's address) and `decode` (a **real `get_batch`** of the request's whole block chain out of the store, then the batch, then the inter-token gaps → answer with the **remaining tokens**, `stream=False`-style, at the last one). It holds no reference to any other host and hands no measurement row to one: each host records its own half into the run's ledger, keyed by request id. Also owns **prefill/decode coupling**, which is a deployment fact, not a policy: when coupled it reports each decode step's end back to the scheduler, and the collision itself needs no reporting at all — both engines book on one accelerator. (The `reserve` call that used to push control's *predicted* completion onto that accelerator is gone: a prefill books its own slot now, so one object owns `busy_until`.) |
 | `_Client` | `workload/_serving.py` | Submits each request to the host it *lands* on (the run wires client affinity) and then **follows the redirects**: route → prefill → decode, three charged client↔host round trips (`TOSO_CLIENT_RTT`, free by default). It is the only participant that receives the whole answer — the first token from the prefill host, the rest from the decode host — so the produced token count is a client-side join, exactly like the end-to-end latency it stamps. Where a request lands is a load balancer's answer and where it should *run* is the coordinator's — neither is a serving decision, so this is run wiring rather than capability code: a deployment deletes it and keeps the hosts. Reaches the runner through `ItemDispatch`, so wiring never has to declare itself a `DataPlane`. |
-| `make_workload` | `workload/_generator.py` | Seeded synthetic generator: shared system prompt + per-conversation context + unique query suffix, conversations chosen by a **Zipf** popularity law, **Poisson** arrivals. |
+| `make_workload` | `workload/_generator.py` | Seeded synthetic generator of **multi-turn conversations**: turn 1 is a shared system prompt + per-tenant context + a user message, and turn N+1 is turn N's whole sequence + turn N's **output** + a new message. A **Zipf** law over tenants decides how many turns each contributes; dialogue starts are **Poisson** and the pause between turns is exponential. One work item is a conversation, and its turns are serial. |
 | `Metrics` | `report/metrics.py` | Hit rate, compute/saved tokens, mean/p90 TTFT, fabric bytes, rejections, and decode-side TBT (`mean_tbt`, `pct_tbt`, `tbt_slo_met`, `wasted_prefills`, `decode_rejections`). |
 | scenarios | `workload/scenarios.py` | The six `realsim.demo.Scenario` subclasses. Each declares its `Run` values over one request stream and narrates the results; `Demo.main` executes them with `Run.execute()`. |
 
 ### The event flow
 
-1. **`make_workload`** produces a deterministic, arrival-sorted list of `Request`s.
-2. **`Runner.run`** releases each request at its arrival in `(arrival, id)` order;
-   on release
+1. **`make_workload`** produces a deterministic, arrival-sorted list of
+   `Conversation`s, each holding its turns (a `Request` and the user's pause in
+   front of it).
+2. **`Runner.run`** releases each *conversation* at its first turn's arrival in
+   `(arrival, id)` order, and the client walks that dialogue's turns one at a time
+   -- turn N+1 contains turn N's output, so it cannot be submitted until turn N has
+   answered. Per turn,
    **`scheduler.schedule(request, now)`** runs (serialized like the Monarch actor
    mailbox — consistent directory snapshot): query `prefix_lengths` for the best
    match, predict TTFT per instance (`queue + transfer + prefill(uncached)`), route

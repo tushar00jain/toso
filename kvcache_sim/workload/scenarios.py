@@ -55,8 +55,8 @@ __all__ = [
 TRACE_LIMIT = 60
 
 
-def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
-    """One labelled configuration over ``requests``.
+def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
+    """One labelled configuration over ``conversations``.
 
     Every kvcache run is built here -- by the scenarios below and by the tests --
     so the trace format and the metrics ledger a run reports into are chosen once
@@ -78,7 +78,7 @@ def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     profile = knobs.pop("profile", _KV_INSTANCE_PROFILE)
     return Run(
         label,
-        KVWorkload(topology, requests),
+        KVWorkload(topology, conversations),
         # One control plane, reached from both services: it decides compute
         # placement through the coordinator seam, and answers the store's routing
         # question through the directory it is installed in.
@@ -140,8 +140,32 @@ _KV_INSTANCE_PROFILE = replace(
 # In blocks, converted to the volume's byte capacity. The smallest must still fit
 # one request's own blocks: a volume now enforces a real limit rather than a model
 # one, so a put that cannot fit even after evicting everything is refused, not
-# absorbed. The largest prompt here is system(2) + conversation(4) + query(2).
-EVICTION_CAPACITIES = (8, 16, 32, 64, 128, 256)
+# absorbed.
+#
+# That constraint is what moved the floor from 8 to 48, and the input to it is what
+# changed rather than the rule. The largest prompt here used to be
+# system(2) + conversation(4) + query(2) = 8 blocks; a conversation's last turn now
+# carries its whole history, so it is system(2) + conversation(4) + 8 turns of
+# (query(2) + one block of output) minus the first turn's output = 29 blocks -- and
+# the floor has to clear that with room for another request's reads to interleave,
+# not merely equal it (32 does not; 48 does).
+#
+# Below that floor the sweep stops measuring eviction and starts measuring
+# something this model does not do correctly, which is worth naming because it is a
+# real hole rather than a tuning matter. A publish is one ``put_batch``, and
+# torchstore registers a batch's keys with the directory *after* every one of them
+# has landed -- while the volume evicts, and reports its evictions, key by key as
+# they land. So a volume with less slack than the batch is writing drops a key out
+# of the batch it is still landing, reports that drop before the key has ever been
+# registered, and is then registered for it anyway. The directory ends the run
+# naming a volume for blocks that volume threw away, which routes a later read at
+# nothing. It is self-healing in behaviour (the read raises and the request
+# recomputes, the ``RESTALE`` path) and it is not self-healing in the directory,
+# and closing it means changing when a batch is registered, which is upstream of
+# this repo. What this constant can do is keep the sweep in the regime it is about:
+# a request's own working set fits, and what is measured is whether everybody
+# else's does.
+EVICTION_CAPACITIES = (48, 64, 96, 128, 192, 256)
 
 
 
@@ -183,19 +207,25 @@ class SharedPrefix(Scenario):
 
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
-        reqs = _shared_prefix_workload(self.seed)
+        convs = _shared_prefix_workload(self.seed)
         return [
-            _configure("cache_aware", topo, reqs, "cache_aware"),
-            _configure("load_balance", topo, reqs, "load_balance"),
+            _configure("cache_aware", topo, convs, "cache_aware"),
+            _configure("load_balance", topo, convs, "load_balance"),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("SHARED PREFIX: conversations sharing a hot system prompt + context")
         console.info("directory: real torchstore.controller.Controller (off-actor)")
-        console.info("4 instances (2 nodes), 200 requests, 8 conversations, Zipf skew.")
-        console.info("Cache-aware routes same-prefix requests to the instance holding the")
-        console.info("prefix (or pulls it once), so shared prefixes are computed ~once;")
-        console.info("load-balance scatters them, recomputing prefixes on every instance.")
+        console.info("4 instances (2 nodes), 200 turns over 30 multi-turn conversations")
+        console.info("(<=8 turns each, Zipf skew over how many turns a tenant contributes).")
+        console.info("Turn N+1 is turn N's prompt plus turn N's OUTPUT plus a new message, so")
+        console.info("the reusable prefix grows every turn and the last turn of a dialogue is")
+        console.info("31 blocks against the first turn's 10. Cache-aware routes a turn to the")
+        console.info("instance holding that history (or pulls it once), so a conversation is")
+        console.info("prefilled ~once; load-balance scatters the turns, recomputing the whole")
+        console.info("history on whichever instance it lands on -- which is why the gap here")
+        console.info("is far wider than it was on a single-turn stream: what a miss costs now")
+        console.info("grows with the conversation.")
         console.trace(results[0].trace, limit=TRACE_LIMIT)
         console.summary(CacheVsBaselineReport("shared_prefix", results))
 
@@ -211,14 +241,14 @@ class Eviction(Scenario):
 
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
-        reqs = make_workload(
+        convs = make_workload(
             num_requests=400, num_conversations=12, system_blocks=2,
             conv_base_blocks=4, query_blocks=2, zipf_s=1.05, arrival_rate=2.5,
             block_tokens=BLOCK_TOKENS, output_tokens=64, seed=self.seed,
         )
         return [
             _configure(
-                str(cap), topo, reqs, "cache_aware",
+                str(cap), topo, convs, "cache_aware",
                 profile=replace(
                     DEFAULT_PROFILE,
                     storage_capacity_bytes=DEFAULT_MODEL.block_bytes(
@@ -231,10 +261,13 @@ class Eviction(Scenario):
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("EVICTION: hit rate vs cache capacity (LRU)")
-        console.info("400 requests, 12 conversations. As per-instance capacity grows, the")
+        console.info("400 turns over 55 conversations. As per-instance capacity grows, the")
         console.info("hot working set fits and the prefix hit rate rises, then plateaus")
-        console.info("(the ~30%%->~50%% shape). Too-small caches also force more KV")
+        console.info("(the ~55% -> ~83% shape). Too-small caches also force more KV")
         console.info("re-fetch (fabric).")
+        console.info("The sweep starts at 48 blocks rather than 8 because a conversation's")
+        console.info("last turn is a 29-block chain: below that a volume cannot hold one")
+        console.info("request's own working set and the curve stops being about eviction.")
         console.info("")
         console.info(EvictionReport(results).render())
 
@@ -249,24 +282,39 @@ class Hotspot(Scenario):
 
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
-        reqs = _hotspot_workload(self.seed)
+        convs = _hotspot_workload(self.seed)
         return [
-            _configure("baseline", topo, reqs, "load_balance"),
-            _configure("no_replication", topo, reqs, "cache_aware", replicate=False),
-            _configure("replication", topo, reqs, "cache_aware",
+            _configure("baseline", topo, convs, "load_balance"),
+            _configure("no_replication", topo, convs, "cache_aware", replicate=False),
+            _configure("replication", topo, convs, "cache_aware",
                  balance_threshold=1.2, replicate=True),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
-        console.section("HOTSPOT: extreme skew -> hot-block replication spreads load")
-        console.info("One dominant conversation. Without replication (balance_threshold huge)")
-        console.info("the cache-aware policy piles every hot request on the single instance")
-        console.info("holding the prefix; with a moderate threshold it replicates the prefix")
-        console.info("to peers (read-through), spreading load and cutting p90 TTFT.")
+        console.section("HOTSPOT: extreme skew -> hot-block replication trades compute for KV")
+        console.info("One dominant tenant (Zipf s=2.2 over 4 ranks, so rank 0 draws ~3 turns in")
+        console.info("4), 21 dialogues. Both cache-aware columns route a turn to whoever holds")
+        console.info("its history and beat the load-balancing baseline 2.7-3.9x on TTFT.")
+        console.info("Replication (balance_threshold 1.2) additionally spreads a shared prefix")
+        console.info("to peers read-through, buying strictly less recompute and paying for it")
+        console.info("in KV fabric bytes.")
         console.trace(results[2].trace, limit=TRACE_LIMIT)
         console.summary(HotspotReport(results))
         console.info("(replication swaps recompute for cheap KV transfer when spreading a")
         console.info(" hot prefix to a peer -> fewer prefill tokens, more fabric bytes.)")
+        console.info("A CLAIM WITHDRAWN, and it is the one this scenario used to lead with:")
+        console.info("that replication also cuts p90 TTFT. It does not on a multi-turn stream")
+        console.info("-- it wins on some seeds and loses on others, and the TTFT columns above")
+        console.info("are noise between the two cache-aware runs. The hotspot it was spreading")
+        console.info("was an artifact of one-shot requests: a dominant *conversation* whose")
+        console.info("every request carried one identical fixed prefix really did pile onto the")
+        console.info("single instance holding it. A dominant *tenant* is many dialogues, each")
+        console.info("with its own growing history, so cache-aware routing already scatters")
+        console.info("them and there is no pile left to spread; what they still share is the")
+        console.info("12-block opening, a shrinking fraction of a prompt that grows. This is")
+        console.info("not retuned to look otherwise: restoring the phenomenon means a workload")
+        console.info("with one very long dialogue, which is a scenario change to argue for")
+        console.info("separately.")
 
 
 class Overload(Scenario):
@@ -279,22 +327,27 @@ class Overload(Scenario):
 
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
-        reqs = make_workload(
+        convs = make_workload(
             num_requests=300, num_conversations=6, system_blocks=6,
             conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=9.0,
             block_tokens=BLOCK_TOKENS, output_tokens=64, seed=self.seed,
         )
         slo = 6.0
         return [
-            _configure("cache_aware", topo, reqs, "cache_aware", slo_ttft=slo),
-            _configure("load_balance", topo, reqs, "load_balance", slo_ttft=slo),
+            _configure("cache_aware", topo, convs, "cache_aware", slo_ttft=slo),
+            _configure("load_balance", topo, convs, "load_balance", slo_ttft=slo),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
         console.section("OVERLOAD: high arrival + TTFT SLO -> rejections")
-        console.info("300 requests at a high rate with a TTFT SLO of 6.0. Prefix reuse")
-        console.info("shortens prefill, freeing capacity, so cache-aware admits more")
-        console.info("requests (fewer rejections) than the load-balancing baseline.")
+        console.info("300 turns over 39 conversations at a high rate, TTFT SLO 6.0. Prefix")
+        console.info("reuse shortens prefill, freeing capacity, so cache-aware admits more")
+        console.info("requests (fewer rejections) than the load-balancing baseline. Multi-turn")
+        console.info("widens that gap: what the baseline recomputes on a miss is a whole")
+        console.info("conversation, so it sheds ~28% more of the same offered load.")
+        console.info("A refused turn does not end its conversation -- the next turn is offered")
+        console.info("anyway -- so both columns are shedding from the same 300, which is what")
+        console.info("makes the counts comparable.")
         console.summary(CacheVsBaselineReport("overload", results))
 
 
@@ -314,7 +367,7 @@ class Disaggregation(Scenario):
 
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)  # s0..s3
-        reqs = make_workload(
+        convs = make_workload(
             num_requests=120, num_conversations=8, system_blocks=2,
             conv_base_blocks=2, query_blocks=1, zipf_s=1.1, arrival_rate=1.2,
             block_tokens=BLOCK_TOKENS, output_tokens=12, seed=self.seed,
@@ -324,9 +377,9 @@ class Disaggregation(Scenario):
             max_batch=DISAGG_MAX_BATCH,
         )
         return [
-            _configure("disaggregated", topo, reqs, "cache_aware",
+            _configure("disaggregated", topo, convs, "cache_aware",
                  prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], **common),
-            _configure("coupled", _subset(topo, ["s2", "s3"]), reqs, "cache_aware",
+            _configure("coupled", _subset(topo, ["s2", "s3"]), convs, "cache_aware",
                  coupled=True, **common),
         ]
 
@@ -352,13 +405,16 @@ class Disaggregation(Scenario):
         console.info("(coupled picks a decode host by load, not by who prefilled). It delays")
         console.info("every request without widening any inter-token gap, so it shows up in")
         console.info("neither TBT column -- it shows up end to end, which the client measures")
-        console.info("from arrival to last token and which is ~a quarter of the disaggregated")
+        console.info("from arrival to last token and which is more than half the disaggregated")
         console.info("column. That is the trade, and it changes sign: disaggregation wins every")
-        console.info("per-token number here and loses the wall clock to pay for it.")
+        console.info("per-token number here and loses the wall clock to pay for it. Both halves")
+        console.info("grew with multi-turn, because what a handoff moves is the conversation's")
+        console.info("whole history and that is what now grows: ~2.3x the handoff bytes of the")
+        console.info("single-turn stream for the same 120 requests.")
         console.info("The decode KV row is the other half of that bill, and it is memory rather")
         console.info("than time: a decode host holds the chain it pulled in AND the KV its")
         console.info("generation appends, so it accumulates blocks it never prefilled. The")
-        console.info("disaggregated column holds ~2.7x the coupled one for the same load --")
+        console.info("disaggregated column holds ~3x the coupled one for the same load --")
         console.info("coupling decodes most requests where they were prefilled, so the chain is")
         console.info("already there and only the generated blocks are new. Neither runs out of")
         console.info("room at this capacity; a decode pool sized for its own KV and not for")
@@ -375,7 +431,7 @@ class EarlyRejection(Scenario):
 
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
-        reqs = make_workload(
+        convs = make_workload(
             num_requests=160, num_conversations=6, system_blocks=6,
             conv_base_blocks=4, query_blocks=2, zipf_s=1.3, arrival_rate=20.0,
             block_tokens=BLOCK_TOKENS, output_tokens=32, seed=self.seed,
@@ -384,7 +440,7 @@ class EarlyRejection(Scenario):
             simulate_decode=True, slo_tbt=EARLY_SLO_TBT, max_batch=EARLY_MAX_BATCH
         )
         return [
-            _configure(mode, topo, reqs, "cache_aware", early_rejection=mode, **common)
+            _configure(mode, topo, convs, "cache_aware", early_rejection=mode, **common)
             for mode in ("off", "early", "predict")
         ]
 
@@ -396,19 +452,29 @@ class EarlyRejection(Scenario):
         console.info("prefill and rejects on a violation -- so each rejection is a wasted")
         console.info("prefill (compute already spent). 'early' and 'predict' both gate at")
         console.info("routing, before prefill, so neither ever wastes prefill; here neither")
-        console.info("rejects (both admit all). The difference is decode routing: 'early' uses")
-        console.info("the current occupancy, which a slow prefill leaves reading ~empty, so it")
-        console.info("piles decode onto one instance and blows the SLO; 'predict' routes by the")
-        console.info("load foreseen at prefill completion, spreading decode so the SLO holds.")
+        console.info("rejects (both admit all), so both serve strictly more of the offered")
+        console.info("load. That is the whole of what separates them here.")
         console.trace(results[2].trace, limit=TRACE_LIMIT)
         console.summary(EarlyRejectionReport(results, EARLY_SLO_TBT))
-        console.info("(Signal: wasted prefill separates 'off' from the rest; TBT attainment")
-        console.info(" separates 'predict' (routes on predicted load) from 'early' (stale).)")
+        console.info("(Signal: wasted prefill separates 'off' from the rest.)")
+        console.info("A CLAIM WITHDRAWN: that TBT attainment also separates 'predict' (routes")
+        console.info("on the load foreseen at prefill completion) from 'early' (routes on a")
+        console.info("current occupancy a slow prefill leaves reading empty). It does not on a")
+        console.info("multi-turn stream, and the reason is structural rather than a matter of")
+        console.info("degree. A conversation is a closed loop -- a user cannot send turn N+1")
+        console.info("before turn N answers -- so at most one request per open dialogue is ever")
+        console.info("in flight, and this scenario's 160 turns arrive as ~22 concurrent")
+        console.info("conversations instead of as a burst at rate 20. Occupancy is then never")
+        console.info("far from what a stale snapshot reports, the two policies route almost")
+        console.info("identically, and across four seeds the attainment gap is noise whose sign")
+        console.info("changes. Restoring the mechanism means offering the concurrency these")
+        console.info("constants intended -- many more, shorter conversations -- and no such")
+        console.info("change tried so far restores it across seeds, so it is left broken and")
+        console.info("said out loud rather than tuned into looking fixed.")
         console.info("The decode KV row is a third, unlooked-for difference between them, and")
         console.info("it is the cost of the routing each one picked: a request decoded away")
-        console.info("from its prefill host drags that host's whole 12-block chain onto the")
-        console.info("decode host's volume and leaves it there. 'early' pays it on nearly every")
-        console.info("request, 'predict' on very few -- routing by foreseen load happens to keep")
-        console.info("decode where the prompt already is -- so 'predict' holds the SLO AND moves")
-        console.info("a third of the KV. This capacity pressure is real: these volumes do evict")
-        console.info("under it, which the eviction sweep would show if it modelled decode.")
+        console.info("from its prefill host drags that host's whole chain onto the decode")
+        console.info("host's volume and leaves it there, and that chain is now a conversation's")
+        console.info("history rather than a fixed 12 blocks. This capacity pressure is real:")
+        console.info("these volumes do evict under it, which the eviction sweep would show if")
+        console.info("it modelled decode.")

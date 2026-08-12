@@ -41,15 +41,16 @@ block's tokens, this one concatenates a counter onto the prompt's last key, and
 the sharing structure it produces is the structure a content hash would produce
 over the same segments.
 
-What it deliberately does not claim is that anything in *this* workload will look
-those keys up. A multi-turn front end submits turn N+1 as "prompt + turn N's
-output + the new query", so turn N+1's chain really does walk through turn N's
-generated blocks and really would hit them -- but the generator here builds each
-request's prompt from fixed conversation segments plus a fresh query and never
-splices a previous turn's output in (:mod:`kvcache_sim.workload._generator`). So
-the entries a decode host publishes are findable and nothing looks for them. That
-is a workload gap, stated rather than papered over, and it is the reason
-publishing costs capacity here without yet buying a hit rate.
+And something *does* look them up. This used to carry a caveat saying nothing
+did: the generator built every request from fixed conversation segments plus a
+fresh query, so a decode host published entries no later prompt ever walked, and
+generated KV cost capacity without buying a hit rate. The workload is multi-turn
+now (:mod:`kvcache_sim.workload._generator`) -- turn N+1 is "turn N's prompt +
+turn N's output + the new message" -- and it builds the middle of that chain by
+calling this very method on turn N rather than re-deriving the same strings from
+a parallel rule. So the keys a decode host publishes and the keys the next turn
+matches against are the same strings by construction, and cannot drift into
+agreeing about nothing.
 """
 
 from __future__ import annotations
@@ -93,9 +94,13 @@ class Request:
     #: the same request is the id and the chain, not a bytewise read of the
     #: prompt, which for a meta tensor is not even possible.
     prompt: torch.Tensor = field(compare=False)
-    #: Which conversation this request continues. Not used to find a *cache* --
-    #: that is what the block keys are for -- but a real front end has it (a
-    #: session or tenant id) and uses it to pick which host a request lands on.
+    #: Which conversation this request continues -- a *turn* of it, since the
+    #: workload is multi-turn and a later turn's ``block_keys`` contain an earlier
+    #: one's. Not used to find a *cache*: that is what the block keys are for, and
+    #: they say far more than this string can, because two turns of one dialogue
+    #: share a prefix and two dialogues of one tenant share only its opening. What
+    #: a real front end uses it for, and what it is used for here, is picking which
+    #: host a request lands on (a session or tenant id).
     conversation: str = ""
 
     def __post_init__(self) -> None:
@@ -122,12 +127,23 @@ class Request:
     def continuation_keys(self, count: int) -> Tuple[str, ...]:
         """``count`` directory keys continuing this prompt's chain past its end.
 
-        What the decode host publishes its **generated** KV under. The prompt's
-        last key names the whole prompt, so ``continuation_keys(2)`` answers
+        What the decode host publishes its **generated** KV under -- and what the
+        *next turn of the same conversation* splices into the middle of its own
+        chain, because a later sequence that really did continue this one is
+        exactly what the next turn is. The prompt's last key names the whole
+        prompt, so ``continuation_keys(2)`` answers
         ``("<last>|g1", "<last>|g1|g2")``: each key contains the entire prefix
         before it, which is the one property that makes a prefix-hash chain work
         -- a later sequence that really did continue this one walks the same keys
         and stops where they stop.
+
+        Two callers, therefore, and it matters that they are the same method: the
+        decode host writing (:meth:`kvcache_sim.data.serving.ServingHost.decode`)
+        and the workload building turn N+1 out of turn N
+        (:mod:`kvcache_sim.workload._generator`). A generator that spelled these
+        keys out itself would be a second definition of one name, and the two
+        would be free to disagree silently -- the reader would simply find
+        nothing, which is indistinguishable from a cache that had evicted it.
 
         **Synthetic, and it says so in the name of the segment.** A real chain
         hashes each block's token ids; this run's tokens are ``device="meta"`` and
