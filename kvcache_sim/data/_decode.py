@@ -59,6 +59,24 @@ answers at the last token. Handing each token out as it is produced is a differe
 API (a channel, a consumer that keeps up) and would change nothing this model
 measures: the inter-token gaps are recorded per step either way, and the client's
 end-to-end stamp is taken at the last token in both.
+
+...and so is the KV those tokens left behind
+--------------------------------------------
+Which is the other thing a decode step produces and the thing this engine used to
+pretend was free. Every generated token is fed back in at the next step and leaves
+a position of KV on the host that generated it, so a request that decodes here
+grows *this host's* cache -- and until :class:`Generated` carried them, it did not:
+a volume only ever held blocks a prefill had published, decode consumed compute and
+no bytes, and a bounded cache could be decoded into forever without once being
+pressured. Every eviction and hit-rate number a decode-simulating run produced was
+flattered by exactly that missing residency.
+
+So finishing hands over the KV as well as the tokens, in whole blocks
+(:meth:`kvcache_sim.data._compute.Accelerator.generated_kv`), and the host
+publishes it. The host and not this engine, for the reason the prefill engine does
+not publish either: a store call is the host's, this object owns a batch and a
+compute timeline and reaches nothing off this box. What the two of them together
+now say is that a decode host pays for what it generates.
 """
 
 from __future__ import annotations
@@ -72,7 +90,32 @@ import torch
 from ..control.request import Request
 from ._compute import Accelerator
 
-__all__ = ["DecodeEngine"]
+__all__ = ["DecodeEngine", "Generated"]
+
+
+@dataclass(eq=False)
+class Generated:
+    """What a decode batch produced for one request: its tokens and its KV.
+
+    The value :meth:`DecodeEngine.admit`'s completion resolves with. Two lists of
+    ``torch.Tensor`` and therefore a named pair rather than a 2-tuple: a caller
+    that unpacked them the wrong way round would publish tokens under block keys
+    and answer the client with KV, and both halves would typecheck all the way
+    down. The names are the whole of what this class adds, and that is enough.
+
+    ``eq=False`` for the reason :attr:`_Active.tokens` carries ``compare=False``:
+    a generated ``__eq__`` would compare tensors elementwise and answer with a
+    tensor, so the first ``==`` anywhere would raise "Boolean value of Tensor is
+    ambiguous". Nothing compares these -- a caller reads the two fields -- so the
+    method is removed rather than made to work.
+    """
+
+    #: One token per decode step this request was in, in order: the request's
+    #: output minus the first, which prefill produced.
+    tokens: List[torch.Tensor]
+    #: The KV those tokens left on the decode host, in whole blocks. Empty when
+    #: no step ran. What makes decode cost memory (see the module docstring).
+    kv: List[torch.Tensor]
 
 
 @dataclass
@@ -181,13 +224,14 @@ class DecodeEngine:
 
         The first token was produced by prefill (TTFT); decode generates the
         remaining ``output_tokens - 1``. A request with <= 1 output token needs no
-        decode and finishes immediately -- with an empty list, which is the truthful
-        answer rather than a special case: there was nothing left to generate, so
-        this engine generated nothing.
+        decode and finishes immediately -- with an empty :class:`Generated`, which
+        is the truthful answer rather than a special case: there was nothing left to
+        generate, so this engine generated no tokens and left no KV behind them.
 
-        The answer is a future resolved with **the tokens this engine generated**,
-        when this request emits its last token, and it is the reason admission is
-        not fire-and-forget any more.
+        The answer is a future resolved with a :class:`Generated` -- **the tokens
+        this engine produced and the KV they left on this host** -- when this
+        request emits its last token, and it is the reason admission is not
+        fire-and-forget any more.
         Decode used to outlive its caller: ``admit`` returned as soon as the
         request had a slot, the step loop ran on as a separate task, and the run
         needed a drain hook to keep the loop alive for the tail nobody was waiting
@@ -214,6 +258,8 @@ class DecodeEngine:
             # Never in the batch, so never in a step: retired here, on the same
             # clock instant it arrived. The caller still gets a future rather than
             # a special case, and awaiting an already-resolved one costs nothing.
+            # No step also means no position of KV, which is why ``_finish``
+            # derives the blocks from the tokens rather than being handed them.
             self._finish(request, 0.0, done, [])
             return done
         a = _Active(
@@ -237,7 +283,7 @@ class DecodeEngine:
         done: "asyncio.Future",
         tokens: List[torch.Tensor],
     ) -> None:
-        """Retire one request: report it, then hand its tokens to whoever admitted it.
+        """Retire one request: report it, then hand over what it produced.
 
         The order is the whole reason this is a method and not two lines at each
         of its two call sites. ``on_finish`` is how this host's half of the
@@ -252,6 +298,16 @@ class DecodeEngine:
         request with nothing to decode is retired inside :meth:`admit` before one
         exists, and its answer is an empty list.
 
+        The **KV** is derived from them here rather than passed in beside them, and
+        that is the one place the two differ. A token is produced per step and has
+        to be accumulated as the steps land, because nothing else remembers it; the
+        KV of those same positions is a function of how many there were, so asking
+        the accelerator once at the end is the same answer as asking it per step and
+        appending -- with one call instead of ``n``, and with no second per-slot
+        list that could disagree with the first about how many tokens this request
+        emitted. ``len(tokens)`` *is* the number of positions the generation
+        appended, so there is only one count in play.
+
         ``set_result`` is unguarded on purpose: a second retirement of the same
         request raises :class:`asyncio.InvalidStateError` here rather than
         silently overwriting a measurement, and that is a batch-accounting bug
@@ -259,7 +315,9 @@ class DecodeEngine:
         """
         if self.on_finish is not None:
             self.on_finish(request, tbt)
-        done.set_result(tokens)
+        done.set_result(
+            Generated(tokens=tokens, kv=self.compute.generated_kv(len(tokens)))
+        )
 
     def _ensure_stepping(self) -> None:
         """Start the decode-step loop unless one is already running."""

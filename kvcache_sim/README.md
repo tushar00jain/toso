@@ -35,7 +35,9 @@ It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsi
   content, so the chain is still generated alongside the prompt rather than derived
   from it — the same compromise the KV blocks make (real object, real shape, no data).
   Not streaming: decode answers with the remaining tokens when the request finishes,
-  which is the `stream=False` shape.
+  which is the `stream=False` shape. Decode answers with the **KV** those tokens left
+  behind as well (`Accelerator.generated_kv`), because that is what makes generating
+  cost memory on the host generating it — see the decode-residency bullet below.
 - **Real cost model.** Every duration -- prefill compute, decode-step time, and the
   fabric/storage/RAM cost of a KV fetch -- is charged through
   `sim_common.cost_model` from a target-machine `MachineProfile`, never measured on
@@ -98,12 +100,18 @@ python -m kvcache_sim --help            # usage + valid scenario names
   a real `get_batch` of its whole block chain to reach the host that decodes it, the
   `KV handoff bytes` row is what that moves and the `end-to-end` rows are what it
   costs. Read together they are the actual trade — the disaggregated column wins every
-  per-token metric and loses the wall clock.
+  per-token metric and loses the wall clock. The `decode KV blocks` row is the same
+  bill in memory: a decode host keeps the chain it pulled in *and* the KV it
+  generated, so the disaggregated pool accumulates ~2.7x the blocks the coupled one
+  does for identical load.
 - **early_rejection** — heavy decode load under a tight TBT SLO, comparing admission
   policies `off`/`early`/`predict`. `off` late-checks decode load after prefill and so
   wastes prefill on rejects; `early`/`predict` gate before prefill (no waste), but only
   `predict` routes decode by the load foreseen at prefill completion, so it holds the
-  SLO where `early`'s stale snapshot cannot.
+  SLO where `early`'s stale snapshot cannot. The `decode KV blocks` row separates them
+  a third way, unlooked-for: routing by foreseen load happens to keep decode where the
+  prompt already is, so `predict` moves a third of the KV `early` does (520 vs 1600
+  blocks) while holding the SLO.
 
 ## Testing
 
@@ -223,13 +231,15 @@ kvcache_sim/
                           #   this -- answered with an address, not a forward),
                           #   prefill (real pull, compute, publish -> answered
                           #   with the FIRST token and the decode host's address)
-                          #   and decode (fetch the KV back out of the store,
-                          #   batch it -> answered with the remaining tokens). No
+                          #   and decode (fetch the KV back out of the store and
+                          #   become resident for it, batch it -> answered with
+                          #   the remaining tokens, publish what they left). No
                           #   host holds a reference to another host
     _compute.py           #   Accelerator: the port an engine runs its work on --
                           #   what it costs, making it take that long, the KV and
                           #   first token a forward pass over a prompt hands back,
-                          #   the token a decode step emits per batch member, and
+                          #   the token a decode step emits per batch member, the
+                          #   KV a generation leaves behind it, and
                           #   the one occupancy both engines book on. Both engines
                           #   get one; the SAME one is what coupling means
     _prefill.py           #   PrefillEngine: what a forward pass costs and
@@ -239,9 +249,10 @@ kvcache_sim/
                           #   the device, so the wait is measured rather than
                           #   taken from control's forecast
     _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT,
-                          #   and the tokens each member generated, handed to
-                          #   whoever admitted it (all three underscored: nothing
-                          #   outside data/ drives them)
+                          #   and the tokens each member generated plus the KV
+                          #   they left on this host, handed to whoever admitted
+                          #   it (all three underscored: nothing outside data/
+                          #   drives them)
     store.py              #   publish / reuse / fetch over a Deployment's clients,
                           #   moving whatever KV it is handed. It holds no notion
                           #   of what a block is or how big one is -- that is the
@@ -377,11 +388,12 @@ plus the prefix-run read that express KV caching on a mesh.
   reported in no table, visible only as an indirect nudge to *when* requests joined
   their batches. The `mean/p90 end-to-end` rows are the fix — arrival to last token,
   measured by the client, the only interval that contains the handoff by construction.
-  On the disaggregation scenario it is **~32% of the mean** (1.269 charged vs 0.860
-  with the transfer made free), against ~1% for the coupled run, which mostly decodes
-  where it prefilled and pays nothing. It is also enough to flip the comparison:
-  disaggregation wins TBT (0.029 vs 0.146) and *loses* end-to-end (1.269 vs 1.126),
-  which is the trade a dedicated decode pool actually makes.
+  On the disaggregation scenario the transfer itself is **~0.41s, ~26% of the 1.573
+  mean** (it was ~32% before the decode side started paying for its own residency,
+  which added 0.31s of local writes to the same column), against ~1% for the coupled
+  run, which mostly decodes where it prefilled and pays nothing. It is also enough to
+  flip the comparison: disaggregation wins TBT (0.028 vs 0.147) and *loses* end-to-end
+  (1.573 vs 1.212), which is the trade a dedicated decode pool actually makes.
   Folding the handoff into TBT instead was tried: the first token
   comes from the prefill host, so the transfer arguably *is* an inter-token gap. It
   takes both disaggregation columns to `0.0%` attainment against a target of five
@@ -389,6 +401,36 @@ plus the prefix-run read that express KV caching on a mesh.
   finding, and it is not how the disaggregation literature measures either
   (DistServe/Mooncake put KV migration in TTFT and keep TPOT for decode cadence). So:
   charged on the clock, its bytes in their own column, its time in end-to-end.
+- **A decode host holds KV, so a decode host now pays for it.** Two things land on a
+  decode host and neither used to touch its volume: the block chain it pulls in to
+  attend over (a `get_batch` delivers bytes and stores nothing) and the KV its own
+  generation appends (one position per step, `ceil(n / block_tokens)` blocks, the
+  trailing partial one charged whole because a paged cache allocates whole blocks).
+  So decoding was free in capacity terms — a host could pull every chain it ever
+  served and generate forever inside a bounded volume without pressuring it, and
+  every eviction, hit-rate and capacity number a decode-simulating run reported was
+  flattered by exactly that. Both are now published on the decode host through the
+  same `publish` the prefill side uses, under the prompt's keys and under keys
+  continuing its chain (`Request.continuation_keys`) respectively, and both are
+  evictable and refusable like anything else there. Published rather than held as
+  unlookupable residency, for the same reason the prefill leg publishes a prefix it
+  pulled: a host that holds a block says so, and the alternative is a second kind of
+  occupancy the directory cannot see. Two consequences, both real: the decode host
+  becomes a **replica** (a read-through cache, which is what the hotspot scenario's
+  `replicate=True` buys deliberately on the prefill side), and decode **competes**
+  with cached prefixes for the volume. What moved: `disaggregation` end-to-end
+  1.266 → 1.573 and `early_rejection`'s wasted prefills 23 → 19 with SLO attainment
+  28.5% → 32.6% (`off`), 23.8% → 28.7% (`early`), 81.9% → 80.6% (`predict`) — the
+  admission moves are second-order, from decode admissions landing at different
+  instants, and nearly all of it is the *chain* rather than the generation (which is
+  one block per request at this block size). The four prefill-only scenarios are
+  byte-identical, because a run that does not model decode never reaches a decode
+  host. Two limits, stated rather than fixed: the generation's bytes are charged when
+  it ends rather than as it grows (a publish inside the step loop would stall every
+  other batch member and invent a TBT effect the hardware does not have), and nothing
+  in this workload ever *looks up* a continuation key — a real multi-turn front end
+  submits turn N+1 as prompt + turn N's output + a new query, and the generator here
+  does not splice a previous turn's output in.
 - **End-to-end is measured only where there is a last token to measure to.** The four
   prefill-only scenarios (`shared_prefix`, `eviction`, `hotspot`, `overload`) do not
   model decode, so the client's walk ends at prefill completion; stamping *that* under

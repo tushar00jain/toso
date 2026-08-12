@@ -26,9 +26,10 @@ it is the shape that made a host need a reference to another host.
 So the join lives here instead, which is where every real system puts it: hosts
 emit what they observed, keyed by request id, and the collector assembles the row.
 :meth:`Metrics.add` is the first writer (the prefill host, or the routing host on a
-rejection) and :meth:`Metrics.handed_off` / :meth:`Metrics.decoded` are the second
-(the decode host), each amending the row the first created. They fail loudly on an
-id nobody opened, because a decode with no prefill is a wiring bug, not a metric.
+rejection) and :meth:`Metrics.handed_off` / :meth:`Metrics.decode_resident` /
+:meth:`Metrics.decoded` are the second (the decode host), each amending the row the
+first created. They fail loudly on an id nobody opened, because a decode with no
+prefill is a wiring bug, not a metric.
 
 There is a third writer, and it is not a host: :meth:`Metrics.completed` is the
 **client's**, and carries the two numbers no host can produce. A request's end-to-end
@@ -105,6 +106,23 @@ class RequestResult:
     decode: str = ""                 # the instance that actually decoded it
     handoff_bytes: int = 0           # KV pulled out of the store to decode here
     handoff_missed: bool = False     # ...or the chain was gone and none was
+    #: KV blocks this request left **resident on its decode host**: the chain it
+    #: pulled in to decode over, plus the blocks its generation appended -- counting
+    #: only what the volume kept, since a refused block occupies nothing.
+    #:
+    #: Zero used to be the only value, for every request in every run, and that
+    #: was the flattery this column exists to remove -- a decode host fetched a
+    #: whole block chain that its volume never heard of and then generated more KV
+    #: on top of it, so decoding cost compute and no memory. It is also zero,
+    #: legitimately, for a request decoded on the host that prefilled it: those
+    #: blocks were already registered here by the prefill, so nothing became
+    #: resident that was not already.
+    decode_blocks: int = 0
+    #: Whether the decode host's volume had room for all of that. A cache fill is
+    #: allowed to fail; this is the decode-side twin of :attr:`published`, and the
+    #: difference between a decode pool that keeps what it serves and one that
+    #: cannot.
+    decode_unpublished: bool = False
     # -- and the client's ---------------------------------------------------- #
     #: Arrival to last token, measured by the client that walked the chain. Stays
     #: 0.0 where there is no last token to wait for: a run that does not model
@@ -181,6 +199,31 @@ class Metrics(Ledger):
         row.decode = decode
         row.handoff_bytes = nbytes
         row.handoff_missed = missed
+
+    def decode_resident(
+        self, request_id: str, blocks: int, *, published: bool
+    ) -> None:
+        """The decode host now holds ``blocks`` more blocks because of this request.
+
+        Called twice per cross-host decode -- once for the chain the host pulled in
+        and once for the KV its generation appended -- so it **accumulates** rather
+        than assigns. Two writers of one column would otherwise be one writer and
+        one silent overwrite, and which of the two won would depend on the order
+        the serving loop happens to publish in.
+
+        A refused set adds **nothing** to the count and raises the flag instead,
+        and the split is what makes the two columns readable side by side: the
+        count is how much of the volume decode is actually occupying -- a number a
+        capacity sweep adds up -- and blocks the volume threw back are not
+        occupying it. The flag is sticky in the other direction: any refusal marks
+        the request, because the question it answers is "did this decode host keep
+        everything this request made it hold", and a partial keep is a no.
+        """
+        row = self._open(request_id)
+        if published:
+            row.decode_blocks += blocks
+        else:
+            row.decode_unpublished = True
 
     def decoded(self, request_id: str, tbt: float) -> None:
         """The decode host emitted this request's last token at ``tbt`` worst gap."""
@@ -322,6 +365,27 @@ class Metrics(Ledger):
         return self.count(lambda r: r.decode_rejected)
 
     @property
+    def decode_blocks(self) -> int:
+        """KV blocks decode hosts became resident for (chains pulled + generated).
+
+        The size of the thing that used to be free. Kept apart from anything on the
+        prefill side because it answers a different sizing question: prefill's
+        publishes are the cache a run is *trying* to build, and this is the load
+        the decode side puts on the same volumes whether anybody reuses it or not.
+        """
+        return self.total("decode_blocks", _accepted)
+
+    @property
+    def decode_unpublished(self) -> int:
+        """Accepted requests whose decode host had no room for what it held.
+
+        The decode-side twin of :attr:`unpublished`. Non-zero says the decode pool
+        is smaller than the working set decoding on it, which a hit rate reports
+        only indirectly and a TBT column not at all.
+        """
+        return self.count(lambda r: r.accepted and r.decode_unpublished)
+
+    @property
     def unpublished(self) -> int:
         """Accepted requests whose computed prefix did not fit in the cache.
 
@@ -377,6 +441,14 @@ def render_disaggregation(disagg: Metrics, coupled: Metrics,
     prediction from before the handoff, TBT is the decode cadence from after it.
     Arrival to last token is the only interval that contains it -- so a run that
     moves three and a half times the KV can no longer look free.
+
+    The last two rows are the same bill in **memory**. A decode host holds the
+    chain it pulled in and the KV its generation appends, and both are registered
+    on its volume, so ``decode KV blocks`` is how much cache the decode side is
+    occupying that no prefill put there. ``decode KV no room`` is how often that
+    did not fit -- zero here, and worth showing anyway, because it is the number
+    that turns "the decode pool is undersized" from a hit rate somebody has to
+    interpret into a count.
     """
     def pct(x: float) -> str:
         return f"{100.0 * x:.1f}%"
@@ -400,6 +472,10 @@ def render_disaggregation(disagg: Metrics, coupled: Metrics,
         f"{coupled.handoff_bytes:>15}",
         f"  {'handoff misses':22}{disagg.handoff_misses:>15}"
         f"{coupled.handoff_misses:>15}",
+        f"  {'decode KV blocks':22}{disagg.decode_blocks:>15}"
+        f"{coupled.decode_blocks:>15}",
+        f"  {'decode KV no room':22}{disagg.decode_unpublished:>15}"
+        f"{coupled.decode_unpublished:>15}",
     ])
 
 
@@ -420,6 +496,12 @@ def render_early_rejection(off: Metrics, early: Metrics, predict: Metrics,
     whether that trade shows up in what a caller experienced. Note what it does
     *not* average over: a rejected request has no end-to-end latency at all, so
     ``off``'s column describes the requests it kept, not the ones it shed.
+
+    The decode-KV rows say what each policy's *routing* costs in cache. A request
+    decoded somewhere other than where it was prefilled drags its whole chain onto
+    the decode host's volume and leaves it there, so a policy that spreads decode
+    widely buys its TBT with somebody's capacity -- and the three columns differ by
+    more than 3x on it, which no other row in this table shows.
     """
     def pct(x: float) -> str:
         return f"{100.0 * x:.1f}%"
@@ -435,6 +517,8 @@ def render_early_rejection(off: Metrics, early: Metrics, predict: Metrics,
         row("accepted (decoded)", lambda m: len(m.accepted)),
         row("TBT SLO attainment", lambda m: pct(m.tbt_slo_met(slo))),
         row("mean end-to-end", lambda m: f"{m.mean_latency:.3f}"),
+        row("decode KV blocks", lambda m: m.decode_blocks),
+        row("decode KV no room", lambda m: m.decode_unpublished),
     ])
 
 

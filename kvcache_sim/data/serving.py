@@ -87,11 +87,38 @@ The lifecycle, once a host is prefilling:
 ...and then, on that host:
 
 7. fetch the request's KV out of the store (a **real** ``get_batch``, and under
-   disaggregation the dominant cost of the request);
+   disaggregation the dominant cost of the request), and **publish it here**,
+   because the bytes are now on this host and this host's volume has to know;
 8. admit it to the decode batch, record its inter-token gaps when the last token
-   lands -- and only then answer the client, with the tokens the batch generated.
-   That is what lets the client stamp arrival-to-last-token and what removed the
-   drain hook the run used to need.
+   lands, publish the KV the generation left behind -- and only then answer the
+   client, with the tokens the batch generated. That is what lets the client stamp
+   arrival-to-last-token and what removed the drain hook the run used to need.
+
+A decode host holds KV, so a decode host pays for it
+----------------------------------------------------
+Both of the new publishes in that list close the same hole, and it is worth
+naming as one thing rather than two. Everywhere else in this model, KV that lands
+on a host is registered on that host's volume: a prefill host publishes the suffix
+it computed *and* the prefix it pulled, because it holds both. The decode host was
+the sole exception -- it pulled an entire block chain in and generated more KV on
+top of it, and its volume knew about neither. So a decode host had unbounded free
+memory: it could hold every chain it ever decoded and generate forever, and no
+capacity, eviction or hit-rate number in a decode-simulating run ever felt it.
+
+Now it holds what it holds. The pulled chain is published when it lands and the
+generated blocks when the generation ends, both through the same
+:meth:`~kvcache_sim.data.store.KVStore.publish` the prefill side uses, both
+evictable by the same LRU, both refusable by the same bounded volume.
+
+Two consequences, and both are real rather than side effects to apologise for.
+The decode host becomes a **replica**: the directory now maps the chain to the
+prefill host *and* the decode host, so a later request can be routed to, or pull
+from, a host that only ever decoded that prefix. That is what a read-through
+cache is, and it is the same thing the hotspot scenario's ``replicate=True``
+already buys deliberately on the prefill side. And decode now **competes** for the
+volume with the cached prefixes on it, which is the whole point: on a bounded
+instance a decode pool that holds every chain it has ever served will evict the
+prefixes prefill is trying to reuse.
 
 Note what moved in that list. The wait used to be step 2, in front of the fetch,
 because that is where control's arithmetic puts it (it prices
@@ -575,13 +602,42 @@ class ServingHost:
         every block, not the ones that happened to be new.
 
         The KV that comes back is what the handoff is *measured* off -- the bytes
-        the transport just charged, added up off the tensors it returned. Beyond
-        that this method does nothing with it, and a deployment would: it would load
-        those blocks into the decode engine's paged cache and the batch would attend
-        over them. What is missing to do that here is a decode engine that holds KV
-        at all -- :class:`~kvcache_sim.data._decode.DecodeEngine` models a step's
-        *duration* and never touches a tensor -- so the honest thing is to say that
-        rather than to stash the list on an attribute nothing reads.
+        the transport just charged, added up off the tensors it returned -- and it
+        is then **published on this host**, which is the thing that used to be
+        missing. A ``get_batch`` delivers bytes to its caller and stores nothing, so
+        a decode host used to attend over an entire block chain that its own volume
+        had never heard of: no capacity consumed, no directory entry, no eviction
+        pressure, for KV it demonstrably had to be holding in order to decode at
+        all. Publishing it is the same rule the prefill leg already follows one step
+        earlier -- a host that pulled a prefix publishes it, because it holds it
+        (see the ``fresh`` list in :meth:`prefill`) -- applied to the one place in
+        the model that was exempt.
+
+        Publishing rather than an unlookupable residency, and the two questions
+        (this chain, and the blocks the generation adds below) get the same answer
+        because they are one question. A "resident but not registered" verb would
+        have to be invented, it is not what a KV cache does with a block it holds,
+        and it would make this method say two different things about two sets of
+        blocks sitting in one volume. What publishing costs is honesty about
+        replication: the directory now says two hosts hold this chain, which is
+        true, and control will route on it.
+
+        Kept afterwards rather than dropped when the request finishes. Both models
+        are defensible -- a real engine frees a finished sequence's blocks, and a
+        real engine with prefix caching keeps them and lets them age out -- and the
+        second is the one this model already implements for every other block it
+        holds: nothing here has a lifetime, the volume's LRU decides what survives,
+        and a decode host that just served a conversation's turn is exactly the host
+        that should still have that prefix when the next turn arrives. Dropping at
+        completion would also need a delete that deregisters (the volume's own
+        eviction path is the only thing in this system allowed to do that today) and
+        would model a decode pool that can never accumulate a working set, which is
+        the opposite of what a bounded decode pool is interesting for.
+
+        A local decode publishes nothing here, and that is not an omission: if this
+        host prefilled the request, the chain is already on this volume under these
+        keys and was already registered. The ``reuse`` touch below is the whole of
+        what is left to say -- the blocks were read, so the ranking should know.
 
         Unless it prefilled the request itself, which the plan says outright. Then
         the chain is already here -- this host computed it and published it -- and
@@ -626,7 +682,48 @@ class ServingHost:
         request decodes, the transfer is recorded as not having happened, and
         :attr:`~kvcache_sim.report.metrics.Metrics.handoff_misses` is the number
         that tells a run its decode pool is being fed by a cache too small to hold
-        the handoff.
+        the handoff. Nothing arrived, so nothing becomes resident either.
+
+        And the generation costs memory
+        -------------------------------
+        The last thing this method does before answering is publish the KV the
+        batch produced. Every generated token is fed back in at the next step and
+        leaves a position of KV behind it, so a request that generates ``n`` tokens
+        grows this host's cache by ``ceil(n / block_tokens)`` blocks
+        (:meth:`~kvcache_sim.data._compute.Accelerator.generated_kv`), under keys
+        that continue the prompt's chain
+        (:meth:`~kvcache_sim.control.request.Request.continuation_keys`). Before
+        this, decoding was free in capacity terms: a host could generate forever
+        inside a bounded volume without once pressuring it.
+
+        **After the last token, not during the generation**, and the choice is
+        about what a store call would do inside the step loop. Awaiting a publish
+        between two steps would stall *every other member of the batch* -- the loop
+        is one coroutine driving one accelerator -- so one request's cache write
+        would widen everybody's inter-token gap, which is a TBT effect the hardware
+        does not have: a real engine's attention kernel writes those blocks as it
+        computes them, and nothing extra happens at the end of the block. The cost
+        that is charged here is the store write, and it lands where the handoff
+        fetch lands -- on the clock, inside the client's arrival-to-last-token, in
+        neither TTFT (predicted before any of it) nor TBT (measured between steps).
+        What it costs to defer it is intra-generation residency: a generation long
+        enough to fill blocks mid-flight is under-charged until it ends. No
+        scenario here generates the 512 tokens that would take, so the two
+        placements are the same run today and the simpler one is written.
+
+        That placement also settles what happens when the generated KV does **not**
+        fit. It is a cache fill like any other -- ``publish`` answers ``False``
+        rather than raising -- and by the time it is attempted the request is no
+        longer mid-generation, so there is no question of dropping a request that
+        is halfway through an answer: it has already been answered, and the only
+        loss is that nobody will reuse this turn. Recorded rather than swallowed
+        (:attr:`~kvcache_sim.report.metrics.Metrics.decode_unpublished`), for the
+        reason the prefill side records its own refusals: "cached" and "had no
+        room" are the two outcomes a capacity sweep exists to tell apart. What is
+        deliberately *not* modelled is preemption -- a real engine that cannot
+        allocate a block for a running sequence evicts it and recomputes or swaps
+        it -- because that is a scheduler this model does not have, and inventing
+        one to cover a misconfigured capacity would be worse than saying so.
         """
         request = plan.request
         keys = list(request.block_keys)
@@ -663,6 +760,12 @@ class ServingHost:
                     f"({len(keys)}blk, {nbytes}B of KV)",
                 )
                 self.metrics.handed_off(request.id, self.me, nbytes)
+                # The chain is on this host now. Say so, so the volume charges
+                # itself for what it is holding and the directory knows where a
+                # second copy is. Published *after* the handoff is recorded, so
+                # the reported transfer stays the bytes that crossed the fabric
+                # and does not absorb the local write that follows it.
+                await self._reside(keys, kv, request.id, "chain")
         # The one place this method can answer without the request having
         # finished, and it is not a decode that was skipped -- it is a run whose
         # decode side is not modelled reaching a host that has no engine. There is
@@ -670,7 +773,55 @@ class ServingHost:
         # there are no tokens to answer with because nothing here generates any.
         if self.decode_engine is None:
             return []
-        return await self.decode_engine.admit(request)
+        generated = await self.decode_engine.admit(request)
+        # What the batch produced, under the chain continued past the prompt. The
+        # keys come off the request because the request is the sequence; the blocks
+        # come off the engine because the engine ran the steps that wrote them.
+        await self._reside(
+            request.continuation_keys(len(generated.kv)),
+            generated.kv,
+            request.id,
+            "generated",
+        )
+        return generated.tokens
+
+    async def _reside(
+        self, keys: List[str], blocks: List[torch.Tensor], request_id: str, why: str
+    ) -> None:
+        """Register KV this host now holds on this host's volume.
+
+        One method for both of the decode side's publishes -- the chain it pulled in
+        and the blocks it generated -- because they are the same act: bytes are on
+        this host, so the volume that is supposed to be accounting for this host's
+        memory has to be told, and the directory has to know a copy is here. Two
+        copies of these six lines would be two places for the accounting to drift,
+        and the difference between the two callers is entirely in the keys and the
+        blocks they hand over, which is what the arguments are.
+
+        ``why`` names which of the two it was, for the trace only. It is not a mode:
+        nothing here branches on it, and both callers get identical treatment,
+        because a block does not become more or less resident according to how it
+        arrived.
+
+        A refusal is not fatal, exactly as it is not on the prefill side: the
+        request has been served (or, for the chain, is about to be served off KV
+        this host is holding in hand either way), and the loss is only that the
+        volume will not keep it. Flagged on the row rather than counted into it --
+        blocks the volume threw back are occupying nothing -- because a run where
+        the decode pool cannot keep what it decodes is a run whose sizing is wrong
+        and whose hit rate will not say so.
+        """
+        if not blocks:
+            return
+        ok = await self.store.publish(self.me, keys, blocks)
+        self.metrics.decode_resident(request_id, len(blocks), published=ok)
+        nbytes = sum(b.numel() * b.element_size() for b in blocks)
+        self.trace.record(
+            self._now(),
+            "RESIDE" if ok else "NOROOM",
+            f"{request_id} {why} {len(blocks)}blk ({nbytes}B) "
+            f"{'now resident on' if ok else 'did not fit'} {self.me}",
+        )
 
     def _decode_done(self, request: Request, tbt: float) -> None:
         """Finalize a request once its last decode token is emitted.

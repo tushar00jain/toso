@@ -36,6 +36,25 @@ them (:class:`kvcache_sim.workload._accelerator.SimulatedAccelerator`); a deploy
 returns the KV its attention kernels just wrote. Neither is a shape this port has to
 know about, which is the point of handing it back rather than describing it.
 
+...and decode produces KV too, which is what makes it cost memory
+-----------------------------------------------------------------
+:meth:`Accelerator.generated_kv` is the decode-side twin of the KV half of
+:meth:`prefill`. Every generated token is fed back in at the next step and leaves
+a position of KV behind it, so a request that generates ``n`` tokens grows its
+decode host's cache by ``n`` positions -- which is ``ceil(n / block_tokens)``
+blocks, because a paged cache allocates in whole blocks.
+
+Its absence was a real hole rather than a missing convenience. A volume only ever
+held blocks a *prefill* published, so a run that modelled decode at all modelled
+it as free in capacity terms: a host could decode forever without its KV cache
+growing by a byte, and every eviction and hit-rate number a decode-simulating run
+produced was flattered by exactly the memory the generation should have been
+taking. A decode step that emits a token and no KV is the same shape of omission
+:meth:`step_tokens` fixed for the token.
+
+Whole blocks, at the end of the generation, and both halves of that are
+deliberate -- see the member's own docstring.
+
 ...and it produces a token, so it hands that back too
 -----------------------------------------------------
 Tokens in, tokens out. :meth:`Accelerator.prefill` takes the **prompt** rather than
@@ -228,6 +247,61 @@ class Accelerator(ABC):
         last position is still attended and sampled even when no new KV had to be
         computed; that is why it is returned unconditionally rather than only when
         there were tokens to compute.
+        """
+
+    @abstractmethod
+    def generated_kv(self, positions: int) -> List[torch.Tensor]:
+        """The KV one request's ``positions`` generated tokens left in this cache.
+
+        One tensor per **block**, in generation order, exactly as :meth:`prefill`
+        answers for a prompt: ``ceil(positions / block_tokens)`` of them, because a
+        paged cache allocates whole blocks and a generation that runs a single
+        token past a boundary has taken the next block whether or not it fills it.
+        ``positions == 0`` answers with nothing, which is the truthful answer for a
+        request whose whole output was the prefill's first token: no decode step
+        ran, so no position of KV was appended.
+
+        **Why this member has to exist.** A decode step reads the whole KV chain
+        and appends one position to it -- that is what makes generation quadratic
+        in the context and what makes a long generation expensive in *memory* on
+        the host running it. Without this the model had decode consuming compute
+        and no bytes: a volume only ever held what a prefill published, so a decode
+        host could generate forever inside a bounded cache without ever pressuring
+        it, and every capacity, eviction and hit-rate number a decode-simulating
+        run reported was flattered by exactly the residency that never happened.
+
+        **Whole blocks, and the trailing one is charged whole.** The last block of
+        a generation is usually partial -- 31 generated positions in a 512-token
+        block here -- and it is still returned, at a full block's size. That is
+        paged allocation: the block manager hands out a physical block for the
+        position that first lands in it, and the unused remainder is internal
+        fragmentation the host really is paying for. Two alternatives were
+        rejected. Dropping the partial block (what an engine that hashes only
+        *full* blocks into its prefix cache does at sequence end) would make decode
+        residency vanish outright at this model's block size, since no scenario
+        here generates the 512 tokens it takes to fill one -- the coarse block is a
+        modelling choice, and letting it erase the phenomenon it is supposed to
+        quantise would be worse than over-charging a bounded amount. Charging the
+        exact positions instead would be a size no key in this system names: the
+        store's unit is a block and the volume's accounting is per key, so a
+        fractional block has nowhere to be.
+
+        **The whole generation at once, not one call per step.** The tokens come
+        out per step (:meth:`step_tokens`) and the KV does not, and the asymmetry
+        is about what the caller does with each. A token is the request's answer
+        and is accumulated as it is produced; the KV is a *publish*, one store call
+        for the request, and asking for it per position would hand the caller
+        ``positions`` sub-block tensors to reassemble into the blocks it was always
+        going to publish. What that costs is intra-generation residency: this model
+        charges a generation's bytes when it ends rather than as it grows, so a
+        generation long enough to matter mid-flight is under-charged until it
+        finishes. Named here rather than fixed, because fixing it means a store
+        call inside the step loop -- see
+        :meth:`kvcache_sim.data.serving.ServingHost.decode`.
+
+        Not async and not charged, for :meth:`step_tokens`' reason: the steps that
+        produced these positions were already paid for one by one, and a second
+        charge here would bill the same milliseconds twice.
         """
 
     @abstractmethod

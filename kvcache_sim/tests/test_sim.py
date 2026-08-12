@@ -120,6 +120,46 @@ def test_block_keys_are_generated_not_derived_from_the_prompt():
     assert a.prompt.numel() == a.prompt_tokens
 
 
+# 1d. The chain continues past the prompt, because the sequence does. Generated
+#     tokens extend the sequence, so the KV a decode host produces needs keys, and
+#     they are built by extending the prompt's last key rather than hashed for the
+#     reason above: there is nothing in a meta token to hash.
+def test_continuation_keys_extend_the_chain_and_cannot_collide_with_a_prompt():
+    request = _request(
+        id="r0", arrival=0.0, block_keys=_block_keys_for("m0", [0, 1]),
+        prompt_tokens=2 * BLOCK_TOKENS, output_tokens=64,
+    )
+    keys = request.continuation_keys(3)
+    assert len(keys) == 3
+    # Each key contains the whole prefix before it -- the property that makes a
+    # prefix-hash chain answer "how much of this sequence do you hold".
+    assert keys[0].startswith(request.block_keys[-1])
+    assert keys[1].startswith(keys[0]) and keys[2].startswith(keys[1])
+    assert len(set(keys)) == 3
+    # And no prompt chain can ever name one: the generator's segments are decimal
+    # integers, so a ``|g<i>`` segment is a namespace of its own.
+    for key in keys:
+        assert key.rsplit("|", 1)[1].startswith("g")
+    assert request.continuation_keys(0) == ()
+
+
+# 1e. A generation leaves KV behind it, in whole blocks, and the trailing partial
+#     block is charged whole. A paged cache hands out a physical block for the
+#     position that first lands in it; the unused remainder is fragmentation the
+#     host is really paying for. Dropping it would make decode residency vanish at
+#     this model's block size, since nothing here generates 512 tokens.
+def test_a_generation_leaves_whole_blocks_of_kv_behind_it():
+    acc = SimulatedAccelerator(block_tokens=BLOCK_TOKENS)
+    assert acc.generated_kv(0) == []                       # no step, no KV
+    assert len(acc.generated_kv(1)) == 1                   # ...one position is a block
+    assert len(acc.generated_kv(BLOCK_TOKENS)) == 1
+    assert len(acc.generated_kv(BLOCK_TOKENS + 1)) == 2    # one past the boundary
+    block, = acc.generated_kv(31)
+    # The same block a prompt's KV is made of: same size, same dtype, same cache.
+    assert block.numel() * block.element_size() == acc.block_nbytes
+    assert block.device.type == "meta"                     # and still free to hold
+
+
 # 2. REAL directory: per-instance prefix-match length, incl. after eviction.
 #    Publishing records block->volume presence in the real Controller directory;
 #    locate_volumes reads it back; eviction removes it. This is the cache-aware
@@ -526,19 +566,30 @@ def _plan(request: Request, *, prefill: str, decode: str):
 
 
 def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
-                published: bool = True, engine: bool = True):
+                published: bool = True, engine: bool = True,
+                capacity_bytes: float = float("inf"), probe: dict = None):
     """Walk one request's decode leg on ``s1``; report when it answered.
 
     Returns ``(answered_at, events, row, tokens)`` -- the sim clock when
     :meth:`ServingHost.decode` returned, the host's own trace lines as
-    ``{kind: [time]}`` (it writes a HANDOFF when the KV lands and a DECODE when
-    the last token does), the ledger row the two halves were joined into, and the
-    tokens the leg answered with.
+    ``{kind: [time]}`` (it writes a HANDOFF when the KV lands, a RESIDE when a set
+    of blocks is registered on this host, and a DECODE when the last token does),
+    the ledger row the two halves were joined into, and the tokens the leg answered
+    with.
+
+    ``probe``, when given, is filled in **inside** the running scenario with what
+    the real directory says once the leg is done: ``chain`` and ``generated`` map
+    instance -> how long a run of the prompt's keys / this request's continuation
+    keys that instance holds. It is a mutable out-parameter rather than a fifth
+    return value only because the directory has to be read before the loop closes
+    and five of these callers do not care.
 
     A real coordinator is wired in because a decode batch *reports itself*: the
     host forwards every batch change to control, so a stub ``None`` would fail on
     the first admission rather than on anything this is testing.
     """
+    from dataclasses import replace as _replace
+
     from kvcache_sim.data.serving import ServingHost
     from kvcache_sim.report.metrics import Metrics, RequestResult
 
@@ -546,6 +597,9 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
         _make_topology(2),
         control=LoadBalanceScheduler(
             block_tokens=BLOCK_TOKENS, simulate_decode=True
+        ),
+        profile=_replace(
+            DEFAULT_PROFILE, storage_capacity_bytes=capacity_bytes
         ),
         ledger=Metrics(),
     )
@@ -573,6 +627,12 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
             tokens = await host.decode(
                 _plan(request, prefill=prefill, decode="s1")
             )
+            if probe is not None:
+                view = KVView(sim.view.directory, sim.topology)
+                probe["chain"] = await view.prefix_lengths(keys)
+                probe["generated"] = await view.prefix_lengths(
+                    list(request.continuation_keys(1))
+                )
             return asyncio.get_running_loop().time(), tokens
 
     try:
@@ -586,16 +646,28 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
 
 
 def test_the_decode_leg_answers_when_the_last_token_lands():
-    """The ordinary path: KV fetched from the host that prefilled it, then steps."""
+    """The ordinary path: KV fetched, made resident, stepped, and published.
+
+    This used to assert ``answered_at == events["DECODE"][0]`` -- the leg returned
+    on the very instant of the last token -- and that equality encoded the absence
+    of decode-side residency rather than a property worth keeping. Nothing happened
+    after the last token because the KV the batch had just produced went nowhere:
+    it was not written, not registered, and cost the decode host nothing. Now it is
+    published, so the leg answers *after* the last token by exactly that write, and
+    the claim the test is really about survives intact -- the leg does not answer at
+    admission, and every decode step is inside the interval.
+    """
     answered_at, events, row, _tokens = _decode_leg(output_tokens=6)
     assert len(events["DECODE"]) == 1
-    # Answered at the last token -- not at admission, which is where the KV
-    # landed and where this used to return.
-    assert answered_at == events["DECODE"][0]
-    # ...and the five steps between the two really ran (6 output tokens, the
-    # first of which prefill produced).
+    # Two residency publishes: the chain this host pulled in, then the KV its
+    # generation appended. The leg answers when the second one lands.
+    assert len(events["RESIDE"]) == 2
+    assert events["HANDOFF"][0] <= events["RESIDE"][0] < events["DECODE"][0]
+    assert answered_at == events["RESIDE"][1]
+    # ...and the five steps really ran between the chain landing and the last
+    # token (6 output tokens, the first of which prefill produced).
     steps = 5 * decode_step_time(1, DEFAULT_PROFILE)
-    assert answered_at - events["HANDOFF"][0] == pytest.approx(steps)
+    assert events["DECODE"][0] - events["RESIDE"][0] == pytest.approx(steps)
     assert row.tbt > 0                       # ...and the row was written first
     assert row.handoff_bytes > 0
 
@@ -634,9 +706,127 @@ def test_the_decode_leg_answers_with_the_tokens_it_generated():
     ("decodes where it prefilled", dict(prefill="s1")),
 ])
 def test_every_decode_path_answers_at_its_last_token(case, kwargs):
+    """Every path answers, and never before the last token.
+
+    The equality this used to assert (answered exactly *at* the last token) was
+    true only while the KV a generation produced went nowhere. It is now published
+    on the way out, so the leg answers at or after the last token -- and where a
+    publish happened, at exactly the instant it landed. What the parametrisation is
+    guarding is unchanged: none of these three paths is one where the caller is
+    left parked forever.
+    """
     answered_at, events, _row, _tokens = _decode_leg(**kwargs)
     assert len(events["DECODE"]) == 1, case
-    assert answered_at == events["DECODE"][0], case
+    assert answered_at >= events["DECODE"][0], case
+    if "RESIDE" in events:
+        assert answered_at == events["RESIDE"][-1], case
+
+
+# 13f. Decoding costs the decode host memory, in both of the ways it can.
+#      Two things land on a decode host and neither used to be accounted for: the
+#      block chain it pulls in to attend over, and the KV its own generation
+#      appends. Both are now published on it, so its volume charges itself for
+#      them and the directory knows a second copy is there. Without this a decode
+#      host had unbounded free memory and every capacity number in a
+#      decode-simulating run was flattered by exactly the residency that never
+#      happened.
+def test_a_decode_host_is_resident_for_the_chain_it_pulled_and_the_kv_it_made():
+    probe: dict = {}
+    _at, events, row, _tokens = _decode_leg(output_tokens=6, probe=probe)
+    # The prefill host published the 2-block chain; the decode host pulled it in
+    # and is now a replica of it -- which is what a read-through cache is.
+    assert probe["chain"] == {"s0": 2, "s1": 2}
+    # ...and the 5 generated positions are one block, on the decode host alone.
+    # Nobody else could hold it: no other host ran a step of this generation.
+    assert probe["generated"] == {"s1": 1}
+    assert row.decode_blocks == 3          # 2 pulled + 1 generated
+    assert row.decode_unpublished is False
+    assert len(events["RESIDE"]) == 2      # one per set, in the order they landed
+
+
+def test_a_host_that_decodes_where_it_prefilled_is_resident_only_for_what_it_made():
+    """The local case adds the generation and nothing else, which is the truth.
+
+    Its prompt's blocks were registered here by the prefill and never left, so
+    counting them again as newly resident would double-charge one copy. What is
+    new is only what the batch generated.
+    """
+    probe: dict = {}
+    _at, _events, row, _tokens = _decode_leg(prefill="s1", probe=probe)
+    assert probe["chain"] == {"s1": 2}
+    assert probe["generated"] == {"s1": 1}
+    assert row.decode_blocks == 1
+
+
+def test_a_request_that_generates_nothing_leaves_no_kv_behind():
+    """``output_tokens=1``: prefill produced the whole answer, decode ran no step.
+
+    No step is no position of KV, so there is no block, no key and no publish --
+    the empty case is empty rather than a zero-length block registered under a
+    continuation key nothing continues.
+    """
+    probe: dict = {}
+    _at, events, row, _tokens = _decode_leg(output_tokens=1, probe=probe)
+    assert probe["generated"] == {}
+    assert row.decode_blocks == 2          # the pulled chain, and only that
+    assert len(events["RESIDE"]) == 1
+
+
+def test_a_decode_host_with_no_room_says_so_and_still_answers():
+    """A decode-side cache fill may fail, exactly as a prefill-side one may.
+
+    A capacity below a single block is the only place a refusal reaches this code,
+    for the reason the prefill-side twin of this test spells out: the transport
+    writes one key per put, so any larger volume absorbs an over-sized publish by
+    evicting its own earlier blocks. Below one block nothing can be kept at all --
+    not the chain the prefill host tried to publish (hence the miss) and not the
+    block this generation produced.
+
+    The request still finishes, and that is the point. Publishing at the end of the
+    generation is what makes "the decode host had no room" a cache-fill failure
+    rather than a request that has to be preempted halfway through an answer: by
+    the time it is attempted the answer exists. There is no mid-generation
+    preemption modelled here and deliberately none invented.
+    """
+    from domain import DEFAULT_MODEL
+
+    _at, events, row, tokens = _decode_leg(
+        output_tokens=6,
+        capacity_bytes=DEFAULT_MODEL.block_bytes(1, BLOCK_TOKENS) - 1,
+    )
+    assert row.decode_unpublished is True
+    assert "NOROOM" in events
+    assert len(tokens) == 5                # served in full regardless
+    # Nothing was kept, so nothing is counted as resident: the refusal is the
+    # separate fact, not a zero hiding inside the block column.
+    assert row.decode_blocks == 0
+    assert row.handoff_missed is True      # the chain could not be cached either
+
+
+def test_decode_residency_is_zero_where_decode_is_not_modelled():
+    """The other half of the claim: this costs nothing to a prefill-only run.
+
+    A run with ``simulate_decode=False`` never reaches a decode host, so no chain
+    is pulled and no KV is generated, and its volumes hold exactly what they held
+    before. That is what keeps the four prefill-side scenarios byte-identical.
+    """
+    aware, _baseline = run_shared_prefix()
+    assert aware.ledger.decode_blocks == 0
+    assert aware.ledger.decode_unpublished == 0
+
+
+def test_a_run_that_models_decode_pays_for_it_in_blocks():
+    """And the amount is the deployment's, not a constant.
+
+    Disaggregation decodes every request away from where it was prefilled, so
+    every request drags its whole chain across and then generates on top of it:
+    120 requests x (5-block prompt chain + 1 block for 11 generated positions).
+    Coupling decodes most requests where the KV already is, so most of them pay
+    only for what they generated -- same load, a third of the residency.
+    """
+    disagg, coupled = run_disaggregation()
+    assert disagg.ledger.decode_blocks == 120 * (5 + 1)
+    assert 0 < coupled.ledger.decode_blocks < disagg.ledger.decode_blocks
 
 
 def test_a_host_with_no_decode_engine_answers_without_waiting():
@@ -645,12 +835,19 @@ def test_a_host_with_no_decode_engine_answers_without_waiting():
     A run that does not model decode never sends a client here at all (prefill
     answers ``None`` and the journey ends), so this is the defensive case: a host
     asked to decode with no engine has no last token coming, and waiting for one
-    would be waiting forever. It answers the moment the KV is there, which is as
-    far as it can honestly get.
+    would be waiting forever. It answers as soon as the KV is here and its volume
+    has been told, which is as far as it can honestly get.
+
+    That last clause is what changed: the host used to answer on the HANDOFF
+    instant, because a fetched chain landed on it and left no trace on its volume.
+    It pulled a whole block chain in and its own storage never heard of it. There
+    is still no engine and still no last token, so the *shape* of the case is the
+    same -- it answers early because there is nothing to wait for -- but "the KV is
+    there" now includes saying so.
     """
     answered_at, events, row, tokens = _decode_leg(engine=False)
     assert "DECODE" not in events
-    assert answered_at == events["HANDOFF"][0]
+    assert events["HANDOFF"][0] < answered_at == events["RESIDE"][0]
     assert row.tbt == 0.0
     # ...and it generated nothing, which is what it answers with. Not a token it
     # did not make and not ``None``: the leg's answer is its output, and this

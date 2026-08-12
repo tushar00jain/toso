@@ -43,6 +43,11 @@ producing the KV here instead:
   and the tokens per block purely to check that the number it had been handed was
   the number the scheduler prices against.
 
+Decode produces KV here too (:meth:`SimulatedAccelerator.generated_kv`), and it is
+the same tensor the prefill path makes: one block of KV is one block of KV whether
+the positions in it came from a prompt or from the model's own output, so the
+decode side is two existing members composed rather than a second geometry.
+
 Shape realism is explicitly *not* the goal here and is not attempted: the KV of one
 block is a flat 1-D tensor of the right dtype and the right size, not a
 ``(layers, 2, kv_heads, block_tokens, head_dim)`` region.
@@ -401,6 +406,17 @@ class SimulatedAccelerator(Accelerator):
         now = asyncio.get_running_loop().time()
         self.busy_until = max(now, self.busy_until) + self.step_cost(batch_size)
         return self.busy_until
+
+    def generated_kv(self, positions: int) -> List[torch.Tensor]:
+        """The KV a generation of ``positions`` tokens left behind, in whole blocks.
+
+        The same blocks :meth:`kv_blocks` makes, counted the same way
+        :meth:`blocks_for` counts a prompt's -- which is the point of building it
+        out of those two rather than out of a second geometry: a block of generated
+        KV is the same size and the same dtype as a block of prompt KV, because it
+        is the same cache. A partial trailing block is one block (see the port).
+        """
+        return self.kv_blocks(self.blocks_for(positions))
 
     def step_tokens(self, batch_size: int) -> List[torch.Tensor]:
         """One token per batch member, as a finished step just sampled them.
