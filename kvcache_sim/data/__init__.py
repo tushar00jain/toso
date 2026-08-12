@@ -9,18 +9,16 @@
   holds a reference to another host and no measurement row travels between them;
 * :mod:`~kvcache_sim.data._decode` -- one host's batched decode engine. It sleeps
   and emits tokens -- real ones, accumulated per batch member and handed back when
-  the request's last one lands -- so it is data. Underscored because nothing outside this package
-  drives it: the host constructs it, owns it, and is the only thing it reports to --
-  control learns the decode load as a value the host forwards, not by holding this
-  object;
+  the request's last one lands -- so it is data. Underscored because nothing outside
+  this package drives it: the host constructs it, owns it, and is the only thing it
+  reports to, so control learns the decode load as a value the host forwards rather
+  than by holding this object;
 * :mod:`~kvcache_sim.data.store` -- publish / reuse / fetch, as real ``put_batch``
-  / ``touch`` / ``get_batch`` calls over whatever KV it is handed. It used to also
-  own *what a KV block is* and check that one was the size the model predicts;
-  both moved to the accelerator, which is the thing that produces the blocks (see
-  :mod:`~kvcache_sim.data._compute`). It is the *only* path between two serving
-  hosts: a prefill host publishes a request's KV and its decode host fetches it
-  back, which is what makes the handoff a transfer with a price rather than an
-  argument to a method call;
+  / ``touch`` / ``get_batch`` calls over whatever KV it is handed (what a block *is*
+  belongs to the accelerator, which produces them). It is the *only* path between
+  two serving hosts: a prefill host publishes a request's KV and its decode host
+  fetches it back, which is what makes the handoff a transfer with a price rather
+  than an argument to a method call;
 * :mod:`~kvcache_sim.data._compute` and :mod:`~kvcache_sim.data._prefill` -- the
   accelerator an engine runs on, and the prefill engine that runs on it. A forward
   pass takes the prompt and returns what it produced -- the KV, and the request's

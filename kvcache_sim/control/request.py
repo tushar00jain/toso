@@ -12,45 +12,21 @@ Building that chain is the *prompt generator's* job
 *view's* (``control/_view.py``); both are private to those modules. What is left
 here is the request itself.
 
-The prompt is a tensor, and the keys still are not derived from it
-------------------------------------------------------------------
-A request carries the prompt it was submitted with -- a ``device="meta"`` tensor
-of token ids, real dtype and real shape with no storage behind it, the same
-compromise the KV blocks are (:mod:`kvcache_sim.workload._accelerator`). It used
-to be an ``int`` count, which made the count the only account of the prompt and
-left the data plane taking a number where a deployment takes a batch of ids.
+The keys are not derived from the prompt
+----------------------------------------
+A request carries the prompt it was submitted with -- under simulation a
+``device="meta"`` tensor of token ids: real dtype and shape, no storage behind it,
+the same compromise the KV blocks are (:mod:`kvcache_sim.workload._accelerator`).
+A meta tensor has no tokens *in* it to hash (reading one is an error, not a zero),
+so the block-key chain cannot be computed from :attr:`Request.prompt` and is handed
+in by whatever generated it. Hashing the *shape* instead would be worse: every
+prompt of a given length would collide, so every request would "reuse" every other
+one's prefix. The honest fix is real token ids, i.e. a real tokenizer and corpus,
+which is a workload change rather than a plumbing one.
 
-What that deliberately does **not** buy is content-addressing. A block key is a
-hash of the tokens in the prefix up to it, and a meta tensor has no tokens in it
-to hash -- reading one is an error, not a zero. So the chain cannot be computed
-from :attr:`Request.prompt` and is still handed in by whatever generated the
-prompt, which is exactly the compromise a meta KV block makes: the right object,
-the right shape, the right size, no data. Hashing the *shape* instead would be
-worse than the stand-in the generator already builds -- every prompt of a given
-length would collide, so every request would "reuse" every other one's prefix.
-The honest fix is real token ids, which means a real tokenizer and a real corpus,
-and that is a workload change rather than a plumbing one.
-
-The chain does not stop at the prompt
--------------------------------------
 Generated tokens extend the sequence, so the KV a decode host produces belongs
-under keys that continue the same chain -- and :meth:`Request.continuation_keys`
-builds them, here, next to the caveat that explains why they cannot be hashed
-either. It is the same compromise one step further out: a real engine hashes the
-block's tokens, this one concatenates a counter onto the prompt's last key, and
-the sharing structure it produces is the structure a content hash would produce
-over the same segments.
-
-And something *does* look them up. This used to carry a caveat saying nothing
-did: the generator built every request from fixed conversation segments plus a
-fresh query, so a decode host published entries no later prompt ever walked, and
-generated KV cost capacity without buying a hit rate. The workload is multi-turn
-now (:mod:`kvcache_sim.workload._generator`) -- turn N+1 is "turn N's prompt +
-turn N's output + the new message" -- and it builds the middle of that chain by
-calling this very method on turn N rather than re-deriving the same strings from
-a parallel rule. So the keys a decode host publishes and the keys the next turn
-matches against are the same strings by construction, and cannot drift into
-agreeing about nothing.
+under keys that continue the same chain; :meth:`Request.continuation_keys` builds
+them, with the same stand-in one step further out.
 """
 
 from __future__ import annotations
@@ -69,9 +45,8 @@ class Request:
 
     ``block_keys`` is the prefix-hash chain for the prompt (one directory key per
     ``B``-token block). ``prompt_tokens == len(block_keys) * B``. ``output_tokens``
-    drives the decode-side occupancy used by the TBT / overload scenarios -- it is
-    what control *predicts* against, and no longer what the produced output is
-    counted from: the data plane counts the tokens it made (see
+    is what control *predicts* decode occupancy against; the produced output is
+    counted by the data plane from the tokens it actually made (see
     :attr:`kvcache_sim.report.metrics.RequestResult.output_tokens`).
     """
 
@@ -81,41 +56,27 @@ class Request:
     prompt_tokens: int
     output_tokens: int
     #: The prompt itself: a 1-D tensor of ``prompt_tokens`` token ids, as the
-    #: caller submitted it. Under simulation it is a ``device="meta"`` tensor and
-    #: therefore has no ids *in* it -- see the module docstring for what that
-    #: costs (the block keys cannot be derived from it) and why it is still worth
-    #: carrying (every downstream signature says "a prompt" instead of "a
-    #: number", and a deployment's real ids drop straight in).
+    #: caller submitted it. Under simulation a ``device="meta"`` tensor with no ids
+    #: in it -- see the module docstring.
     #:
-    #: ``compare=False`` because this dataclass is frozen and therefore has a
-    #: generated ``__eq__`` and ``__hash__``: comparing two tensors with ``==``
-    #: answers with a *tensor*, and the first ``request_a == request_b`` anywhere
-    #: would raise "Boolean value of Tensor is ambiguous". What makes two requests
-    #: the same request is the id and the chain, not a bytewise read of the
-    #: prompt, which for a meta tensor is not even possible.
+    #: ``compare=False``: this dataclass is frozen and so has a generated ``__eq__``
+    #: / ``__hash__``, and comparing two tensors with ``==`` answers with a *tensor*,
+    #: so the first ``request_a == request_b`` anywhere would raise "Boolean value of
+    #: Tensor is ambiguous". Two requests are the same request by id and chain.
     prompt: torch.Tensor = field(compare=False)
-    #: Which conversation this request continues -- a *turn* of it, since the
-    #: workload is multi-turn and a later turn's ``block_keys`` contain an earlier
-    #: one's. Not used to find a *cache*: that is what the block keys are for, and
-    #: they say far more than this string can, because two turns of one dialogue
-    #: share a prefix and two dialogues of one tenant share only its opening. What
-    #: a real front end uses it for, and what it is used for here, is picking which
-    #: host a request lands on (a session or tenant id).
+    #: Which conversation *turn* this request continues. Not used to find a cache --
+    #: that is the block keys' job -- but to pick which host a request lands on, the
+    #: way a real front end uses a session or tenant id.
     conversation: str = ""
 
     def __post_init__(self) -> None:
         """Refuse a prompt whose length is not the length everything prices.
 
-        ``prompt_tokens`` is what the control plane routes on -- the prefix match,
-        the uncached suffix, the predicted TTFT -- and the tensor is what the data
-        plane runs the forward pass over. Two descriptions of one prompt that are
-        allowed to disagree eventually do, and the failure would be silent in the
-        worst way: the scheduler pricing one length while the accelerator computes
-        another, with every reported number internally consistent.
-
-        Checked here rather than left to the generator because every construction
-        site goes through this, tests included, and a shape read costs nothing on
-        a meta tensor.
+        ``prompt_tokens`` is what the control plane routes on (prefix match,
+        uncached suffix, predicted TTFT) and the tensor is what the data plane runs
+        the forward pass over. If they disagree the scheduler prices one length
+        while the accelerator computes another, and every reported number stays
+        internally consistent while being wrong.
         """
         if self.prompt.numel() != self.prompt_tokens:
             raise ValueError(
@@ -127,51 +88,27 @@ class Request:
     def continuation_keys(self, count: int) -> Tuple[str, ...]:
         """``count`` directory keys continuing this prompt's chain past its end.
 
-        What the decode host publishes its **generated** KV under -- and what the
-        *next turn of the same conversation* splices into the middle of its own
-        chain, because a later sequence that really did continue this one is
-        exactly what the next turn is. The prompt's last key names the whole
-        prompt, so ``continuation_keys(2)`` answers
-        ``("<last>|g1", "<last>|g1|g2")``: each key contains the entire prefix
-        before it, which is the one property that makes a prefix-hash chain work
-        -- a later sequence that really did continue this one walks the same keys
-        and stops where they stop.
+        Each key contains the whole prefix before it, so ``continuation_keys(2)``
+        answers ``("<last>|g1", "<last>|g1|g2")`` -- a later sequence that really did
+        continue this one walks the same keys and stops where they stop.
 
-        Two callers, therefore, and it matters that they are the same method: the
-        decode host writing (:meth:`kvcache_sim.data.serving.ServingHost.decode`)
-        and the workload building turn N+1 out of turn N
-        (:mod:`kvcache_sim.workload._generator`). A generator that spelled these
-        keys out itself would be a second definition of one name, and the two
-        would be free to disagree silently -- the reader would simply find
-        nothing, which is indistinguishable from a cache that had evicted it.
+        Two callers, and it matters that they share this method rather than spelling
+        the keys out twice: the decode host publishing its generated KV
+        (:meth:`kvcache_sim.data.serving.ServingHost.decode`) and the workload
+        building turn N+1 out of turn N (:mod:`kvcache_sim.workload._generator`).
 
-        **Synthetic, and it says so in the name of the segment.** A real chain
-        hashes each block's token ids; this run's tokens are ``device="meta"`` and
-        have none (see the module docstring), so the prompt's chain is built from
-        the generator's segment ids and this is the same stand-in one step further
-        out. ``g<i>`` rather than another integer segment precisely so the two
-        cannot collide: the generator's segments are decimal integers, so no prompt
-        chain can ever name a key that ends in ``|g1``, and a request's generated
-        blocks therefore cannot be mistaken for another request's prompt blocks.
+        **Synthetic.** A real chain hashes each block's token ids; this run's tokens
+        are ``device="meta"`` and have none, so this concatenates a counter instead.
+        ``g<i>`` cannot collide with a prompt key: the generator's segments are
+        decimal integers, so no prompt chain names a key ending in ``|g1``.
 
-        **A counter, not the content, and that is a modelling limit worth stating.**
-        Two requests that generated the same tokens after the same prompt would get
-        the same keys here and would in a real system too; two requests that
-        generated *different* tokens after the same prompt would collide here and
-        would not in a real system. Nothing in this workload can produce that case
-        -- every request's prompt chain is unique, because the generator gives each
-        one a fresh query segment -- but it is a property of the workload rather
-        than of this method, so it is written down instead of assumed.
-
-        Content hashing over the meta tensors the batch produced is *not* the fix
-        and is not attempted: a meta token has no id in it to hash, so hashing
-        would either raise or, worse, hash the shape and make every generation of a
-        given length alias every other one.
+        Modelling limit: two requests generating *different* tokens after the same
+        prompt would collide here and would not in a real system. This workload
+        cannot produce that -- every prompt chain is unique, because each request
+        gets a fresh query segment -- but that is a property of the workload.
         """
-        # The prompt's last key when there is one. A request with no prompt blocks
-        # is degenerate here (the generator never makes one) but is not a reason to
-        # raise: its id is a unique root, so its generated blocks still get keys
-        # that collide with nothing.
+        # A request with no prompt blocks is degenerate (the generator never makes
+        # one) but not an error: its id is a unique root.
         acc = self.block_keys[-1] if self.block_keys else self.id
         keys: list[str] = []
         for i in range(1, count + 1):

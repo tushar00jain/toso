@@ -26,32 +26,20 @@ Mapping (real directory + real types throughout):
 
 Three verbs over whatever it is handed
 --------------------------------------
-This object used to own a fourth thing: *what a KV block is*. It was constructed
-with a "carrier" -- one stand-in value it wrote under every key -- plus the tokens
-per block and the served model, so that it could check the carrier was the size the
-model predicts, and it answered ``block_nbytes`` for anyone pricing a transfer.
-
-None of that is a store's business, and holding it had two costs. It made the store
-the authority on a byte count it never computes, one object away from the thing that
-does (a forward pass produces KV; a ``put`` moves it). And because one carrier stood
-in for every block, a run could only ever store the same value everywhere -- which
-is how the simulated data plane ended up on torchstore's *object* path
-(``put_batch`` types its values: a ``Tensor`` takes ``Request.from_any``, anything
-else takes ``Request.from_objects``), exercising a code path no KV deployment uses.
-
-So the verbs take the blocks. What produces them is the accelerator
-(:meth:`kvcache_sim.data._compute.Accelerator.prefill`), what they *are* is that
+The verbs take the blocks; what produces them is the accelerator
+(:meth:`kvcache_sim.data._compute.Accelerator.prefill`) and what they *are* is that
 implementation's answer -- zero-storage ``device="meta"`` tensors under simulation,
-attention output in a deployment -- and this module is indifferent, which is what
-lets it be three calls and no premises.
+attention output in a deployment. This module is indifferent, which is what lets it
+be three calls and no premises. In particular the byte count every transfer is
+priced against belongs with the thing that computes the KV, not with the thing that
+moves it.
 
 **Eviction is not here.** A volume drops its own coldest keys when a put does not
-fit and tells the directory itself, so a verb here that deregistered a key would
-be half an eviction: the entry would go and the bytes would stay. Which key to
-drop is the volume's (``realsim.seams._retention``), and saying so is the
-volume's too.
+fit and tells the directory itself, so a verb here that deregistered a key would be
+half an eviction: the entry would go and the bytes would stay. Which key to drop is
+the volume's (``realsim.seams._retention``), and saying so is the volume's too.
 
-Reading the directory is *not* here either: a ``locate`` decides nothing and moves
+**Reading the directory is not here either**: a ``locate`` decides nothing and moves
 nothing, so per-instance prefix presence is a control-plane view
 (:class:`kvcache_sim.control._view.KVView`). That includes re-reading it to see
 whether a planned pull is still available -- :meth:`KVStore.fetch` asks for what it
@@ -77,12 +65,9 @@ class KVStore:
     than three functions only so that the deployment is named once instead of at
     every call site.
 
-    Deliberately absent: what a KV block *is*, and how big one is. See the module
-    docstring for what used to be here and why it moved to the accelerator; the
-    short version is that this object moves KV and computes none, so the byte count
-    every fetch is priced against belongs with the thing that produces it. The one
-    thing this class still insists on is that a caller publishing ``n`` keys hands
-    it ``n`` blocks -- an arity check, not a size premise (see :meth:`publish`).
+    Deliberately absent: what a KV block *is*, and how big one is (see the module
+    docstring). The one thing this class insists on is that a caller publishing
+    ``n`` keys hands it ``n`` blocks -- an arity check, not a size premise.
 
     Args:
         deployment: the :class:`~proposed.deployment.Deployment` these instances
@@ -101,23 +86,17 @@ class KVStore:
 
         Writes the KV into ``inst``'s real store (co-located -> zero fabric) and
         registers ``key -> volume`` in the real directory. ``blocks[i]`` is the KV
-        of ``keys[i]``: the caller is the host that just held both -- it pulled part
-        of that prefix and computed the rest -- and pairing them anywhere else would
-        mean re-deriving here which key each block belongs to.
+        of ``keys[i]``; the caller is the host that holds both.
 
         A **cache fill**, so it is allowed to fail: ``False`` when the instance has
-        no room for these blocks even after evicting what it could. A KV cache that
-        cannot fit something does not cache it -- the request has already been
-        served, and the only loss is that nobody reuses this prefix. Letting the
-        store refuse and treating that as fatal would make a bounded cache unusable
-        the moment one request's working set exceeded a volume.
+        no room for these blocks even after evicting what it could. The request has
+        already been served, and the only loss is that nobody reuses this prefix.
 
         Raises:
             ValueError: if there is not exactly one block per key. Loud rather than
-                zipped-to-the-shorter, because both ways of being wrong are silent
-                and expensive: publishing fewer blocks than keys registers a prefix
-                the directory will route reads to and the volume does not hold, and
-                publishing more drops KV this host computed and paid for.
+                zipped-to-the-shorter: too few blocks registers a prefix the
+                directory routes reads to and the volume does not hold, too many
+                drops KV this host computed and paid for.
         """
         if not keys:
             return True
@@ -150,29 +129,23 @@ class KVStore:
     async def fetch(self, inst: str, keys: List[str]) -> List[torch.Tensor]:
         """Pull ``keys`` into ``inst`` via a real ``get_batch`` (charges fabric).
 
-        Drives the real client planning core + transport seam, so the storage /
-        RAM / network cost is charged by the real cost model against the peer that
-        actually serves the blocks.
+        Drives the real client planning core + transport seam, so the storage / RAM
+        / network cost is charged by the real cost model against the peer that
+        actually serves the blocks. That peer is the one the control plane priced:
+        the installed policy *is* that control plane, so nothing has to be threaded
+        through this call.
 
-        Answers with the KV, one block per key in the order asked for -- what the
-        client returned, not a count derived from a size this object was told once.
-        A caller that wants the bytes it just paid for can add them up off the
-        tensors, which is the same number the transport charged and cannot drift
-        from it. ``get_batch`` answers with a dict, so the ordering is re-imposed
-        here: the caller asked for a prefix and a prefix has an order.
+        Answers with the KV, one block per key in the order asked for
+        (``get_batch`` answers with a dict, so the prefix order is re-imposed here).
+        A caller that wants the bytes can sum them off the tensors, which is the
+        same number the transport charged.
 
-        The peer that serves it is the one the control plane priced: the installed
-        policy *is* that control plane, so it narrows the directory answer to the
-        decision it already made. Nothing has to be threaded through this call.
-
-        A routing decision is made when the request arrives, but the pull runs
-        later (after the prefill queue), by which time the peer may have dropped
-        some of the planned blocks. ``get_batch`` is all-or-nothing, so that
-        surfaces here as a ``KeyError`` and the caller decides -- which is the
-        honest place for it: whether a half-usable prefix is worth pulling is a
-        question about the request, not about the store. Filtering the batch down
-        to what survived would answer it here, silently, and charge the caller for
-        a reuse it did not get.
+        The pull runs after the prefill queue, by which time the peer may have
+        dropped some of the planned blocks. ``get_batch`` is all-or-nothing, so that
+        surfaces as a ``KeyError`` and the caller decides: whether a half-usable
+        prefix is worth pulling is a question about the request. Filtering the batch
+        down to what survived would answer it here, silently, and charge the caller
+        for a reuse it did not get.
         """
         if not keys:
             return []

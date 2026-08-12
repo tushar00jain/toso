@@ -2,10 +2,8 @@
 
 * :mod:`~kvcache_sim.control.request` -- what is being decided *about*: an
   inference ``Request``, carrying the prompt it was submitted with and its
-  prefix-hash block keys (each a plain directory key). The keys are not derived
-  from the prompt and cannot be -- see that module for the compromise a
-  zero-storage prompt forces. It sits here rather than in ``workload/`` because
-  all three planes pass it, and ``workload/`` does not exist in production;
+  prefix-hash block keys (each a plain directory key). It sits here rather than in
+  ``workload/`` because all three planes pass it;
 * :mod:`~kvcache_sim.control.scheduler` -- the serving scheduler: which instance
   prefills, pull-vs-recompute, the TTFT/TBT admission gates, where decode lands.
   These are *compute* decisions the store knows nothing about, which is why they
@@ -21,7 +19,8 @@
 * :mod:`~kvcache_sim.control._cache` -- per-instance LRU. It picks victims; it
   does not delete anything.
 
-Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and
-nothing here reaches into the simulator -- all checked by the repo's contract lint. Control senses through a view and returns
-decisions; what actually happened comes back as an observation.
+Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and nothing
+reaches into the simulator -- all checked by the repo's contract lint. Control
+senses through a view and returns decisions; what actually happened comes back as
+an observation.
 """

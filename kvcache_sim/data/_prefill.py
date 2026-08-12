@@ -1,43 +1,26 @@
 """This host's prefill compute: :class:`PrefillEngine`.
 
-The sibling of :class:`~kvcache_sim.data._decode.DecodeEngine`, and the reason it
-exists is that it did not. Decode had an engine -- a batch, a step loop, a
-timeline -- while prefill was three lines inlined in the serving loop: sleep the
-queue wait, sleep the forward pass, and a cost function to re-price it when a
-planned reuse turned out to be gone. Same physical resource, same kind of work,
-two very different shapes, and the asymmetry was the reason a host could not
-simply be asked which engines it runs.
+The sibling of :class:`~kvcache_sim.data._decode.DecodeEngine`. A host runs one,
+the other, or both, and both are handed the host's
+:class:`~kvcache_sim.data._compute.Accelerator` -- which is what makes "coupled" a
+fact about a host rather than a flag beside it: two engines on one accelerator
+collide, and there is nothing to configure.
 
-So prefill is an engine too, and a host runs one, the other, or both. Both are
-handed the host's :class:`~kvcache_sim.data._compute.Accelerator`, which is what
-makes "coupled" a fact about a host rather than a flag beside it: two engines on
-one accelerator collide, and there is nothing to configure.
+The queue is emergent
+---------------------
+There is no member here that sleeps a predicted wait. :meth:`PrefillEngine.run`
+submits a forward pass to this host's accelerator, the accelerator runs it when it
+is free -- behind whatever prefill or decode step already has the device -- and how
+long that took is something the caller measures. ``plan.queue_wait`` is therefore a
+*prediction the run can disagree with*, rather than an input the run replays: a
+data plane that sleeps a forecast waits exactly as long as the forecast said, so
+every column containing the wait would inherit the prediction instead of testing
+it.
 
-The queue is real, and that is why this engine has one member fewer
--------------------------------------------------------------------
-This class used to have a ``wait_turn(queue_wait)``: the serving host handed it the
-number the *control plane predicted* the request would wait at this host, and it
-slept exactly that. The prediction was therefore unfalsifiable. A data plane that
-sleeps a forecast waits precisely as long as the forecast said, so a scheduler that
-mispredicts its own queue is never contradicted by the run, and every column
-containing the wait -- TTFT, end-to-end latency, the next request's predicted queue
--- inherits the prediction rather than testing it. That was the weakest joint in the
-whole model and the one thing here that could not be wrong.
-
-There is no member for it now, and no flag that brings it back. The wait is
-**emergent**: :meth:`PrefillEngine.run` submits a forward pass to this host's
-accelerator, the accelerator runs it when it is free -- behind whatever prefill or
-decode step already has the device -- and how long that took is something the
-caller measures. ``plan.queue_wait`` still exists and control still computes it;
-it is now a *prediction the run can disagree with*, which is the point.
-
-Two smaller things fell out with it, and both are simplifications rather than
-losses. The wait moved to the far side of the request's KV fetch, where a forward
-pass that cannot start before its inputs arrive actually has it (control's
-arithmetic puts the wait first, which also means control charges a fabric transfer
-to a device that is idle during it -- a divergence the run can now show). And
-``reserve``, which existed so that a decode step would not be scheduled through a
-prefill the accelerator did not know about, is gone: it knows about it.
+The wait also lands on the far side of the request's KV fetch, where a forward pass
+that cannot start before its inputs arrive actually has it. Control's arithmetic
+puts the wait first, and so charges a fabric transfer to a device that is idle
+during it -- a divergence the run can now show.
 
 What is deliberately still missing
 ----------------------------------
@@ -83,19 +66,17 @@ class PrefillEngine:
     def block_tokens(self) -> int:
         """Tokens per KV block, as this host's accelerator lays them out.
 
-        Forwarded rather than stored, so there is one answer on the host and it is
-        the one the KV was actually cut into (see
-        :attr:`~kvcache_sim.data._compute.Accelerator.block_tokens`).
+        Forwarded rather than stored, so the host has one answer and it is the one
+        the KV was actually cut into.
         """
         return self.compute.block_tokens
 
     def cost(self, uncached_tokens: int) -> float:
         """What prefilling ``uncached_tokens`` costs on this host.
 
-        Asked of the accelerator rather than computed here, because what a forward
-        pass costs is a fact about the machine running it. Needed for the one case
-        control cannot have priced: a plan whose remote prefix was evicted between
-        routing and fetching, which has to be recomputed and re-reported.
+        Asked of the accelerator: what a forward pass costs is a fact about the
+        machine running it. Needed for the one case control cannot have priced -- a
+        plan whose remote prefix was evicted between routing and fetching.
         """
         return self.compute.prefill_cost(uncached_tokens)
 
@@ -108,31 +89,20 @@ class PrefillEngine:
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """Run the forward pass on this host's accelerator; answer with KV and token.
 
-        Named in tokens rather than seconds, because how long that takes is the
-        accelerator's answer and not this engine's -- and because a deployment
-        implementing the port runs a model, which needs the work and not a duration.
-        ``prompt`` is the uncached suffix of the request's prompt, as ids: the count
-        it used to be was the last place a duration could have been substituted for
-        the work, and it was also the reason a deployment's engine could not have
-        been dropped in behind this call.
+        ``prompt`` is the uncached suffix of the request's prompt, as ids -- the
+        work, not a duration, so a deployment's engine drops in behind this call.
+        ``cached`` is the prefix this host pulled out of the store.
 
-        ``cached`` is the prefix this host pulled out of the store, and the first
-        half of the answer is every KV block this host now holds and did not before
-        (that prefix, then the computed suffix). Passed straight through: which
-        blocks a prefill ends up holding is the accelerator's account of its own
-        output, and an engine in between that reassembled the list would be a second
-        place for the order to be wrong.
-
-        The second half is the request's **first token** -- the one TTFT is the time
-        to. It travels the same way and for the same reason: the pass produced it,
-        so the pass answers with it, and this engine adds nothing to either.
+        Answers with every KV block this host now holds and did not before (that
+        prefix, then the computed suffix) and the request's **first token**, the one
+        TTFT is the time to. Both are passed straight through from the accelerator,
+        which is what produced them.
 
         This is where the pass is **submitted**, and therefore where it queues:
         after the caller's fetch, because a forward pass cannot start before its
-        inputs are here, and with the tokens that fetch actually left it with -- a
-        planned reuse that turned out to be evicted makes this a bigger pass than
-        the plan priced, and the queue slot has to be the real one. ``tag`` names
-        the submission so two passes handed in at the same instant queue in a fixed
-        order; the caller passes the request's id.
+        inputs are here, and with the tokens that fetch actually left it with -- an
+        evicted reuse makes this a bigger pass than the plan priced, and the queue
+        slot has to be the real one. ``tag`` (the request's id) fixes the order of
+        two passes submitted at the same instant.
         """
         return await self.compute.prefill(prompt, cached, tag=tag)

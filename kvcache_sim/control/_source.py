@@ -7,10 +7,9 @@ locally, the TTFT/TBT gates, where decode lands -- is compute placement, which
 the store knows nothing about, and stays in
 :mod:`kvcache_sim.control.scheduler`.
 
-Unlike ``dedup_sim``'s policy, this one is **not** installed in the controller.
-The scheduler does not want to be handed a source; it wants to *price* one
-against the alternative of recomputing the prefix. So it calls :meth:`select`
-itself, through the view, and then decides.
+Unlike ``dedup_sim``'s policy, this one is **not** installed in the controller: the
+scheduler wants to *price* a source against recomputing the prefix rather than be
+handed one, so it calls :meth:`select` itself, through the view, and then decides.
 """
 
 from __future__ import annotations
@@ -40,17 +39,7 @@ class LongestPrefixPolicy(Policy):
     async def select(
         self, view: Any, keys: Sequence[str], requester: str
     ) -> Selection:
-        """Instances holding a leading run of ``keys``, longest run first.
-
-        ``chosen`` short-circuits the ranking. When the scheduler asks, it is
-        pricing alternatives and passes nothing. When the *controller* asks, the
-        caller is a serving host fetching a gap it already decided to pull from a
-        specific peer -- priced at that peer's locality tier -- so re-ranking here
-        could hand it a different one and charge a cross-node read for a
-        same-node prediction. Re-deriving would not even agree by construction:
-        the scheduler ranks over the request's whole block chain, while the fetch
-        only names the gap.
-        """
+        """Instances holding a leading run of ``keys``, longest run first."""
         counts = await self._prefix_runs(view, list(keys))
         if not counts:
             return Selection.of([])
@@ -62,12 +51,11 @@ class LongestPrefixPolicy(Policy):
         """Per-instance prefix runs, from whichever view this caller has.
 
         The scheduler hands a :class:`~kvcache_sim.control._view.KVView` -- usually
-        the *pinned* one, so a whole routing decision reads one directory snapshot
-        and the candidate loop cannot disagree with itself. The controller can only
-        hand the plain :class:`~proposed.view.View` it was built with, because a
-        prefix run is a KV-cache notion the store has no reason to know. So use the
-        derived read when it is offered and derive it otherwise, off one shared
-        definition rather than two.
+        the *pinned* one, so a routing decision reads one directory snapshot. The
+        controller can only hand the plain :class:`~proposed.view.View` it was built
+        with, since a prefix run is a KV-cache notion the store has no reason to
+        know. Use the derived read when offered, derive it otherwise, off one shared
+        definition.
         """
         pinned = getattr(view, "prefix_lengths", None)
         if pinned is not None:

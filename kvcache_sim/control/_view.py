@@ -1,20 +1,17 @@
 """The one derived directory read the KV-cache scheduler needs.
 
 :class:`~proposed.view.View` stops at "who holds this key". A KV-cache scheduler
-asks something one step further on: *how many leading blocks of this prompt does
-each instance hold contiguously?* -- because a cache is only useful as a
-contiguous prefix. That is a KV-cache notion (a block-key chain), not a store
-notion, so it is a subclass here rather than a field on the base view.
-:func:`_longest_prefix_run` is that walk -- stop at the first missing block -- and
-lives here because this is the only thing that performs it.
+asks one step further on: *how many leading blocks of this prompt does each
+instance hold contiguously?* -- because a cache is only useful as a contiguous
+prefix. That is a KV-cache notion, not a store notion, so it is a subclass here
+rather than a field on the base view.
 
-:class:`PinnedKVView` is the second half of the same idea. A routing decision
-reads the prefix runs several times -- once for the candidate loop's local
-matches and once per candidate when it asks the source
-:class:`~proposed.policy.Policy` which peer would serve the gap -- and every one of
-those reads must see the *same* directory state or the decision is incoherent.
-Pinning the snapshot for the duration of one decision makes that explicit
-(and means the directory is walked once per request, not once per read).
+:class:`PinnedKVView` is the second half of the same idea. A routing decision reads
+the prefix runs several times -- once for the candidate loop's local matches, once
+per candidate when it asks the source :class:`~proposed.policy.Policy` which peer
+would serve the gap -- and all of them must see the *same* directory state or the
+decision is incoherent. Pinning also means the directory is walked once per
+request, not once per read.
 """
 
 from __future__ import annotations
@@ -46,12 +43,10 @@ def prefix_lengths_of(
 ) -> Dict[str, int]:
     """``instance -> leading blocks of ``block_keys`` it holds contiguously``.
 
-    The derivation, split from the read that feeds it, because the two callers get
-    their directory answer from different places: :meth:`KVView.prefix_lengths`
-    reads it (or serves a pinned snapshot of it), while
+    Split from the read that feeds it: :meth:`KVView.prefix_lengths` reads the
+    directory (or serves a pinned snapshot), while
     :class:`~kvcache_sim.control._source.LongestPrefixPolicy` is handed a plain
-    :class:`~proposed.view.View` by the controller and has to read it itself. One
-    definition either way.
+    :class:`~proposed.view.View` and reads it itself. One definition either way.
     """
     keys = list(block_keys)
     if not keys:
