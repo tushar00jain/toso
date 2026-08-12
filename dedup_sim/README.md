@@ -97,6 +97,12 @@ across runs (default and under a fixed random-scheduling seed). The exact-byte
 reassembly guarantee of the real client is covered separately in
 `../realsim/tests/test_correctness.py`.
 
+`test_evicts.py` runs the harder half: volumes with room for one payload, so a
+new version displaces the one a reader cached and the directory *unregisters* it
+mid-run. The same key is read twice with that eviction in between, and the fabric
+is 1x per read -- the chain re-forms because each answer is withheld against what
+the directory holds now, not against a registration that has since been dropped.
+
 ## Module layout
 
 Split by plane: `control/` decides, `data/` executes, and neither imports the
@@ -108,8 +114,9 @@ dedup_sim/
   control/                # DECIDES
     routing.py            #   DedupPolicy: a proposed.Policy -- ranked source
                           #   + a readiness gate, from a read-only View
-    _readiness.py         #   Readiness: facts observed + a gate per fact not
-                          #   true yet -- the waiting, kept out of the routing
+    _readiness.py         #   Readiness: a gate per fact not true yet, opened
+                          #   against the directory (nothing remembered, because
+                          #   volumes evict) -- the waiting, out of the routing
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- the
                           #   reader's put, via the Deployment's client for it

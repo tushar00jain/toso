@@ -130,6 +130,13 @@ class Policy(ControlPlane, ABC):
         Called by the controller on every real registration
         (``notify_put_batch``). Default: nothing. A policy whose answer is
         withheld until a planned peer registers opens its readiness gate here.
+
+        There is deliberately no counterpart for a *de*-registration
+        (``notify_delete_batch``, which is how a full volume says what it
+        evicted). This hook exists to deliver a **wakeup**, and nothing waits for
+        a key to disappear; a policy that needs to know who holds a key right now
+        reads the directory when it forms its answer, which is the only reading
+        that survives an eviction.
         """
 
 

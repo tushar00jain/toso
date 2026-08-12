@@ -103,8 +103,13 @@ class VolumeService:
     Args:
         store: an existing ``InMemoryStore`` to back this volume; a fresh one is
             created if omitted.
-        volume_id: the volume's id, used when asking for room and in a
-            :class:`StorageCapacityExceeded` message.
+        volume_id: the volume's **directory** identity -- the id its co-located
+            client registers puts under, which is therefore the id a dropped key
+            has to be reported against (and the one named in a
+            :class:`StorageCapacityExceeded` message). Not the endpoint id the
+            transport prices locality with: telling the directory that one would
+            name a volume it has never heard of, and the real
+            ``Controller._notify_delete`` swallows that silently.
         profile: the run's target-machine
             :class:`~sim_common.cost_model.MachineProfile`; its
             ``storage_capacity_bytes`` is this volume's byte capacity (defaults

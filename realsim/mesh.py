@@ -124,11 +124,18 @@ class Mesh:
         # (``storage_capacity_bytes``, default unbounded); the seam enforces it
         # against the aggregate resident working set, evicting its own coldest
         # before refusing a put that does not fit. It is handed the controller
-        # handle so it can tell the directory what it dropped.
+        # handle so it can tell the directory what it dropped -- under the node
+        # id, because that is the volume's *directory* identity: it is what the
+        # co-located client registers its puts under (``client_volume_id``), so
+        # it is the only name a ``notify_delete_batch`` can be matched against.
+        # The endpoint's ``.id`` is a different identity (the transfer one) and
+        # naming a dropped key with it would be silently ignored by the real
+        # ``Controller._notify_delete``, whose ``missing_ok`` swallows a volume
+        # id it does not know.
         self.volumes: Dict[str, LocalVolumeHandle] = {
             vid: LocalVolumeHandle(
                 VolumeService(
-                    volume_id=self.topology[vid].id,
+                    volume_id=vid,
                     profile=self.profile,
                     controller=self.controller_handle,
                 )

@@ -82,7 +82,11 @@ def test_default_capacity_is_unbounded_and_tracks_resident():
     # peak both equal the payload. Every reader volume only served gets (no put),
     # so it holds nothing.
     origin_vol = volumes["p"]
-    assert origin_vol.volume_id == origin
+    # The volume's directory identity is the node id, not the endpoint id the
+    # transport charges against (``origin`` below) -- it is what the co-located
+    # client registers puts under, so it is what a dropped key is reported under.
+    assert origin_vol.volume_id == "p"
+    assert origin == "volp"
     assert origin_vol.service.resident_bytes == PAYLOAD_BYTES
     assert origin_vol.service.peak_resident_bytes == PAYLOAD_BYTES
     assert origin_vol.service.capacity_bytes == float("inf")
@@ -122,13 +126,13 @@ def test_over_capacity_raises_with_details():
         _run_build(profile=profile)
 
     exc = excinfo.value
-    assert exc.volume_id == "volp"  # the origin volume's endpoint id
+    assert exc.volume_id == "p"  # the origin volume's directory id
     assert exc.capacity == cap
     assert exc.resident == 0  # nothing resident before the failed seed put
     assert exc.attempted == PAYLOAD_BYTES
     # The message names the volume, its capacity, and the attempted bytes.
     msg = str(exc)
-    assert "volp" in msg
+    assert "'p'" in msg
     assert str(cap) in msg
     assert str(PAYLOAD_BYTES) in msg
 
@@ -153,7 +157,9 @@ async def _put_delete_put() -> VolumeService:
     # Capacity for exactly two payloads.
     profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES * 2)
     topology = {"0": Endpoint(id="vol0", host="hA", node="nA")}
-    svc = VolumeService(volume_id="vol0", profile=profile)
+    # ``volume_id`` is the directory identity: the same id the client below
+    # registers its puts under (``client_volume_id``), not the endpoint id.
+    svc = VolumeService(volume_id="0", profile=profile)
     vol = LocalVolumeHandle(svc)
     volumes = {"0": vol}
     producer = RealClientAdapter(
@@ -218,12 +224,17 @@ def test_resident_tracking_is_deterministic():
 
 
 async def _put_over_capacity(policy=None, *, wired=True, keys=("A", "B", "C")):
-    """Fill a two-payload volume, then put one more and let it make room."""
+    """Fill a two-payload volume, then put one more and let it make room.
+
+    Returns ``(volume service, controller adapter)`` so a caller can check the
+    directory as well as the store -- an eviction is not done until the directory
+    has stopped saying this volume holds the key.
+    """
     controller = RealControllerAdapter()
     profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES * 2)
     topology = {"0": Endpoint(id="vol0", host="hA", node="nA")}
     svc = VolumeService(
-        volume_id="vol0",
+        volume_id="0",  # the directory identity, i.e. the client's volume id
         profile=profile,
         controller=controller.handle if wired else None,
     )
@@ -237,20 +248,34 @@ async def _put_over_capacity(policy=None, *, wired=True, keys=("A", "B", "C")):
     with producer.installed():
         for key in keys:
             await producer.client.put(key, _meta_payload())
-    return svc
+    return svc, controller
 
 
 def test_a_full_volume_evicts_its_own_coldest():
     """Plain LRU is local knowledge: the volume needs nobody's help to apply it."""
-    svc = asyncio.run(_put_over_capacity())
+    svc, _controller = asyncio.run(_put_over_capacity())
     assert sorted(svc.store.kv) == ["B", "C"]      # A was the coldest, and went
+
+
+def test_the_directory_is_told_what_was_evicted():
+    """The bytes are gone, so the one service that routes reads has to know.
+
+    The volume reports the drop under its *directory* id; naming itself anything
+    else would leave the real ``Controller`` still listing it as a holder (its
+    ``_notify_delete`` is ``missing_ok`` and ignores a volume it does not know),
+    and the next read would be routed here for a key that is not.
+    """
+    _svc, controller = asyncio.run(_put_over_capacity())
+    directory = controller.controller.keys_to_storage_volumes
+    assert "A" not in directory                    # the evicted key, unrouted
+    assert list(directory["B"]) == ["0"]           # what is still held, still listed
 
 
 
 
 def test_a_key_this_put_is_writing_is_never_evicted():
     """Freeing the bytes the caller is about to add would drop the new value."""
-    svc = asyncio.run(_put_over_capacity(keys=("A", "B", "A")))
+    svc, _controller = asyncio.run(_put_over_capacity(keys=("A", "B", "A")))
     assert sorted(svc.store.kv) == ["A", "B"]
 
 

@@ -18,6 +18,19 @@ readiness gate, and the controller withholds its answer until the peer's
 read-through put lands (:meth:`DedupPolicy.notice`). Peers are handed out FIFO
 under a fan-out cap, so cap 1 builds a chain and cap >= 2 a shallow tree.
 
+Whether a peer holds the key is asked of the directory every time an answer is
+formed (:meth:`DedupPolicy._registered`), never remembered: volumes evict, so a
+peer that registered the key and later dropped it for a newer version is a peer
+the next requester has to wait for again.
+
+Which raises the question of when waiting is safe at all, because a gate that
+nothing will ever open hangs the requester behind it. The answer is the debt the
+policy is already tracking: a requester it routes is going to read the key
+through, so from the moment it asks it *owes* that registration, and waiting for
+it is bounded. A source that owes nothing has to hold the key already, and one
+that holds nothing and owes nothing is no longer a source at all -- it is retired
+and the directory answers for that requester (:meth:`DedupPolicy._retire`).
+
 Exactly one reader is ever routed to a pre-existing holder, so exactly one
 transfer's source is an origin: ``origin_bytes`` is the 1x union whatever the cap.
 
@@ -34,7 +47,9 @@ a gather of ``client.get(K)``, with no idea a policy exists.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Optional, Sequence
+from typing import (
+    Any, Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple,
+)
 
 from proposed import DecisionLog, Policy, Selection
 
@@ -69,8 +84,15 @@ class DedupPolicy(Policy):
         self._planned: Dict[str, int] = defaultdict(int)
         # sources still under the fan-out cap, oldest first.
         self._avail: Deque[str] = deque()
-        # Which (volume, key) the real directory has registered, and the waiting
-        # for the ones it has not. The concurrency lives there, not here.
+        # The (volume, key) publications this policy has planned and not yet seen
+        # land: a requester it routes reads the key through into its own volume,
+        # so from the moment it is routed it OWES that registration. This is the
+        # only thing that makes waiting for a source safe -- see :meth:`select`.
+        self._promised: Set[Tuple[str, str]] = set()
+        # The waiting for the (volume, key) pairs the real directory has not
+        # registered yet. The concurrency lives there, not here; so does the rule
+        # that the directory -- not a memory of past registrations -- says which
+        # of them are true, because a volume that evicts makes one false again.
         self._ready = Readiness()
 
     # -- decide -------------------------------------------------------------- #
@@ -78,6 +100,12 @@ class DedupPolicy(Policy):
         self, view: Any, keys: Sequence[str], requester: str
     ) -> Selection:
         """Route ``requester`` to a peer (or, if it is first, to a holder)."""
+        # Asking is the promise: this requester is about to fetch these keys, and
+        # the read-through plane publishes what it fetched, so it now owes the
+        # directory that registration. Recorded before any source is handed out,
+        # which is what makes the invariant below hold -- a peer is only ever
+        # offered as a source after it has asked, hence after it has promised.
+        self._promised.update((requester, key) for key in keys)
         source = self._route.get(requester)
         if source is None:
             source = await self._assign(view, keys, requester)
@@ -90,12 +118,40 @@ class DedupPolicy(Policy):
                 self.trace.record(
                     view.now(), "route", f"{requester} <- {source}"
                 )
-        # The gate is built here, where the answer is formed, rather than where the
-        # source was picked: a requester asking again after its source registered is
-        # told to wait for nothing.
-        return Selection.of(
-            [source], ready=self._ready.gate((source, key) for key in keys)
-        )
+        # The answer is formed here, rather than where the source was picked, and
+        # what shape it takes depends on what the source owes:
+        facts = [(source, key) for key in keys]
+        if all(fact in self._promised for fact in facts):
+            # It owes every key, so the wait is bounded by its read-through: gate
+            # (which is still a directory read, because it may already hold a key
+            # it is about to republish -- then there is nothing to wait for).
+            ready = await self._ready.gate(
+                facts, lambda f: self._registered(view, f)
+            )
+            return Selection.of([source], ready=ready)
+        # It owes nothing, so a gate here could outlive the run: nothing would
+        # ever record it. It is a usable source only if it holds every key right
+        # now -- which is the ordinary case, because this is how the requester
+        # routed to a pre-existing holder is answered.
+        if len(await self._registered(view, facts)) == len(facts):
+            return Selection.of([source])
+        # Holds nothing, owes nothing: a peer that published and has since
+        # evicted (a newer version displaced it). Waiting on it would hang and
+        # naming it would route a reader to a volume with nothing to serve, so it
+        # stops being a source and the directory answers this one for itself.
+        return self._retire(view, requester, source)
+
+    def _retire(self, view: Any, requester: str, source: str) -> Selection:
+        """Drop a source nothing is coming from, and answer naively this once.
+
+        The requester keeps no route to it, so its next ask is assigned afresh --
+        to a peer that is actually going to have the key.
+        """
+        self._avail = deque(peer for peer in self._avail if peer != source)
+        self._route.pop(requester, None)
+        if self.trace is not None:
+            self.trace.record(view.now(), "retire", f"{source} holds nothing")
+        return Selection()
 
     async def _assign(
         self, view: Any, keys: Sequence[str], requester: str
@@ -108,7 +164,11 @@ class DedupPolicy(Policy):
             self._planned[source] += 1
             if self._planned[source] >= self.cap:
                 self._avail.popleft()
-            self._avail.append(requester)
+            if requester not in self._avail:
+                # Once: a requester re-assigned after its source was retired is
+                # already in the queue, and a second entry would let it be handed
+                # out past the cap.
+                self._avail.append(requester)
             return source
         # First requester: the closest volume that already holds every key. This
         # is the one hop whose source is an origin -- the 1x fabric cost.
@@ -119,14 +179,35 @@ class DedupPolicy(Policy):
         holders.discard(requester)
         if not holders:
             return None
-        self._avail.append(requester)
+        if requester not in self._avail:
+            self._avail.append(requester)
         return view.nearest(sorted(holders), requester)
 
     # -- readiness ----------------------------------------------------------- #
+    async def _registered(
+        self, view: Any, facts: Sequence[Hashable]
+    ) -> List[Hashable]:
+        """Which of these ``(volume, key)`` pairs the directory holds *now*.
+
+        The truth a readiness gate is opened against, read from the real directory
+        rather than remembered: a source that registered a key and later evicted it
+        (a new version displacing the old) does not hold it, and a requester routed
+        there has to wait for the read-through that brings it back.
+        """
+        located = await view.locate([key for _volume, key in facts])
+        return [
+            (volume, key)
+            for volume, key in facts
+            if volume in view.holders(located, key)
+        ]
+
     def notice(self, volume_id: str, keys: Sequence[str]) -> None:
         """The real directory just registered ``keys`` on ``volume_id``.
 
-        Releases any requester whose answer was withheld pending that volume.
+        Releases any requester whose answer was withheld pending that volume, and
+        settles the debt: the publication happened, so from here on the directory
+        is what says whether that volume still holds the key.
         """
         for key in keys:
+            self._promised.discard((volume_id, key))
             self._ready.record((volume_id, key))

@@ -253,17 +253,33 @@ def test_the_scenario_holds_no_burst_loop():
 
 
 # --------------------------------------------------------------------------
-# Readiness: the waiting the policy delegates. Its three safety properties are
-# the ones a hand-rolled latch gets wrong, so they are asserted directly rather
-# than only through a burst that happens to exercise them.
+# Readiness: the waiting the policy delegates. Its safety properties are the ones
+# a hand-rolled latch gets wrong, so they are asserted directly rather than only
+# through a burst that happens to exercise them.
+#
+# It remembers nothing: a gate is opened against the truth read from wherever the
+# caller says it lives -- the real directory, in the policy -- because a volume
+# that evicts makes a past registration false. ``_holds`` stands in for that read.
 # --------------------------------------------------------------------------
 
 
-def test_a_fact_recorded_first_needs_no_gate():
-    """The lost-wakeup guard: never wait for something that already happened."""
-    ready = Readiness()
-    ready.record(("v0", "K"))
-    assert ready.gate([("v0", "K")]) is None
+def _holds(*facts):
+    """An ``observed`` probe: the directory currently holds exactly ``facts``."""
+
+    async def observed(wanted):
+        return [f for f in wanted if f in facts]
+
+    return observed
+
+
+def test_a_fact_the_directory_already_holds_needs_no_gate():
+    """The whole point of the read: never wait for what is already true."""
+
+    async def _ask():
+        return await Readiness().gate([("v0", "K")], _holds(("v0", "K")))
+
+    gate, _trace = run_sim(_ask())
+    assert gate is None
 
 
 def test_a_gate_opens_when_its_last_fact_is_recorded():
@@ -271,7 +287,7 @@ def test_a_gate_opens_when_its_last_fact_is_recorded():
 
     async def _wait() -> str:
         ready = Readiness()
-        gate = ready.gate([("v0", "K"), ("v1", "K")])
+        gate = await ready.gate([("v0", "K"), ("v1", "K")], _holds())
         assert gate is not None
         order: list[str] = []
 
@@ -292,11 +308,66 @@ def test_a_gate_opens_when_its_last_fact_is_recorded():
     assert result == "released"
 
 
-def test_a_released_gate_is_dropped_but_the_fact_is_kept():
-    """Otherwise the map grows for the life of the run, holding dead events."""
-    ready = Readiness()
-    assert ready.gate([("v0", "K")]) is not None
-    assert len(ready._gates) == 1
-    ready.record(("v0", "K"))
-    assert ready._gates == {}, "a released gate is never consulted again"
-    assert ready.gate([("v0", "K")]) is None, "the fact outlives its gate"
+def test_a_registration_during_the_directory_read_is_not_lost():
+    """The lost-wakeup guard, and the reason interest is registered first.
+
+    The read is awaited, so the fact can land while it is in flight -- and the
+    answer that comes back is then already stale. Because the event existed
+    before the read started, that registration sets it instead of falling into
+    the window between "is it true?" and "wait".
+    """
+
+    async def _ask():
+        ready = Readiness()
+
+        async def observed(wanted):
+            # The put lands while the directory read is in flight; what the read
+            # reports is the state from before it.
+            await asyncio.sleep(0)
+            ready.record(("v0", "K"))
+            return []
+
+        return await ready.gate([("v0", "K")], observed)
+
+    gate, _trace = run_sim(_ask())
+    assert gate is None, "would have parked on a fact that is already true"
+
+
+def test_a_released_gate_is_dropped_and_nothing_takes_its_place():
+    """Otherwise the object grows for the life of the run.
+
+    Not just with dead events -- the *fact* is what used to be kept forever, one
+    entry per (volume, key), so a run that reads a hundred model versions carried
+    a hundred times the readers' worth of them to the end.
+    """
+
+    async def _versions():
+        ready = Readiness()
+        for version in range(100):
+            fact = ("v0", f"W{version}")
+            assert await ready.gate([fact], _holds()) is not None
+            assert len(ready._gates) == 1, "one entry per fact being waited on"
+            ready.record(fact)
+        return len(ready._gates)
+
+    outstanding, _trace = run_sim(_versions())
+    assert outstanding == 0, "a released gate is never consulted again"
+
+
+def test_a_registration_that_was_evicted_does_not_open_a_later_gate():
+    """The stale-routing guard: "recorded once" is not "true from now on".
+
+    A volume that registered a key and later dropped it (a new version displacing
+    the old) does not hold it. Answering the next requester from the memory of
+    that registration would route it to a volume with nothing to serve.
+    """
+
+    async def _evict_then_ask():
+        ready = Readiness()
+        assert await ready.gate([("v0", "K")], _holds()) is not None
+        ready.record(("v0", "K"))  # v0's put landed; the waiter goes
+        # ...and later v0 evicts K, so the directory no longer holds it.
+        return await ready.gate([("v0", "K")], _holds())
+
+    gate, _trace = run_sim(_evict_then_ask())
+    assert gate is not None, "answered from memory, not from the directory"

@@ -53,8 +53,12 @@ def test_mesh_wires_one_client_and_volume_per_node_on_one_directory():
     clients = [mesh.client(v) for v in mesh.ids]
     assert len({id(c) for c in clients}) == 3
     assert all(a.client is not None for a in mesh.adapters.values())
-    # The volume handle's id is the endpoint's transfer identity, not the node key.
-    assert mesh.volumes["a"].volume_id == "vola"
+    # The volume handle's id is its DIRECTORY identity -- the node key, which is
+    # what the co-located client registers puts under and therefore the only name
+    # a key this volume drops can be reported to the directory under. (The
+    # endpoint's ``.id``, "vola", is the separate transfer identity.)
+    assert mesh.volumes["a"].volume_id == "a"
+    assert mesh.topology["a"].id == "vola"
     # One registry shared by every adapter (so concurrent transfers can contend).
     assert mesh.registry is not None
 
