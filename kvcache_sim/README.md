@@ -157,8 +157,9 @@ kvcache_sim/
                           #   coupling, which is a deployment fact, not a policy
     _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT
                           #   (underscored: nothing outside data/ drives it)
-    store.py              #   publish / fetch / evict over a Deployment's clients,
-                          #   plus KVStore.for_deployment, the one factory
+    store.py              #   what a KV block is stored as, and publish / reuse /
+                          #   fetch over a Deployment's clients. Constructing one
+                          #   checks the block-size premise fetches are priced on
   workload/               # WHAT IS SIMULATED
     _generator.py         #   seeded synthetic request stream (Zipf + Poisson),
                           #   incl. the prompt's prefix-hash chain (str keys)

@@ -201,10 +201,11 @@ class ServingPlane(DataPlane):
                 await self.store.fetch(plan.prefill, plan.pull_keys)
             except KeyError:
                 # The peer had those blocks when this was planned and does not now:
-                # a volume it shares with other requests ran out of room and control
-                # named them. Nothing is wrong -- a cache that cannot evict is not a
+                # a volume it shares with other requests ran out of room and dropped
+                # its coldest. Nothing is wrong -- a cache that cannot evict is not a
                 # cache -- but this plan is stale, so recompute what was going to be
-                # reused instead of failing the request.
+                # reused instead of failing the request. All of it: the pull is
+                # all-or-nothing, and half a prefix is not a prefix.
                 prefill_t = self._recompute(plan, row)
         # (3) charge the prefill compute for the uncached suffix.
         if prefill_t > 0:

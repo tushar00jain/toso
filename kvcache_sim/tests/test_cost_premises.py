@@ -199,7 +199,7 @@ def test_predicted_block_bytes_equal_the_bytes_the_data_plane_moves():
     this pins them together for the default and for a much larger model.
     """
     for model in (DEFAULT_MODEL, REAL_MODEL):
-        cl = KVStore.for_deployment(
+        cl = KVStore(
             Simulation(_make_topology(2)).mesh,
             block_tokens=BLOCK_TOKENS,
             carrier=_sim_block_carrier(BLOCK_TOKENS, model),
@@ -225,7 +225,7 @@ def test_a_real_pull_costs_what_get_time_predicted():
     keys = ["blk0"]
 
     sim = Simulation(topo)
-    cl = KVStore.for_deployment(
+    cl = KVStore(
         sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
     )
 

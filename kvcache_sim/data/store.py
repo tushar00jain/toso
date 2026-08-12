@@ -8,7 +8,7 @@ instance id to one of many in-process clients; a real one has a single client an
 ignores the id. Either way what follows is the same code -- which is the point:
 nothing here imports the simulator.
 
-This module holds only the three KV verbs that move bytes or change the directory.
+This module holds only the KV verbs that move bytes or change the directory.
 
 Mapping (real directory + real types throughout):
 
@@ -24,13 +24,19 @@ Mapping (real directory + real types throughout):
   where a deployment would supply the KV tensors;
 * a **remote prefix pull** (:meth:`KVStore.fetch`) is a real ``client.get_batch``,
   so a simulated run charges fabric/storage/RAM for it through the same cost model
-  the scheduler predicted against;
-* **eviction** (:meth:`KVStore.evict`) removes ``K -> volume_X`` from the real
-  directory via the real ``notify_delete_batch`` endpoint.
+  the scheduler predicted against.
 
-Reading the directory is *not* here: a ``locate`` decides nothing and moves
+**Eviction is not here.** A volume drops its own coldest keys when a put does not
+fit and tells the directory itself, so a verb here that deregistered a key would
+be half an eviction: the entry would go and the bytes would stay. Which key to
+drop is the volume's (``realsim.seams._retention``), and saying so is the
+volume's too.
+
+Reading the directory is *not* here either: a ``locate`` decides nothing and moves
 nothing, so per-instance prefix presence is a control-plane view
-(:class:`kvcache_sim.control._view.KVView`).
+(:class:`kvcache_sim.control._view.KVView`). That includes re-reading it to see
+whether a planned pull is still available -- :meth:`KVStore.fetch` asks for what it
+was told to and lets the store answer.
 """
 
 from __future__ import annotations
@@ -45,19 +51,30 @@ __all__ = ["KVStore"]
 
 
 class KVStore:
-    """The KV data plane's three verbs over real per-instance clients.
+    """What a KV block is stored as, and the store calls that follow from it.
+
+    The verbs are thin because the mapping is thin -- a block is a key, publishing
+    is a ``put_batch``. What is not thin, and is why this is an object rather than
+    three calls in the serving loop, is the premise it enforces at construction:
+    whatever a block is stored as must occupy the bytes
+    :meth:`~domain.llm.Model.block_bytes` predicts, because that is the number the
+    scheduler prices every fetch against. A carrier that disagrees would make the
+    run charge for one size and route on another, with nothing else noticing.
 
     Args:
         deployment: the :class:`~proposed.deployment.Deployment` these instances
-            run against; it vends the client for an instance id.
+            run against; it vends the client for an instance id. A real one vends
+            its single client and ignores the id.
         block_tokens: tokens per KV block.
-        carrier: what one block is stored as. Supplied by the run because it is
-            the piece that differs between a simulated run (an allocation-free
-            descriptor) and a real one (the KV tensors).
+        carrier: what one block is stored as, and the piece that differs between a
+            simulated run (an allocation-free descriptor) and a real one (the KV
+            tensors). Supplied by the run: *what* to store is not a data-plane
+            decision.
         model: served-model :class:`~domain.llm.Model`, which sets how many bytes
-            one KV block occupies. The carrier must be sized from it (see
-            :attr:`block_nbytes`) so the bytes moved are the bytes
-            :meth:`~domain.llm.Model.block_bytes` predicts.
+            one KV block occupies and therefore what ``carrier`` must measure.
+
+    Raises:
+        ValueError: if the carrier is not the size the model predicts.
     """
 
     def __init__(
@@ -68,36 +85,6 @@ class KVStore:
         carrier,
         model: Model = DEFAULT_MODEL,
     ) -> None:
-        self.deployment = deployment
-        self.block_tokens = block_tokens
-        self.model = model
-        # What one KV block is, as far as the store is concerned. Supplied by the
-        # workload rather than built here: *what* to store is not a data-plane
-        # decision, and it is the piece that differs between a simulated run
-        # (an allocation-free carrier) and a real one (the KV tensors).
-        self._block_carrier = carrier
-
-    @classmethod
-    def for_deployment(
-        cls,
-        deployment: Deployment,
-        *,
-        block_tokens: int,
-        carrier,
-        model: Model = DEFAULT_MODEL,
-    ) -> "KVStore":
-        """Build a store over ``deployment``, checking the block-size premise.
-
-        The one invariant worth failing loudly on: whatever a block is stored as,
-        it must occupy the bytes :meth:`~domain.llm.Model.block_bytes` predicts,
-        because that is the number the scheduler prices every fetch against. A
-        carrier that disagrees would make the sim charge for one size and route
-        on another, with nothing else noticing.
-
-        Both the deployment and the carrier are the caller's: a real one vends
-        its own client and stores the KV tensors; a simulated one vends the
-        client for an instance id and stores an allocation-free descriptor.
-        """
         want = model.block_bytes(1, block_tokens)
         if carrier.nbytes != want:
             raise ValueError(
@@ -105,9 +92,9 @@ class KVStore:
                 f"{want}B for {block_tokens} tokens: every fetch would be priced "
                 f"against the wrong byte count"
             )
-        return cls(
-            deployment, block_tokens=block_tokens, carrier=carrier, model=model
-        )
+        self.deployment = deployment
+        self.block_tokens = block_tokens
+        self._block_carrier = carrier
 
     @property
     def block_nbytes(self) -> int:
@@ -169,26 +156,14 @@ class KVStore:
         decision it already made. Nothing has to be threaded through this call.
 
         A routing decision is made when the request arrives, but the pull runs
-        later (after the prefill queue), by which time a peer may have *evicted*
-        some of the planned blocks. Like a real read-through, we fetch only the
-        blocks still present in the directory; any that vanished are simply
-        recomputed by prefill. The presence re-check and the ``get_batch`` locate
-        run back-to-back without yielding the loop, so they observe the same state.
+        later (after the prefill queue), by which time the peer may have dropped
+        some of the planned blocks. ``get_batch`` is all-or-nothing, so that
+        surfaces here as a ``KeyError`` and the caller decides -- which is the
+        honest place for it: whether a half-usable prefix is worth pulling is a
+        question about the request, not about the store. Filtering the batch down
+        to what survived would answer it here, silently, and charge the caller for
+        a reuse it did not get.
         """
         if not keys:
             return
-        located = await self.deployment.controller_handle.locate_volumes.call_one(
-            list(keys), missing_ok=True
-        )
-        present = [k for k in keys if k in located]
-        if not present:
-            return
-        await self.deployment.client_for(inst).get_batch(present)
-
-    async def evict(self, inst: str, keys: List[str]) -> None:
-        """Drop ``key -> volume`` for ``inst`` from the REAL directory (eviction)."""
-        if not keys:
-            return
-        await self.deployment.controller_handle.notify_delete_batch.call(
-            {inst: list(keys)}
-        )
+        await self.deployment.client_for(inst).get_batch(list(keys))

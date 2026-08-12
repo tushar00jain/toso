@@ -64,12 +64,28 @@ def test_longest_prefix_run():
 #    Publishing records block->volume presence in the real Controller directory;
 #    locate_volumes reads it back; eviction removes it. This is the cache-aware
 #    scheduler's core query, answered directly by the real directory.
+async def _evict(deployment, inst: str, keys: list) -> None:
+    """Evict ``keys`` from ``inst`` the way a full volume does.
+
+    Both halves, because either alone is a state the store never produces: the
+    volume drops the bytes (its own ``delete``, which releases what the key owns)
+    and then tells the directory. There is no verb for this in the data plane --
+    which key to drop is the volume's own decision, taken when a put does not fit
+    -- so a test that wants the outcome without the capacity pressure does what
+    the volume would have done.
+    """
+    await deployment.volume_handle(inst).delete_batch.call_one(list(keys))
+    await deployment.controller_handle.notify_delete_batch.call_one(
+        {inst: list(keys)}
+    )
+
+
 def test_real_directory_prefix_presence_and_eviction():
     topo = _make_topology(2)
     keys = _block_keys_for("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
-    store = KVStore.for_deployment(
+    store = KVStore(
         sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512)
     )
     view = KVView(sim.view.directory, sim.topology)
@@ -81,7 +97,7 @@ def test_real_directory_prefix_presence_and_eviction():
             await store.publish("s1", list(keys[:1]))  # s1 holds 1
             counts = await view.prefix_lengths(list(keys))
             assert counts == {"s0": 3, "s1": 1}
-            await store.evict("s0", [keys[1]])         # break s0's run at index 1
+            await _evict(sim.mesh, "s0", [keys[1]])    # break s0's run at index 1
             counts2 = await view.prefix_lengths(list(keys))
             assert counts2 == {"s0": 1, "s1": 1}
         return True
@@ -91,6 +107,35 @@ def test_real_directory_prefix_presence_and_eviction():
     finally:
         sim.loop.close()
     assert ok
+
+
+# 2b. A pull is all-or-nothing. A plan is made when the request arrives and the
+#     pull happens after the prefill queue, so a peer can drop a planned block in
+#     between. The fetch then raises and moves nothing, which is what lets the
+#     serving plane recompute the whole prefix instead of pulling a hole through
+#     it -- half a prefix is not a prefix, and quietly fetching the survivors
+#     would charge the request for a reuse it did not get.
+def test_a_fetch_whose_block_vanished_raises_and_moves_nothing():
+    topo = _make_topology(2)
+    keys = _block_keys_for("m0", [0, 1])
+
+    sim = Simulation(topo)
+    store = KVStore(sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512))
+
+    async def scenario():
+        with sim.mesh.installed():
+            await store.publish("s0", list(keys))
+            await _evict(sim.mesh, "s0", [keys[1]])
+            before = sim.ledger.transfer_bytes
+            with pytest.raises(KeyError):
+                await store.fetch("s1", list(keys))
+            return sim.ledger.transfer_bytes - before
+
+    try:
+        moved = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+    assert moved == 0  # it fails at the locate, before anything crosses
 
 
 # 3. LRU now lives in the volume -- recency of a node's own data is the one thing
@@ -422,7 +467,7 @@ def test_the_source_policy_accepts_a_plain_view():
     async def scenario():
         with sim.mesh.installed():
             empty = await LongestPrefixPolicy().select(sim.view, keys, "s0")
-            store = KVStore.for_deployment(
+            store = KVStore(
                 sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512)
             )
             await store.publish("s1", list(keys))

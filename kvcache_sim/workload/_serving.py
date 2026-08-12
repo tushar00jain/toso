@@ -141,7 +141,7 @@ def serving_plane(
     def build(sim: Simulation) -> ServingPlane:
         # The simulation *is* the deployment: it vends the client for an instance
         # and holds the directory. All the run adds is the block carrier.
-        store = KVStore.for_deployment(
+        store = KVStore(
             sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
         )
         return ServingPlane(
