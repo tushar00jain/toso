@@ -154,18 +154,27 @@ kvcache_sim/
                           #   (str keys): what is decided about, and what data/
                           #   is handed
   data/                   # EXECUTES -- advances the clock, moves bytes
-    serving.py            #   one ServingHost per instance -- routes, then serves:
-                          #   queue wait, real pull, prefill charge, publish/evict,
-                          #   decode admission, outcome rows. Owns prefill/decode
-                          #   coupling, which is a deployment fact, not a policy
+    serving.py            #   one ServingHost per instance: the router role every
+                          #   host plays, then -- for the ones it serves -- the real
+                          #   pull, the publish and the decode handoff. Holds the
+                          #   engines below; runs neither itself
+    _compute.py           #   Accelerator: the port an engine runs its work on --
+                          #   what it costs and making it take that long. Both
+                          #   engines get one; the SAME one is what coupling means
+    _prefill.py           #   PrefillEngine: the queue a request waits behind and
+                          #   the forward pass, run on the accelerator
     _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT
-                          #   (underscored: nothing outside data/ drives it)
+                          #   (all three underscored: nothing outside data/ drives
+                          #   them)
     store.py              #   what a KV block is stored as, and publish / reuse /
                           #   fetch over a Deployment's clients. Constructing one
                           #   checks the block-size premise fetches are priced on
   workload/               # WHAT IS SIMULATED
     _generator.py         #   seeded synthetic request stream (Zipf + Poisson),
                           #   incl. the prompt's prefix-hash chain (str keys)
+    _accelerator.py       #   SimulatedAccelerator: the Accelerator port, answered
+                          #   by a roofline and a sleep. The one piece of the
+                          #   compute story a deployment replaces outright
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
                           #   the wiring a run installs around it
     scenarios.py          #   the six Scenarios: each declares its Runs over one

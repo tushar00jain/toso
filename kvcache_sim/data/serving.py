@@ -83,7 +83,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Callable, Dict, List, Optional
 
-from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model, prefill_time
 from proposed import Coordinator
 
 from ..control.scheduler import (
@@ -92,6 +91,7 @@ from ..control.scheduler import (
 from ..report.metrics import Metrics, RequestResult
 from ..control.request import Request
 from ._decode import DecodeEngine
+from ._prefill import PrefillEngine
 from .store import KVStore
 
 __all__ = ["ServingHost"]
@@ -115,12 +115,16 @@ class ServingHost:
             hop is charged on the way through it.
         trace: the run's shared trace.
         metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger.
-        coupled: whether prefill shares this host's decode compute timeline.
-        simulate_decode / max_batch / profile / model: how this host models
-            decode. They come from the run's wiring
-            (:func:`kvcache_sim.workload._serving.serving_plane`), which is the
-            same place the coordinator got them -- not read off the coordinator,
-            which would be this host inspecting another service's fields.
+        prefill: this host's :class:`~kvcache_sim.data._prefill.PrefillEngine`,
+            or ``None`` if it does not prefill.
+        decode: this host's :class:`~kvcache_sim.data._decode.DecodeEngine`, or
+            ``None`` if it does not decode. Whether the two were handed the *same*
+            :class:`~kvcache_sim.data._compute.ComputeTimeline` is whether they
+            contend -- see :attr:`coupled`.
+        models_decode: whether this *run* models the request's second half at all.
+            Not the same question as whether this host decodes: a prefill-only host
+            in a disaggregated run has no decode engine, and its requests still go
+            on to decode somewhere else.
     """
 
     def __init__(
@@ -132,11 +136,9 @@ class ServingHost:
         peers: Callable[[str], Any],
         trace,
         metrics: Metrics,
-        coupled: bool = False,
-        simulate_decode: bool = False,
-        max_batch: int = 8,
-        profile=DEFAULT_PROFILE,
-        model: Model = DEFAULT_MODEL,
+        prefill: Optional[PrefillEngine] = None,
+        decode: Optional[DecodeEngine] = None,
+        models_decode: bool = False,
     ) -> None:
         self.me = me
         self.store = store
@@ -144,30 +146,34 @@ class ServingHost:
         self.peers = peers
         self.trace = trace
         self.metrics = metrics
-        self.coupled = coupled
-        self.simulate_decode = simulate_decode
-        # Cost constants, for the one thing this host has to price itself: a
-        # prefill re-priced because the reuse it was planned around is gone.
-        self.profile = profile
-        self.model = model
+        self.prefill = prefill
+        self.engine = decode
+        self.models_decode = models_decode
         self.block_tokens = store.block_tokens
+        #: Whether a prefill here delays a decode step here -- true exactly when
+        #: both engines run on one accelerator. A run may model two engines on one
+        #: host as *not* contending, which is a simplification rather than a
+        #: deployment: the wiring says so by handing them separate timelines.
+        self.coupled = (
+            prefill is not None
+            and decode is not None
+            and prefill.compute is decode.compute
+        )
         # On the decode-simulating path acceptance is provisional until the request
         # is admitted to a decode batch (it may still be shed on the TBT SLO). We
         # stash the accepted row here and publish it once decode finishes (success)
         # or admission is refused (wasted prefill).
         self._pending: Dict[str, RequestResult] = {}
-        self.engine: Optional[DecodeEngine] = None
-        if simulate_decode:
-            self.engine = DecodeEngine(
-                max_batch=max_batch,
-                profile=profile,
-                model=model,
-                on_finish=self._decode_done,
-                # Coupled: prefill and decode are one timeline, so every step is
-                # reported to control's predicted queue. Disaggregated: never.
-                on_compute_busy=self._compute_busy if coupled else None,
-                on_state=self._decode_state,
-            )
+        if self.engine is not None:
+            self.engine.on_finish = self._decode_done
+            self.engine.on_state = self._decode_state
+            # There is something to report only when a decode step can actually
+            # collide with a prefill, and that is exactly when the two engines were
+            # given the *same* accelerator. Identity, not a flag: the run's wiring
+            # answers it by what it hands them, so there is nowhere for a second
+            # answer to disagree.
+            if self.coupled:
+                self.engine.on_compute_busy = self._compute_busy
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
@@ -219,14 +225,14 @@ class ServingHost:
     async def serve(self, plan: Plan) -> None:
         """Prefill ``plan``'s request here, then hand it to its decode host."""
         request = plan.request
-        # The accepted plan reserved this host in control's predicted queue. When
-        # coupled that reservation occupies the same compute the decode engine
-        # steps on, so apply it there too -- immediately, with no await in
-        # between, so no decode step can slip past it.
-        if self.coupled and self.engine is not None:
-            self.engine.reserve(plan.done_time)
+        # The accepted plan reserved this host in control's predicted queue. If a
+        # decode engine shares this accelerator that reservation occupies the same
+        # timeline its steps run on, so take it -- immediately, with no await in
+        # between, so no step can slip past it.
+        if self.coupled:
+            self.prefill.reserve(plan.done_time)
 
-        tbt = self.simulate_decode
+        tbt = self.models_decode
         self._trace_route(plan)
         row = self._make_accepted(plan)
         if not tbt:
@@ -235,8 +241,7 @@ class ServingHost:
             self._pending[request.id] = row
 
         # (1) wait out the prefill queue at this host.
-        if plan.queue_wait > 0:
-            await asyncio.sleep(plan.queue_wait)
+        await self.prefill.wait_turn(plan.queue_wait)
         # (2) the prefix this host already had is a read the store never sees,
         # so tell it: the volume evicts on what it has observed.
         local_blocks = plan.match_blocks - len(plan.pull_keys)
@@ -245,7 +250,7 @@ class ServingHost:
                 self.me, list(plan.request.block_keys[:local_blocks])
             )
         # ...then pull the remote prefix (a real get_batch -> real fabric cost).
-        prefill_t = plan.prefill_t
+        uncached = plan.uncached_tokens
         if plan.reuse_source is not None and plan.pull_keys:
             try:
                 await self.store.fetch(self.me, plan.pull_keys)
@@ -256,10 +261,10 @@ class ServingHost:
                 # cache -- but this plan is stale, so recompute what was going to be
                 # reused instead of failing the request. All of it: the pull is
                 # all-or-nothing, and half a prefix is not a prefix.
-                prefill_t = self._recompute(plan, row)
-        # (3) charge the prefill compute for the uncached suffix.
-        if prefill_t > 0:
-            await asyncio.sleep(prefill_t)
+                uncached = self._recompute(plan, row)
+        # (3) charge the prefill compute for the uncached suffix. The engine is
+        # told the work, not a duration: what it costs is the accelerator's answer.
+        await self.prefill.run(uncached)
 
         # (4) publish what this host now holds and did not before: the prefix it
         # pulled, plus the suffix it computed. Which blocks those are is not a
@@ -278,14 +283,14 @@ class ServingHost:
         busy_until = await self.coordinator.decide.call_one(
             PrefillFinished(self.me, now)
         )
-        if self.coupled and self.engine is not None:
+        if self.coupled:
             # The reply, not a read of control's queue: prefill just occupied the
             # timeline decode steps on, and only the coordinator knows the tail.
-            self.engine.reserve(busy_until)
+            self.prefill.reserve(busy_until)
         await self._prefill_done(plan, row.published)
 
-    def _recompute(self, plan: Plan, row: RequestResult) -> float:
-        """Re-price this prefill with the reuse that vanished, and say what it costs.
+    def _recompute(self, plan: Plan, row: RequestResult) -> int:
+        """Re-price this prefill with the reuse that vanished; answer what is left.
 
         The remote prefix is gone, so only what this host already held is still
         cached: the planned match minus the blocks that were going to be pulled.
@@ -299,15 +304,14 @@ class ServingHost:
         row.cached_tokens = cached
         row.uncached_tokens = uncached
         row.transfer_bytes = 0
-        recomputed = prefill_time(uncached, self.profile, self.model)
-        row.ttft += recomputed - plan.prefill_t
+        row.ttft += self.prefill.cost(uncached) - plan.prefill_t
         self.trace.record(
             self._now(),
             "RESTALE",
             f"{plan.request.id} lost {len(plan.pull_keys)}blk of reuse on "
             f"{plan.reuse_source} (evicted); recomputing on {self.me}",
         )
-        return recomputed
+        return uncached
 
     # -- outcome bookkeeping ---------------------------------------------- #
     def _make_accepted(self, plan: Plan) -> RequestResult:
@@ -345,7 +349,7 @@ class ServingHost:
         stored = len(plan.request.block_keys) - (
             plan.match_blocks - len(plan.pull_keys)
         )
-        if not self.simulate_decode:
+        if not self.models_decode:
             self.trace.record(
                 self._now(),
                 "DONE",

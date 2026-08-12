@@ -4,23 +4,23 @@ Prefill answers "how fast is the first token" (TTFT); this module answers "how f
 is every *subsequent* token" (TBT). A serving instance decodes a **batch** of
 requests together: each decode *step* emits one token for every request in the
 batch, and the step's wall time is the TBT every batched request sees for that
-token. Step time rises with batch size (:func:`~domain.llm.decode_step_time`,
-charged on the GPU roofline), so TBT degrades as an instance fills up -- exactly
-the tension a TBT SLO bounds.
+token. Step time rises with batch size -- the accelerator says by how much -- so
+TBT degrades as an instance fills up, which is exactly the tension a TBT SLO
+bounds.
 
 Two levers the design cares about are modelled here:
 
 * **VRAM cap** (``max_batch``): a batch grows only to the cap; requests over it
   queue (``pending``) and their wait counts against their TBT.
 * **Prefill/decode coupling**: this host's compute timeline
-  (:attr:`DecodeEngine.compute_busy`) is owned *here*, in the data plane, because
-  it is the physical resource. On a **coupled** host prefill runs on that same
-  timeline, so a long prefill delays the next decode step and spikes that token's
-  TBT. That is expressed by two explicit calls rather than a dict shared with the
-  scheduler: :meth:`DecodeEngine.reserve` applies a prefill reservation to the
-  timeline, and ``on_compute_busy`` reports each step's end back out so the
-  control plane's *predicted* prefill queue can be corrected. A disaggregated host
-  simply never makes either call, so decode is never disturbed by prefill.
+  (:class:`~kvcache_sim.data._compute.ComputeTimeline`) is owned by the *host*,
+  because it is the host's accelerator, and handed to whichever engines run on it.
+  A host with a :class:`~kvcache_sim.data._prefill.PrefillEngine` too shares one
+  between them, so a long prefill delays the next decode step and spikes that
+  token's TBT -- and a host with only this engine shares it with nothing. That is
+  what coupling *is*, so there is no flag for it. ``on_compute_busy`` reports each
+  step's end back out so the control plane's *predicted* prefill queue can be
+  corrected.
 
 One engine is **one host's** decode side: one batch, one compute timeline, one
 step loop. It used to be all of them at once, keyed by instance id, which is a
@@ -28,9 +28,9 @@ shape no deployment has -- a host has its own VRAM and its own GPU, and knows
 nothing of another's batch. Everything that used to take an ``inst`` argument
 therefore takes none.
 
-Async & deterministic: decode runs as a coroutine on the shared run's event loop
--- one step per ``await asyncio.sleep(step_time)``. Recency/clocks are the loop's
-virtual time; no wall-clock, no randomness.
+Async & deterministic: decode runs as a coroutine on the shared run's event loop,
+one step at a time, each booked on and awaited through the accelerator. Clocks are
+the loop's virtual time; no wall-clock, no randomness.
 """
 
 from __future__ import annotations
@@ -39,11 +39,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from domain import (
-    DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, Model,
-)
-
 from ..control.request import Request
+from ._compute import Accelerator
 
 __all__ = ["DecodeEngine"]
 
@@ -66,9 +63,10 @@ class DecodeEngine:
     simulation its clock is virtual, so a step costs no wall time).
 
     Args:
+        compute: the host's :class:`~kvcache_sim.data._compute.Accelerator` -- what
+            a step costs and what makes it take that long. The *same object* as its
+            prefill engine's when the two are modelled as contending.
         max_batch: VRAM cap on this host's decode batch.
-        profile: target-machine profile driving :func:`decode_step_time`.
-        model: served-model profile supplying the decode flop term.
         on_finish: called ``(request, tbt_max)`` when a request emits its last
             token.
         on_compute_busy: called ``(until)`` every time a step occupies this
@@ -86,25 +84,22 @@ class DecodeEngine:
 
     def __init__(
         self,
+        compute: Accelerator,
         *,
         max_batch: int,
-        profile=DEFAULT_PROFILE,
-        model: Model = DEFAULT_MODEL,
         on_finish: Optional[Callable[[Request, float], None]] = None,
         on_compute_busy: Optional[Callable[[float], None]] = None,
         on_state: Optional[Callable[[List[float]], None]] = None,
     ) -> None:
         self.max_batch = max_batch
-        self.profile = profile
-        self.model = model
         # Batch=1 baseline step time for the decode-load prediction (each remaining
-        # token is assumed to cost ~one uncontended step). Derived per engine from
-        # this run's profiles, not once at import from the defaults.
-        self._base_step = decode_step_time(1, profile, model)
-        # The ACTUAL compute timeline of this host. Owned here; the control plane
-        # keeps its own predicted queue and hears about this one through
-        # ``on_compute_busy`` when the two are the same physical resource.
-        self.compute_busy: float = 0.0
+        # token is assumed to cost ~one uncontended step). Asked of the accelerator,
+        # so it is this host's answer rather than a constant.
+        self._base_step = compute.step_cost(1)
+        # The ACTUAL compute timeline of this host, shared with whatever else runs
+        # on it. The control plane keeps its own predicted queue and hears about
+        # this one through ``on_compute_busy``.
+        self.compute = compute
         self.on_finish = on_finish
         self.on_compute_busy = on_compute_busy
         self.on_state = on_state
@@ -129,16 +124,6 @@ class DecodeEngine:
             a.last_token_time + a.remaining * self._base_step
             for a in self.batch + self.pending
         ])
-
-    # -- the coupled-host timeline ----------------------------------------- #
-    def reserve(self, until: float) -> None:
-        """Occupy this host's compute timeline until ``until`` (a prefill).
-
-        Called by the host only when its prefill and decode share the compute. It
-        is the actuation half of the coupling; ``on_compute_busy`` is the
-        observation half.
-        """
-        self.compute_busy = until
 
     # -- lifecycle -------------------------------------------------------- #
     def admit(self, request: Request) -> None:
@@ -174,16 +159,15 @@ class DecodeEngine:
 
     async def _run_steps(self) -> None:
         """Emit tokens one step at a time until the batch drains."""
-        loop = asyncio.get_running_loop()
         while self.batch:
             members = list(self.batch)             # frozen for this step
-            dt = decode_step_time(len(members), self.profile, self.model)
-            start = max(loop.time(), self.compute_busy)
-            step_end = start + dt
-            self.compute_busy = step_end
+            # Booked before it is waited for, so the end can be announced to a
+            # prefill sharing this accelerator while there is still time to
+            # schedule around it.
+            step_end = self.compute.claim_step(len(members))
             if self.on_compute_busy is not None:
                 self.on_compute_busy(step_end)
-            await asyncio.sleep(step_end - loop.time())
+            await self.compute.wait_until(step_end)
             self._step_complete(members, step_end)
 
     async def drain(self) -> None:

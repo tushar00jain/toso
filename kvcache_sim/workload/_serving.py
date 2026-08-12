@@ -11,8 +11,12 @@ Two separate things, deliberately:
   factories because they reach for the view, the mesh and the ledger, none of
   which exists before the stack does.
 
-Three things a deployment would not need are built here, because in a deployment
-they are not built at all. One is the peer references a host reaches another host
+Four things a deployment would not need are built here, because in a deployment
+they are not built at all. One is
+:class:`~kvcache_sim.workload._accelerator.SimulatedAccelerator`: what a forward
+pass costs and how it is made to take that long is the run's answer under
+simulation and the model's in production, so the capability is handed a port and
+this supplies the implementation. One is the peer references a host reaches another host
 through -- in production a handle to a remote actor, here a
 :class:`~realsim.seams.link.LocalEndpoint` pair over a
 :class:`~realsim.seams.link.ServiceHop`, so the boundary is charged. The other two
@@ -48,6 +52,9 @@ from sim_common import config
 
 from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
+from ._accelerator import SimulatedAccelerator
+from ..data._decode import DecodeEngine
+from ..data._prefill import PrefillEngine
 from ..data.serving import ServingHost
 from ..data.store import KVStore
 
@@ -226,18 +233,25 @@ def serving_plane(
     coupled: bool = False,
     simulate_decode: bool = False,
     max_batch: int = 8,
+    prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
 ) -> Callable[[Simulation], ItemDispatch]:
     """Build the factory for this run's **data plane**: one host per instance.
 
-    ``coupled`` says whether prefill shares a host's decode compute -- a deployment
-    fact, so it belongs to the host, not to the scheduler. The decode settings are
-    passed here *and* to :func:`coordinator` from the one scenario that declares
-    them, rather than one reading them off the other.
+    The pools are the deployment's answer to which hosts run what, and giving a
+    host an engine is how it is told.
 
-    ``decode_pool`` needs no telling now: a host that is never named as a plan's
-    decode instance is never handed one, so only the coordinator has to know which
-    hosts decode.
+    ``coupled`` is the remaining question, and it is a *fidelity* one rather than a
+    placement one: a host in both pools really has one accelerator, but a run may
+    model its prefill and decode as not contending, which several scenarios here do
+    and which is the historical default. It is answered by handing the two engines
+    one timeline or two, so the host reads it off the objects instead of being told
+    twice.
+
+    ``simulate_decode`` is not that question. It asks whether this *run* models the
+    request's second half at all, which is a scenario's choice and not a fact about
+    any host; a host is told so it knows whether a finished prefill is the end of
+    the request.
     """
 
     def build(sim: Simulation) -> ItemDispatch:
@@ -253,16 +267,29 @@ def serving_plane(
         def peers(instance: str) -> Any:
             return handles[instance]
 
+        prefills = set(prefill_pool) if prefill_pool else set(sim.ids)
+        decodes = (set(decode_pool) if decode_pool else set(sim.ids)) if simulate_decode else set()
         for instance in sorted(sim.ids):
+            def accelerator() -> SimulatedAccelerator:
+                return SimulatedAccelerator(profile=DEFAULT_PROFILE, model=DEFAULT_MODEL)
+
+            compute = accelerator()
+            # One accelerator when the run models the collision; two when it does
+            # not, which is what ``coupled=False`` on a host in both pools means.
+            prefill_compute = compute if coupled else accelerator()
             hosts[instance] = ServingHost(
                 instance, store, sim.coordinator_handle,
                 peers=peers,
                 trace=sim.trace, metrics=sim.ledger,
-                coupled=coupled,
-                simulate_decode=simulate_decode,
-                max_batch=max_batch,
-                profile=DEFAULT_PROFILE,
-                model=DEFAULT_MODEL,
+                prefill=(
+                    PrefillEngine(prefill_compute)
+                    if instance in prefills else None
+                ),
+                decode=(
+                    DecodeEngine(compute, max_batch=max_batch)
+                    if instance in decodes else None
+                ),
+                models_decode=simulate_decode,
             )
         # After every host exists, because a handle names one: the lookup is
         # deferred through ``peers`` so the cycle is closed by the time anyone

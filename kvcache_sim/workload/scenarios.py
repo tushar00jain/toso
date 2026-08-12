@@ -62,10 +62,13 @@ def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
     so the trace format and the metrics ledger a run reports into are chosen once
     and cannot drift between them.
     """
-    # ``coupled`` is a deployment fact (does prefill share decode's compute?), so
-    # it goes to the data plane alone; the decode settings go to both, because
-    # each plane needs them and neither may read them off the other.
+    # The pools are a deployment fact and go to both planes: the data plane gives
+    # a host the engines its pools put on it, and the coordinator routes to the
+    # same pools. ``coupled`` is a separate, fidelity question -- does this run
+    # model a prefill and a decode step on one host as colliding? -- so it goes to
+    # the data plane alone, which answers it by sharing a timeline or not.
     coupled = knobs.pop("coupled", False)
+
     # A per-run machine, so a scenario can give its volumes a different capacity.
     # The default is finite: a serving instance's KV memory is a real bound, and a
     # cache that cannot run out of room is not one -- the eviction it never performs
@@ -84,6 +87,7 @@ def _configure(label: str, topology, requests, kind: str, **knobs) -> Run:
             coupled=coupled,
             simulate_decode=knobs.get("simulate_decode", False),
             max_batch=knobs.get("max_batch", 8),
+            prefill_pool=knobs.get("prefill_pool"),
             decode_pool=knobs.get("decode_pool"),
         ),
         profile=profile,
@@ -321,8 +325,7 @@ class Disaggregation(Scenario):
         )
         return [
             _configure("disaggregated", topo, reqs, "cache_aware",
-                 prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], coupled=False,
-                 **common),
+                 prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], **common),
             _configure("coupled", _subset(topo, ["s2", "s3"]), reqs, "cache_aware",
                  coupled=True, **common),
         ]
