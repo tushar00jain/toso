@@ -44,13 +44,30 @@ and no coroutine was still on the request when its last token landed, so nothing
 was in a position to measure arrival-to-last-token. Both are gone: the drain hook
 is deleted and the client stamps the latency
 (:mod:`kvcache_sim.workload._serving`).
+
+...and the completion is the tokens
+-----------------------------------
+That future resolves with **the tokens this engine generated**, which for a while
+was ``None`` -- a batch that emitted a token per member per step and handed none of
+them to anybody, with the request's whole output represented by the
+``output_tokens`` the workload had asked for. A batch member now accumulates its own
+tokens as the steps land, and finishing hands them over.
+
+Deliberately not a stream. The tokens arrive together, at the end, which is the
+``stream=False`` shape of a serving API and the one that fits a leg that already
+answers at the last token. Handing each token out as it is produced is a different
+API (a channel, a consumer that keeps up) and would change nothing this model
+measures: the inter-token gaps are recorded per step either way, and the client's
+end-to-end stamp is taken at the last token in both.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional
+
+import torch
 
 from ..control.request import Request
 from ._compute import Accelerator
@@ -71,7 +88,18 @@ class _Active:
     #: cannot leave the batch without it being resolved.
     done: "asyncio.Future"
     tbt_max: float = 0.0        # worst inter-token gap observed so far
-    tokens: int = 0             # decode tokens emitted so far
+    #: What this slot has generated so far, one token per step it has been in --
+    #: the request's *output*, accumulated where it is produced and handed over by
+    #: :meth:`DecodeEngine._finish`. It was an ``int`` counter that nothing ever
+    #: read, which is what a count is once the things being counted exist.
+    #:
+    #: ``compare=False`` for the reason
+    #: :attr:`kvcache_sim.control.request.Request.prompt` carries it: this is a
+    #: dataclass, so ``==`` between two slots would compare these lists element by
+    #: element, and comparing two tensors answers with a tensor rather than a bool.
+    #: The batch is searched by identity (``a not in self.batch`` short-circuits on
+    #: ``is``), so nothing needs the field-by-field comparison anyway.
+    tokens: List[torch.Tensor] = field(default_factory=list, compare=False)
 
 
 class DecodeEngine:
@@ -149,14 +177,17 @@ class DecodeEngine:
 
     # -- lifecycle -------------------------------------------------------- #
     def admit(self, request: Request) -> "asyncio.Future":
-        """Enter ``request`` into this host's decode batch; answer when it is done.
+        """Enter ``request`` into this host's decode batch; answer with its tokens.
 
         The first token was produced by prefill (TTFT); decode generates the
         remaining ``output_tokens - 1``. A request with <= 1 output token needs no
-        decode and finishes immediately.
+        decode and finishes immediately -- with an empty list, which is the truthful
+        answer rather than a special case: there was nothing left to generate, so
+        this engine generated nothing.
 
-        The answer is a future resolved when this request emits its **last**
-        token, and it is the reason admission is not fire-and-forget any more.
+        The answer is a future resolved with **the tokens this engine generated**,
+        when this request emits its last token, and it is the reason admission is
+        not fire-and-forget any more.
         Decode used to outlive its caller: ``admit`` returned as soon as the
         request had a slot, the step loop ran on as a separate task, and the run
         needed a drain hook to keep the loop alive for the tail nobody was waiting
@@ -183,7 +214,7 @@ class DecodeEngine:
             # Never in the batch, so never in a step: retired here, on the same
             # clock instant it arrived. The caller still gets a future rather than
             # a special case, and awaiting an already-resolved one costs nothing.
-            self._finish(request, 0.0, done)
+            self._finish(request, 0.0, done, [])
             return done
         a = _Active(
             request=request,
@@ -199,8 +230,14 @@ class DecodeEngine:
         self._ensure_stepping()
         return done
 
-    def _finish(self, request: Request, tbt: float, done: "asyncio.Future") -> None:
-        """Retire one request: report it, then release whoever admitted it.
+    def _finish(
+        self,
+        request: Request,
+        tbt: float,
+        done: "asyncio.Future",
+        tokens: List[torch.Tensor],
+    ) -> None:
+        """Retire one request: report it, then hand its tokens to whoever admitted it.
 
         The order is the whole reason this is a method and not two lines at each
         of its two call sites. ``on_finish`` is how this host's half of the
@@ -210,6 +247,11 @@ class DecodeEngine:
         written into it. Nothing today reads the row that early, which is exactly
         why the ordering has to be stated somewhere rather than held by luck.
 
+        ``tokens`` is what this engine generated for the request -- passed in rather
+        than read off the slot, because one of the two call sites has no slot: a
+        request with nothing to decode is retired inside :meth:`admit` before one
+        exists, and its answer is an empty list.
+
         ``set_result`` is unguarded on purpose: a second retirement of the same
         request raises :class:`asyncio.InvalidStateError` here rather than
         silently overwriting a measurement, and that is a batch-accounting bug
@@ -217,7 +259,7 @@ class DecodeEngine:
         """
         if self.on_finish is not None:
             self.on_finish(request, tbt)
-        done.set_result(None)
+        done.set_result(tokens)
 
     def _ensure_stepping(self) -> None:
         """Start the decode-step loop unless one is already running."""
@@ -267,18 +309,26 @@ class DecodeEngine:
         self.pending.clear()
 
     def _step_complete(self, members: List[_Active], step_end: float) -> None:
-        """Emit one token for each member; retire finished; promote pending."""
-        for a in members:
+        """Emit one token for each member; retire finished; promote pending.
+
+        The tokens come from the accelerator that just ran the step, one per member
+        and in the order the members were frozen in, so a slot accumulates the token
+        the step produced *for it* rather than a stand-in this engine made up. That
+        is the whole of what "a decode step emits a token per request" means here,
+        and until the port could answer it, it meant a counter.
+        """
+        emitted = self.compute.step_tokens(len(members))
+        for a, token in zip(members, emitted):
             if a not in self.batch:
                 continue  # defensive; members never leave mid-step in this model
             gap = step_end - a.last_token_time
             a.tbt_max = max(a.tbt_max, gap)
             a.last_token_time = step_end
             a.remaining -= 1
-            a.tokens += 1
+            a.tokens.append(token)
             if a.remaining == 0:
                 self.batch.remove(a)
-                self._finish(a.request, a.tbt_max, a.done)
+                self._finish(a.request, a.tbt_max, a.done, a.tokens)
         # A freed VRAM slot admits the next queued request (still counting its wait).
         while self.pending and len(self.batch) < self.max_batch:
             self.batch.append(self.pending.pop(0))

@@ -14,6 +14,17 @@ and a real byte count and no storage behind it. That pairing is why this class o
 the block size and the served model: the thing that knows what a pass costs is the
 thing that knows what it produces, and both come out of the same two descriptors.
 
+The same goes for the *tokens*, which is the other thing a pass produces and the
+thing this class used to leave to nobody: :meth:`SimulatedAccelerator.prefill`
+answers with the request's first token and :meth:`SimulatedAccelerator.step_tokens`
+with the one each decode step emits per batch member. They are meta tensors for the
+same reason the KV is -- a scalar :data:`TOKEN_DTYPE` id with no id in it -- and
+that is the whole of the sampling model: there is no vocabulary here, no logits and
+no stopping rule, so a token is a shape and a dtype and how many of them there are
+is still the workload's ``output_tokens``. What it buys is that the count is now
+*produced* rather than asserted, and the plumbing that carries it is the plumbing a
+real engine's would replace.
+
 What that replaced, and why
 ---------------------------
 The run used to hand the *store* a "block carrier": one ``(shape, dtype)``
@@ -80,7 +91,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import torch
 
@@ -90,13 +101,38 @@ from domain import (
 
 from ..data._compute import Accelerator
 
-__all__ = ["BLOCK_TOKENS", "SimulatedAccelerator"]
+__all__ = ["BLOCK_TOKENS", "SimulatedAccelerator", "TOKEN_DTYPE", "token_tensor"]
 
 #: Tokens per KV block. The engine's cache-page size, so it lives with the
 #: accelerator that lays the KV out; fixed for every scenario so runs stay
 #: comparable (``kvcache_sim.workload._serving`` re-exports it, because the
 #: scheduler has to be told the same number to price a prefix match with).
 BLOCK_TOKENS = 512
+
+#: What a token id is. ``int64`` because that is what every tokenizer hands an
+#: engine and what an engine indexes its embedding table with; a narrower type
+#: would be a size this model has no reason to claim. One definition, here, for
+#: both ends of a request: the prompt the generator builds
+#: (:mod:`kvcache_sim.workload._generator`) and the tokens this accelerator
+#: produces have to be the same kind of thing, and two modules each naming a dtype
+#: is two claims about one vocabulary.
+TOKEN_DTYPE = torch.int64
+
+
+def token_tensor(*shape: int) -> torch.Tensor:
+    """Token ids of ``shape``, allocation-free -- ``token_tensor()`` is exactly one.
+
+    The token twin of :meth:`SimulatedAccelerator.kv_blocks`, and free for the same
+    reason: ``device="meta"`` gives a real ``torch.Tensor`` with a real dtype and a
+    real ``nbytes`` and no storage, so a run can carry every prompt and every
+    generated token of a hundred-thousand-request workload without allocating one
+    byte of them.
+
+    It is a plain function rather than a method because both ends of a request need
+    it and only one of them is an accelerator: a prompt is the *client's* to
+    produce, and there is no accelerator in sight when the workload generates one.
+    """
+    return torch.empty(shape, dtype=TOKEN_DTYPE, device="meta")
 
 
 @dataclass
@@ -317,8 +353,9 @@ class SimulatedAccelerator(Accelerator):
         return self.busy_until
 
     async def prefill(
-        self, tokens: int, cached: Sequence[torch.Tensor] = (), *, tag: str = ""
-    ) -> List[torch.Tensor]:
+        self, prompt: torch.Tensor, cached: Sequence[torch.Tensor] = (), *,
+        tag: str = "",
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """Submit the forward pass; it runs when this device is free.
 
         The pass joins this accelerator's single-server queue and is booked on the
@@ -332,13 +369,21 @@ class SimulatedAccelerator(Accelerator):
         A pass with nothing to compute (a prompt entirely covered by cached blocks)
         does not queue. Zero flops occupy no device, and letting an empty submission
         take a turn would make a fully-cached request wait behind a full-length
-        prefill for the privilege of doing nothing.
+        prefill for the privilege of doing nothing. It still answers with a first
+        token: attending the last position and sampling is what a fully-cached
+        prefill is *for*, and it is not what this cost model prices.
+
+        How long the pass takes is read off ``prompt``'s length -- one shape read,
+        no second description of the work. That is the whole mechanical consequence
+        of taking the prompt instead of a count; the rest of it is that the
+        signature now says what a deployment's says.
 
         Answers with ``cached`` (the prefix this host pulled, which a real engine
         would have written into its cache before attending over it) followed by one
-        fresh block per block of ``tokens``. Nothing is charged for carrying the
-        pulled blocks through: the fetch that produced them already paid, and a
-        forward pass over an uncached suffix is what this is priced as.
+        fresh block per block of ``prompt``, and with the token sampled at the end
+        of the pass. Nothing is charged for carrying the pulled blocks through: the
+        fetch that produced them already paid, and a forward pass over an uncached
+        suffix is what this is priced as.
 
         The pulled blocks are passed along **as they arrived** rather than replaced
         with locally-made ones of the same size. They are the objects the store
@@ -346,15 +391,30 @@ class SimulatedAccelerator(Accelerator):
         the bytes it pulled has something to compare; making new ones here would be
         a simulation detail quietly deciding they are interchangeable.
         """
-        if self.prefill_cost(tokens) > 0:
-            await self._queue.run(tokens, tag)
-        return [*cached, *self.kv_blocks(self.blocks_for(tokens))]
+        uncached = prompt.numel()
+        if self.prefill_cost(uncached) > 0:
+            await self._queue.run(uncached, tag)
+        return [*cached, *self.kv_blocks(self.blocks_for(uncached))], token_tensor()
 
     def claim_step(self, batch_size: int) -> float:
         """Book a decode step after whatever already has this accelerator."""
         now = asyncio.get_running_loop().time()
         self.busy_until = max(now, self.busy_until) + self.step_cost(batch_size)
         return self.busy_until
+
+    def step_tokens(self, batch_size: int) -> List[torch.Tensor]:
+        """One token per batch member, as a finished step just sampled them.
+
+        A distinct object each, for the reason :meth:`kv_blocks` makes distinct
+        blocks: each belongs to a different request, each is accumulated onto a
+        different slot's output, and one shared object under every member would be
+        the kind of aliasing that reads as correct until somebody looks at whose
+        token is whose.
+
+        Costs nothing and advances nothing -- :meth:`claim_step` already charged the
+        step this is the output of.
+        """
+        return [token_tensor() for _ in range(batch_size)]
 
     async def wait_until(self, when: float) -> None:
         loop = asyncio.get_running_loop()

@@ -24,6 +24,18 @@ It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsi
   driven through `realsim`'s transport seam and it hands the KV back; eviction
   removes presence via the real `notify_delete_batch`. A KV block is a directory key
   holding a tensor -- real types throughout, with no translation layer.
+- **Real tensors at both ends of the request, too.** A `Request` carries its **prompt**
+  (one `device="meta"` `int64` per prompt token), `Accelerator.prefill(prompt, cached)`
+  takes it and answers with the KV *and* the request's **first token**, and each decode
+  step emits one token per batch member — so the client that walks the redirect chain
+  receives the whole output, first token from the prefill host and the rest from the
+  decode host, and the run *counts* what it produced instead of reporting the
+  `output_tokens` the workload asked for. One thing that deliberately does **not**
+  follow: a block key is a hash of a prefix's content and a meta tensor has no
+  content, so the chain is still generated alongside the prompt rather than derived
+  from it — the same compromise the KV blocks make (real object, real shape, no data).
+  Not streaming: decode answers with the remaining tokens when the request finishes,
+  which is the `stream=False` shape.
 - **Real cost model.** Every duration -- prefill compute, decode-step time, and the
   fabric/storage/RAM cost of a KV fetch -- is charged through
   `sim_common.cost_model` from a target-machine `MachineProfile`, never measured on
@@ -110,15 +122,15 @@ No serving host calls another serving host. A host answers with an *address* and
 client goes there:
 
 ```
-client -> A          "serve this"
+client -> A          "serve this" (a prompt tensor)
 A      -> client     "prefill is B"     # A asks the coordinator; A does not call B
 client -> B          B prefills, publishes its KV blocks to the store
-B      -> client     "decode is C"
+B      -> client     the FIRST token + "decode is C"
 client -> C          C fetches that KV back out of the store, decodes, finishes
-C      -> client     "done"             # at the LAST token, not at admission
+C      -> client     the remaining tokens   # at the LAST token, not at admission
 ```
 
-Four consequences, and they are the reason for the shape:
+Five consequences, and they are the reason for the shape:
 
 - **A host's whole outward surface is the store and the coordinator.** There is no
   peer lookup and nothing to wire up after all the hosts exist. `workload/_serving.py`
@@ -138,6 +150,12 @@ Four consequences, and they are the reason for the shape:
   make, since it spans both of them. That also deleted the run's drain plumbing: decode
   no longer outlives the coroutine that asked for it, so the harness has nothing left
   to wait for after the requests.
+- **...and it is the only thing that holds the whole answer.** TTFT means time to the
+  *first* token, and that token is sampled from the prefill's last position, so the
+  prefill leg answers with it and the decode leg answers with the remaining
+  `output_tokens - 1`. No host holds both halves, which is why the produced token
+  count is a client-side join in exactly the way end-to-end latency is
+  (`RequestResult.output_tokens`, counted; `Request.output_tokens`, asked for).
 
 ## The user-facing entry point mirrors the store
 
@@ -194,44 +212,51 @@ kvcache_sim/
                           #   pinned snapshot one routing decision reads through
                           #   (underscored: the coordinator builds its own, so
                           #   nothing outside control/ names this)
-    request.py            #   inference Request, carrying its prefix-hash chain
-                          #   (str keys): what is decided about, and what data/
-                          #   is handed
+    request.py            #   inference Request, carrying its prompt (a
+                          #   zero-storage meta tensor of token ids) and its
+                          #   prefix-hash chain (str keys). The keys are NOT
+                          #   derived from the prompt -- a meta tensor has no
+                          #   content to hash -- so they are generated with it
   data/                   # EXECUTES -- advances the clock, moves bytes
     serving.py            #   one ServingHost per instance, as three things a
                           #   client asks it: route (which host should prefill
                           #   this -- answered with an address, not a forward),
                           #   prefill (real pull, compute, publish -> answered
-                          #   with the decode host's address) and decode (fetch
-                          #   the KV back out of the store, then batch it). No
+                          #   with the FIRST token and the decode host's address)
+                          #   and decode (fetch the KV back out of the store,
+                          #   batch it -> answered with the remaining tokens). No
                           #   host holds a reference to another host
     _compute.py           #   Accelerator: the port an engine runs its work on --
-                          #   what it costs, making it take that long, the KV a
-                          #   forward pass hands back, and the one occupancy both
-                          #   engines book on. Both engines get one; the SAME one
-                          #   is what coupling means
+                          #   what it costs, making it take that long, the KV and
+                          #   first token a forward pass over a prompt hands back,
+                          #   the token a decode step emits per batch member, and
+                          #   the one occupancy both engines book on. Both engines
+                          #   get one; the SAME one is what coupling means
     _prefill.py           #   PrefillEngine: what a forward pass costs and
                           #   submitting it -> the KV blocks this host now holds
-                          #   and did not before. It no longer sleeps a queue
-                          #   wait: the pass waits for the device, so the wait is
-                          #   measured rather than taken from control's forecast
-    _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT
-                          #   (all three underscored: nothing outside data/ drives
-                          #   them)
+                          #   and did not before, plus the request's first token.
+                          #   It no longer sleeps a queue wait: the pass waits for
+                          #   the device, so the wait is measured rather than
+                          #   taken from control's forecast
+    _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT,
+                          #   and the tokens each member generated, handed to
+                          #   whoever admitted it (all three underscored: nothing
+                          #   outside data/ drives them)
     store.py              #   publish / reuse / fetch over a Deployment's clients,
                           #   moving whatever KV it is handed. It holds no notion
                           #   of what a block is or how big one is -- that is the
                           #   accelerator's, which produces them
   workload/               # WHAT IS SIMULATED
     _generator.py         #   seeded synthetic request stream (Zipf + Poisson),
-                          #   incl. the prompt's prefix-hash chain (str keys)
+                          #   incl. each prompt's tensor and the prefix-hash chain
+                          #   (str keys) generated beside it
     _accelerator.py       #   SimulatedAccelerator: the Accelerator port, answered
-                          #   by a roofline, a sleep, and one zero-storage meta
-                          #   tensor per KV block at the size the scheduler priced.
-                          #   Owns BLOCK_TOKENS, and the single-server queue that
-                          #   makes a forward pass wait for the device. The one
-                          #   piece of the compute story a deployment replaces
-                          #   outright
+                          #   by a roofline, a sleep, one zero-storage meta tensor
+                          #   per KV block at the size the scheduler priced, and
+                          #   one per token produced. Owns BLOCK_TOKENS,
+                          #   TOKEN_DTYPE, and the single-server queue that makes
+                          #   a forward pass wait for the device. The one piece of
+                          #   the compute story a deployment replaces outright
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
                           #   the wiring a run installs around it, incl. the
                           #   client that submits a request and follows the two
@@ -384,6 +409,16 @@ plus the prefix-run read that express KV caching on a mesh.
   decodes, no transfer is charged, and `handoff misses` counts it. A non-zero count in
   that column means the run's cache is too small for the store to be a credible
   handoff, not that a request failed.
+- **The tokens are real objects with nothing in them, and there is no stopping
+  rule.** A prompt, the first token and every decode token are `device="meta"`
+  `int64` tensors: right dtype, right shape, right `nbytes`, no data — the same
+  compromise the KV blocks make, and the reason a block key still cannot be a hash of
+  its prefix's content. What follows is that nothing here can *decide* to stop: there
+  is no vocabulary, no logits and no EOS, so a request generates exactly the
+  `output_tokens` it asked for and the produced count equals the requested one in
+  every run. That is why both are recorded (`RequestResult.output_tokens` counted
+  against `Request.output_tokens` asked for): today the pair is a consistency check,
+  and the day a stopping rule or a preemption exists it is the answer.
 - **The client hops are free by default**, and are the only hops a request's journey
   now has besides the coordinator's and the directory's: `TOSO_CLIENT_RTT` prices one
   client↔host round trip, and a request makes three of them (route, prefill, decode).

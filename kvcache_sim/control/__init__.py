@@ -1,9 +1,11 @@
 """The KV-cache control plane: everything that is decided, nothing that runs.
 
 * :mod:`~kvcache_sim.control.request` -- what is being decided *about*: an
-  inference ``Request``, carrying its prefix-hash block keys (each a plain
-  directory key). It sits here rather than in ``workload/`` because all three
-  planes pass it, and ``workload/`` does not exist in production;
+  inference ``Request``, carrying the prompt it was submitted with and its
+  prefix-hash block keys (each a plain directory key). The keys are not derived
+  from the prompt and cannot be -- see that module for the compromise a
+  zero-storage prompt forces. It sits here rather than in ``workload/`` because
+  all three planes pass it, and ``workload/`` does not exist in production;
 * :mod:`~kvcache_sim.control.scheduler` -- the serving scheduler: which instance
   prefills, pull-vs-recompute, the TTFT/TBT admission gates, where decode lands.
   These are *compute* decisions the store knows nothing about, which is why they

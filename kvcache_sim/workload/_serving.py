@@ -211,11 +211,11 @@ class _Client:
 
     Three legs, which is nearly the whole object::
 
-        plan   = await hosts[landed(request)].route(request)   # "prefill is B"
-        decode = await hosts[plan.prefill].prefill(plan)       # "decode is C"
-        await hosts[decode].decode(plan)                       # ...returns at the
-                                                               # last token
-        metrics.completed(request.id, now - request.arrival)
+        plan = await hosts[landed(request)].route(request)      # "prefill is B"
+        decode, first = await hosts[plan.prefill].prefill(plan)  # "decode is C"
+        rest = await hosts[decode].decode(plan)                 # ...returns at the
+                                                                # last token
+        metrics.completed(request.id, now - request.arrival, 1 + len(rest))
 
     The last line is the rest of it, and it is the one measurement this object is
     entitled to make. A client does not learn the hit rate or the handoff bytes --
@@ -226,6 +226,15 @@ class _Client:
     which is also who a latency SLO is written for. Server-side timing and
     client-side timing are different numbers in every real deployment, and this is
     the client-side one.
+
+    The same argument makes it the only thing that holds the whole **answer**. The
+    output arrives in two pieces from two machines -- the first token out of the
+    prefill's last position, the remaining ``output_tokens - 1`` out of the decode
+    batch -- and no host ever holds both. So the client concatenates them, and how
+    many tokens the request produced becomes something the run *counted* rather
+    than the ``output_tokens`` the workload asked for read back out of the
+    request. The two agree today, and the point is that they are now two numbers
+    that could disagree: one is what was asked for and one is what was made.
 
     That the stamp is even possible is what the decode leg's shape now buys. It
     used to answer at *admission* -- the batch stepped on afterwards as its own
@@ -279,16 +288,29 @@ class _Client:
         plan = await self.hosts[self.landed(request)].route.call_one(request)
         if plan is None:
             return  # refused at the door; the host that refused recorded it
-        decode = await self.hosts[plan.prefill].prefill.call_one(plan)
+        # The prefill leg answers with both: the first token it produced, and the
+        # address of whoever generates the rest. The token comes back even when the
+        # address does not -- a prefill that happened is a prefill that emitted one.
+        decode, first_token = await self.hosts[plan.prefill].prefill.call_one(plan)
         if decode is None:
-            return  # nothing after prefill: no decode modelled, or it was shed
-        await self.hosts[decode].decode.call_one(plan)
+            # Nothing after prefill: no decode modelled, or it was shed. The client
+            # holds one token and the run models no more of this request, so there
+            # is nothing to report -- the same reason the latency below is not
+            # stamped on this path, and not a place to invent a shorter one.
+            return
+        output = [first_token, *await self.hosts[decode].decode.call_one(plan)]
         # Stamped only here, on the one path where a last token exists. A refused
         # request has no end-to-end latency and a prefill-only run has no last
         # token, so both leave the field at its default rather than reporting a
         # shorter interval under the same name.
+        #
+        # The token count travels with it because it is the same kind of fact: what
+        # the client received, counted off the tokens themselves rather than read
+        # back off ``request.output_tokens``, which is what was *asked for*.
         self.metrics.completed(
-            request.id, asyncio.get_running_loop().time() - request.arrival
+            request.id,
+            asyncio.get_running_loop().time() - request.arrival,
+            output_tokens=len(output),
         )
 
 

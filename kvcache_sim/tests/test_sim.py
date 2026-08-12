@@ -17,7 +17,9 @@ from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
 from kvcache_sim.control._view import KVView, _longest_prefix_run
-from kvcache_sim.workload._accelerator import BLOCK_TOKENS, SimulatedAccelerator
+from kvcache_sim.workload._accelerator import (
+    BLOCK_TOKENS, SimulatedAccelerator, TOKEN_DTYPE, token_tensor,
+)
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
@@ -28,7 +30,7 @@ from kvcache_sim.control.scheduler import (
     AdmitDecode, ComputeBusy, DecodeState, LoadBalanceScheduler,
     PrefillFinished, Route,
 )
-from kvcache_sim.workload._generator import _block_keys_for
+from kvcache_sim.workload._generator import _block_keys_for, make_workload
 from kvcache_sim.tests._run import (
     run,
     run_disaggregation,
@@ -57,6 +59,18 @@ def _kv(count: int, block_tokens: int = BLOCK_TOKENS):
     return SimulatedAccelerator(block_tokens=block_tokens).kv_blocks(count)
 
 
+def _request(**kwargs) -> Request:
+    """A ``Request`` whose prompt tensor matches whatever ``prompt_tokens`` says.
+
+    A request carries the prompt itself now, and refuses to be built with one whose
+    length disagrees with the count the scheduler prices against. Every test below
+    cares about the count and none of them about the ids (there are none -- it is a
+    meta tensor), so the prompt is derived here rather than spelled out at a dozen
+    call sites.
+    """
+    return Request(prompt=token_tensor(kwargs["prompt_tokens"]), **kwargs)
+
+
 # 1. Prefix-hash addressing: shared prefixes yield shared keys.
 def test_prefix_hash_chain_shares_prefix():
     a = _block_keys_for("m0", [0, 1, 7, 9])
@@ -71,6 +85,39 @@ def test_longest_prefix_run():
     keys = _block_keys_for("m0", [0, 1, 2, 3])
     present = {keys[0], keys[1], keys[3]}   # a gap at index 2
     assert _longest_prefix_run(keys, present) == 2   # stops at first miss
+
+
+# 1b. A request carries the prompt, and the two descriptions of it must agree.
+#     ``prompt_tokens`` is what the scheduler prices (the prefix match, the
+#     uncached suffix, the predicted TTFT) and the tensor is what the forward pass
+#     runs over. If they may differ, the run stays internally consistent and
+#     measures a prompt nobody submitted, which is the failure mode worth a
+#     constructor check.
+def test_a_request_refuses_a_prompt_that_is_not_the_length_it_claims():
+    with pytest.raises(ValueError, match="prompt of 256"):
+        Request(
+            id="r0", arrival=0.0, block_keys=_block_keys_for("m0", [0]),
+            prompt_tokens=BLOCK_TOKENS, output_tokens=1,
+            prompt=token_tensor(256),
+        )
+
+
+# 1c. ...and the block keys are still generated beside the prompt rather than
+#     hashed out of it, because a meta tensor has nothing to hash. The compromise
+#     is asserted so it cannot be quietly forgotten: two requests with identical
+#     prompt *shapes* and different content share no keys, which is exactly what a
+#     shape-derived "hash" would get wrong.
+def test_block_keys_are_generated_not_derived_from_the_prompt():
+    a, b = make_workload(
+        num_requests=2, num_conversations=2, system_blocks=1, conv_base_blocks=1,
+        query_blocks=1, block_tokens=BLOCK_TOKENS, seed=7,
+    )
+    assert a.prompt.shape == b.prompt.shape       # identical shapes...
+    assert a.block_keys[-1] != b.block_keys[-1]   # ...and distinct queries
+    # The prompt is real, exactly sized and free to hold -- and has no ids in it,
+    # which is why the keys cannot come from it.
+    assert a.prompt.device.type == "meta"
+    assert a.prompt.numel() == a.prompt_tokens
 
 
 # 2. REAL directory: per-instance prefix-match length, incl. after eviction.
@@ -345,8 +392,8 @@ def _run_decode_batch(n: int, output_tokens: int = 6):
     async def drive():
         await asyncio.gather(*[
             eng.admit(
-                Request(id=f"r{i}", arrival=0.0, block_keys=("m0|0",),
-                        prompt_tokens=512, output_tokens=output_tokens)
+                _request(id=f"r{i}", arrival=0.0, block_keys=("m0|0",),
+                         prompt_tokens=512, output_tokens=output_tokens)
             )
             for i in range(n)
         ])
@@ -482,10 +529,11 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
                 published: bool = True, engine: bool = True):
     """Walk one request's decode leg on ``s1``; report when it answered.
 
-    Returns ``(answered_at, events, row)`` -- the sim clock when
+    Returns ``(answered_at, events, row, tokens)`` -- the sim clock when
     :meth:`ServingHost.decode` returned, the host's own trace lines as
     ``{kind: [time]}`` (it writes a HANDOFF when the KV lands and a DECODE when
-    the last token does), and the ledger row the two halves were joined into.
+    the last token does), the ledger row the two halves were joined into, and the
+    tokens the leg answered with.
 
     A real coordinator is wired in because a decode batch *reports itself*: the
     host forwards every batch change to control, so a stub ``None`` would fail on
@@ -503,7 +551,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
     )
     store = KVStore(sim.mesh)
     keys = list(_block_keys_for("m0", [0, 1]))
-    request = Request(
+    request = _request(
         id="r0", arrival=0.0, block_keys=tuple(keys),
         prompt_tokens=2 * BLOCK_TOKENS, output_tokens=output_tokens,
     )
@@ -522,22 +570,24 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
             # The prefill host opens the row; here there is no prefill host, so the
             # test stands in for it -- the decode side amends, it never creates.
             sim.ledger.add(RequestResult(id=request.id, accepted=True))
-            await host.decode(_plan(request, prefill=prefill, decode="s1"))
-            return asyncio.get_running_loop().time()
+            tokens = await host.decode(
+                _plan(request, prefill=prefill, decode="s1")
+            )
+            return asyncio.get_running_loop().time(), tokens
 
     try:
-        answered_at = sim.loop.run_until_complete(scenario())
+        answered_at, tokens = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
     events: dict = {}
     for t, kind, _msg in sim.trace.events:
         events.setdefault(kind, []).append(t)
-    return answered_at, events, sim.ledger.results[0]
+    return answered_at, events, sim.ledger.results[0], tokens
 
 
 def test_the_decode_leg_answers_when_the_last_token_lands():
     """The ordinary path: KV fetched from the host that prefilled it, then steps."""
-    answered_at, events, row = _decode_leg(output_tokens=6)
+    answered_at, events, row, _tokens = _decode_leg(output_tokens=6)
     assert len(events["DECODE"]) == 1
     # Answered at the last token -- not at admission, which is where the KV
     # landed and where this used to return.
@@ -550,6 +600,30 @@ def test_the_decode_leg_answers_when_the_last_token_lands():
     assert row.handoff_bytes > 0
 
 
+def test_the_decode_leg_answers_with_the_tokens_it_generated():
+    """Decode's half of the output: ``output_tokens - 1``, one per step it ran.
+
+    The division of labour the engine's docstring has always described, now
+    checked against what comes back rather than against a counter: the first token
+    is the prefill's (it is what TTFT is the time to) and the remainder is this
+    leg's. A request that needs no decode step gets an empty list, which is the
+    same statement -- prefill produced the whole output -- rather than a special
+    case in the caller.
+    """
+    for asked, expected in ((6, 5), (2, 1), (1, 0)):
+        _at, _events, _row, tokens = _decode_leg(output_tokens=asked)
+        assert len(tokens) == expected, asked
+        # Real tensors, and free ones: a token id of the run's dtype with no
+        # storage behind it, exactly like the KV blocks it was decoded from.
+        for token in tokens:
+            assert token.device.type == "meta"
+            assert token.dtype is TOKEN_DTYPE
+            assert token.numel() == 1
+        # Distinct objects, one per step -- a batch that handed the same tensor to
+        # every member would be indistinguishable from this if they aliased.
+        assert len({id(t) for t in tokens}) == len(tokens)
+
+
 @pytest.mark.parametrize("case,kwargs", [
     # Nothing to decode: retired inside ``admit``, on the instant it arrived.
     ("no decode tokens", dict(output_tokens=1)),
@@ -560,7 +634,7 @@ def test_the_decode_leg_answers_when_the_last_token_lands():
     ("decodes where it prefilled", dict(prefill="s1")),
 ])
 def test_every_decode_path_answers_at_its_last_token(case, kwargs):
-    answered_at, events, _row = _decode_leg(**kwargs)
+    answered_at, events, _row, _tokens = _decode_leg(**kwargs)
     assert len(events["DECODE"]) == 1, case
     assert answered_at == events["DECODE"][0], case
 
@@ -574,10 +648,14 @@ def test_a_host_with_no_decode_engine_answers_without_waiting():
     would be waiting forever. It answers the moment the KV is there, which is as
     far as it can honestly get.
     """
-    answered_at, events, row = _decode_leg(engine=False)
+    answered_at, events, row, tokens = _decode_leg(engine=False)
     assert "DECODE" not in events
     assert answered_at == events["HANDOFF"][0]
     assert row.tbt == 0.0
+    # ...and it generated nothing, which is what it answers with. Not a token it
+    # did not make and not ``None``: the leg's answer is its output, and this
+    # host's output is empty.
+    assert tokens == []
 
 
 # 13f. What the client measures, and what it refuses to measure.
@@ -657,6 +735,30 @@ def test_each_host_records_its_own_half_of_a_request():
         assert row.ttft > 0          # the prefill host's half
         assert row.handoff_bytes > 0  # the decode host's half
         assert row.tbt > 0            # ...and the decode host's again, later
+
+
+# 13g. The output is counted off the tokens the run produced, by the only
+#      participant that receives all of them. The first token comes back from the
+#      prefill host and the rest from the decode host, so a request's length is a
+#      client-side join in exactly the way its end-to-end latency is -- and it is
+#      now a measurement rather than the ``output_tokens`` the workload asked for,
+#      read back out of the request that asked.
+@pytest.mark.parametrize("asked", [1, 5])
+def test_the_client_counts_the_tokens_the_two_legs_produced(asked):
+    reqs = make_workload(
+        num_requests=6, num_conversations=2, system_blocks=1, conv_base_blocks=1,
+        query_blocks=1, block_tokens=BLOCK_TOKENS, output_tokens=asked, seed=3,
+    )
+    ledger = run(
+        _make_topology(2), reqs, "cache_aware",
+        simulate_decode=True, max_batch=4,
+    ).ledger
+    assert ledger.accepted
+    for row in ledger.accepted:
+        assert row.output_tokens == asked, row.id
+    # ``asked=1`` is the case that pins down which leg produced what: decode had
+    # nothing to do, so the single token in the count can only have come from the
+    # prefill host -- which is the one TTFT is the time to.
 
 
 # 13d. Nothing on a serving host can reach another serving host. The redirect
@@ -921,7 +1023,7 @@ def _scheduler(n: int = 2):
 def test_decide_dispatches_each_demand_to_its_own_handler():
     """One member, three questions, told apart by the demand's type."""
     sim, sched = _scheduler()
-    request = Request(
+    request = _request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
         block_keys=tuple(_block_keys_for("m0", [0, 1])),
     )

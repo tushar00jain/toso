@@ -12,13 +12,21 @@ cluster-wide fact. So a host that receives a request asks the coordinator where 
 belongs (:meth:`ServingHost.route`) -- and then *answers with the address*. It does
 not call the host it named. The client does::
 
-    client -> A          "serve this"
+    client -> A          "serve this" (a prompt)
     A      -> client     "prefill is B"          (a redirect, not a forward)
     client -> B          B prefills and publishes its KV blocks to the store
-    B      -> client     "decode is C"           (another redirect)
+    B      -> client     the first token, and "decode is C"   (another redirect)
     client -> C          C fetches that KV back out of the store, decodes, finishes
-    C      -> client     "done" -- after the last token, which is what makes the
-                         client's arrival-to-last-token stamp mean anything
+    C      -> client     the remaining tokens -- after the last one, which is what
+                         makes the client's arrival-to-last-token stamp mean
+                         anything
+
+Both ends of that carry tensors, and the split between the two answers is the
+division of labour the engines have always had: TTFT is the time to the *first*
+token and that token is sampled from the prefill's last position, so :meth:`prefill`
+answers with it; everything after it is the decode batch's, so :meth:`decode`
+answers with the rest. The client is the only participant that sees both halves,
+which is the same reason it is the only one that can time the request.
 
 This used to be two host-to-host RPCs: ``A`` called ``B.serve(plan)`` and ``B``
 called ``C.admit_decode(request, row)``. Both are gone, and with them the
@@ -73,15 +81,17 @@ The lifecycle, once a host is prefilling:
 4. publish what this host now holds and did not before -- a real ``put_batch``;
 5. tell the coordinator the clock the real ops actually reached;
 6. on the decode-simulating path, ask control whether the request may enter a
-   decode batch, and answer the client with the host that will run it.
+   decode batch, and answer the client with the first token and the host that
+   will run the rest.
 
 ...and then, on that host:
 
 7. fetch the request's KV out of the store (a **real** ``get_batch``, and under
    disaggregation the dominant cost of the request);
 8. admit it to the decode batch, record its inter-token gaps when the last token
-   lands -- and only then answer the client, which is what lets the client stamp
-   arrival-to-last-token and what removed the drain hook the run used to need.
+   lands -- and only then answer the client, with the tokens the batch generated.
+   That is what lets the client stamp arrival-to-last-token and what removed the
+   drain hook the run used to need.
 
 Note what moved in that list. The wait used to be step 2, in front of the fetch,
 because that is where control's arithmetic puts it (it prices
@@ -134,7 +144,7 @@ measured. Coupling is now entirely a matter of which object a host was handed.
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -285,13 +295,20 @@ class ServingHost:
         return plan
 
     # -- leg 2: the request's prefill, on the host control chose ----------- #
-    async def prefill(self, plan: Plan) -> Optional[str]:
-        """Prefill ``plan``'s request here; answer with the host that decodes it.
+    async def prefill(self, plan: Plan) -> Tuple[Optional[str], torch.Tensor]:
+        """Prefill ``plan``'s request here; answer with its first token and where next.
 
-        Returns the instance id the client should take this plan to next, or
-        ``None`` when there is no next host -- either because this run does not
-        model decode at all, or because control refused the decode admission, which
-        makes this a *wasted* prefill and is recorded here as one.
+        Returns ``(next host, first token)``: the instance id the client should take
+        this plan to, or ``None`` when there is no next host -- either because this
+        run does not model decode at all, or because control refused the decode
+        admission, which makes this a *wasted* prefill and is recorded here as one.
+
+        The token is not ``Optional`` and the address is, which is the asymmetry
+        worth naming: every request that reaches this method gets prefilled, and a
+        prefill produces a first token whatever happens afterwards. A decode
+        admission refused a moment later does not un-produce it -- that is precisely
+        what makes the prefill *wasted* rather than avoided, and answering with the
+        token on that path is the honest version of a bill this host already pays.
         """
         # Nothing is reserved here, and there used to be two things. This method
         # opened by pushing ``plan.done_time`` -- control's *predicted* completion
@@ -340,11 +357,22 @@ class ServingHost:
         # the work, not a duration: what it costs is the accelerator's answer, and
         # *when* it runs is the accelerator's answer too -- the pass waits here for
         # the device, behind whatever prefill or decode step already has it. It
-        # answers with the KV: the prefix handed in, then the suffix it computed.
-        # The request's id goes with it as the submission's name, which the
-        # accelerator uses to break a same-instant tie in its service order.
+        # answers with the KV (the prefix handed in, then the suffix it computed)
+        # and with the request's first token. The request's id goes with it as the
+        # submission's name, which the accelerator uses to break a same-instant tie
+        # in its service order.
+        #
+        # The work is the tail of the prompt: the leading ``cached`` tokens are what
+        # the pulled and local blocks already cover, so what is left to compute is
+        # everything past them. Sliced off the request's own prompt rather than
+        # rebuilt from a count, so the tokens the pass runs over are the tokens the
+        # client submitted -- and sliced by *offset* rather than as ``prompt[-n:]``,
+        # which would hand a fully-cached request its entire prompt back.
+        prompt = plan.request.prompt[plan.request.prompt_tokens - uncached:]
         submitted_at = self._now()
-        kv = await self.prefill_engine.run(uncached, pulled, tag=plan.request.id)
+        kv, first_token = await self.prefill_engine.run(
+            prompt, pulled, tag=plan.request.id
+        )
         # Whatever that took beyond the pass itself was queueing for the device.
         # This is the *measured* wait, and the row already carries control's
         # prediction of it: the two used to be the same number by construction,
@@ -391,7 +419,7 @@ class ServingHost:
         # non-zero coordinator hop. The value itself is control's own model, and
         # this host has no use for a model of a completion it just performed.
         await self.coordinator.decide.call_one(PrefillFinished(self.me, self._now()))
-        return await self._prefill_done(plan, row)
+        return await self._prefill_done(plan, row), first_token
 
     def _recompute(self, plan: Plan, row: RequestResult) -> int:
         """Re-price this prefill with the reuse that vanished; answer what is left.
@@ -488,8 +516,19 @@ class ServingHost:
         return plan.decode
 
     # -- leg 3: decode, on a host that has to go and get the KV ------------ #
-    async def decode(self, plan: Plan) -> None:
+    async def decode(self, plan: Plan) -> List[torch.Tensor]:
         """The client brought a prefilled request here. Fetch its KV, decode, finish.
+
+        Answers with **the tokens this host generated** -- the request's output
+        minus the first, which the prefill host produced and already handed the
+        client. Together the two legs account for the whole answer, and neither
+        holds a token the other also holds.
+
+        Not a stream, deliberately: the tokens arrive together when the request
+        finishes. That is the ``stream=False`` shape of a real serving API, it is
+        what the leg's timing already is (it returns at the last token so the client
+        can stamp the request end to end), and incremental delivery would be a
+        second transport with nothing new to measure through it.
 
         Returns when the request's **last token** has been emitted, not when it
         entered the batch. It used to return at admission -- the step loop runs as
@@ -627,10 +666,11 @@ class ServingHost:
         # The one place this method can answer without the request having
         # finished, and it is not a decode that was skipped -- it is a run whose
         # decode side is not modelled reaching a host that has no engine. There is
-        # no last token coming, so waiting for one would be waiting forever.
+        # no last token coming, so waiting for one would be waiting forever, and
+        # there are no tokens to answer with because nothing here generates any.
         if self.decode_engine is None:
-            return
-        await self.decode_engine.admit(request)
+            return []
+        return await self.decode_engine.admit(request)
 
     def _decode_done(self, request: Request, tbt: float) -> None:
         """Finalize a request once its last decode token is emitted.

@@ -57,7 +57,7 @@ models and the one a deployment's continuous batcher is a departure from.
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import torch
 
@@ -101,30 +101,38 @@ class PrefillEngine:
 
     async def run(
         self,
-        uncached_tokens: int,
+        prompt: torch.Tensor,
         cached: Sequence[torch.Tensor] = (),
         *,
         tag: str = "",
-    ) -> List[torch.Tensor]:
-        """Run the forward pass on this host's accelerator; answer with its KV.
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Run the forward pass on this host's accelerator; answer with KV and token.
 
         Named in tokens rather than seconds, because how long that takes is the
         accelerator's answer and not this engine's -- and because a deployment
         implementing the port runs a model, which needs the work and not a duration.
+        ``prompt`` is the uncached suffix of the request's prompt, as ids: the count
+        it used to be was the last place a duration could have been substituted for
+        the work, and it was also the reason a deployment's engine could not have
+        been dropped in behind this call.
 
-        ``cached`` is the prefix this host pulled out of the store, and the answer
-        is every KV block this host now holds and did not before (that prefix, then
-        the computed suffix). Passed straight through: which blocks a prefill ends
-        up holding is the accelerator's account of its own output, and an engine in
-        between that reassembled the list would be a second place for the order to
-        be wrong.
+        ``cached`` is the prefix this host pulled out of the store, and the first
+        half of the answer is every KV block this host now holds and did not before
+        (that prefix, then the computed suffix). Passed straight through: which
+        blocks a prefill ends up holding is the accelerator's account of its own
+        output, and an engine in between that reassembled the list would be a second
+        place for the order to be wrong.
+
+        The second half is the request's **first token** -- the one TTFT is the time
+        to. It travels the same way and for the same reason: the pass produced it,
+        so the pass answers with it, and this engine adds nothing to either.
 
         This is where the pass is **submitted**, and therefore where it queues:
         after the caller's fetch, because a forward pass cannot start before its
-        inputs are here, and with the token count that fetch actually left it with
-        -- a planned reuse that turned out to be evicted makes this a bigger pass
-        than the plan priced, and the queue slot has to be the real one. ``tag``
-        names the submission so two passes handed in at the same instant queue in a
-        fixed order; the caller passes the request's id.
+        inputs are here, and with the tokens that fetch actually left it with -- a
+        planned reuse that turned out to be evicted makes this a bigger pass than
+        the plan priced, and the queue slot has to be the real one. ``tag`` names
+        the submission so two passes handed in at the same instant queue in a fixed
+        order; the caller passes the request's id.
         """
-        return await self.compute.prefill(uncached_tokens, cached, tag=tag)
+        return await self.compute.prefill(prompt, cached, tag=tag)

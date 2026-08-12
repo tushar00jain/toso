@@ -47,7 +47,9 @@ from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
 from kvcache_sim.data.store import KVStore
-from kvcache_sim.workload._accelerator import SimulatedAccelerator
+from kvcache_sim.workload._accelerator import (
+    SimulatedAccelerator, TOKEN_DTYPE, token_tensor,
+)
 from realsim.simulation import Simulation
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, _make_topology
 
@@ -241,6 +243,37 @@ def test_a_kv_block_is_a_real_tensor_with_no_storage():
     # Distinct objects per block: the store keys them separately and a volume
     # evicts them separately, so nothing here may alias.
     a, b = SimulatedAccelerator(block_tokens=BLOCK_TOKENS).kv_blocks(2)
+    assert a is not b
+
+
+def test_a_prompt_and_a_generated_token_are_real_tensors_with_no_storage():
+    """The same premise at the two ends of a request, where it is easier to break.
+
+    A KV block has an arithmetic reason to be a real tensor -- the transport prices
+    what it moves. The prompt and the generated tokens have no byte count anybody
+    charges, which makes them precisely the place a stand-in would go unnoticed: an
+    ``int`` count, a list of Python ints, a ``None``. So the shape is asserted
+    rather than assumed, and so is the cost of it -- these runs carry a prompt per
+    request and a token per decode step per request, and every one of them has to
+    be free.
+    """
+    gpu = SimulatedAccelerator(block_tokens=BLOCK_TOKENS)
+    prompt = token_tensor(4 * BLOCK_TOKENS)
+    (first,) = gpu.step_tokens(1)
+    for name, t in (("prompt", prompt), ("token", first)):
+        assert isinstance(t, torch.Tensor), name
+        assert t.device.type == "meta", name
+        assert t.dtype is TOKEN_DTYPE, name
+        # A meta tensor reports the size it *would* occupy and points at nothing:
+        # ``nbytes`` is real arithmetic over shape and dtype, while the storage has
+        # no address, which is what lets a run "hold" every prompt and every token
+        # of a 300-request workload for free.
+        assert t.numel() * t.element_size() > 0, name
+        assert t.data_ptr() == 0, name
+    assert prompt.numel() == 4 * BLOCK_TOKENS
+    assert first.numel() == 1               # one token, not a batch of one
+    # ...and a step's tokens are one object per member, never one aliased tensor.
+    a, b = gpu.step_tokens(2)
     assert a is not b
 
 

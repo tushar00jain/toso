@@ -36,6 +36,32 @@ them (:class:`kvcache_sim.workload._accelerator.SimulatedAccelerator`); a deploy
 returns the KV its attention kernels just wrote. Neither is a shape this port has to
 know about, which is the point of handing it back rather than describing it.
 
+...and it produces a token, so it hands that back too
+-----------------------------------------------------
+Tokens in, tokens out. :meth:`Accelerator.prefill` takes the **prompt** rather than
+a count of it and answers with the KV *and* the **first token**, sampled from the
+pass's last position; :meth:`Accelerator.step_tokens` answers with the one token per
+batch member a decode step just emitted. Both used to be absent, and the absence was
+in the shape of the port rather than in a comment: a prefill was handed an ``int``
+and a decode step produced nothing at all, so the only account of a request's output
+anywhere in the run was the ``output_tokens`` the workload had asked for.
+
+That split is not new -- :meth:`kvcache_sim.data._decode.DecodeEngine.admit` has
+always said "the first token was produced by prefill (TTFT); decode generates the
+remaining ``output_tokens - 1``" -- but the signatures could not say it. TTFT is
+time to *first* token, and that token comes out of the prefill's last position, so a
+prefill that answers only with KV is a prefill whose headline metric measures the
+arrival of something it never produced. Now the two members between them account for
+every token of the answer, and the client that walks the redirect chain collects
+both halves.
+
+Deliberately **not** streaming. Decode answers with the remaining tokens when the
+request finishes, which is the ``stream=False`` shape of every serving API and the
+one that matches what this plane already does -- the decode leg returns at the last
+token because that is what lets the client time the request end to end. Incremental
+delivery would be a second shape (a channel per request, a client that consumes as
+it goes) and would measure nothing this model does not already measure.
+
 One object is one accelerator
 -----------------------------
 A host has one, and hands it to whichever engines run on it. Whether its prefill
@@ -68,7 +94,7 @@ which is exactly the case this model exists to study.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import torch
 
@@ -112,7 +138,14 @@ class Accelerator(ABC):
 
     @abstractmethod
     def prefill_cost(self, tokens: int) -> float:
-        """What prefilling ``tokens`` uncached tokens costs here."""
+        """What prefilling ``tokens`` uncached tokens costs here.
+
+        A count, where :meth:`prefill` takes the ids, and the asymmetry is the
+        point: this is a *question about work that may never be submitted* -- the
+        serving host asks it to re-price a plan whose reuse was evicted -- and
+        answering it needs the length and nothing else. Making it take a tensor
+        would oblige every caller to materialise a prompt to ask about one.
+        """
 
     @abstractmethod
     def step_cost(self, batch_size: int) -> float:
@@ -120,9 +153,10 @@ class Accelerator(ABC):
 
     @abstractmethod
     async def prefill(
-        self, tokens: int, cached: Sequence[torch.Tensor] = (), *, tag: str = ""
-    ) -> List[torch.Tensor]:
-        """Submit a forward pass over ``tokens`` uncached tokens; answer with its KV.
+        self, prompt: torch.Tensor, cached: Sequence[torch.Tensor] = (), *,
+        tag: str = "",
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Submit a forward pass over ``prompt``; answer with its KV and first token.
 
         **Runs when this accelerator is free to run it**, which is the difference
         between submitting work and being told how long to sleep. The pass is
@@ -141,6 +175,20 @@ class Accelerator(ABC):
         fetch, where control's arithmetic has it, rather than behind it, where a
         forward pass that cannot start before its inputs arrive actually has it.
 
+        ``prompt`` is the **uncached suffix** of the request's prompt: the token
+        ids this pass has to compute KV for, with whatever ``cached`` covers already
+        chopped off the front. A tensor rather than the ``int`` count this took
+        before, because that count was the only thing standing between this port and
+        the one a deployment implements -- an engine runs a model over ids, and a
+        number is not something it can run. How many tokens it is remains a shape
+        read, so nothing downstream had to be told twice.
+
+        What that does not fix is the *content*: under simulation the prompt is a
+        ``device="meta"`` tensor, so it has the right length and dtype and no ids in
+        it, which is the same compromise the KV blocks are and is why a request's
+        block keys are still generated alongside the prompt rather than hashed out
+        of it (:class:`kvcache_sim.control.request.Request`).
+
         ``cached`` is the KV this host pulled for the prefix in front of those
         tokens -- blocks another host computed and this one fetched out of the store.
         It is passed in rather than fetched here because getting it is a store call
@@ -157,19 +205,29 @@ class Accelerator(ABC):
         reorder when an unrelated ``await`` is added upstream of one of its
         callers, which is a determinism bug that hides for months.
 
-        Answers with **one tensor per KV block this host now holds and did not
-        before**, in prompt order: the pulled prefix first, then the suffix this
-        pass computed. That is exactly the set the caller publishes, which is the
-        reason for the shape -- the alternative, returning only the newly computed
-        blocks and leaving the caller to splice the pulled ones back in front, puts
-        the ordering of a request's KV in the serving loop, where a silent
-        off-by-one would publish real bytes under the wrong keys.
+        Answers with two things, and the first is **one tensor per KV block this
+        host now holds and did not before**, in prompt order: the pulled prefix
+        first, then the suffix this pass computed. That is exactly the set the
+        caller publishes, which is the reason for the shape -- the alternative,
+        returning only the newly computed blocks and leaving the caller to splice
+        the pulled ones back in front, puts the ordering of a request's KV in the
+        serving loop, where a silent off-by-one would publish real bytes under the
+        wrong keys.
 
         A real engine holds its KV as one contiguous per-layer region and would
         slice it; per-block is what the store wants and what a paged engine already
         has, so it is what this port asks for. Returning the region plus a block
         table was considered and rejected: it is a second description of the same
         layout that only the caller would use, and only to cut it up again.
+
+        The second is the request's **first token**, sampled from the pass's last
+        position -- which is what makes the TTFT this run reports a time to a token
+        that exists. It is one token and not a list: a prefill emits exactly one,
+        however long the prompt was, and everything after it is decode's
+        (:meth:`step_tokens`). A fully cached prompt still produces it, because the
+        last position is still attended and sampled even when no new KV had to be
+        computed; that is why it is returned unconditionally rather than only when
+        there were tokens to compute.
         """
 
     @abstractmethod
@@ -186,3 +244,27 @@ class Accelerator(ABC):
     @abstractmethod
     async def wait_until(self, when: float) -> None:
         """Wait until ``when``, the moment :meth:`claim_step` answered with."""
+
+    @abstractmethod
+    def step_tokens(self, batch_size: int) -> List[torch.Tensor]:
+        """The tokens a finished decode step emitted -- one per batch member.
+
+        A third decode member rather than a return value on either of the other
+        two, and both alternatives were considered. :meth:`claim_step` *books* the
+        device and answers before the step has run, so tokens coming out of it
+        would be an answer produced before the work; ``await wait_until(...)``
+        answers for whoever is waiting on the clock and knows nothing about a
+        batch. So the caller books, waits, and then asks what came out -- which is
+        also the order a real step loop runs in.
+
+        In batch order, one per member, so the caller pairs them positionally with
+        the batch it froze for the step. The alternative -- one ``(batch_size,)``
+        tensor, which is what a sampling kernel actually writes -- was rejected for
+        what it does to the caller: the engine would index it against a list it
+        holds separately, and a batch that reordered between the claim and the read
+        would attribute every token to the wrong request with nothing raising.
+
+        Not async and not charged. The step's whole cost is the claim; sampling is
+        inside it, so a second cost here would be double-counting the same
+        milliseconds.
+        """

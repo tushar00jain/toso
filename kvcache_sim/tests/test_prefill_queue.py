@@ -30,11 +30,18 @@ import pytest
 
 from sim_common.async_engine import AsyncEngine
 
-from kvcache_sim.workload._accelerator import BLOCK_TOKENS, SimulatedAccelerator
+from kvcache_sim.workload._accelerator import (
+    BLOCK_TOKENS, SimulatedAccelerator, token_tensor,
+)
 from kvcache_sim.tests._run import run_shared_prefix
 
 
 TOKENS = 4 * BLOCK_TOKENS
+#: The prompt every submission below hands in. A forward pass takes the tokens it
+#: has to compute, not a count of them, so a test that submits one has to have a
+#: prompt -- and a ``device="meta"`` one costs nothing to make and says exactly as
+#: much as the integer did, which is how long the pass is.
+PROMPT = token_tensor(TOKENS)
 
 
 def _drive(coro):
@@ -62,7 +69,7 @@ def test_the_accelerator_runs_one_pass_at_a_time():
     finished = {}
 
     async def submit(tag: str) -> None:
-        await gpu.prefill(TOKENS, tag=tag)
+        await gpu.prefill(PROMPT, tag=tag)
         finished[tag] = asyncio.get_running_loop().time()
 
     async def drive() -> float:
@@ -93,7 +100,7 @@ def test_the_wait_is_emergent_and_nobody_was_told_it():
     async def submit(tag: str) -> None:
         loop = asyncio.get_running_loop()
         start = loop.time()
-        await gpu.prefill(TOKENS, tag=tag)
+        await gpu.prefill(PROMPT, tag=tag)
         waited[tag] = loop.time() - start - cost
 
     async def drive() -> None:
@@ -119,7 +126,7 @@ def test_the_service_order_is_sorted_not_the_order_the_loop_resumed_them():
     order = []
 
     async def submit(tag: str) -> None:
-        await gpu.prefill(TOKENS, tag=tag)
+        await gpu.prefill(PROMPT, tag=tag)
         order.append(tag)
 
     async def drive() -> None:
@@ -137,12 +144,14 @@ def test_a_pass_with_nothing_to_compute_does_not_take_a_turn():
     cost = gpu.prefill_cost(TOKENS)
     finished = {}
 
-    async def submit(tag: str, tokens: int) -> None:
-        await gpu.prefill(tokens, tag=tag)
+    async def submit(tag: str, prompt) -> None:
+        await gpu.prefill(prompt, tag=tag)
         finished[tag] = asyncio.get_running_loop().time()
 
     async def drive() -> None:
-        await asyncio.gather(submit("r0", TOKENS), submit("r1", 0))
+        # ...and "nothing to compute" is an empty prompt, which is what a prompt
+        # entirely covered by cached blocks leaves for the pass.
+        await asyncio.gather(submit("r0", PROMPT), submit("r1", token_tensor(0)))
 
     _drive(drive)
     assert finished["r1"] == pytest.approx(0.0)
@@ -165,7 +174,7 @@ def test_a_prefill_queues_behind_a_decode_step_on_the_same_accelerator():
 
     async def drive() -> float:
         gpu.claim_step(4)
-        await gpu.prefill(TOKENS, tag="r0")
+        await gpu.prefill(PROMPT, tag="r0")
         return asyncio.get_running_loop().time()
 
     assert _drive(drive) == pytest.approx(step + cost)
@@ -179,7 +188,7 @@ def test_a_decode_step_queues_behind_a_running_prefill():
 
     async def drive() -> float:
         running = asyncio.get_running_loop().create_task(
-            gpu.prefill(TOKENS, tag="r0")
+            gpu.prefill(PROMPT, tag="r0")
         )
         await asyncio.sleep(0)  # let the pass claim the device
         booked = gpu.claim_step(1)

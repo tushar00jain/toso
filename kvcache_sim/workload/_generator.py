@@ -19,6 +19,19 @@ accessed tens of thousands of times, most never reused). Prompts are **bounded**
 Determinism: a single ``random.Random(seed)`` drives conversation choice and
 Poisson arrivals, so the whole request stream -- and every downstream metric -- is
 byte-identical across runs of the same seed.
+
+A prompt and its keys, generated together
+-----------------------------------------
+Each request leaves here carrying both a **prompt tensor** (``prompt_tokens``
+zero-storage token ids -- see :func:`kvcache_sim.workload._accelerator.token_tensor`)
+and the block-key chain that addresses it. The two are produced side by side and
+that is the compromise, stated where it is made: a real chain is a hash of the
+prompt's *content*, and a ``device="meta"`` prompt has none to hash. So the keys are
+built from the segment ids this generator chose, which is the same sharing structure
+a content hash would produce over prompts that really did share those segments, and
+the prompt is the right shape with nothing in it. Hashing the prompt's shape instead
+would make every same-length prompt a cache hit for every other, which is not a
+weaker model but a wrong one.
 """
 
 from __future__ import annotations
@@ -27,6 +40,7 @@ import random
 from typing import List, Sequence, Tuple
 
 from ..control.request import Request
+from ._accelerator import token_tensor
 
 __all__ = ["make_workload"]
 
@@ -106,12 +120,17 @@ def make_workload(
         fresh += query_blocks
         segments = conv_prefix[c] + query
         keys = _block_keys_for(model_id, segments)
+        prompt_tokens = len(keys) * block_tokens
         requests.append(Request(
             id=f"r{i}",
             arrival=t,
             block_keys=keys,
             conversation=f"c{c}",
-            prompt_tokens=len(keys) * block_tokens,
+            prompt_tokens=prompt_tokens,
+            # The prompt the client submits, one token id per prompt token. Built
+            # here because a prompt is the caller's, not the cluster's -- and free,
+            # so the stream costs no more memory than the counts did.
+            prompt=token_tensor(prompt_tokens),
             output_tokens=output_tokens,
         ))
     return requests
