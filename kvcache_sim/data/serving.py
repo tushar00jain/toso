@@ -147,7 +147,7 @@ class ServingHost:
         self.trace = trace
         self.metrics = metrics
         self.prefill = prefill
-        self.engine = decode
+        self.decode = decode
         self.models_decode = models_decode
         self.block_tokens = store.block_tokens
         #: Whether a prefill here delays a decode step here -- true exactly when
@@ -164,16 +164,16 @@ class ServingHost:
         # stash the accepted row here and publish it once decode finishes (success)
         # or admission is refused (wasted prefill).
         self._pending: Dict[str, RequestResult] = {}
-        if self.engine is not None:
-            self.engine.on_finish = self._decode_done
-            self.engine.on_state = self._decode_state
+        if self.decode is not None:
+            self.decode.on_finish = self._decode_done
+            self.decode.on_state = self._decode_state
             # There is something to report only when a decode step can actually
             # collide with a prefill, and that is exactly when the two engines were
             # given the *same* accelerator. Identity, not a flag: the run's wiring
             # answers it by what it hands them, so there is nowhere for a second
             # answer to disagree.
             if self.coupled:
-                self.engine.on_compute_busy = self._compute_busy
+                self.decode.on_compute_busy = self._compute_busy
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
@@ -189,8 +189,8 @@ class ServingHost:
 
     async def drain(self) -> None:
         """Keep the loop running until this host's last decode token is emitted."""
-        if self.engine is not None:
-            await self.engine.drain()
+        if self.decode is not None:
+            await self.decode.drain()
 
     # -- the router role, which every host plays --------------------------- #
     async def receive(self, request: Request) -> None:
@@ -374,13 +374,13 @@ class ServingHost:
             return
         # Hand the request to the host that decodes it. Under disaggregation that
         # is always another host, so it is a hop and not a method call: this host
-        # cannot reach into another's batch.
+        # cannot reach into another's batch. Ourselves is the same operation with
+        # nothing in between, so it is the same member, called directly.
+        row = self._pending.pop(plan.request.id)
         if plan.decode == self.me:
-            self._admit_locally(plan.request, self._pending.pop(plan.request.id))
+            await self.admit_decode(plan.request, row)
         else:
-            await self.peers(plan.decode).admit_decode.call_one(
-                plan.request, self._pending.pop(plan.request.id)
-            )
+            await self.peers(plan.decode).admit_decode.call_one(plan.request, row)
         self.trace.record(
             self._now(),
             "DONE",
@@ -395,12 +395,9 @@ class ServingHost:
         The row travels with the request because the host that finishes a request
         is the host that reports it, and after this point that is this one.
         """
-        self._admit_locally(request, row)
-
-    def _admit_locally(self, request: Request, row: RequestResult) -> None:
         self._pending[request.id] = row
-        if self.engine is not None:
-            self.engine.admit(request)
+        if self.decode is not None:
+            self.decode.admit(request)
 
     def _decode_done(self, request: Request, tbt: float) -> None:
         """Finalize a request once its last decode token is emitted."""
