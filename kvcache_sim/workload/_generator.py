@@ -110,6 +110,7 @@ def make_workload(
             id=f"r{i}",
             arrival=t,
             block_keys=keys,
+            conversation=f"c{c}",
             prompt_tokens=len(keys) * block_tokens,
             output_tokens=output_tokens,
         ))

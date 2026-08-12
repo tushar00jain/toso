@@ -35,3 +35,7 @@ class Request:
     block_keys: Tuple[str, ...]
     prompt_tokens: int
     output_tokens: int
+    #: Which conversation this request continues. Not used to find a *cache* --
+    #: that is what the block keys are for -- but a real front end has it (a
+    #: session or tenant id) and uses it to pick which host a request lands on.
+    conversation: str = ""

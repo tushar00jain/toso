@@ -1,8 +1,26 @@
 """The serving loop: turning one routing decision into real store calls.
 
-:class:`ServingPlane` is ``kvcache_sim``'s :class:`~proposed.plane.DataPlane`. The
-The run harness releases one work item per request at its arrival
-time; everything from there is here:
+:class:`ServingHost` is **one serving instance**: its cache, its decode batch, its
+compute. A deployment runs one per host and they reach each other over the same
+kind of port they reach the store and the coordinator over. :class:`Arrivals` is
+the harness-facing :class:`~proposed.plane.DataPlane`, and it is deliberately
+almost nothing -- see below.
+
+Every host is also a router
+---------------------------
+A request can land on any host, and the host it lands on is rarely the host that
+should serve it: which instance holds the longest reusable prefix is a
+cluster-wide fact. So a host that receives a request asks the coordinator where it
+belongs (:meth:`ServingHost.receive`), then either serves it or forwards it to the
+host named (:meth:`ServingHost.serve`). Routing is a *role every host plays*, not
+a tier in front of them -- a single router object would re-centralize exactly what
+running one of these per host decentralizes.
+
+What is left over is which host a request arrives at, and that is a load balancer's
+answer, not a serving decision. So it belongs to the run's wiring rather than here,
+and :class:`Arrivals` does nothing but deliver.
+
+The lifecycle, once a host is serving:
 
 1. ask the coordinator to route the request (control), and record a rejection if
    it refuses;
@@ -39,20 +57,30 @@ on.
 
 Coupling lives here
 -------------------
-Whether prefill and decode contend for one instance's compute is a fact about the
-deployment, not about the policy, so this plane owns it. On a coupled instance it
-applies each accepted plan's reservation to the decode engine's timeline
+Whether prefill and decode contend for this host's compute is a fact about the
+deployment, not about the policy, so the host owns it. When coupled it applies each
+accepted plan's reservation to its decode engine's timeline
 (:meth:`~kvcache_sim.data._decode.DecodeEngine.reserve`) and reports each decode
 step's end on through
 a :class:`~kvcache_sim.control.scheduler.ComputeBusy` fact, so the control
 plane's *predicted* prefill queue tracks the timeline decode is actually using. A
-disaggregated pool does neither, and prefill never stalls decode.
+disaggregated host does neither, and prefill never stalls decode.
+
+Reaching another host
+---------------------
+Two things cross a host boundary: forwarding a request to the host that should
+prefill it, and handing a finished prefill to the host that will decode it (which
+under disaggregation is always a different host). Both go through ``peers`` -- a
+lookup returning an endpoint-shaped reference, the same shape as the coordinator
+handle -- so both are charged a hop rather than being a method call on an object
+this host should not be able to see. ``peers`` is a lookup and not a dict of
+objects for that reason.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model, prefill_time
 from proposed import Coordinator, DataPlane
@@ -65,28 +93,30 @@ from ..control.request import Request
 from ._decode import DecodeEngine
 from .store import KVStore
 
-__all__ = ["ServingPlane"]
+__all__ = ["Arrivals", "ServingHost"]
 
 
-class ServingPlane(DataPlane):
-    # Rows are published at rejection, at acceptance, or when the last decode
-    # token lands -- never one per item, so the harness must not write them.
-    writes_own_outcomes = True
-
-    """Runs one request's lifecycle against the real store.
+class ServingHost:
+    """One serving instance: its cache, its decode batch, its compute.
 
     The running loop's ``time()`` is the only clock (virtual under simulation).
 
     Args:
+        me: this host's instance id. The only place an instance id is *this*
+            host's; every other one names a peer.
         store: the :class:`~kvcache_sim.data.store.KVStore` verbs.
         coordinator: the control plane, through its
             :class:`~proposed.coordinator.Coordinator` port and nothing
             else. It decides; it never executes, and it is not on this host.
+        peers: ``instance id -> a reference to that host``, endpoint-shaped
+            (``.serve.call_one(...)``). A lookup rather than a dict of objects,
+            because what a host holds for another host is a reference, and the
+            hop is charged on the way through it.
         trace: the run's shared trace.
         metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger.
-        coupled: whether prefill shares each decode instance's compute timeline.
-        simulate_decode / decode_ids / max_batch / profile / model: how this plane
-            models decode. They come from the run's wiring
+        coupled: whether prefill shares this host's decode compute timeline.
+        simulate_decode / max_batch / profile / model: how this host models
+            decode. They come from the run's wiring
             (:func:`kvcache_sim.workload._serving.serving_plane`), which is the
             same place the coordinator got them -- not read off the coordinator,
             which would be this host inspecting another service's fields.
@@ -94,25 +124,28 @@ class ServingPlane(DataPlane):
 
     def __init__(
         self,
+        me: str,
         store: KVStore,
         coordinator: Coordinator,
         *,
+        peers: Callable[[str], Any],
         trace,
         metrics: Metrics,
         coupled: bool = False,
         simulate_decode: bool = False,
-        decode_ids: Optional[List[str]] = None,
         max_batch: int = 8,
         profile=DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
     ) -> None:
+        self.me = me
         self.store = store
         self.coordinator: Coordinator = coordinator
+        self.peers = peers
         self.trace = trace
         self.metrics = metrics
         self.coupled = coupled
         self.simulate_decode = simulate_decode
-        # Cost constants, for the one thing this plane has to price itself: a
+        # Cost constants, for the one thing this host has to price itself: a
         # prefill re-priced because the reuse it was planned around is gone.
         self.profile = profile
         self.model = model
@@ -125,7 +158,6 @@ class ServingPlane(DataPlane):
         self.engine: Optional[DecodeEngine] = None
         if simulate_decode:
             self.engine = DecodeEngine(
-                decode_ids if decode_ids is not None else [],
                 max_batch=max_batch,
                 profile=profile,
                 model=model,
@@ -140,24 +172,28 @@ class ServingPlane(DataPlane):
         return asyncio.get_running_loop().time()
 
     # -- what this host tells the coordinator about its decode side -------- #
-    def _decode_state(self, inst: str, finishes: List[float]) -> None:
+    def _decode_state(self, finishes: List[float]) -> None:
         """Forward a changed decode batch. The engine reports here, not there."""
-        self.coordinator.observe.broadcast(DecodeState(inst, tuple(finishes)))
+        self.coordinator.observe.broadcast(DecodeState(self.me, tuple(finishes)))
 
-    def _compute_busy(self, inst: str, until: float) -> None:
-        """Forward a coupled instance's occupied compute timeline."""
-        self.coordinator.observe.broadcast(ComputeBusy(inst, until))
+    def _compute_busy(self, until: float) -> None:
+        """Forward this host's occupied compute timeline (coupled only)."""
+        self.coordinator.observe.broadcast(ComputeBusy(self.me, until))
 
     async def drain(self) -> None:
-        """Keep the loop running until the last decode token is emitted."""
+        """Keep the loop running until this host's last decode token is emitted."""
         if self.engine is not None:
             await self.engine.drain()
 
-    # -- the request lifecycle -------------------------------------------- #
-    async def execute(self, item) -> None:
-        """Serve one request end to end (the runner already waited for arrival)."""
-        request: Request = item.payload
+    # -- the router role, which every host plays --------------------------- #
+    async def receive(self, request: Request) -> None:
+        """A client's request landed here. Find out where it belongs, and send it.
 
+        The host a request arrives at is a load balancer's answer; the host that
+        should *serve* it is a cluster-wide question about who holds the longest
+        reusable prefix, which only the coordinator can answer. So every host asks,
+        and most of the time forwards.
+        """
         plan = await self.coordinator.decide.call_one(Route(request))
         if plan is None:
             self.trace.record(
@@ -169,12 +205,25 @@ class ServingPlane(DataPlane):
                 )
             )
             return
-        # The accepted plan reserved its prefill instance in control's predicted
-        # queue. On a coupled instance that reservation occupies the same compute
-        # the decode engine steps on, so apply it there too -- immediately, with
-        # no await in between, so no decode step can slip past it.
+        if plan.prefill == self.me:
+            await self.serve(plan)
+            return
+        # Not ours: hand it to the host that should prefill it, and pay the hop.
+        self.trace.record(
+            self._now(), "FWD", f"{request.id} {self.me} -> {plan.prefill}"
+        )
+        await self.peers(plan.prefill).serve.call_one(plan)
+
+    # -- the request lifecycle, on the host that owns it ------------------- #
+    async def serve(self, plan: Plan) -> None:
+        """Prefill ``plan``'s request here, then hand it to its decode host."""
+        request = plan.request
+        # The accepted plan reserved this host in control's predicted queue. When
+        # coupled that reservation occupies the same compute the decode engine
+        # steps on, so apply it there too -- immediately, with no await in
+        # between, so no decode step can slip past it.
         if self.coupled and self.engine is not None:
-            self.engine.reserve(plan.prefill, plan.done_time)
+            self.engine.reserve(plan.done_time)
 
         tbt = self.simulate_decode
         self._trace_route(plan)
@@ -184,21 +233,21 @@ class ServingPlane(DataPlane):
         else:
             self._pending[request.id] = row
 
-        # (1) wait out the prefill queue at this instance.
+        # (1) wait out the prefill queue at this host.
         if plan.queue_wait > 0:
             await asyncio.sleep(plan.queue_wait)
-        # (2) the prefix this instance already had is a read the store never sees,
+        # (2) the prefix this host already had is a read the store never sees,
         # so tell it: the volume evicts on what it has observed.
         local_blocks = plan.match_blocks - len(plan.pull_keys)
         if local_blocks:
             await self.store.reuse(
-                plan.prefill, list(plan.request.block_keys[:local_blocks])
+                self.me, list(plan.request.block_keys[:local_blocks])
             )
         # ...then pull the remote prefix (a real get_batch -> real fabric cost).
         prefill_t = plan.prefill_t
         if plan.reuse_source is not None and plan.pull_keys:
             try:
-                await self.store.fetch(plan.prefill, plan.pull_keys)
+                await self.store.fetch(self.me, plan.pull_keys)
             except KeyError:
                 # The peer had those blocks when this was planned and does not now:
                 # a volume it shares with other requests ran out of room and dropped
@@ -221,23 +270,23 @@ class ServingPlane(DataPlane):
         # dropped, because "cached" and "tried to cache and had no room" are exactly
         # the two outcomes a capacity sweep is measuring between, and a hit rate
         # cannot tell them apart.
-        row.published = await self.store.publish(plan.prefill, fresh)
+        row.published = await self.store.publish(self.me, fresh)
         # (5) tell control the clock the real ops reached, and (coupled only) the
-        # decode timeline the same instance now carries.
+        # decode timeline this host now carries.
         now = self._now()
         busy_until = await self.coordinator.decide.call_one(
-            PrefillFinished(plan.prefill, now)
+            PrefillFinished(self.me, now)
         )
         if self.coupled and self.engine is not None:
             # The reply, not a read of control's queue: prefill just occupied the
             # timeline decode steps on, and only the coordinator knows the tail.
-            self.engine.reserve(plan.prefill, busy_until)
+            self.engine.reserve(busy_until)
         await self._prefill_done(plan, row.published)
 
     def _recompute(self, plan: Plan, row: RequestResult) -> float:
         """Re-price this prefill with the reuse that vanished, and say what it costs.
 
-        The remote prefix is gone, so only what this instance already held is still
+        The remote prefix is gone, so only what this host already held is still
         cached: the planned match minus the blocks that were going to be pulled.
         Corrects the row too -- the request really did compute those tokens, and a
         hit rate that counted the plan rather than the outcome would flatter the
@@ -255,7 +304,7 @@ class ServingPlane(DataPlane):
             self._now(),
             "RESTALE",
             f"{plan.request.id} lost {len(plan.pull_keys)}blk of reuse on "
-            f"{plan.reuse_source} (evicted); recomputing on {plan.prefill}",
+            f"{plan.reuse_source} (evicted); recomputing on {self.me}",
         )
         return recomputed
 
@@ -299,12 +348,12 @@ class ServingPlane(DataPlane):
             self.trace.record(
                 self._now(),
                 "DONE",
-                f"{plan.request.id} prefill done on {plan.prefill}"
+                f"{plan.request.id} prefill done on {self.me}"
                 f" (published {stored}blk){note}",
             )
             return
         # Decode-simulating path: control decides whether decode can honour the
-        # TBT SLO; we perform (or skip) the admission.
+        # TBT SLO; the host performs (or skips) the admission.
         if not await self.coordinator.decide.call_one(AdmitDecode(plan)):
             result = self._pending.pop(plan.request.id)
             result.accepted = False
@@ -315,18 +364,38 @@ class ServingPlane(DataPlane):
                 self._now(),
                 "REJECT",
                 f"{plan.request.id} decode rejected on {plan.decode}"
-                f" (TBT SLO; wasted prefill on {plan.prefill}){note}",
+                f" (TBT SLO; wasted prefill on {self.me}){note}",
             )
             return
-        if self.engine is not None:
-            self.engine.admit(plan.request, plan.decode)
+        # Hand the request to the host that decodes it. Under disaggregation that
+        # is always another host, so it is a hop and not a method call: this host
+        # cannot reach into another's batch.
+        if plan.decode == self.me:
+            self._admit_locally(plan.request, self._pending.pop(plan.request.id))
+        else:
+            await self.peers(plan.decode).admit_decode.call_one(
+                plan.request, self._pending.pop(plan.request.id)
+            )
         self.trace.record(
             self._now(),
             "DONE",
-            f"{plan.request.id} prefill done on {plan.prefill}"
+            f"{plan.request.id} prefill done on {self.me}"
             f" (published {stored}blk){note}"
             f"; decoding on {plan.decode}",
         )
+
+    async def admit_decode(self, request: Request, row: RequestResult) -> None:
+        """A peer finished prefill and this host decodes it. Its outcome is ours now.
+
+        The row travels with the request because the host that finishes a request
+        is the host that reports it, and after this point that is this one.
+        """
+        self._admit_locally(request, row)
+
+    def _admit_locally(self, request: Request, row: RequestResult) -> None:
+        self._pending[request.id] = row
+        if self.engine is not None:
+            self.engine.admit(request)
 
     def _decode_done(self, request: Request, tbt: float) -> None:
         """Finalize a request once its last decode token is emitted."""
@@ -336,3 +405,42 @@ class ServingPlane(DataPlane):
         self.trace.record(
             self._now(), "DECODE", f"{request.id} decode done (tbt {tbt:.3f})"
         )
+
+
+class Arrivals(DataPlane):
+    """Deliver each request to the host it lands on. That is the whole job.
+
+    The harness-facing :class:`~proposed.plane.DataPlane`, and deliberately almost
+    nothing: *where a request arrives* is a load balancer's answer -- DNS, a
+    client's affinity, a round robin -- and *where it should run* is the
+    coordinator's. Neither is a serving decision, so this holds no policy of its
+    own and the arrival host is decided by the run's wiring.
+
+    Args:
+        hosts: ``instance id -> ServingHost``. Held as objects rather than
+            references because this stands in for the client side of the
+            deployment, which is outside every host.
+        arrival_host: which host a request lands on.
+    """
+
+    #: Rows are published at rejection, at acceptance, or when the last decode
+    #: token lands -- never one per item, so the harness must not write them.
+    writes_own_outcomes = True
+
+    def __init__(
+        self,
+        hosts: Dict[str, ServingHost],
+        arrival_host: Callable[[Request], str],
+    ) -> None:
+        self.hosts = hosts
+        self.arrival_host = arrival_host
+
+    async def execute(self, item) -> None:
+        """Hand the request to whichever host it arrived at."""
+        request: Request = item.payload
+        await self.hosts[self.arrival_host(request)].receive(request)
+
+    async def drain(self) -> None:
+        """Every host's decode has to finish before the run is over."""
+        for host in sorted(self.hosts):
+            await self.hosts[host].drain()

@@ -238,6 +238,43 @@ def test_a_prefix_that_does_not_fit_is_reported_as_not_cached():
     assert refused.hit_rate == 0.0
 
 
+# 7c. A request is served where the coordinator says, not where it landed.
+def test_a_request_is_served_by_its_plan_host_not_the_host_it_landed_on():
+    """Every host routes, so where a request lands does not decide where it runs.
+
+    Arrival is client affinity -- a load balancer's answer, made without looking
+    at the cache -- so most requests land somewhere other than the host holding
+    their prefix, and the host they land on forwards them. If arrival decided
+    placement instead, cache-aware routing would be measuring its own load
+    balancer.
+
+    The two counts have to agree: one forward is traced for exactly the requests
+    whose serving host is not their arrival host.
+    """
+    from kvcache_sim.workload._serving import _affinity
+
+    topo, reqs = _make_topology(4), _shared_prefix_workload()
+    result = run(topo, reqs, "cache_aware")
+
+    landed = _affinity(sorted(topo))
+    by_id = {r.id: r for r in reqs}
+    moved = [
+        row for row in result.ledger.accepted
+        if row.prefill != landed(by_id[row.id])
+    ]
+    forwards = [
+        line for line in result.trace.render().splitlines() if " FWD " in line
+    ]
+    assert moved, "every request happened to land on its own prefill host"
+    assert len(moved) == len(forwards)
+    # ...and affinity is a function of the conversation alone, so a conversation's
+    # requests all land together however their prefixes differ.
+    for request in reqs:
+        assert landed(request) == landed(by_id[request.id])
+    homes = {r.conversation: landed(r) for r in reqs}
+    assert all(landed(r) == homes[r.conversation] for r in reqs)
+
+
 # 8. Hotspot: replication lowers TTFT and prefill compute vs recompute-only,
 #    at the cost of KV fabric bytes.
 def test_hotspot_replication_helps():
@@ -275,16 +312,16 @@ def test_decode_step_time_shape():
 # 12. Batching raises TBT: a solo request decodes at the batch=1 baseline; several
 #     requests co-batched at the same instant each observe a strictly larger gap.
 def _run_decode_batch(n: int):
-    """Admit ``n`` requests at t=0 on one instance; return {id -> worst TBT}.
+    """Admit ``n`` requests at t=0 on one host; return {id -> worst TBT}.
 
     Drives the decode engine against a bare clock: it needs no store, no
     directory and no topology, so assembling a Simulation would build a mesh for
-    nothing.
+    nothing. One engine is one host's decode side, so there is no instance to name.
     """
     loop = AsyncEngine()
     res = {}
     eng = DecodeEngine(
-        ["s0"], max_batch=8,
+        max_batch=8,
         on_finish=lambda r, tbt: res.__setitem__(r.id, tbt),
     )
 
@@ -292,8 +329,7 @@ def _run_decode_batch(n: int):
         for i in range(n):
             eng.admit(
                 Request(id=f"r{i}", arrival=0.0, block_keys=("m0|0",),
-                        prompt_tokens=512, output_tokens=6),
-                "s0",
+                        prompt_tokens=512, output_tokens=6)
             )
         await eng.drain()
 

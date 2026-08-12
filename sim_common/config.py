@@ -105,6 +105,12 @@ class SimConfig:
     # lag of one-way sends is not modelled (see the handles' docstrings).
     coordinator_rtt: float = 0.0
     controller_rtt: float = 0.0
+    # ``host_rtt`` is the fourth boundary: one serving host reaching another, which
+    # a request crosses when it arrives somewhere other than the host that should
+    # prefill it, and again when its prefill host hands it to its decode host.
+    # Same contract as the two above -- ``0.0`` keeps a hop inline and the run
+    # byte-identical, and a non-zero value is an opt-in fidelity model.
+    host_rtt: float = 0.0
 
 
 _current = SimConfig()
@@ -147,6 +153,9 @@ def _from_env() -> dict:
     controller_rtt = os.environ.get("TOSO_CONTROLLER_RTT")
     if controller_rtt is not None:
         out["controller_rtt"] = float(controller_rtt)
+    host_rtt = os.environ.get("TOSO_HOST_RTT")
+    if host_rtt is not None:
+        out["host_rtt"] = float(host_rtt)
     return out
 
 

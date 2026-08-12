@@ -6,10 +6,18 @@ Two separate things, deliberately:
   :class:`~realsim.runner.WorkItem` per request at its arrival time. It builds no
   store, no scheduler and no plane;
 * :func:`coordinator` and :func:`serving_plane` are the *capability wiring*, one
-  per plane: the scheduler over the view, and the store plus the
-  :class:`~kvcache_sim.data.serving.ServingPlane` over it. Both are factories
-  because they reach for the view, the mesh and the ledger, none of which exists
-  before the stack does.
+  per plane: the scheduler over the view, and the store plus one
+  :class:`~kvcache_sim.data.serving.ServingHost` per instance over it. Both are
+  factories because they reach for the view, the mesh and the ledger, none of
+  which exists before the stack does.
+
+Two things a deployment would not need are built here, because in a deployment
+they are not built at all. One is the peer references a host reaches another host
+through -- in production a handle to a remote actor, here a
+:class:`~realsim.seams.link.LocalEndpoint` pair over a
+:class:`~realsim.seams.link.ServiceHop`, so the boundary is charged. The other is
+:func:`_affinity`, which decides where a request lands: production has a load
+balancer, and a simulation has to stand in for one.
 
 They are two functions because they are two services. The plane factory does not
 build the scheduler; it takes ``sim.coordinator_handle``, the handle
@@ -20,19 +28,23 @@ different wiring, which is exactly what "cache-aware vs load-balance" means.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from zlib import crc32
 
 import torch
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
 from proposed import Endpoint
 from realsim.runner import WorkItem
+from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.seams.transport import TensorDescriptor
 from realsim.simulation import Simulation
 from realsim.run import Workload
+from sim_common import config
 
+from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
-from ..data.serving import ServingPlane
+from ..data.serving import Arrivals, ServingHost
 from ..data.store import KVStore
 
 #: Tokens per KV block. Fixed for every scenario so runs stay comparable.
@@ -123,35 +135,99 @@ def coordinator(
     return LoadBalanceScheduler(**knobs)
 
 
+class _LocalHostHandle:
+    """A reference to another serving host, endpoint-shaped and hop-charged.
+
+    What a host holds for a peer, standing in for Monarch's handle over that
+    host's actor: one :class:`~realsim.seams.link.LocalEndpoint` per member a peer
+    may call, over a shared :class:`~realsim.seams.link.ServiceHop`. Reaching
+    another host is a boundary like reaching the directory or the coordinator, and
+    is charged like one -- free by default (``host_rtt`` is ``0.0``), so a run that
+    does not ask for the fidelity is byte-identical.
+
+    Only the two members a *peer* calls are exposed. ``receive`` is not one of
+    them: a request arrives from a client, and a host that could hand another host
+    an unrouted request would be a second router.
+    """
+
+    def __init__(self, host: ServingHost, hop: ServiceHop) -> None:
+        self.serve = LocalEndpoint(host.serve, hop)
+        self.admit_decode = LocalEndpoint(host.admit_decode, hop)
+
+
+def _affinity(ids: List[str]) -> Callable[[Request], str]:
+    """Which host a request lands on: same conversation, same host.
+
+    The load balancer a deployment has and a simulation has to stand in for. Client
+    affinity rather than round robin because it is what a real front end does with
+    a session id, and because it is the arrival policy that forwards least: a
+    conversation's requests share a prefix, so the host that served the last one is
+    usually the host that should serve the next.
+
+    Note what it deliberately does *not* do: it never looks at the block keys. An
+    arrival policy that routed by cache contents would be doing the coordinator's
+    job with none of the coordinator's information, and the comparison this whole
+    package exists to make would be measuring itself.
+
+    Deterministic across runs and platforms: ``crc32`` of the conversation id, not
+    Python's salted ``hash``.
+    """
+    ordered = sorted(ids)
+
+    def landed(request: Request) -> str:
+        return ordered[crc32(request.conversation.encode()) % len(ordered)]
+
+    return landed
+
+
 def serving_plane(
     *,
     coupled: bool = False,
     simulate_decode: bool = False,
     max_batch: int = 8,
     decode_pool: Optional[List[str]] = None,
-) -> Callable[[Simulation], ServingPlane]:
-    """Build the factory for this run's **data plane**.
+) -> Callable[[Simulation], Arrivals]:
+    """Build the factory for this run's **data plane**: one host per instance.
 
-    ``coupled`` says whether prefill shares the decode instances' compute -- a
-    deployment fact, so it belongs to the serving plane, not to the scheduler.
-    The decode settings are passed here *and* to :func:`coordinator` from the one
-    scenario that declares them, rather than one reading them off the other.
+    ``coupled`` says whether prefill shares a host's decode compute -- a deployment
+    fact, so it belongs to the host, not to the scheduler. The decode settings are
+    passed here *and* to :func:`coordinator` from the one scenario that declares
+    them, rather than one reading them off the other.
+
+    ``decode_pool`` needs no telling now: a host that is never named as a plan's
+    decode instance is never handed one, so only the coordinator has to know which
+    hosts decode.
     """
 
-    def build(sim: Simulation) -> ServingPlane:
+    def build(sim: Simulation) -> Arrivals:
         # The simulation *is* the deployment: it vends the client for an instance
         # and holds the directory. All the run adds is the block carrier.
         store = KVStore(
             sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
         )
-        return ServingPlane(
-            store, sim.coordinator_handle, trace=sim.trace, metrics=sim.ledger,
-            coupled=coupled,
-            simulate_decode=simulate_decode,
-            decode_ids=sorted(decode_pool) if decode_pool else sim.ids,
-            max_batch=max_batch,
-            profile=DEFAULT_PROFILE,
-            model=DEFAULT_MODEL,
-        )
+        hop = ServiceHop(config.current().host_rtt)
+        hosts: Dict[str, ServingHost] = {}
+        handles: Dict[str, _LocalHostHandle] = {}
+
+        def peers(instance: str) -> Any:
+            return handles[instance]
+
+        for instance in sorted(sim.ids):
+            hosts[instance] = ServingHost(
+                instance, store, sim.coordinator_handle,
+                peers=peers,
+                trace=sim.trace, metrics=sim.ledger,
+                coupled=coupled,
+                simulate_decode=simulate_decode,
+                max_batch=max_batch,
+                profile=DEFAULT_PROFILE,
+                model=DEFAULT_MODEL,
+            )
+        # After every host exists, because a handle names one: the lookup is
+        # deferred through ``peers`` so the cycle is closed by the time anyone
+        # calls, and no host holds another host's object.
+        for instance, host in hosts.items():
+            handles[instance] = _LocalHostHandle(host, hop)
+        return Arrivals(hosts, _affinity(sorted(sim.ids)))
 
     return build
