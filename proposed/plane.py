@@ -1,27 +1,38 @@
-"""The execution half of a capability: :class:`DataPlane`.
+"""The two halves of a capability: :class:`ControlPlane` and :class:`DataPlane`.
 
 A capability's control plane returns a decision; something has to turn that
-decision into store calls. That something is small and has the same shape in
-every capability, so it is one two-method type:
+decision into store calls. That something is its data plane, and the point of
+declaring both is the whole proposal in miniature: a capability is written
+*against* torchstore rather than *into* it, so writing one should mean
+implementing these and nothing else.
 
 * :class:`ControlPlane` -- the deciding half's one lifecycle member: knobs at
   construction, the stack's ports at :meth:`ControlPlane.attach`;
-* :meth:`DataPlane.execute` -- the work *around* the transfer. The transfer
-  itself is an ordinary client call, so the default adds nothing and simply runs
-  the work item's own call;
-* :meth:`DataPlane.after` -- registration and eviction once the bytes have
-  landed. The default does nothing.
+* :class:`DataPlane` -- the executing half's one member,
+  :meth:`DataPlane.after`: what the capability does once a transfer has landed.
+  The transfer itself is an ordinary client call and needs no interface.
 
 Both defaults are real behaviour, not stubs: a plain fetch takes them unchanged.
-``dedup_sim`` overrides only :meth:`after` (the read-through put that makes the
-reader a directory source for the next one); ``kvcache_sim`` overrides both (a
-serving loop around the pull, then publish + evict). A new capability starts by
-overriding one method.
 
-Deliberately absent: any per-operation hook to *shape* a transfer -- chunking,
-striping across sources, batching keys, failover. Those are real questions, but
-answering them here would put execution back under the control plane's thumb,
-which is the coupling this split exists to remove.
+What is deliberately *not* here
+-------------------------------
+Anything shaped like a run. This package may not import the simulator (see
+:mod:`proposed`), and for a long time :class:`DataPlane` broke that rule without
+importing anything: it carried ``execute(item)``, ``drain()`` and
+``writes_own_outcomes``, every one of them phrased in terms of a *work item* --
+which exists only because a harness releases work onto a clock. ``Any`` hid the
+import; it did not hide the dependency, and nobody outside a harness could have
+implemented them.
+
+They were never the capability's contract, they were the runner's, so they live
+with the runner now (``realsim.runner.ItemDispatch``). What is left is the one
+thing a capability genuinely declares, and it names a requester rather than an
+item, so a deployment can implement it.
+
+Also absent, and for a different reason: any per-operation hook to *shape* a
+transfer -- chunking, striping across sources, batching keys, failover. Those are
+real questions, but answering them here would put execution back under the control
+plane's thumb, which is the coupling this split exists to remove.
 """
 
 from __future__ import annotations
@@ -32,36 +43,25 @@ __all__ = ["ControlPlane", "DataPlane"]
 
 
 class DataPlane:
-    """What a capability does around, and after, a transfer.
+    """What a capability does once a transfer has landed.
 
-    Two class-level facts let a run be driven without the caller restating them:
-    whether the capability publishes its own outcome rows, and whether it has work
-    that outlives the items. Both default to the simple answer.
+    The executing half, and one member wide on purpose. Moving the bytes is an
+    ordinary client call -- ``get``, ``put``, ``get_batch`` -- so a capability
+    needs no interface to do it and this declares none. What it may need is the
+    step *after*: ``dedup_sim``'s reader publishes what it just fetched into its
+    own volume, which is what makes it a source for the next reader.
+
+    A capability with no such step implements nothing and inherits the default,
+    which is real behaviour rather than a stub.
     """
 
-    #: Set by a capability that records its own outcome rows -- one published at
-    #: several different lifecycle points, say -- so the harness does not also
-    #: write one per item.
-    writes_own_outcomes: bool = False
+    async def after(self, requester: str, result: Any) -> None:
+        """``requester``'s transfer landed, with ``result``. Default: nothing.
 
-    async def execute(self, item: Any) -> Any:
-        """Run the work ``item`` describes; return its result.
-
-        Default: nothing around the transfer -- just the item's own ordinary
-        store call.
-        """
-        return await item.run()
-
-    async def after(self, item: Any, result: Any) -> None:
-        """Registration / eviction once ``item``'s bytes have landed.
-
-        Default: nothing.
-        """
-
-    async def drain(self) -> None:
-        """Await work that outlives the items (kvcache's decode steps).
-
-        Called once, after every item's coroutine has returned. Default: nothing.
+        ``requester`` is the node that did the transfer -- the identity it reaches
+        the store under, which is what a capability needs to act on its behalf
+        (``deployment.client_for(requester)``). Not a work item: a deployment has
+        requesters and no items, and this interface has to be implementable by one.
         """
 
 

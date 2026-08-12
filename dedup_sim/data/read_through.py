@@ -37,6 +37,6 @@ class ReadThroughPlane(DataPlane):
         self.key = key
         self.value = value
 
-    async def after(self, item: Any, result: Any) -> None:
+    async def after(self, requester: str, result: Any) -> None:
         """Real read-through: the reader stores the key into its own volume."""
-        await self.deployment.client_for(item.id).put(self.key, self.value)
+        await self.deployment.client_for(requester).put(self.key, self.value)

@@ -22,6 +22,7 @@ from typing import List, Optional, Sequence
 
 from putget_sim.workload.put_get import KEY, PutGetBurst
 from realsim.demo import Console, Scenario
+from realsim.runner import ItemDispatch
 from realsim.run import Result, Run
 from sim_common.trace import Trace
 
@@ -74,8 +75,11 @@ class Dedup(Scenario):
                     f"cap={cap}",
                     burst,
                     control=DedupPolicy(fanout_cap=cap, trace=trace),
-                    data=lambda sim, b=burst: ReadThroughPlane(
-                        sim.mesh, KEY, b.put_value
+                    # The capability is the plane's one member; what the runner
+                    # drives is the dispatch that calls it. Wiring, so it is here
+                    # and not in ``data/``.
+                    data=lambda sim, b=burst: ItemDispatch(
+                        on_after=ReadThroughPlane(sim.mesh, KEY, b.put_value).after
                     ),
                     profile=burst.profile,
                     trace=trace,

@@ -1,8 +1,8 @@
 """The four shared types every capability plugs into.
 
 :class:`~proposed.view.View` (sense), :class:`~proposed.policy.Policy` (decide),
-:class:`~proposed.plane.DataPlane` (execute) and :class:`~realsim.runner.Runner`
-(release on the clock) are the generic half of both capabilities. These tests
+:class:`~proposed.plane.DataPlane` (what follows a transfer) and
+:class:`~realsim.runner.Runner` / :class:`~realsim.runner.ItemDispatch` (drive a run) are the generic half of both capabilities. These tests
 pin the contract each one owes its callers:
 
 1. the view reads the *real* directory and the run's virtual clock, and reading
@@ -34,7 +34,7 @@ from realsim.simulation import Simulation
 from proposed import DataPlane
 from proposed import Policy, Selection
 from proposed.policy import NaivePolicy  # not exported: the base Policy is naive
-from realsim.runner import Runner, WorkItem
+from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.transport import Endpoint
 from proposed import View
 from sim_common.async_engine import run_sim
@@ -202,6 +202,13 @@ def test_selection_withholds_until_its_gate_opens():
 
 
 def test_data_plane_defaults_run_the_call_and_do_nothing_after():
+    """The two defaults are real behaviour: run the item, do nothing after.
+
+    They now live on either side of the boundary -- running an item is the
+    runner's ``ItemDispatch``, what follows it is the capability's ``DataPlane``
+    -- so the plain path is the two of them composed, which is what a run with no
+    capability installed gets.
+    """
     calls: list[str] = []
 
     async def call():
@@ -211,9 +218,9 @@ def test_data_plane_defaults_run_the_call_and_do_nothing_after():
     item = WorkItem(id="i0", run=call)
 
     async def scenario():
-        plane = DataPlane()
-        result = await plane.execute(item)
-        assert await plane.after(item, result) is None
+        result = await ItemDispatch().execute(item)
+        assert await ItemDispatch().after(item, result) is None
+        assert await DataPlane().after(item.id, result) is None
         return result
 
     assert asyncio.run(scenario()) == 42
@@ -262,7 +269,7 @@ def test_runner_awaits_the_drain_before_returning():
         drained.append(asyncio.get_running_loop().time())
 
     mesh = Mesh(_topology())
-    runner = Runner(mesh, drain=drain)
+    runner = Runner(mesh, dispatch=ItemDispatch(on_drain=drain))
     run_sim(runner.run([WorkItem(id="i0", run=call)]))
     assert drained == [3.0]
 

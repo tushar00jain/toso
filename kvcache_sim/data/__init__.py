@@ -18,5 +18,5 @@ The test for what belongs here: does it advance the clock or move bytes? A
 directory *read* does neither, so it is a control-plane view, not a verb here. So
 is *delivering* a request to the host it landed on: which host that is belongs to a
 load balancer, which a deployment has and this package is not
-(:mod:`kvcache_sim.workload._serving`).
+(:class:`kvcache_sim.workload._serving._LoadBalancer`).
 """

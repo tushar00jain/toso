@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from proposed import ControlPlane, DataPlane, Endpoint, Policy, View
+from proposed import ControlPlane, Endpoint, Policy, View
 from sim_common import config
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
@@ -50,7 +50,7 @@ from realsim.mesh import Mesh
 from realsim.seams.coordinator_handle import LocalCoordinatorHandle
 from realsim.seams.coordinator_service import CoordinatorService
 from realsim.seams.link import ServiceHop
-from realsim.runner import Runner
+from realsim.runner import ItemDispatch, Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from realsim.run import Workload
@@ -188,23 +188,21 @@ class Simulation:
         self,
         workload: "Workload",
         *,
-        plane: Optional[DataPlane] = None,
+        dispatch: Optional[ItemDispatch] = None,
     ) -> Dict[str, Any]:
         """Run ``workload`` on this stack; return ``item id -> result``.
 
         The workload supplies the items and whatever precedes them on the clock;
-        the plane says whether it publishes its own outcome rows and whether it
+        the dispatch says whether it publishes its own outcome rows and whether it
         has work outliving the items, so none of that is passed here.
 
         Closes the loop when done; a :class:`Simulation` runs once.
         """
-        plane = plane if plane is not None else DataPlane()
-        drains = type(plane).drain is not DataPlane.drain
+        dispatch = dispatch if dispatch is not None else ItemDispatch()
         runner = Runner(
             self.mesh,
-            plane=plane,
-            ledger=None if plane.writes_own_outcomes else self.ledger,
-            drain=plane.drain if drains else None,
+            dispatch=dispatch,
+            ledger=None if dispatch.writes_own_outcomes else self.ledger,
         )
         items = workload.items(self)
 

@@ -29,8 +29,9 @@ the allocation-free data plane, the policy seam, and the concurrency contract.
 - **Model:** the four types a capability plugs into — `Policy` (which volume
   serves these keys for this requester, and when; consulted *inside* the real
   `locate_volumes`, naive by default), `View` (the read-only observation a policy
-  is handed), `DataPlane` (work around and after a transfer) and `Runner`
-  (release work items on the virtual clock, install the mesh once, drain).
+  is handed), `DataPlane` (what a capability does after a transfer lands) and
+  `Runner` + `ItemDispatch` (release work items on the virtual clock, install the
+  mesh once, drain).
 - **Virtual clock:** every resource cost advances time via `asyncio.sleep` on
   `sim_common.async_engine.AsyncEngine`, so the run is free and deterministic.
 
@@ -182,8 +183,8 @@ proposed/       every contract that outlives the simulator; imports nothing
   view.py         View -- awaited, read-only observation: locate, topology and
                   locality, the clock. Built over a Controller (locate_raw)
   deployment.py   Deployment -- how data-plane code reaches its store
-  plane.py        DataPlane -- execute(item) / after(item, result), both
-                  defaulting to no-op
+  plane.py        ControlPlane -- attach(view, cost); DataPlane --
+                  after(requester, result), defaulting to no-op
   cost.py         TransferCost -- what a fetch is predicted to cost
   topology.py     Endpoint / Tier / locality -- where a volume is
 domain/

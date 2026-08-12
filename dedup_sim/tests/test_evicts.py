@@ -40,7 +40,7 @@ from typing import Any, Callable, List, Optional
 
 from putget_sim.workload.put_get import DEFAULT_N, KEY, PutGetBurst
 from realsim.run import Result, Run
-from realsim.runner import WorkItem
+from realsim.runner import ItemDispatch, WorkItem
 from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
@@ -98,13 +98,21 @@ class VersionedRounds(PutGetBurst):
 
 
 class PerItemReadThrough(ReadThroughPlane):
-    """Read-through for the key the item names, or nothing if it names none."""
+    """Read-through for the key the item names, or nothing if it names none.
 
-    async def after(self, item: Any, result: Any) -> None:
-        if item.payload is None:
-            return
-        reader, key = item.payload
-        await self.deployment.client_for(reader).put(key, self.value)
+    ``DataPlane.after`` is handed a requester and what it fetched, which is all a
+    capability serving one key needs and one thing short of what this needs: the
+    key varies per item here. So this composes the whole step as the run's
+    ``on_item`` instead -- run the item, then publish -- which is what the split
+    between the runner's contract and the capability's is for.
+    """
+
+    async def run_then_publish(self, item: Any) -> Any:
+        result = await item.run()
+        if item.payload is not None:
+            reader, key = item.payload
+            await self.deployment.client_for(reader).put(key, self.value)
+        return result
 
 
 def _run(num_readers: int = 3, *, fanout_cap: int = 1) -> tuple[Result, DedupPolicy]:
@@ -119,7 +127,9 @@ def _run(num_readers: int = 3, *, fanout_cap: int = 1) -> tuple[Result, DedupPol
         f"cap={fanout_cap}",
         workload,
         control=policy,
-        data=lambda sim: PerItemReadThrough(sim.mesh, KEY, workload.put_value),
+        data=lambda sim: ItemDispatch(
+            PerItemReadThrough(sim.mesh, KEY, workload.put_value).run_then_publish
+        ),
         profile=profile,
     ).execute()
     return result, policy

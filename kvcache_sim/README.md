@@ -154,7 +154,7 @@ kvcache_sim/
                           #   (str keys): what is decided about, and what data/
                           #   is handed
   data/                   # EXECUTES -- advances the clock, moves bytes
-    serving.py            #   the per-request serving loop (a DataPlane):
+    serving.py            #   one ServingHost per instance -- routes, then serves:
                           #   queue wait, real pull, prefill charge, publish/evict,
                           #   decode admission, outcome rows. Owns prefill/decode
                           #   coupling, which is a deployment fact, not a policy
@@ -185,7 +185,7 @@ recorder and the `Ledger`/report helpers live in the repo-root `sim_common/`; th
 served model's flop terms, KV block bytes and token→time conversions live in
 `domain/llm.py` (both planes call them: control predicts, data charges); the real
 client/controller/transport seams + adapters, the `Mesh`, the `Policy` / `View` /
-`DataPlane` / `Runner` types live in `realsim/`. This package holds only the
+`DataPlane` / `Runner` / `ItemDispatch` types live in `realsim/`. This package holds only the
 KV-cache decisions and the three directory verbs (`publish` / `fetch` / `evict`)
 plus the prefix-run read that express KV caching on a mesh.
 

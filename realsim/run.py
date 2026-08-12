@@ -40,12 +40,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Sequence
 
-from proposed import DataPlane, Endpoint, Policy
+from proposed import Endpoint, Policy
 from sim_common.cost_model import MachineProfile
 from sim_common.report import Ledger
 from sim_common.trace import Trace
 
-from realsim.runner import WorkItem
+from realsim.runner import ItemDispatch, WorkItem
 from realsim.simulation import Simulation
 
 __all__ = ["Workload", "Report", "MakePlane", "Run", "Result"]
@@ -93,7 +93,7 @@ class Report(ABC):
 #: Builds the capability's data plane once the stack exists. It cannot be a
 #: plain object: a plane reaches for the clock, the mesh, the ledger and the
 #: coordinator handle, none of which exist before the ``Simulation`` does.
-MakePlane = Callable[[Simulation], DataPlane]
+MakePlane = Callable[[Simulation], ItemDispatch]
 
 
 
@@ -137,9 +137,10 @@ class Run:
             (Neither seam charges its hop by default: ``--coordinator-rtt`` gives
             the coordinator one a cost, and the client-to-controller hop is free
             for every capability, including the baseline.)
-        data: builds the capability's :class:`~proposed.plane.DataPlane` onto the
-            assembled stack -- the half that executes. ``None`` -> no plane, the
-            plain path. It reaches that control plane through
+        data: builds this run's :class:`~realsim.runner.ItemDispatch` onto the
+            assembled stack -- how the executing half is driven, and where a
+            capability's :class:`~proposed.plane.DataPlane` is plugged in.
+            ``None`` -> the plain path: run each item, nothing around it. It reaches that control plane through
             ``sim.coordinator_handle``,
             never by being handed the object.
         profile / trace / ledger: the run's target machine, event trace and
@@ -180,7 +181,7 @@ class Run:
             random_seed=random_seed,
         )
         plane = self.data(sim) if self.data is not None else None
-        results = sim.run(self.workload, plane=plane)
+        results = sim.run(self.workload, dispatch=plane)
         return Result(results=results, sim=sim, run=self)
 
 

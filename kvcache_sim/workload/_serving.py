@@ -17,7 +17,7 @@ through -- in production a handle to a remote actor, here a
 :class:`~realsim.seams.link.LocalEndpoint` pair over a
 :class:`~realsim.seams.link.ServiceHop`, so the boundary is charged. The other two
 are the load balancer: :func:`_affinity` decides which host a request lands on and
-:class:`_Arrivals` delivers it there. Production has a client SDK, an ingress proxy
+:class:`_LoadBalancer` hands it there. Production has a client SDK, an ingress proxy
 or DNS doing that, none of which is part of the serving system -- which is why they
 are here rather than in ``data/``, whose test for membership is whether a thing
 advances the clock or moves bytes, and whose contents are what would lift into a
@@ -38,8 +38,8 @@ from zlib import crc32
 import torch
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
-from proposed import DataPlane, Endpoint
-from realsim.runner import WorkItem
+from proposed import Endpoint
+from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.seams.transport import TensorDescriptor
 from realsim.simulation import Simulation
@@ -184,44 +184,41 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
     return landed
 
 
-class _Arrivals(DataPlane):
-    """Deliver each request to the host it lands on. That is the whole job.
+class _LoadBalancer:
+    """Which host a request lands on, and handing it there. Not a serving decision.
 
-    The harness-facing :class:`~proposed.plane.DataPlane`, and deliberately almost
-    nothing: *where a request arrives* is a load balancer's answer -- DNS, a
-    client's affinity, a round robin -- and *where it should run* is the
-    coordinator's. Neither is a serving decision, which is why this is wiring and
-    not part of the capability: a deployment deletes it and keeps the hosts.
+    Stands in for what a deployment already has in front of its hosts -- a client
+    SDK doing client-side balancing, an ingress proxy, DNS -- and therefore for
+    something that is deleted rather than moved when this ships. It holds no
+    policy of its own beyond ``landed``, and it never asks where a request should
+    *run*: that is the coordinator's answer, and the host it delivers to will go
+    and get it.
 
     Args:
         hosts: ``instance id -> ServingHost``. Held as objects rather than
-            references because this stands in for the client side of the
-            deployment, which is outside every host -- and so pays no hop that
-            every scheduler would not pay equally.
-        arrival_host: which host a request lands on.
+            references because this is outside every host -- the client side of
+            the deployment -- and so pays no hop that every scheduler would not
+            pay equally.
+        landed: which host a request arrives at.
     """
-
-    #: Rows are published at rejection, at acceptance, or when the last decode
-    #: token lands -- never one per item, so the harness must not write them.
-    writes_own_outcomes = True
 
     def __init__(
         self,
         hosts: Dict[str, ServingHost],
-        arrival_host: Callable[[Request], str],
+        landed: Callable[[Request], str],
     ) -> None:
         self.hosts = hosts
-        self.arrival_host = arrival_host
+        self.landed = landed
 
-    async def execute(self, item) -> None:
+    async def deliver(self, item) -> None:
         """Hand the request to whichever host it arrived at."""
         request: Request = item.payload
-        await self.hosts[self.arrival_host(request)].receive(request)
+        await self.hosts[self.landed(request)].receive(request)
 
     async def drain(self) -> None:
         """Every host's decode has to finish before the run is over."""
-        for host in sorted(self.hosts):
-            await self.hosts[host].drain()
+        for instance in sorted(self.hosts):
+            await self.hosts[instance].drain()
 
 
 def serving_plane(
@@ -230,7 +227,7 @@ def serving_plane(
     simulate_decode: bool = False,
     max_batch: int = 8,
     decode_pool: Optional[List[str]] = None,
-) -> Callable[[Simulation], "_Arrivals"]:
+) -> Callable[[Simulation], ItemDispatch]:
     """Build the factory for this run's **data plane**: one host per instance.
 
     ``coupled`` says whether prefill shares a host's decode compute -- a deployment
@@ -243,7 +240,7 @@ def serving_plane(
     hosts decode.
     """
 
-    def build(sim: Simulation) -> "_Arrivals":
+    def build(sim: Simulation) -> ItemDispatch:
         # The simulation *is* the deployment: it vends the client for an instance
         # and holds the directory. All the run adds is the block carrier.
         store = KVStore(
@@ -272,6 +269,13 @@ def serving_plane(
         # calls, and no host holds another host's object.
         for instance, host in hosts.items():
             handles[instance] = _LocalHostHandle(host, hop)
-        return _Arrivals(hosts, _affinity(sorted(sim.ids)))
+        balancer = _LoadBalancer(hosts, _affinity(sorted(sim.ids)))
+        # What the runner drives is a dispatcher, not a plane: the executing half
+        # of this capability is the hosts, and there are several. The rows are
+        # published at rejection, at acceptance, or when the last decode token
+        # lands -- never one per item, so the harness must not write them.
+        return ItemDispatch(
+            balancer.deliver, on_drain=balancer.drain, writes_own_outcomes=True
+        )
 
     return build

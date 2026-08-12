@@ -147,8 +147,9 @@ realsim/
                               #   real locate_volumes body
   view.py                     # View — awaited read-only observation: locate, topology and
                               #   locality, the clock. No mutation
-  plane.py                    # DataPlane — execute(item) / after(item, result), both
-                              #   defaulting to real no-op behaviour
+  plane.py                    # ControlPlane — attach(view, cost); DataPlane —
+                              #   after(requester, result), defaulting to real
+                              #   no-op behaviour
   runner.py                   # Runner — release work on the virtual clock in
                               #   (release_time, id) order, install the mesh once, drain
   simulation.py               # Simulation — assembles engine + mesh + directory + registry,
@@ -443,10 +444,13 @@ directory handle, trace, profile, registry, install).
   in its own `control/`, and neither capability's *load* signal is an observation
   (the scheduler's is its own predicted queue, the dedup policy's is its planned
   tree), so there is no `load()` on the base type.
-- **`DataPlane`.** `execute(item)` for the work around a transfer and
-  `after(item, result)` for registration/eviction, both defaulting to real
-  behaviour (run the call; do nothing after). A plain fetch takes both unchanged,
-  `dedup_sim` overrides `after`, `kvcache_sim` overrides both.
+- **`DataPlane`.** One member — `after(requester, result)`, what a capability does
+  once a transfer has landed — defaulting to real behaviour (nothing). Moving the
+  bytes is an ordinary client call and needs no interface. `dedup_sim` implements
+  it; a plain fetch and `kvcache_sim` do not. It names a *requester* rather than a
+  work item so a deployment can implement it: the run-shaped members it used to
+  carry (`execute` / `drain` / `writes_own_outcomes`) were the runner's contract
+  wearing the capability's name, and are now `realsim.runner.ItemDispatch`.
 - **`Runner`.** The generic half of the two private drivers this replaced: order
   work by `(release_time, id)`, install the mesh's shared transport factory
   **once**, release each item at its time and gather, drain whatever outlives them
