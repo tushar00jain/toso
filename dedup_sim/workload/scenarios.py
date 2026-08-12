@@ -4,16 +4,15 @@
 many readers, which fan-out caps, and what each configuration installs -- and
 narrates the results. It wires no clock, no mesh and no plane, and it executes
 nothing; :meth:`realsim.demo.Demo.main` does that with
-:meth:`realsim.run.Run.execute`, the same way for every capability.
+:meth:`realsim.run.Run.execute`.
 
-This is the point of the whole exercise. Every run below shares one
-:class:`~putget_sim.workload.put_get.PutGetBurst` -- ordinary user code: seed
-``W``, then a gather of ``client.get(W)``. The baseline installs nothing and
-gets ``m x``. The routed runs add
+Every run shares one :class:`~putget_sim.workload.put_get.PutGetBurst` -- ordinary
+user code: seed ``W``, then a gather of ``client.get(W)``. The baseline installs
+nothing and gets ``m x``; the routed runs add
 :class:`~dedup_sim.control.routing.DedupPolicy` and the read-through
 :class:`~dedup_sim.data.read_through.ReadThroughPlane` and get 1x. Same topology,
-same payload, same cost model, same client calls -- the *only* difference is what
-the ``Run`` carries, which is what makes the comparison mean something.
+payload, cost model and client calls -- the *only* difference is what the ``Run``
+carries, which is what makes the comparison mean something.
 """
 
 from __future__ import annotations

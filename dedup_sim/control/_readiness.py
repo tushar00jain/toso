@@ -13,49 +13,41 @@ is the real directory (``(volume_id, key)``: "that volume holds that key").
 
 Register interest, then read the truth
 --------------------------------------
-The obvious order -- ask whether the fact is true, and park on an event if it is
-not -- loses a wakeup: the fact can land in the window between the two. The classic
-fix is to remember every fact ever recorded, so the "is it true?" question can be
-answered from memory with no window at all. That is what this used to do, and it is
-wrong for a store whose volumes **evict**: a remembered registration is not a fact
-about the present (a new model version displaces the old one, and the volume that
-registered the key no longer holds it), and the memory grows with every key
-version the run touches, for the life of the run.
+Asking whether a fact is true and *then* parking on an event loses a wakeup: the
+fact can land in the window between the two. Remembering every fact ever recorded
+closes that window, but it is wrong for a store whose volumes **evict** -- a
+remembered registration is not a fact about the present, and the memory grows with
+every key version the run touches.
 
-So the order is inverted instead. :meth:`gate` creates the event **first** and only
-then reads the truth, which means the window has nowhere to hide a wakeup: anything
+So :meth:`gate` inverts the order: it creates the event **first** and only then
+reads the truth, leaving the window nowhere to hide a wakeup, since anything
 recorded during the read sets an event that already exists. Nothing is remembered,
-because nothing needs to be -- the directory is the record of what is true, and it
-is the one record eviction updates.
+because the directory is the record of what is true and the one record eviction
+updates.
 
 Why it is safe
 --------------
 * **No lost wakeup.** Interest is registered before the truth is read, so a
-  :meth:`record` landing in between sets the event rather than being missed. The
-  gate is only returned for facts that were false *after* the event existed.
+  :meth:`record` landing in between sets the event rather than being missed.
 * **One fact, one event, however many waiters.** Requesters gating on the same
-  fact share it, and one :meth:`record` wakes all of them -- there is one
-  registration coming, not one per waiter.
+  fact share it, and one :meth:`record` wakes all of them.
 * **Released gates are dropped.** :meth:`record` pops the event as it sets it, so
-  the map holds one entry per fact somebody is waiting on right now and nothing
-  else -- it does not grow with the run, and a fact recorded with no waiter costs
-  nothing. Dropping is safe: every waiter already inside :meth:`gate`'s closure
-  holds the event object itself, not a lookup.
-* **No stale truth.** A fact is never answered from memory, so a registration that
-  has since been evicted cannot release a waiter -- the next :meth:`gate` asks the
-  directory again and waits for the key to come back.
+  the map holds one entry per fact somebody is waiting on right now. Safe because
+  every waiter inside :meth:`gate`'s closure holds the event object, not a lookup.
+* **No stale truth.** A fact is never answered from memory, so a registration since
+  evicted cannot release a waiter -- the next :meth:`gate` asks the directory again.
 * **Release order is deterministic.** One event per fact, awaited in the order the
-  caller listed them, and every wakeup goes through the loop's FIFO ready queue --
-  so two requesters released by the same fact resume in the order they parked.
+  caller listed them, and every wakeup goes through the loop's FIFO ready queue, so
+  two requesters released by the same fact resume in the order they parked.
 
 What is *not* here: whether waiting for a fact is a good idea. A gate nothing will
 ever record hangs the requester behind it forever, and only the caller knows which
 facts are coming -- for dedup, the registration a routed peer owes. That check is
 in :mod:`dedup_sim.control.routing`, next to the state that answers it.
 
-It is folder-private because dedup is the only capability that waits today. If a
-second one needs it, this is what would move into ``proposed`` -- it is the
-mechanism behind ``Selection.ready``, and nothing in it knows about dedup.
+Folder-private because dedup is the only capability that waits today; it is the
+mechanism behind ``Selection.ready`` and knows nothing about dedup, so it is what
+would move into ``proposed`` if a second one needed it.
 """
 
 from __future__ import annotations
@@ -94,12 +86,12 @@ class Readiness:
     ) -> Optional[Callable[[], Awaitable[None]]]:
         """An awaitable that returns once every one of ``facts`` is true.
 
-        ``observed`` is asked which of them already are -- *after* interest in
-        every one of them has been registered, which is what makes the answer
-        safe to act on however long it takes to arrive.
+        ``observed`` is asked which of them already are -- *after* interest in every
+        one has been registered, which is what makes the answer safe to act on
+        however long it takes to arrive.
 
-        ``None`` when they are all already true -- which the caller should read as
-        "no need to wait at all", not as an empty wait.
+        ``None`` when they are all already true: "no need to wait at all", not an
+        empty wait.
         """
         wanted = list(facts)
         if not wanted:

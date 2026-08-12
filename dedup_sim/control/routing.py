@@ -66,8 +66,7 @@ class DedupPolicy(Policy):
             chain, >= 2 = a shallow tree). The fabric stays 1x for any cap; the
             cap only trades wallclock against tree depth.
         trace: optional :class:`~proposed.policy.DecisionLog` to record each
-            routing decision into. Control explaining itself costs nothing and
-            makes the demo readable; it changes no metric, and the policy behaves
+            routing decision into. Changes no metric; the policy behaves
             identically with none attached.
     """
 
@@ -83,22 +82,22 @@ class DedupPolicy(Policy):
         # One entry per peer a source may still be planned to feed, oldest first: a
         # requester joins with ``cap`` slots and each assignment consumes one. The
         # cap is the queue's own shape rather than a tally compared against it,
-        # which matters because assignment is a read-modify-write with no lock --
-        # one popleft cannot leave a half-applied cap behind the way an increment,
-        # a comparison and a conditional pop could. See :meth:`_assign`.
+        # because assignment is a read-modify-write with no lock -- one popleft
+        # cannot leave a half-applied cap behind the way an increment, a comparison
+        # and a conditional pop could. See :meth:`_assign`.
         self._avail: Deque[str] = deque()
-        # Requesters that have already been offered their slots. A requester is
-        # offered once however many times it is assigned -- see :meth:`_offer`.
+        # Requesters already offered their slots -- once each, however many times
+        # they are assigned (see :meth:`_offer`).
         self._offered: Set[str] = set()
-        # The (volume, key) publications this policy has planned and not yet seen
-        # land: a requester it routes reads the key through into its own volume,
-        # so from the moment it is routed it OWES that registration. This is the
-        # only thing that makes waiting for a source safe -- see :meth:`select`.
+        # The (volume, key) publications planned and not yet seen to land: a routed
+        # requester reads the key through into its own volume, so from the moment it
+        # is routed it OWES that registration. The only thing that makes waiting for
+        # a source safe -- see :meth:`select`.
         self._promised: Set[Tuple[str, str]] = set()
-        # The waiting for the (volume, key) pairs the real directory has not
-        # registered yet. The concurrency lives there, not here; so does the rule
-        # that the directory -- not a memory of past registrations -- says which
-        # of them are true, because a volume that evicts makes one false again.
+        # Waiting for the (volume, key) pairs the real directory has not registered
+        # yet. The concurrency lives there, as does the rule that the directory --
+        # not a memory of past registrations -- says which are true, since a volume
+        # that evicts makes one false again.
         self._ready = Readiness()
 
     # -- decide -------------------------------------------------------------- #
@@ -106,11 +105,11 @@ class DedupPolicy(Policy):
         self, view: Any, keys: Sequence[str], requester: str
     ) -> Selection:
         """Route ``requester`` to a peer (or, if it is first, to a holder)."""
-        # Asking is the promise: this requester is about to fetch these keys, and
-        # the read-through plane publishes what it fetched, so it now owes the
-        # directory that registration. Recorded before any source is handed out,
-        # which is what makes the invariant below hold -- a peer is only ever
-        # offered as a source after it has asked, hence after it has promised.
+        # Asking is the promise: this requester is about to fetch these keys and the
+        # read-through plane publishes what it fetched, so it now owes the directory
+        # that registration. Recorded before any source is handed out, which is what
+        # makes the invariant below hold -- a peer is only ever offered as a source
+        # after it has asked, hence after it has promised.
         self._promised.update((requester, key) for key in keys)
         source = self._route.get(requester)
         if source is None:
@@ -124,27 +123,25 @@ class DedupPolicy(Policy):
                 self.trace.record(
                     view.now(), "route", f"{requester} <- {source}"
                 )
-        # The answer is formed here, rather than where the source was picked, and
-        # what shape it takes depends on what the source owes:
+        # The answer's shape depends on what the source owes:
         facts = [(source, key) for key in keys]
         if all(fact in self._promised for fact in facts):
-            # It owes every key, so the wait is bounded by its read-through: gate
-            # (which is still a directory read, because it may already hold a key
-            # it is about to republish -- then there is nothing to wait for).
+            # It owes every key, so the wait is bounded by its read-through. Still a
+            # directory read, because it may already hold a key it is about to
+            # republish -- then there is nothing to wait for.
             ready = await self._ready.gate(
                 facts, lambda f: self._registered(view, f)
             )
             return Selection.of([source], ready=ready)
-        # It owes nothing, so a gate here could outlive the run: nothing would
-        # ever record it. It is a usable source only if it holds every key right
-        # now -- which is the ordinary case, because this is how the requester
-        # routed to a pre-existing holder is answered.
+        # It owes nothing, so a gate here could outlive the run -- nothing would
+        # ever record it. Usable only if it holds every key right now, which is the
+        # ordinary case: this is how a requester routed to a pre-existing holder is
+        # answered.
         if len(await self._registered(view, facts)) == len(facts):
             return Selection.of([source])
-        # Holds nothing, owes nothing: a peer that published and has since
-        # evicted (a newer version displaced it). Waiting on it would hang and
-        # naming it would route a reader to a volume with nothing to serve, so it
-        # stops being a source and the directory answers this one for itself.
+        # Holds nothing, owes nothing: a peer that published and has since evicted.
+        # Waiting would hang and naming it would route a reader to a volume with
+        # nothing to serve, so it stops being a source.
         return self._retire(view, requester, source)
 
     def _retire(self, view: Any, requester: str, source: str) -> Selection:
@@ -177,8 +174,8 @@ class DedupPolicy(Policy):
             source = self._avail.popleft()
             self._offer(requester)
             return source
-        # First requester: the closest volume that already holds every key. This
-        # is the one hop whose source is an origin -- the 1x fabric cost.
+        # First requester: the closest volume that already holds every key -- the
+        # one hop whose source is an origin, and the 1x fabric cost.
         located = await view.locate(keys)
         holders = set(view.holders(located, keys[0]))
         for key in keys[1:]:
@@ -193,12 +190,11 @@ class DedupPolicy(Policy):
         """Offer ``requester`` as a source for up to ``cap`` later peers.
 
         Once per requester, however many times it is assigned. A requester whose
-        source is retired is assigned afresh, and offering it again there would
-        hand it a second full batch of slots -- so one whose first batch had
-        already been consumed would go on to feed ``2 x cap`` peers. Tracked
-        separately from the queue because the queue only remembers the slots that
-        are *left*: an exhausted requester is absent from it and would otherwise
-        look like one that had never been offered at all.
+        source is retired is assigned afresh, and offering it again would hand it a
+        second full batch of slots, so one whose first batch was already consumed
+        would go on to feed ``2 x cap`` peers. Tracked separately from the queue
+        because the queue only remembers the slots that are *left*: an exhausted
+        requester is absent from it and would otherwise look like one never offered.
         """
         if requester in self._offered:
             return
@@ -211,10 +207,9 @@ class DedupPolicy(Policy):
     ) -> List[Hashable]:
         """Which of these ``(volume, key)`` pairs the directory holds *now*.
 
-        The truth a readiness gate is opened against, read from the real directory
-        rather than remembered: a source that registered a key and later evicted it
-        (a new version displacing the old) does not hold it, and a requester routed
-        there has to wait for the read-through that brings it back.
+        The truth a readiness gate is opened against, read rather than remembered: a
+        source that registered a key and later evicted it does not hold it, and a
+        requester routed there waits for the read-through that brings it back.
         """
         located = await view.locate([key for _volume, key in facts])
         return [

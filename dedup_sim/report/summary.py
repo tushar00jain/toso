@@ -1,11 +1,10 @@
 """Render the dedup-vs-baseline fabric comparison.
 
-The measurements themselves are a shared :class:`sim_common.report.Ledger`,
-filled by the mesh's transfer accounting -- this capability defines none of its
-own (contrast ``kvcache_sim.report.metrics``, which owns a whole per-request
-outcome model). All these reports do is turn the runs' :class:`~realsim.run.
-Result` objects into the side-by-side story: how many times the payload crossed
-the fabric under each policy, and who served whom.
+The measurements are a shared :class:`sim_common.report.Ledger` filled by the
+mesh's transfer accounting; this capability defines none of its own. All these
+reports do is turn the runs' :class:`~realsim.run.Result` objects into the
+side-by-side story: how many times the payload crossed the fabric under each
+policy, and who served whom.
 """
 
 from __future__ import annotations
