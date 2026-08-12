@@ -36,6 +36,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from proposed import ControlPlane, DataPlane, Endpoint, Policy, View
+from sim_common import config
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
     DEFAULT_PROFILE,
@@ -46,8 +47,9 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
-from realsim.seams.coordinator_handle import CoordinatorHandle
+from realsim.seams.coordinator_handle import LocalCoordinatorHandle
 from realsim.seams.coordinator_service import CoordinatorService
+from realsim.seams.link import ServiceHop
 from realsim.runner import Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -71,7 +73,7 @@ class Simulation:
             * if it declares ``attach(view, transfer_cost)`` it also senses and
               prices through this stack, which only a control plane deciding more
               than the store's question needs -- so it is fronted by a
-              :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` as
+              :class:`~realsim.seams.coordinator_handle.LocalCoordinatorHandle` as
               :attr:`coordinator_handle` and reached as its own service.
 
             Both, for one object, is the interesting case: kvcache's coordinator
@@ -144,7 +146,13 @@ class Simulation:
         self.coordinator_handle: Optional[Any] = None
         if isinstance(control, ControlPlane):
             control.attach(self.view, self.transfer_cost)
-            self.coordinator_handle = CoordinatorHandle(CoordinatorService(control))
+            # What reaching this coordinator costs. Resolved once, here, because
+            # this is the one place a run's coordinator is built -- the same
+            # reason ``make_controller_adapter`` resolves the directory's.
+            self.coordinator_handle = LocalCoordinatorHandle(
+                CoordinatorService(control),
+                hop=ServiceHop(config.current().coordinator_rtt),
+            )
 
     @property
     def loop(self) -> AsyncEngine:

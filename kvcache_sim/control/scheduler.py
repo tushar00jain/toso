@@ -182,7 +182,7 @@ class _Base(Policy, Coordinator):
     :class:`~proposed.policy.Policy`, so the run installs it in the directory and
     the controller consults it there (:meth:`select`); and it is a
     :class:`~proposed.coordinator.Coordinator`, so the run also fronts it with a
-    :class:`~realsim.seams.coordinator_handle.CoordinatorHandle` and a serving host
+    :class:`~realsim.seams.coordinator_handle.LocalCoordinatorHandle` and a serving host
     reaches it as its own service. The two are one object on purpose: the peer it
     prices a pull against is the peer it later tells the directory to serve, with
     nothing threaded through the data plane to carry that between them.

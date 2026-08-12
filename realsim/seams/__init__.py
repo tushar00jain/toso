@@ -19,7 +19,9 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
   ``keys``), reached through ``call_one`` / ``call`` / ``broadcast``.
 - ``volume_handle.LocalVolumeHandle`` -- the same for a storage volume
   (``put`` / ``get`` / ``handshake`` / ``delete`` / ``delete_batch`` / ``reset``).
-- ``coordinator_handle.CoordinatorHandle`` -- the same for a coordinator service.
+- ``coordinator_handle.LocalCoordinatorHandle`` -- the same for a coordinator
+  service (``decide`` / ``observe``), and the one of the three whose hop a run
+  gives a duration.
 
 Each pair is a server and a reference to it, split because they are different
 shapes: a service has methods, a reference has endpoints, and in a deployment the
