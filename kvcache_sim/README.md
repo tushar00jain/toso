@@ -141,6 +141,9 @@ kvcache_sim/
                           #   prefill placement, pull-vs-recompute, SLO gates,
                           #   decode placement; owns the PREDICTED prefill queue
                           #   and its model of the decode load
+    _pending.py           #   Reservations / RoutedPulls: what was decided and
+                          #   not yet done. Each expires on its own terms, when
+                          #   read -- so no decision method carries a sweep
     _source.py            #   LongestPrefixPolicy: the one store question
                           #   ("which peer serves this gap"), a proposed.Policy
     _view.py              #   KVView: per-instance prefix-run lengths, plus the

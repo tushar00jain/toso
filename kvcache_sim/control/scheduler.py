@@ -75,6 +75,7 @@ from domain import (
 )
 from proposed import TransferCost
 
+from ._pending import Reservations, RoutedPulls
 from ._view import KVView
 from ._source import LongestPrefixPolicy
 from .request import Request
@@ -239,11 +240,12 @@ class _Base(Policy, Coordinator):
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
         self._decode_finishes: Dict[str, List[float]] = {}
-        self._inflight: List[Tuple[float, str, int]] = []
-        # Pulls this coordinator has already routed and priced, oldest first:
-        # ``(requester, gap keys, chosen peer)``. Read back by :meth:`select` when
-        # the directory asks who should serve those keys -- see its docstring.
-        self._routed: List[Tuple[str, Tuple[str, ...], str]] = []
+        # What this coordinator has decided and the cluster has not yet done:
+        # prefills promised, and pulls priced against a peer. Both expire on their
+        # own terms, which is why neither is a bare list here
+        # (:mod:`kvcache_sim.control._pending`).
+        self._reserved = Reservations()
+        self._routed = RoutedPulls()
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view, transfer_cost: TransferCost) -> None:
@@ -399,11 +401,9 @@ class _Base(Policy, Coordinator):
         only for what is still present. Oldest routed pull first, so two requests
         in flight to one instance resolve in a fixed order.
         """
-        wanted = set(keys)
-        for i, (inst, gap, peer) in enumerate(self._routed):
-            if inst == requester and wanted <= set(gap):
-                del self._routed[i]
-                return Selection.of([peer])
+        peer = self._routed.claim(requester, keys)
+        if peer is not None:
+            return Selection.of([peer])
         # Nothing routed for this caller: whoever is asking chose nothing, so the
         # ranking is the honest answer (and an empty one lets the directory speak).
         return await self.source_policy.select(self.view or view, list(keys), requester)
@@ -433,11 +433,17 @@ class _Base(Policy, Coordinator):
             return 0
         if self.early_rejection == "predict":
             n = self._predict_occupancy(d, done_time)
-            for pd_done, dec_id, out in self._inflight:
+            # Requests whose prefill has not landed yet are invisible to the
+            # observed decode state, so the reservations are what stands in for
+            # them -- the ones still outstanding at this instant, which is the
+            # record's own answer and not a list this method has to prune.
+            for res in self._reserved.pending(self.view.now()):
                 if (
-                    dec_id == d
-                    and pd_done <= done_time
-                    and pd_done + max(0, out - 1) * decode_step_time(1, self.profile, self.model)
+                    res.decode_id == d
+                    and res.prefill_done <= done_time
+                    and res.prefill_done
+                    + max(0, res.output_tokens - 1)
+                    * decode_step_time(1, self.profile, self.model)
                     > done_time
                 ):
                     n += 1
@@ -467,20 +473,21 @@ class _Base(Policy, Coordinator):
 
     # -- commit ----------------------------------------------------------- #
     def _commit(self, plan: Plan) -> Plan:
-        """Reserve the prefill server for an accepted plan (decode admitted later)."""
+        """Reserve the prefill server for an accepted plan (decode admitted later).
+
+        Everything here is a *record* of the decision just taken. Nothing is swept,
+        expired or matched: what each record is worth keeping until is the record's
+        own business, and it answers that when it is read.
+        """
         # Remember the peer this pull was priced against, for the moment the
         # directory asks (see :meth:`select`). Recorded at commit, so a plan that
         # was considered and dropped leaves nothing behind.
         if plan.reuse_source is not None and plan.pull_keys:
-            self._routed.append(
-                (plan.prefill, tuple(plan.pull_keys), plan.reuse_source)
-            )
+            self._routed.route(plan.prefill, plan.pull_keys, plan.reuse_source)
         self.busy_until[plan.prefill] = plan.done_time
         if self.early_rejection == "predict" and self.tbt_enabled:
-            now = self.view.now()
-            self._inflight = [e for e in self._inflight if e[0] >= now]
-            self._inflight.append(
-                (plan.done_time, plan.decode, plan.request.output_tokens)
+            self._reserved.reserve(
+                plan.done_time, plan.decode, plan.request.output_tokens
             )
         return plan
 
