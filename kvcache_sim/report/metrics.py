@@ -46,6 +46,7 @@ class RequestResult:
     tbt: float = 0.0                  # worst inter-token gap observed in decode
     decode_rejected: bool = False    # shed at decode admission (TBT SLO)
     wasted_prefill: bool = False     # prefill was spent, then decode rejected
+    published: bool = True           # the prefix this request computed was cached
 
 
 def _accepted(r: RequestResult) -> bool:
@@ -120,6 +121,16 @@ class Metrics(Ledger):
     def decode_rejections(self) -> int:
         """Requests rejected at decode admission (TBT SLO)."""
         return self.count(lambda r: r.decode_rejected)
+
+    @property
+    def unpublished(self) -> int:
+        """Accepted requests whose computed prefix did not fit in the cache.
+
+        A cache fill is allowed to fail, so this is not an error -- but it is the
+        difference between "cached" and "tried to cache and had no room", which a
+        hit rate alone cannot show and a capacity sweep is measuring.
+        """
+        return self.count(lambda r: r.accepted and not r.published)
 
 
 def render_summary(name: str, cache_aware: Metrics, baseline: Metrics) -> str:

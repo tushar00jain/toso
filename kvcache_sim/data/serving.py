@@ -216,7 +216,12 @@ class ServingPlane(DataPlane):
         # decision and not control's to make -- it is everything past what was
         # already local, and the plan says how much that was.
         fresh = list(plan.request.block_keys[local_blocks:])
-        await self.store.publish(plan.prefill, fresh)
+        # A cache fill is allowed to fail -- the request has already been served and
+        # the only loss is that nobody reuses this prefix. Recorded rather than
+        # dropped, because "cached" and "tried to cache and had no room" are exactly
+        # the two outcomes a capacity sweep is measuring between, and a hit rate
+        # cannot tell them apart.
+        row.published = await self.store.publish(plan.prefill, fresh)
         # (5) tell control the clock the real ops reached, and (coupled only) the
         # decode timeline the same instance now carries.
         now = self._now()
@@ -227,7 +232,7 @@ class ServingPlane(DataPlane):
             # The reply, not a read of control's queue: prefill just occupied the
             # timeline decode steps on, and only the coordinator knows the tail.
             self.engine.reserve(plan.prefill, busy_until)
-        await self._prefill_done(plan)
+        await self._prefill_done(plan, row.published)
 
     def _recompute(self, plan: Plan, row: RequestResult) -> float:
         """Re-price this prefill with the reuse that vanished, and say what it costs.
@@ -283,14 +288,19 @@ class ServingPlane(DataPlane):
             f"compute {plan.uncached_tokens}tok, ttft {plan.ttft:.3f})",
         )
 
-    async def _prefill_done(self, plan: Plan) -> None:
-        note = ""
+    async def _prefill_done(self, plan: Plan, published: bool = True) -> None:
+        note = "" if published else " -- NOT cached, no room on the volume"
+        # What was published is what this host did not already have: the blocks it
+        # pulled plus the suffix it computed, not the request's whole chain.
+        stored = len(plan.request.block_keys) - (
+            plan.match_blocks - len(plan.pull_keys)
+        )
         if not self.simulate_decode:
             self.trace.record(
                 self._now(),
                 "DONE",
                 f"{plan.request.id} prefill done on {plan.prefill}"
-                f" (published {len(plan.request.block_keys)}blk){note}",
+                f" (published {stored}blk){note}",
             )
             return
         # Decode-simulating path: control decides whether decode can honour the
@@ -314,7 +324,7 @@ class ServingPlane(DataPlane):
             self._now(),
             "DONE",
             f"{plan.request.id} prefill done on {plan.prefill}"
-            f" (published {len(plan.request.block_keys)}blk){note}"
+            f" (published {stored}blk){note}"
             f"; decoding on {plan.decode}",
         )
 

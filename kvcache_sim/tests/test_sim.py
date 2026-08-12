@@ -198,6 +198,46 @@ def test_eviction_hit_rate_monotone_then_plateau():
     assert abs(unbounded - big) < 1e-9
 
 
+# 7b. A cache fill is allowed to fail, and the run says when it did.
+def test_a_prefix_that_does_not_fit_is_reported_as_not_cached():
+    """``publish`` may refuse, and refusing has to be visible in the outcome.
+
+    Only a block that cannot fit *at all* is refused: the transport writes one key
+    per put, so a request whose whole working set exceeds the volume still stores
+    every block -- it just evicts its own earlier ones. That makes a capacity below
+    a single block the one place ``StorageFull`` reaches the serving loop, and the
+    place to check the answer is not dropped: the request is still served, but
+    nothing is cached and no later request can reuse it.
+    """
+    from dataclasses import replace as _replace
+
+    from domain import DEFAULT_MODEL, DEFAULT_PROFILE
+
+    from kvcache_sim.workload._serving import BLOCK_TOKENS
+
+    topo, reqs = _make_topology(4), _shared_prefix_workload()
+    one_block = DEFAULT_MODEL.block_bytes(1, BLOCK_TOKENS)
+
+    def _at(capacity_bytes: int):
+        return run(
+            topo, reqs, "cache_aware",
+            profile=_replace(
+                DEFAULT_PROFILE, storage_capacity_bytes=capacity_bytes
+            ),
+        ).ledger
+
+    fits = _at(one_block)
+    assert fits.unpublished == 0
+    assert all(r.published for r in fits.accepted)
+
+    refused = _at(one_block - 1)
+    # Every request is still served -- a cache fill failing is not a request
+    # failing -- and every one of them reports that it cached nothing.
+    assert len(refused.accepted) == len(fits.accepted)
+    assert refused.unpublished == len(refused.accepted)
+    assert refused.hit_rate == 0.0
+
+
 # 8. Hotspot: replication lowers TTFT and prefill compute vs recompute-only,
 #    at the cost of KV fabric bytes.
 def test_hotspot_replication_helps():
