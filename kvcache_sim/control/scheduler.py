@@ -60,10 +60,18 @@ corrected by observations, never a live read:
 
 * the **prefill queue** (:attr:`_Base.busy_until`) is predicted -- routing reserves
   an instance until the TTFT it predicted -- and corrected by :class:`PrefillFinished`.
-  On a **coupled** instance prefill and decode are one physical resource, so the data
-  plane also mirrors each decode step back as :class:`ComputeBusy`; it is the data
-  plane that decides whether coupling applies, because whether the two contend is a
-  fact about the deployment, not about the policy;
+  It is a model of a queue that now really exists: a serving host's accelerator
+  serialises its own forward passes, so the wait a request serves is measured rather
+  than slept from this number, and the two are separately recorded and compared
+  (:attr:`kvcache_sim.report.metrics.RequestResult.queue_wait` against
+  ``predicted_queue_wait``). They disagree, and the honest place to say why is here:
+  :meth:`_Base._candidate` prices a candidate as ``queue -> transfer -> prefill`` and
+  reserves the instance for the whole of it, so a remote prefix pull is charged to a
+  device that is idle while the fabric works. On a **coupled** instance prefill and
+  decode are one physical resource, so the data plane also mirrors each decode step
+  back as :class:`ComputeBusy`; it is the data plane that decides whether coupling
+  applies, because whether the two contend is a fact about the deployment, not about
+  the policy;
 * **decode occupancy** (:attr:`_Base._decode_finishes`) is a per-instance list of
   estimated finish times, replaced wholesale by :class:`DecodeState` whenever a batch
   changes. This used to be a
@@ -132,10 +140,22 @@ class AdmitDecode:
 class PrefillFinished:
     """*Prefill really finished at this clock -- what is the queue tail now?*
 
-    Both a report and a question, which is why it is a demand and not a fact:
-    ``schedule`` reserved the instance until a *predicted* completion, the executed
-    cost can differ, and the data plane needs the corrected tail back to apply it to
-    a coupled instance's decode timeline.
+    The one thing that tells this coordinator its model of an instance's prefill
+    queue was wrong, and it became load-bearing when the data plane stopped
+    sleeping the wait this coordinator predicted. It used to be a report of a
+    number the data plane had been handed here in the first place; now the serving
+    host's accelerator serialises its own forward passes, so ``now`` is an
+    independent measurement and it is routinely earlier than the ``done_time``
+    routing reserved -- most obviously for a request that pulled a remote prefix,
+    which :meth:`_Base._candidate` charges to the prefill instance's occupancy and
+    a real device is idle for.
+
+    Still a demand rather than a fact, for two reasons. The answer states the
+    corrected tail, which is this coordinator's own model and worth being able to
+    ask for; and the *await* is an ordering guarantee the caller relies on -- the
+    decode admission it asks next must be decided by a coordinator that has already
+    recorded this completion, which a one-way report would not promise across a
+    service hop.
     """
 
     inst: str
@@ -376,14 +396,19 @@ class _Base(Policy, Coordinator):
     async def _decide_prefill_finished(self, demand: PrefillFinished) -> float:
         """Correct the predicted queue with the clock the real ops reached.
 
-        Routing reserved this instance until the *predicted* ``done_time``; the
-        executed cost can differ (the pull may find fewer blocks still resident, may
-        be served by a different peer than the one priced, or may be slowed by
-        contention), and only now is the true completion time known.
+        Routing reserved this instance until the *predicted* ``done_time``, and the
+        executed time differs for more reasons than it used to: the pull may find
+        fewer blocks still resident or be served by a different peer than the one
+        priced, contention may slow it -- and, now that the data plane really
+        queues for its accelerators, the prediction's own arithmetic can simply be
+        wrong about the wait.
 
-        Answers with the corrected queue tail. The data plane needs it on a coupled
-        instance -- prefill just occupied the timeline decode steps run on -- and
-        answering is what keeps that a reply rather than a field it reads.
+        Raises the tail and never lowers it, which is the conservative half of a
+        model that is now knowingly approximate: a completion earlier than
+        predicted leaves this instance looking busier than it is until the next
+        request is routed against it, whereas lowering it on one report would
+        under-count the prefills this coordinator has promised and not yet seen
+        finish. Answers with the tail it holds.
         """
         if demand.now > self.busy_until[demand.inst]:
             self.busy_until[demand.inst] = demand.now

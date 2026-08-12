@@ -83,6 +83,18 @@ class RequestResult:
     decode_rejected: bool = False    # shed at decode admission (TBT SLO)
     wasted_prefill: bool = False     # prefill was spent, then decode rejected
     published: bool = True           # the prefix this request computed was cached
+    #: What the coordinator predicted this request would wait for its prefill
+    #: host, taken off the plan it was routed with.
+    predicted_queue_wait: float = 0.0
+    #: What it actually waited: the time its forward pass spent queued for the
+    #: host's accelerator, behind whatever prefill or decode step already had it.
+    #:
+    #: The pair is the point. These used to be the same number by construction --
+    #: the data plane slept the prediction, so measuring the wait could only return
+    #: the prediction, and a scheduler that mispredicted its own queue was never
+    #: contradicted. The wait is now emergent, so the difference is a real residual:
+    #: it is how wrong the control plane's model of its own queue is, per request.
+    queue_wait: float = 0.0
     # -- the decode host's half -------------------------------------------- #
     decode: str = ""                 # the instance that actually decoded it
     handoff_bytes: int = 0           # KV pulled out of the store to decode here

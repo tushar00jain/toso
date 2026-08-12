@@ -206,12 +206,15 @@ kvcache_sim/
                           #   the KV back out of the store, then batch it). No
                           #   host holds a reference to another host
     _compute.py           #   Accelerator: the port an engine runs its work on --
-                          #   what it costs, making it take that long, and the KV
-                          #   a forward pass hands back. Both engines get one; the
-                          #   SAME one is what coupling means
-    _prefill.py           #   PrefillEngine: the queue a request waits behind and
-                          #   the forward pass, run on the accelerator -> the KV
-                          #   blocks this host now holds and did not before
+                          #   what it costs, making it take that long, the KV a
+                          #   forward pass hands back, and the one occupancy both
+                          #   engines book on. Both engines get one; the SAME one
+                          #   is what coupling means
+    _prefill.py           #   PrefillEngine: what a forward pass costs and
+                          #   submitting it -> the KV blocks this host now holds
+                          #   and did not before. It no longer sleeps a queue
+                          #   wait: the pass waits for the device, so the wait is
+                          #   measured rather than taken from control's forecast
     _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT
                           #   (all three underscored: nothing outside data/ drives
                           #   them)
@@ -225,8 +228,10 @@ kvcache_sim/
     _accelerator.py       #   SimulatedAccelerator: the Accelerator port, answered
                           #   by a roofline, a sleep, and one zero-storage meta
                           #   tensor per KV block at the size the scheduler priced.
-                          #   Owns BLOCK_TOKENS. The one piece of the compute story
-                          #   a deployment replaces outright
+                          #   Owns BLOCK_TOKENS, and the single-server queue that
+                          #   makes a forward pass wait for the device. The one
+                          #   piece of the compute story a deployment replaces
+                          #   outright
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
                           #   the wiring a run installs around it, incl. the
                           #   client that submits a request and follows the two
@@ -268,6 +273,56 @@ plus the prefix-run read that express KV caching on a mesh.
   client takes whichever holder the directory lists first, which for a block several
   instances hold (a shared system prompt, anything replicated) can be a different
   locality tier than the one the TTFT prediction was built on.
+- **The prefill queue is real, and it disagrees with the scheduler that predicted
+  it.** A request used to wait by *sleeping `plan.queue_wait`* — the number the
+  scheduler produced when it routed the request — and then sleeping its forward
+  pass. Nothing measured the queue, so a scheduler that mispredicted its own backlog
+  was right by construction in every column the wait lands in: TTFT, end-to-end, and
+  the next request's predicted queue. Now the forward pass is *submitted* to the
+  host's accelerator, after the KV fetch, and runs when that accelerator is free,
+  behind whatever prefill or decode step already has it. The wait is emergent, both
+  numbers are recorded per request (`predicted_queue_wait` and `queue_wait`), and the
+  run can contradict control. It does. Mean over accepted requests:
+
+  | run | predicted | actual | requests differing |
+  |---|---|---|---|
+  | `shared_prefix` cache-aware | 0.987 | 0.898 | 14.5% |
+  | `shared_prefix` load-balance | 1.585 | 1.585 | 0% |
+  | `eviction` cap 8 | 27.640 | 23.989 | 95.0% |
+  | `eviction` cap 32 | 0.519 | 0.477 | 17.8% |
+  | `hotspot` cache/repl | 11.096 | 10.309 | 80.6% |
+  | `hotspot` cache/no-repl | 11.433 | 11.433 | 0% |
+  | `overload` cache-aware | 4.590 | 4.259 | 78.2% |
+  | `early_rejection` predict | 85.047 | 85.041 | 8.1% |
+
+  The error is nearly all one-signed and has one cause: control prices a candidate as
+  `queue → transfer → prefill` and reserves the instance until the end of all three,
+  so a **remote prefix pull is charged to the prefill device's occupancy** while a real
+  device is idle during it. Every configuration that never pulls — both `load_balance`
+  runs, `hotspot`'s no-replication run — predicts its queue exactly, which is what
+  makes the cause legible rather than inferred. The other direction exists but is rare
+  (0.2–1.2% of requests, up to +2.9s): a request queued behind one whose planned reuse
+  had been evicted and became a full-length recompute. Saturated queues predict
+  themselves well — at an arrival rate of 20/s (`early_rejection`) the backlog dwarfs
+  every transfer and the mean error is 0.007% — so this is a light-to-moderate-load
+  effect, not an overload one.
+
+  What it moved, against the same runs before the queue existed: `early_rejection`'s
+  `predict` mode loses TBT attainment (86.2% → 81.9%), because routing decode by the
+  load foreseen *at prefill completion* is only as good as the prefill completion it
+  foresees — the clearest sign that a self-fulfilling wait was propping a result up.
+  `eviction` hit rates shift in both directions (34.9% → 32.7% at capacity 8,
+  51.5% → 55.2% at 16) as a small cache's publish/evict interleaving moves with the
+  queue. End-to-end barely moves where the queue is short (disaggregation
+  1.269 → 1.266, coupled 1.126 → 1.117). Everything else — the cache-aware-vs-baseline
+  story, the eviction curve's shape, the disaggregation trade — is unchanged.
+
+  There is no flag for the old behaviour, deliberately. A flag is for a genuine
+  alternative (`contention="none"` is a defensible model of an uncontended fabric);
+  sleeping a forecast is not an alternative model, it is just less true, and a second
+  path nobody runs is a second path everybody maintains. The run stays deterministic
+  because the queue is served in an explicitly sorted order — submission instant, then
+  request id — rather than in whichever order the event loop resumed its waiters.
 - **The coordinator hop is free by default.** Control is a service, reached through
   `realsim/seams/coordinator_handle.py` — so there is now somewhere to charge the round trip,
   but `--coordinator-rtt` defaults to `0` and every call is inline. Turn it up and it

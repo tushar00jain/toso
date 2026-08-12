@@ -65,22 +65,31 @@ The lifecycle, once a host is prefilling:
 
 1. ask the coordinator to route the request (control), and record a rejection if
    it refuses;
-2. wait out the prefill queue;
-3. if the plan pulls a remote prefix, drive a **real** ``get_batch`` (charging
+2. if the plan pulls a remote prefix, drive a **real** ``get_batch`` (charging
    fabric via the cost model);
-4. charge the prefill compute;
-5. publish what this host now holds and did not before -- a real ``put_batch``;
-6. tell the coordinator the clock the real ops actually reached;
-7. on the decode-simulating path, ask control whether the request may enter a
+3. submit the forward pass to this host's accelerator, which runs it when the
+   device is free -- so the queue wait is *waited*, not slept from a number, and
+   what the request actually waited is recorded next to what control predicted;
+4. publish what this host now holds and did not before -- a real ``put_batch``;
+5. tell the coordinator the clock the real ops actually reached;
+6. on the decode-simulating path, ask control whether the request may enter a
    decode batch, and answer the client with the host that will run it.
 
 ...and then, on that host:
 
-8. fetch the request's KV out of the store (a **real** ``get_batch``, and under
+7. fetch the request's KV out of the store (a **real** ``get_batch``, and under
    disaggregation the dominant cost of the request);
-9. admit it to the decode batch, record its inter-token gaps when the last token
+8. admit it to the decode batch, record its inter-token gaps when the last token
    lands -- and only then answer the client, which is what lets the client stamp
    arrival-to-last-token and what removed the drain hook the run used to need.
+
+Note what moved in that list. The wait used to be step 2, in front of the fetch,
+because that is where control's arithmetic puts it (it prices
+``queue -> transfer -> prefill`` and reserves the instance for all three). A
+forward pass cannot be submitted before its inputs have arrived, so the wait is
+now behind the fetch, and the fetch runs on the fabric while the device belongs to
+somebody else -- which is also why control's forecast now diverges from what
+happens, most for the requests that pull.
 
 Simplification (documented in SPEC): a block becomes reusable at prefill
 *completion*, not while in flight, so two requests racing for the same brand-new
@@ -106,13 +115,20 @@ on.
 Coupling lives here
 -------------------
 Whether prefill and decode contend for this host's compute is a fact about the
-deployment, not about the policy, so the host owns it. When coupled it applies each
-accepted plan's reservation to its decode engine's timeline
-(:meth:`~kvcache_sim.data._decode.DecodeEngine.reserve`) and reports each decode
-step's end on through
-a :class:`~kvcache_sim.control.scheduler.ComputeBusy` fact, so the control
-plane's *predicted* prefill queue tracks the timeline decode is actually using. A
-disaggregated host does neither, and prefill never stalls decode.
+deployment, not about the policy, so the host owns it -- by handing both engines
+one accelerator or two, and by reporting each decode step's end onward as a
+:class:`~kvcache_sim.control.scheduler.ComputeBusy` fact so the control plane's
+*predicted* prefill queue tracks the device decode is actually using. A
+disaggregated host reports nothing, and prefill never stalls decode.
+
+The host used to do a third thing here, and it is worth naming because it is
+gone. It pushed each accepted plan's predicted completion onto the accelerator
+(``reserve``), so that a decode step would not be scheduled through a prefill that
+had been promised but not yet started. A prefill now books its own slot when it is
+submitted, on the very occupancy decode steps take, so the reservation had nothing
+left to add and something to subtract: it held the device across a KV fetch that
+does not use it, and it wrote control's estimate over a completion this host had
+measured. Coupling is now entirely a matter of which object a host was handed.
 """
 
 from __future__ import annotations
@@ -164,7 +180,7 @@ class ServingHost:
             or ``None`` if it does not prefill.
         decode: this host's :class:`~kvcache_sim.data._decode.DecodeEngine`, or
             ``None`` if it does not decode. Whether the two were handed the *same*
-            :class:`~kvcache_sim.data._compute.ComputeTimeline` is whether they
+            :class:`~kvcache_sim.data._compute.Accelerator` is whether they
             contend -- see :attr:`coupled`.
         models_decode: whether this *run* models the request's second half at all.
             Not the same question as whether this host decodes: a prefill-only host
@@ -277,13 +293,17 @@ class ServingHost:
         model decode at all, or because control refused the decode admission, which
         makes this a *wasted* prefill and is recorded here as one.
         """
-        # The accepted plan reserved this host in control's predicted queue. If a
-        # decode engine shares this accelerator that reservation occupies the same
-        # timeline its steps run on, so take it -- immediately, with no await in
-        # between, so no step can slip past it.
-        if self.coupled:
-            self.prefill_engine.reserve(plan.done_time)
-
+        # Nothing is reserved here, and there used to be two things. This method
+        # opened by pushing ``plan.done_time`` -- control's *predicted* completion
+        # -- onto the accelerator, so that a decode step sharing it would schedule
+        # around a prefill the accelerator itself knew nothing about, and closed by
+        # pushing control's corrected tail onto it again. Both are gone with the
+        # queue: the accelerator books the pass when it is submitted, decode books
+        # its steps on the same occupancy, and one object owns the answer. Applying
+        # a forecast on top of that would be worse than redundant -- the first
+        # reservation held a device across a fetch that does not use it, and the
+        # second overwrote a completion this host had just performed with control's
+        # estimate of it.
         self._trace_route(plan)
         row = self._make_accepted(plan)
         # Published straight away, before any of the work below. This host is the
@@ -292,9 +312,7 @@ class ServingHost:
         # amends the ledger's copy rather than being handed one.
         self.metrics.add(row)
 
-        # (1) wait out the prefill queue at this host.
-        await self.prefill_engine.wait_turn(plan.queue_wait)
-        # (2) the prefix this host already had is a read the store never sees,
+        # (1) the prefix this host already had is a read the store never sees,
         # so tell it: the volume evicts on what it has observed.
         if plan.local_blocks:
             await self.store.reuse(
@@ -318,12 +336,28 @@ class ServingHost:
                 # all-or-nothing, and half a prefix is not a prefix.
                 uncached = self._recompute(plan, row)
                 pulled = []
-        # (3) charge the prefill compute for the uncached suffix. The engine is
-        # told the work, not a duration: what it costs is the accelerator's answer.
-        # It answers with the KV: the prefix handed in, then the suffix it computed.
-        kv = await self.prefill_engine.run(uncached, pulled)
+        # (2) submit the forward pass for the uncached suffix. The engine is told
+        # the work, not a duration: what it costs is the accelerator's answer, and
+        # *when* it runs is the accelerator's answer too -- the pass waits here for
+        # the device, behind whatever prefill or decode step already has it. It
+        # answers with the KV: the prefix handed in, then the suffix it computed.
+        # The request's id goes with it as the submission's name, which the
+        # accelerator uses to break a same-instant tie in its service order.
+        submitted_at = self._now()
+        kv = await self.prefill_engine.run(uncached, pulled, tag=plan.request.id)
+        # Whatever that took beyond the pass itself was queueing for the device.
+        # This is the *measured* wait, and the row already carries control's
+        # prediction of it: the two used to be the same number by construction,
+        # because the wait was slept from the prediction. Derived rather than
+        # reported back through the engine -- the pass costs exactly what the
+        # accelerator says it costs, so the remainder is the wait, and asking the
+        # port to hand a measurement back would put a simulation's bookkeeping in a
+        # member a deployment implements.
+        row.queue_wait = (
+            self._now() - submitted_at - self.prefill_engine.cost(uncached)
+        )
 
-        # (4) publish what this host now holds and did not before: the prefix it
+        # (3) publish what this host now holds and did not before: the prefix it
         # pulled, plus the suffix it computed. Which blocks those are is not a
         # decision and not control's to make -- it is everything past what was
         # already local, and the plan says how much that was. The store is handed
@@ -341,16 +375,22 @@ class ServingHost:
         # the two outcomes a capacity sweep is measuring between, and a hit rate
         # cannot tell them apart.
         row.published = await self.store.publish(self.me, fresh, kv)
-        # (5) tell control the clock the real ops reached, and (coupled only) the
-        # decode timeline this host now carries.
-        now = self._now()
-        busy_until = await self.coordinator.decide.call_one(
-            PrefillFinished(self.me, now)
-        )
-        if self.coupled:
-            # The reply, not a read of control's queue: prefill just occupied the
-            # timeline decode steps on, and only the coordinator knows the tail.
-            self.prefill_engine.reserve(busy_until)
+        # (4) tell control the clock the real ops actually reached.
+        #
+        # This is the only thing that closes the loop between control's model of
+        # this host's queue and the queue, and it means far more than it used to:
+        # when the data plane slept the forecast, ``now`` was that forecast coming
+        # back and the correction was a rounding. Now it is the first news control
+        # gets that its prediction was wrong, and the next request routed here is
+        # priced off what happened.
+        #
+        # Awaited, and its answer -- control's corrected tail -- deliberately not
+        # used. The wait is for the ordering: the decode admission asked a few lines
+        # below must be decided by a coordinator that has already recorded this
+        # completion, and a one-way report would not guarantee that under a
+        # non-zero coordinator hop. The value itself is control's own model, and
+        # this host has no use for a model of a completion it just performed.
+        await self.coordinator.decide.call_one(PrefillFinished(self.me, self._now()))
         return await self._prefill_done(plan, row)
 
     def _recompute(self, plan: Plan, row: RequestResult) -> int:
@@ -391,6 +431,7 @@ class ServingHost:
             transfer_bytes=plan.transfer_bytes,
             prefill=plan.prefill,
             reuse_source=plan.reuse_source,
+            predicted_queue_wait=plan.queue_wait,
         )
 
     def _trace_route(self, plan: Plan) -> None:

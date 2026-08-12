@@ -12,8 +12,8 @@ Two levers the design cares about are modelled here:
 
 * **VRAM cap** (``max_batch``): a batch grows only to the cap; requests over it
   queue (``pending``) and their wait counts against their TBT.
-* **Prefill/decode coupling**: this host's compute timeline
-  (:class:`~kvcache_sim.data._compute.ComputeTimeline`) is owned by the *host*,
+* **Prefill/decode coupling**: this host's compute
+  (:class:`~kvcache_sim.data._compute.Accelerator`) is owned by the *host*,
   because it is the host's accelerator, and handed to whichever engines run on it.
   A host with a :class:`~kvcache_sim.data._prefill.PrefillEngine` too shares one
   between them, so a long prefill delays the next decode step and spikes that

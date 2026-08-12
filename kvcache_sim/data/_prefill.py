@@ -9,26 +9,55 @@ two very different shapes, and the asymmetry was the reason a host could not
 simply be asked which engines it runs.
 
 So prefill is an engine too, and a host runs one, the other, or both. Both are
-handed the host's :class:`~kvcache_sim.data._compute.ComputeTimeline`, which is
-what makes "coupled" a fact about a host rather than a flag beside it: two engines
-on one timeline collide, and there is nothing to configure.
+handed the host's :class:`~kvcache_sim.data._compute.Accelerator`, which is what
+makes "coupled" a fact about a host rather than a flag beside it: two engines on
+one accelerator collide, and there is nothing to configure.
+
+The queue is real, and that is why this engine has one member fewer
+-------------------------------------------------------------------
+This class used to have a ``wait_turn(queue_wait)``: the serving host handed it the
+number the *control plane predicted* the request would wait at this host, and it
+slept exactly that. The prediction was therefore unfalsifiable. A data plane that
+sleeps a forecast waits precisely as long as the forecast said, so a scheduler that
+mispredicts its own queue is never contradicted by the run, and every column
+containing the wait -- TTFT, end-to-end latency, the next request's predicted queue
+-- inherits the prediction rather than testing it. That was the weakest joint in the
+whole model and the one thing here that could not be wrong.
+
+There is no member for it now, and no flag that brings it back. The wait is
+**emergent**: :meth:`PrefillEngine.run` submits a forward pass to this host's
+accelerator, the accelerator runs it when it is free -- behind whatever prefill or
+decode step already has the device -- and how long that took is something the
+caller measures. ``plan.queue_wait`` still exists and control still computes it;
+it is now a *prediction the run can disagree with*, which is the point.
+
+Two smaller things fell out with it, and both are simplifications rather than
+losses. The wait moved to the far side of the request's KV fetch, where a forward
+pass that cannot start before its inputs arrive actually has it (control's
+arithmetic puts the wait first, which also means control charges a fabric transfer
+to a device that is idle during it -- a divergence the run can now show). And
+``reserve``, which existed so that a decode step would not be scheduled through a
+prefill the accelerator did not know about, is gone: it knows about it.
 
 What is deliberately still missing
 ----------------------------------
-A queue. :meth:`PrefillEngine.wait_turn` sleeps the wait the *control plane
-predicted*, which is what the serving loop did before it and what keeps this a
-move rather than a change. It is also the weakest thing in the model: a predicted
-wait that the data plane then sleeps is self-fulfilling, so a scheduler that
-mispredicts its own queue is never contradicted by the run. Making the queue real
--- submit work, run when the accelerator is free, let the wait be emergent -- is
-the fidelity step this shape is here to allow, and it moves measured numbers, so
-it is not taken here.
+**Batching.** A real prefill engine runs several prompts in one forward pass, and
+chunks a long one across several. Here a submission is one prompt and occupies the
+device alone for what a roofline says it costs, so this queue is a single server
+with FIFO service, not a scheduler: it can show that a wait was mispredicted, but
+it cannot show a scheduler recovering by co-batching two short prompts. That needs
+:meth:`~kvcache_sim.data._compute.Accelerator.prefill_cost` to price a *set* of
+prompts, which is a change to the cost model and not to this shape.
+
+**Preemption.** A queued prefill cannot be cancelled, reordered by priority, or
+evicted for a request with a tighter SLO once it is behind one that is not. The
+service order is fixed at submission, which is the honest version of what this
+models and the one a deployment's continuous batcher is a departure from.
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
 import torch
 
@@ -70,18 +99,12 @@ class PrefillEngine:
         """
         return self.compute.prefill_cost(uncached_tokens)
 
-    async def wait_turn(self, queue_wait: float) -> None:
-        """Wait out the queue this request was routed behind.
-
-        ``queue_wait`` is control's prediction rather than this engine's own
-        backlog -- see the module docstring for why that is the model's weakest
-        joint and why it is still what happens here.
-        """
-        if queue_wait > 0:
-            await asyncio.sleep(queue_wait)
-
     async def run(
-        self, uncached_tokens: int, cached: Sequence[torch.Tensor] = ()
+        self,
+        uncached_tokens: int,
+        cached: Sequence[torch.Tensor] = (),
+        *,
+        tag: str = "",
     ) -> List[torch.Tensor]:
         """Run the forward pass on this host's accelerator; answer with its KV.
 
@@ -95,15 +118,13 @@ class PrefillEngine:
         up holding is the accelerator's account of its own output, and an engine in
         between that reassembled the list would be a second place for the order to
         be wrong.
-        """
-        return await self.compute.prefill(uncached_tokens, cached)
 
-    def reserve(self, until: float) -> None:
-        """Hold the accelerator until ``until`` on this request's behalf.
-
-        Called when the host also decodes: the prefill about to run is on the
-        timeline decode steps use, so a step must not be scheduled through it. A
-        host with no decode engine shares its timeline with nothing and the call is
-        harmless.
+        This is where the pass is **submitted**, and therefore where it queues:
+        after the caller's fetch, because a forward pass cannot start before its
+        inputs are here, and with the token count that fetch actually left it with
+        -- a planned reuse that turned out to be evicted makes this a bigger pass
+        than the plan priced, and the queue slot has to be the real one. ``tag``
+        names the submission so two passes handed in at the same instant queue in a
+        fixed order; the caller passes the request's id.
         """
-        self.compute.reserve(until)
+        return await self.compute.prefill(uncached_tokens, cached, tag=tag)

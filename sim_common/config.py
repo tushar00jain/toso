@@ -26,6 +26,12 @@ transport reads it ambiently -- there is no longer a per-scenario ``contention``
 override argument; the mode is read from this config everywhere. It remains
 deterministic under the contract: the mode is fixed for the whole run, not read
 per event, and re-rating is ordered by a monotonic transfer sequence.
+
+What does **not** belong here is a switch that preserves behaviour the model has
+decided is wrong. A flag is for a genuine alternative -- ``contention="none"`` is
+a defensible simplification somebody may want -- not for keeping a superseded path
+reachable, which is how a codebase acquires a second implementation of everything
+that nobody runs and everybody has to maintain.
 """
 
 from __future__ import annotations
