@@ -11,13 +11,17 @@ Two separate things, deliberately:
   factories because they reach for the view, the mesh and the ledger, none of
   which exists before the stack does.
 
-Two things a deployment would not need are built here, because in a deployment
+Three things a deployment would not need are built here, because in a deployment
 they are not built at all. One is the peer references a host reaches another host
 through -- in production a handle to a remote actor, here a
 :class:`~realsim.seams.link.LocalEndpoint` pair over a
-:class:`~realsim.seams.link.ServiceHop`, so the boundary is charged. The other is
-:func:`_affinity`, which decides where a request lands: production has a load
-balancer, and a simulation has to stand in for one.
+:class:`~realsim.seams.link.ServiceHop`, so the boundary is charged. The other two
+are the load balancer: :func:`_affinity` decides which host a request lands on and
+:class:`_Arrivals` delivers it there. Production has a client SDK, an ingress proxy
+or DNS doing that, none of which is part of the serving system -- which is why they
+are here rather than in ``data/``, whose test for membership is whether a thing
+advances the clock or moves bytes, and whose contents are what would lift into a
+deployment unchanged.
 
 They are two functions because they are two services. The plane factory does not
 build the scheduler; it takes ``sim.coordinator_handle``, the handle
@@ -34,7 +38,7 @@ from zlib import crc32
 import torch
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
-from proposed import Endpoint
+from proposed import DataPlane, Endpoint
 from realsim.runner import WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.seams.transport import TensorDescriptor
@@ -44,7 +48,7 @@ from sim_common import config
 
 from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
-from ..data.serving import Arrivals, ServingHost
+from ..data.serving import ServingHost
 from ..data.store import KVStore
 
 #: Tokens per KV block. Fixed for every scenario so runs stay comparable.
@@ -180,13 +184,53 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
     return landed
 
 
+class _Arrivals(DataPlane):
+    """Deliver each request to the host it lands on. That is the whole job.
+
+    The harness-facing :class:`~proposed.plane.DataPlane`, and deliberately almost
+    nothing: *where a request arrives* is a load balancer's answer -- DNS, a
+    client's affinity, a round robin -- and *where it should run* is the
+    coordinator's. Neither is a serving decision, which is why this is wiring and
+    not part of the capability: a deployment deletes it and keeps the hosts.
+
+    Args:
+        hosts: ``instance id -> ServingHost``. Held as objects rather than
+            references because this stands in for the client side of the
+            deployment, which is outside every host -- and so pays no hop that
+            every scheduler would not pay equally.
+        arrival_host: which host a request lands on.
+    """
+
+    #: Rows are published at rejection, at acceptance, or when the last decode
+    #: token lands -- never one per item, so the harness must not write them.
+    writes_own_outcomes = True
+
+    def __init__(
+        self,
+        hosts: Dict[str, ServingHost],
+        arrival_host: Callable[[Request], str],
+    ) -> None:
+        self.hosts = hosts
+        self.arrival_host = arrival_host
+
+    async def execute(self, item) -> None:
+        """Hand the request to whichever host it arrived at."""
+        request: Request = item.payload
+        await self.hosts[self.arrival_host(request)].receive(request)
+
+    async def drain(self) -> None:
+        """Every host's decode has to finish before the run is over."""
+        for host in sorted(self.hosts):
+            await self.hosts[host].drain()
+
+
 def serving_plane(
     *,
     coupled: bool = False,
     simulate_decode: bool = False,
     max_batch: int = 8,
     decode_pool: Optional[List[str]] = None,
-) -> Callable[[Simulation], Arrivals]:
+) -> Callable[[Simulation], "_Arrivals"]:
     """Build the factory for this run's **data plane**: one host per instance.
 
     ``coupled`` says whether prefill shares a host's decode compute -- a deployment
@@ -199,7 +243,7 @@ def serving_plane(
     hosts decode.
     """
 
-    def build(sim: Simulation) -> Arrivals:
+    def build(sim: Simulation) -> "_Arrivals":
         # The simulation *is* the deployment: it vends the client for an instance
         # and holds the directory. All the run adds is the block carrier.
         store = KVStore(
@@ -228,6 +272,6 @@ def serving_plane(
         # calls, and no host holds another host's object.
         for instance, host in hosts.items():
             handles[instance] = _LocalHostHandle(host, hop)
-        return Arrivals(hosts, _affinity(sorted(sim.ids)))
+        return _Arrivals(hosts, _affinity(sorted(sim.ids)))
 
     return build

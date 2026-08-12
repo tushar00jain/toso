@@ -2,9 +2,7 @@
 
 :class:`ServingHost` is **one serving instance**: its cache, its decode batch, its
 compute. A deployment runs one per host and they reach each other over the same
-kind of port they reach the store and the coordinator over. :class:`Arrivals` is
-the harness-facing :class:`~proposed.plane.DataPlane`, and it is deliberately
-almost nothing -- see below.
+kind of port they reach the store and the coordinator over.
 
 Every host is also a router
 ---------------------------
@@ -16,9 +14,12 @@ host named (:meth:`ServingHost.serve`). Routing is a *role every host plays*, no
 a tier in front of them -- a single router object would re-centralize exactly what
 running one of these per host decentralizes.
 
-What is left over is which host a request arrives at, and that is a load balancer's
-answer, not a serving decision. So it belongs to the run's wiring rather than here,
-and :class:`Arrivals` does nothing but deliver.
+What is left over is which host a request arrives at, and that is a load
+balancer's answer rather than a serving decision -- a client SDK, an ingress proxy
+or DNS, none of which is part of the serving system and none of which survives
+into a deployment of it. So it is not here: the run's wiring stands in for it
+(:mod:`kvcache_sim.workload._serving`), and a host is simply told a request has
+arrived.
 
 The lifecycle, once a host is serving:
 
@@ -83,7 +84,7 @@ import asyncio
 from typing import Any, Callable, Dict, List, Optional
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model, prefill_time
-from proposed import Coordinator, DataPlane
+from proposed import Coordinator
 
 from ..control.scheduler import (
     AdmitDecode, ComputeBusy, DecodeState, Plan, PrefillFinished, Route,
@@ -93,7 +94,7 @@ from ..control.request import Request
 from ._decode import DecodeEngine
 from .store import KVStore
 
-__all__ = ["Arrivals", "ServingHost"]
+__all__ = ["ServingHost"]
 
 
 class ServingHost:
@@ -405,42 +406,3 @@ class ServingHost:
         self.trace.record(
             self._now(), "DECODE", f"{request.id} decode done (tbt {tbt:.3f})"
         )
-
-
-class Arrivals(DataPlane):
-    """Deliver each request to the host it lands on. That is the whole job.
-
-    The harness-facing :class:`~proposed.plane.DataPlane`, and deliberately almost
-    nothing: *where a request arrives* is a load balancer's answer -- DNS, a
-    client's affinity, a round robin -- and *where it should run* is the
-    coordinator's. Neither is a serving decision, so this holds no policy of its
-    own and the arrival host is decided by the run's wiring.
-
-    Args:
-        hosts: ``instance id -> ServingHost``. Held as objects rather than
-            references because this stands in for the client side of the
-            deployment, which is outside every host.
-        arrival_host: which host a request lands on.
-    """
-
-    #: Rows are published at rejection, at acceptance, or when the last decode
-    #: token lands -- never one per item, so the harness must not write them.
-    writes_own_outcomes = True
-
-    def __init__(
-        self,
-        hosts: Dict[str, ServingHost],
-        arrival_host: Callable[[Request], str],
-    ) -> None:
-        self.hosts = hosts
-        self.arrival_host = arrival_host
-
-    async def execute(self, item) -> None:
-        """Hand the request to whichever host it arrived at."""
-        request: Request = item.payload
-        await self.hosts[self.arrival_host(request)].receive(request)
-
-    async def drain(self) -> None:
-        """Every host's decode has to finish before the run is over."""
-        for host in sorted(self.hosts):
-            await self.hosts[host].drain()
