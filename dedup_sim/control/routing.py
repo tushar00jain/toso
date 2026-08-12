@@ -46,7 +46,7 @@ a gather of ``client.get(K)``, with no idea a policy exists.
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import deque
 from typing import (
     Any, Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple,
 )
@@ -80,9 +80,12 @@ class DedupPolicy(Policy):
         self.trace = trace
         # requester -> the source it was routed to (decided once, then reused).
         self._route: Dict[str, str] = {}
-        # source -> peers it has been planned to feed (the tree-shaping tally).
-        self._planned: Dict[str, int] = defaultdict(int)
-        # sources still under the fan-out cap, oldest first.
+        # One entry per peer a source may still be planned to feed, oldest first: a
+        # requester joins with ``cap`` slots and each assignment consumes one. The
+        # cap is the queue's own shape rather than a tally compared against it,
+        # which matters because assignment is a read-modify-write with no lock --
+        # one popleft cannot leave a half-applied cap behind the way an increment,
+        # a comparison and a conditional pop could. See :meth:`_assign`.
         self._avail: Deque[str] = deque()
         # The (volume, key) publications this policy has planned and not yet seen
         # land: a requester it routes reads the key through into its own volume,
@@ -156,19 +159,20 @@ class DedupPolicy(Policy):
     async def _assign(
         self, view: Any, keys: Sequence[str], requester: str
     ) -> Optional[str]:
-        """Pick this requester's source and fold it into the read-through tree."""
+        """Pick this requester's source and fold it into the read-through tree.
+
+        Safe without a lock only because nothing awaited here ever suspends: a
+        ``View``'s directory read is the controller's own unrouted body, which
+        contains no ``await``, so this runs to completion before the next
+        requester's does -- the serialized mailbox a real controller would give it.
+        A directory that could suspend would make the queue below a check-then-act
+        race, and the cap would be exceeded rather than enforced.
+        """
         if self._avail:
-            # A peer is already planned to hold the key: attach to the oldest one
-            # still under the cap, and become a source ourselves.
-            source = self._avail[0]
-            self._planned[source] += 1
-            if self._planned[source] >= self.cap:
-                self._avail.popleft()
-            if requester not in self._avail:
-                # Once: a requester re-assigned after its source was retired is
-                # already in the queue, and a second entry would let it be handed
-                # out past the cap.
-                self._avail.append(requester)
+            # A peer is already planned to hold the key: take the oldest free slot
+            # and offer our own.
+            source = self._avail.popleft()
+            self._offer(requester)
             return source
         # First requester: the closest volume that already holds every key. This
         # is the one hop whose source is an origin -- the 1x fabric cost.
@@ -179,9 +183,18 @@ class DedupPolicy(Policy):
         holders.discard(requester)
         if not holders:
             return None
-        if requester not in self._avail:
-            self._avail.append(requester)
+        self._offer(requester)
         return view.nearest(sorted(holders), requester)
+
+    def _offer(self, requester: str) -> None:
+        """Offer ``requester`` as a source for up to ``cap`` later peers.
+
+        Once: a requester re-assigned after its source was retired still holds the
+        slots it was given, and a second offer would let it be handed out past the
+        cap.
+        """
+        if requester not in self._avail:
+            self._avail.extend([requester] * self.cap)
 
     # -- readiness ----------------------------------------------------------- #
     async def _registered(

@@ -1,7 +1,7 @@
 """One dedup configuration, for the tests that assert on a single run.
 
 The demo compares a whole list of :class:`~realsim.run.Run` values at once
-(:func:`dedup_sim.workload.scenarios.dedup_vs_baseline`); a test usually wants
+(:meth:`dedup_sim.workload.scenarios.Dedup.runs`); a test usually wants
 exactly one -- the baseline, or one fan-out cap -- so this builds and executes
 that one. Test scaffolding, not API.
 """
