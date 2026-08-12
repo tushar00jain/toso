@@ -21,6 +21,16 @@ are *not* mutually derived, so these tests cover both:
    the conclusion is not an artifact of the illustrative scaling; and
 3. the predicted block size equals the byte count the data plane actually moves,
    the coupling that makes the prediction meaningful at all.
+
+Where premise 3 is checked moved with the thing it is about. The KV store used to
+enforce it at construction -- it was handed a "carrier" and refused one that was not
+``Model.block_bytes`` big -- but the store neither produces KV nor knows what a
+token costs, so the check sat one object away from every number in it. The
+accelerator produces the blocks now
+(:class:`~kvcache_sim.workload._accelerator.SimulatedAccelerator`), derives their
+size from the model, and refuses a model whose block does not come out whole; the
+tests below assert against a **produced block** rather than against anything that
+object says about itself.
 """
 
 from __future__ import annotations
@@ -28,13 +38,16 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 
+import pytest
+import torch
+
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, _get_time, MachineProfile
 from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
 from kvcache_sim.data.store import KVStore
-from kvcache_sim.workload._serving import _sim_block_carrier
+from kvcache_sim.workload._accelerator import SimulatedAccelerator
 from realsim.simulation import Simulation
 from kvcache_sim.workload.scenarios import BLOCK_TOKENS, _make_topology
 
@@ -194,22 +207,61 @@ def test_from_architecture_derives_kv_bytes_and_flops_together():
 def test_predicted_block_bytes_equal_the_bytes_the_data_plane_moves():
     """What the scheduler prices must be what the transport charges.
 
-    ``Model.block_bytes`` feeds the routing prediction; the carrier's size is what the
-    transport actually charges. They are both derived from the model profile, and
-    this pins them together for the default and for a much larger model.
+    ``Model.block_bytes`` feeds the routing prediction; a produced block's
+    ``numel * element_size`` is what the transport charges. Asserted against the
+    tensor a forward pass actually hands back -- not against the accelerator's own
+    ``block_nbytes``, which would let the two agree by both being wrong.
     """
     for model in (DEFAULT_MODEL, REAL_MODEL):
-        cl = KVStore(
-            Simulation(_make_topology(2)).mesh,
-            block_tokens=BLOCK_TOKENS,
-            carrier=_sim_block_carrier(BLOCK_TOKENS, model),
-            model=model,
-        )
-        assert cl.block_nbytes == model.block_bytes(1, BLOCK_TOKENS), (
-            "the KV block carrier and Model.block_bytes() disagree, so every "
-            "fetch "
+        gpu = SimulatedAccelerator(model=model, block_tokens=BLOCK_TOKENS)
+        block, = gpu.kv_blocks(1)
+        assert block.numel() * block.element_size() == model.block_bytes(
+            1, BLOCK_TOKENS
+        ), (
+            "a produced KV block and Model.block_bytes() disagree, so every fetch "
             "prediction would be priced against the wrong byte count"
         )
+
+
+def test_a_kv_block_is_a_real_tensor_with_no_storage():
+    """The carrier premise's other half: a real tensor, and free to hold.
+
+    Both matter and they pull in opposite directions. It must be a
+    ``torch.Tensor``, because ``put_batch`` types its value -- a ``Tensor``/
+    ``DTensor`` goes down ``Request.from_any`` and anything else down
+    ``Request.from_objects`` -- so a non-tensor carrier puts every KV block on
+    torchstore's *object* path, which is not the path a KV deployment takes. And it
+    must allocate nothing, because these runs "store" far more KV than the test box
+    has memory for. ``device="meta"`` is what satisfies both.
+    """
+    block, = SimulatedAccelerator(block_tokens=BLOCK_TOKENS).kv_blocks(1)
+    assert isinstance(block, torch.Tensor)
+    assert block.device.type == "meta"
+    assert block.dtype == getattr(torch, DEFAULT_MODEL.compute_dtype)
+    # Distinct objects per block: the store keys them separately and a volume
+    # evicts them separately, so nothing here may alias.
+    a, b = SimulatedAccelerator(block_tokens=BLOCK_TOKENS).kv_blocks(2)
+    assert a is not b
+
+
+def test_a_block_that_does_not_come_out_whole_is_refused():
+    """The premise fails loudly where the KV is made, instead of rounding.
+
+    The check the ``KVStore`` constructor used to do, in its new home and in the
+    only form left to it: the block size is *derived* from
+    ``Model.block_bytes``, so it cannot disagree with the prediction -- unless the
+    model's bytes are not a whole number of KV elements, in which case a block would
+    have to round and be charged a size nobody predicted. Refused rather than
+    rounded, because the run would otherwise be internally consistent and wrong.
+    """
+    odd = replace(DEFAULT_MODEL, kv_bytes_per_token=1)
+    with pytest.raises(ValueError, match="whole number"):
+        # 3 tokens x 1 byte = 3B, which is not a whole number of float16 elements.
+        SimulatedAccelerator(model=odd, block_tokens=3)
+    # ...and the even case a scenario actually runs is fine.
+    assert SimulatedAccelerator(model=odd, block_tokens=BLOCK_TOKENS).block_nbytes == (
+        odd.block_bytes(1, BLOCK_TOKENS)
+    )
 
 
 def test_a_real_pull_costs_what_get_time_predicted():
@@ -225,19 +277,21 @@ def test_a_real_pull_costs_what_get_time_predicted():
     keys = ["blk0"]
 
     sim = Simulation(topo)
-    cl = KVStore(
-        sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
-    )
+    cl = KVStore(sim.mesh)
+    gpu = SimulatedAccelerator(block_tokens=BLOCK_TOKENS)
 
     async def scenario():
         import asyncio
 
         with sim.mesh.installed():
-            await cl.publish(holder, list(keys))
+            await cl.publish(holder, list(keys), gpu.kv_blocks(len(keys)))
             loop = asyncio.get_running_loop()
             before = loop.time()
-            await cl.fetch(puller, list(keys))
-            return loop.time() - before, cl.block_nbytes
+            pulled = await cl.fetch(puller, list(keys))
+            # Measured off what came back, which is the whole point: the bytes the
+            # clock advanced for are the bytes the fetch returned.
+            moved = sum(b.numel() * b.element_size() for b in pulled)
+            return loop.time() - before, moved
 
     # Drives one op rather than a workload, so it uses the stack's clock directly
     # instead of Simulation.run.

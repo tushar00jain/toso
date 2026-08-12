@@ -14,15 +14,17 @@ Two separate things, deliberately:
 Three things a deployment would not need are built here, because in a deployment
 they are not built at all. One is
 :class:`~kvcache_sim.workload._accelerator.SimulatedAccelerator`: what a forward
-pass costs and how it is made to take that long is the run's answer under
-simulation and the model's in production, so the capability is handed a port and
-this supplies the implementation. The other two are the client: :func:`_affinity`
-decides which host a request lands on and :class:`_Client` takes it there and
-follows the redirects it gets back. Production has a client SDK, an ingress proxy
-or DNS doing that, none of which is part of the serving system -- which is why they
-are here rather than in ``data/``, whose test for membership is whether a thing
-advances the clock or moves bytes, and whose contents are what would lift into a
-deployment unchanged.
+pass costs, how it is made to take that long, and what KV it leaves behind are the
+run's answers under simulation and the model's in production, so the capability is
+handed a port and this supplies the implementation. It is why the store below is
+built with nothing but the deployment -- what a KV block *is* arrives at the store
+as an argument, from the accelerator, per request. The other two are the client:
+:func:`_affinity` decides which host a request lands on and :class:`_Client` takes
+it there and follows the redirects it gets back. Production has a client SDK, an
+ingress proxy or DNS doing that, none of which is part of the serving system --
+which is why they are here rather than in ``data/``, whose test for membership is
+whether a thing advances the clock or moves bytes, and whose contents are what
+would lift into a deployment unchanged.
 
 The client is where the request's itinerary lives
 -------------------------------------------------
@@ -49,47 +51,30 @@ from __future__ import annotations
 from typing import Awaitable, Callable, Dict, List, Optional
 from zlib import crc32
 
-import torch
-
-from domain import DEFAULT_MODEL, DEFAULT_PROFILE, Model
+from domain import DEFAULT_MODEL, DEFAULT_PROFILE
 from proposed import Endpoint
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
-from realsim.seams.transport import TensorDescriptor
 from realsim.simulation import Simulation
 from realsim.run import Workload
 from sim_common import config
 
 from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
-from ._accelerator import SimulatedAccelerator
+from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from ..data._decode import DecodeEngine
 from ..data._prefill import PrefillEngine
 from ..data.serving import ServingHost
 from ..data.store import KVStore
 
-#: Tokens per KV block. Fixed for every scenario so runs stay comparable.
-BLOCK_TOKENS = 512
+# ``BLOCK_TOKENS`` is imported rather than declared: how much of a prompt one KV
+# block covers is the engine's cache-page size, so it lives with the accelerator
+# that lays the KV out (:mod:`kvcache_sim.workload._accelerator`). It is re-exported
+# here because the *scheduler* has to be told the same number -- it prices a prefix
+# match in blocks -- and a run that told the two different numbers would route on
+# one geometry and store in another.
 
 __all__ = ["BLOCK_TOKENS", "coordinator", "KVWorkload", "serving_plane"]
-
-
-def _sim_block_carrier(
-    block_tokens: int = BLOCK_TOKENS, model: Model = DEFAULT_MODEL
-):
-    """What one KV block is stored as **under simulation**.
-
-    A metadata-only carrier: a uint8 descriptor whose length *is* the block's
-    modeled byte size, so the bytes the transport charges cannot drift from the
-    bytes the scheduler predicted. Zero real storage.
-
-    This is the one piece a real deployment chooses differently -- it stores the
-    KV tensors -- which is why it lives with the run rather than in
-    :mod:`kvcache_sim.data.store`.
-    """
-    return TensorDescriptor(
-        shape=(model.block_bytes(1, block_tokens),), dtype=torch.uint8
-    )
 
 
 class KVWorkload(Workload):
@@ -302,10 +287,10 @@ def serving_plane(
 
     def build(sim: Simulation) -> ItemDispatch:
         # The simulation *is* the deployment: it vends the client for an instance
-        # and holds the directory. All the run adds is the block carrier.
-        store = KVStore(
-            sim.mesh, block_tokens=BLOCK_TOKENS, carrier=_sim_block_carrier()
-        )
+        # and holds the directory, and that is the whole of what the store needs.
+        # What a KV block is -- and how big one is -- is the accelerator's answer
+        # below, so there is nothing left for the run to hand the store.
+        store = KVStore(sim.mesh)
         hop = ServiceHop(config.current().client_rtt)
         hosts: Dict[str, ServingHost] = {}
 
@@ -313,7 +298,11 @@ def serving_plane(
         decodes = (set(decode_pool) if decode_pool else set(sim.ids)) if simulate_decode else set()
         for instance in sorted(sim.ids):
             def accelerator() -> SimulatedAccelerator:
-                return SimulatedAccelerator(profile=DEFAULT_PROFILE, model=DEFAULT_MODEL)
+                return SimulatedAccelerator(
+                    profile=DEFAULT_PROFILE,
+                    model=DEFAULT_MODEL,
+                    block_tokens=BLOCK_TOKENS,
+                )
 
             compute = accelerator()
             # One accelerator when the run models the collision; two when it does

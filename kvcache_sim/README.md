@@ -12,14 +12,18 @@ It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsi
   `RealControllerAdapter` / `LocalControllerHandle`. A KV block is a directory **key**
   (the prefix-hash chain string); "instance X holds block K" is the directory entry
   `K -> volume_X`. Routing consults the real `locate_volumes`.
-- **Real clients + types.** Each serving instance is a real storage volume with a
-  co-located real `LocalClient` (`realsim`'s `RealClientAdapter`). Publishing a
-  prefix after prefill is a real, **metadata-only** `put_batch` (a `(shape, dtype)`
-  `TensorDescriptor` per block -- zero real tensor storage) that records presence in
-  the real directory; a remote-prefix pull is a real `client.get_batch` driven
-  through `realsim`'s transport seam; eviction removes presence via the real
-  `notify_delete_batch`. A KV block is a directory key -- real types throughout,
-  with no translation layer.
+- **Real clients + real tensors.** Each serving instance is a real storage volume
+  with a co-located real `LocalClient` (`realsim`'s `RealClientAdapter`). Prefill
+  returns the KV it produced -- one `torch.Tensor` per block, `device="meta"`, so it
+  has the model's dtype and exact byte count and **zero** storage -- and publishing
+  it is a real `put_batch` of those tensors, which records presence in the real
+  directory. Being tensors is the point: `put_batch` types its value, sending a
+  `Tensor`/`DTensor` down `Request.from_any` and anything else down
+  `Request.from_objects`, so a run that published a descriptor exercised the object
+  path no KV deployment takes. A remote-prefix pull is a real `client.get_batch`
+  driven through `realsim`'s transport seam and it hands the KV back; eviction
+  removes presence via the real `notify_delete_batch`. A KV block is a directory key
+  holding a tensor -- real types throughout, with no translation layer.
 - **Real cost model.** Every duration -- prefill compute, decode-step time, and the
   fabric/storage/RAM cost of a KV fetch -- is charged through
   `sim_common.cost_model` from a target-machine `MachineProfile`, never measured on
@@ -194,22 +198,27 @@ kvcache_sim/
                           #   the KV back out of the store, then batch it). No
                           #   host holds a reference to another host
     _compute.py           #   Accelerator: the port an engine runs its work on --
-                          #   what it costs and making it take that long. Both
-                          #   engines get one; the SAME one is what coupling means
+                          #   what it costs, making it take that long, and the KV
+                          #   a forward pass hands back. Both engines get one; the
+                          #   SAME one is what coupling means
     _prefill.py           #   PrefillEngine: the queue a request waits behind and
-                          #   the forward pass, run on the accelerator
+                          #   the forward pass, run on the accelerator -> the KV
+                          #   blocks this host now holds and did not before
     _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT
                           #   (all three underscored: nothing outside data/ drives
                           #   them)
-    store.py              #   what a KV block is stored as, and publish / reuse /
-                          #   fetch over a Deployment's clients. Constructing one
-                          #   checks the block-size premise fetches are priced on
+    store.py              #   publish / reuse / fetch over a Deployment's clients,
+                          #   moving whatever KV it is handed. It holds no notion
+                          #   of what a block is or how big one is -- that is the
+                          #   accelerator's, which produces them
   workload/               # WHAT IS SIMULATED
     _generator.py         #   seeded synthetic request stream (Zipf + Poisson),
                           #   incl. the prompt's prefix-hash chain (str keys)
     _accelerator.py       #   SimulatedAccelerator: the Accelerator port, answered
-                          #   by a roofline and a sleep. The one piece of the
-                          #   compute story a deployment replaces outright
+                          #   by a roofline, a sleep, and one zero-storage meta
+                          #   tensor per KV block at the size the scheduler priced.
+                          #   Owns BLOCK_TOKENS. The one piece of the compute story
+                          #   a deployment replaces outright
     _serving.py           #   KVWorkload (the request stream) + serving_plane,
                           #   the wiring a run installs around it, incl. the
                           #   client that submits a request and follows the two

@@ -28,7 +28,9 @@ it is not taken here.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import List, Optional, Sequence
+
+import torch
 
 from ._compute import Accelerator
 
@@ -47,6 +49,16 @@ class PrefillEngine:
 
     def __init__(self, compute: Accelerator) -> None:
         self.compute = compute
+
+    @property
+    def block_tokens(self) -> int:
+        """Tokens per KV block, as this host's accelerator lays them out.
+
+        Forwarded rather than stored, so there is one answer on the host and it is
+        the one the KV was actually cut into (see
+        :attr:`~kvcache_sim.data._compute.Accelerator.block_tokens`).
+        """
+        return self.compute.block_tokens
 
     def cost(self, uncached_tokens: int) -> float:
         """What prefilling ``uncached_tokens`` costs on this host.
@@ -68,14 +80,23 @@ class PrefillEngine:
         if queue_wait > 0:
             await asyncio.sleep(queue_wait)
 
-    async def run(self, uncached_tokens: int) -> None:
-        """Run the forward pass for ``uncached_tokens`` on this host's accelerator.
+    async def run(
+        self, uncached_tokens: int, cached: Sequence[torch.Tensor] = ()
+    ) -> List[torch.Tensor]:
+        """Run the forward pass on this host's accelerator; answer with its KV.
 
         Named in tokens rather than seconds, because how long that takes is the
         accelerator's answer and not this engine's -- and because a deployment
         implementing the port runs a model, which needs the work and not a duration.
+
+        ``cached`` is the prefix this host pulled out of the store, and the answer
+        is every KV block this host now holds and did not before (that prefix, then
+        the computed suffix). Passed straight through: which blocks a prefill ends
+        up holding is the accelerator's account of its own output, and an engine in
+        between that reassembled the list would be a second place for the order to
+        be wrong.
         """
-        await self.compute.prefill(uncached_tokens)
+        return await self.compute.prefill(uncached_tokens, cached)
 
     def reserve(self, until: float) -> None:
         """Hold the accelerator until ``until`` on this request's behalf.

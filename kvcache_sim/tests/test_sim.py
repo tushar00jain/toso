@@ -15,8 +15,7 @@ from sim_common import config
 from sim_common.async_engine import AsyncEngine, run_sim
 
 from kvcache_sim.control._view import KVView, _longest_prefix_run
-from kvcache_sim.workload._accelerator import SimulatedAccelerator
-from kvcache_sim.workload._serving import _sim_block_carrier
+from kvcache_sim.workload._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
@@ -43,6 +42,17 @@ from kvcache_sim.workload.scenarios import (
     _make_topology,
     _shared_prefix_workload,
 )
+
+
+def _kv(count: int, block_tokens: int = BLOCK_TOKENS):
+    """``count`` KV blocks, exactly as a prefill on this run's accelerator makes them.
+
+    A publish takes the blocks now (the store holds no notion of what one is), so a
+    test that wants keys present has to produce KV for them. It does that through
+    the same object the serving plane does rather than conjuring a tensor of its
+    own, so a test can never publish a block of a size the run would not.
+    """
+    return SimulatedAccelerator(block_tokens=block_tokens).kv_blocks(count)
 
 
 # 1. Prefix-hash addressing: shared prefixes yield shared keys.
@@ -86,16 +96,14 @@ def test_real_directory_prefix_presence_and_eviction():
     keys = _block_keys_for("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
-    store = KVStore(
-        sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512)
-    )
+    store = KVStore(sim.mesh)
     view = KVView(sim.view.directory, sim.topology)
 
     async def scenario():
         # The data plane publishes/evicts; the control-plane view reads back.
         with sim.mesh.installed():
-            await store.publish("s0", list(keys[:3]))  # s0 holds 3 leading blocks
-            await store.publish("s1", list(keys[:1]))  # s1 holds 1
+            await store.publish("s0", list(keys[:3]), _kv(3))  # s0: 3 leading blocks
+            await store.publish("s1", list(keys[:1]), _kv(1))  # s1 holds 1
             counts = await view.prefix_lengths(list(keys))
             assert counts == {"s0": 3, "s1": 1}
             await _evict(sim.mesh, "s0", [keys[1]])    # break s0's run at index 1
@@ -121,11 +129,11 @@ def test_a_fetch_whose_block_vanished_raises_and_moves_nothing():
     keys = _block_keys_for("m0", [0, 1])
 
     sim = Simulation(topo)
-    store = KVStore(sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512))
+    store = KVStore(sim.mesh)
 
     async def scenario():
         with sim.mesh.installed():
-            await store.publish("s0", list(keys))
+            await store.publish("s0", list(keys), _kv(len(keys)))
             await _evict(sim.mesh, "s0", [keys[1]])
             before = sim.ledger.transfer_bytes
             with pytest.raises(KeyError):
@@ -451,7 +459,6 @@ def test_a_serving_host_cannot_reach_another_serving_host():
     import inspect
 
     from kvcache_sim.data.serving import ServingHost
-    from kvcache_sim.workload._serving import BLOCK_TOKENS
 
     accepted = set(inspect.signature(ServingHost.__init__).parameters) - {"self"}
     assert accepted == {
@@ -460,10 +467,7 @@ def test_a_serving_host_cannot_reach_another_serving_host():
     }
 
     sim = Simulation(_make_topology(2))
-    store = KVStore(
-        sim.mesh, block_tokens=BLOCK_TOKENS,
-        carrier=_sim_block_carrier(BLOCK_TOKENS),
-    )
+    store = KVStore(sim.mesh)
     hosts = {
         i: ServingHost(
             i, store, sim.coordinator_handle, trace=sim.trace, metrics=sim.ledger
@@ -678,10 +682,8 @@ def test_the_source_policy_accepts_a_plain_view():
     async def scenario():
         with sim.mesh.installed():
             empty = await LongestPrefixPolicy().select(sim.view, keys, "s0")
-            store = KVStore(
-                sim.mesh, block_tokens=512, carrier=_sim_block_carrier(512)
-            )
-            await store.publish("s1", list(keys))
+            store = KVStore(sim.mesh)
+            await store.publish("s1", list(keys), _kv(len(keys)))
             ranked = await LongestPrefixPolicy().select(sim.view, keys, "s0")
         return empty, ranked
 

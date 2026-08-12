@@ -117,6 +117,8 @@ from __future__ import annotations
 import asyncio
 from typing import List, Optional
 
+import torch
+
 from proposed import Coordinator
 
 from ..control.scheduler import (
@@ -192,7 +194,6 @@ class ServingHost:
         self.prefill_engine = prefill
         self.decode_engine = decode
         self.models_decode = models_decode
-        self.block_tokens = store.block_tokens
         #: Whether a prefill here delays a decode step here -- true exactly when
         #: both engines run on one accelerator. A run may model two engines on one
         #: host as *not* contending, which is a simplification rather than a
@@ -212,6 +213,20 @@ class ServingHost:
             # answer to disagree.
             if self.coupled:
                 self.decode_engine.on_compute_busy = self._compute_busy
+
+    @property
+    def block_tokens(self) -> int:
+        """Tokens per KV block, as this host's prefill accelerator lays them out.
+
+        Read through the engine rather than held, because the block size is the
+        thing that cuts the KV into blocks -- it used to come from the store, which
+        was told it a second time and could disagree with the accelerator about how
+        much of a prompt a reused block covers.
+
+        A host that does not prefill has no answer, and needs none: the one caller
+        is :meth:`_recompute`, which re-prices a prefill this host is running.
+        """
+        return self.prefill_engine.block_tokens
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
@@ -301,10 +316,14 @@ class ServingHost:
                 self.me, list(plan.request.block_keys[:plan.local_blocks])
             )
         # ...then pull the remote prefix (a real get_batch -> real fabric cost).
+        # The KV comes back, because this host is about to hold it: it goes into the
+        # forward pass below (which attends over it) and out again in what that pass
+        # answers with, which is what gets published.
         uncached = plan.uncached_tokens
+        pulled: List[torch.Tensor] = []
         if plan.reuse_source is not None and plan.pull_keys:
             try:
-                await self.store.fetch(self.me, plan.pull_keys)
+                pulled = await self.store.fetch(self.me, plan.pull_keys)
             except KeyError:
                 # The peer had those blocks when this was planned and does not now:
                 # a volume it shares with other requests ran out of room and dropped
@@ -313,14 +332,19 @@ class ServingHost:
                 # reused instead of failing the request. All of it: the pull is
                 # all-or-nothing, and half a prefix is not a prefix.
                 uncached = self._recompute(plan, row)
+                pulled = []
         # (3) charge the prefill compute for the uncached suffix. The engine is
         # told the work, not a duration: what it costs is the accelerator's answer.
-        await self.prefill_engine.run(uncached)
+        # It answers with the KV: the prefix handed in, then the suffix it computed.
+        kv = await self.prefill_engine.run(uncached, pulled)
 
         # (4) publish what this host now holds and did not before: the prefix it
         # pulled, plus the suffix it computed. Which blocks those are is not a
         # decision and not control's to make -- it is everything past what was
-        # already local, and the plan says how much that was.
+        # already local, and the plan says how much that was. The store is handed
+        # the KV itself, one tensor per key, rather than told how big a block is and
+        # left to invent one: it moves bytes and computes none, so what a block is
+        # is the accelerator's answer (see kvcache_sim/data/store.py).
         #
         # Under disaggregation this is no longer only a cache fill for some later
         # request: it is how *this* request's KV reaches the host that will decode
@@ -331,7 +355,7 @@ class ServingHost:
         # dropped, because "cached" and "tried to cache and had no room" are exactly
         # the two outcomes a capacity sweep is measuring between, and a hit rate
         # cannot tell them apart.
-        row.published = await self.store.publish(self.me, fresh)
+        row.published = await self.store.publish(self.me, fresh, kv)
         # (5) tell control the clock the real ops reached, and (coupled only) the
         # decode timeline this host now carries.
         now = self._now()
@@ -451,6 +475,15 @@ class ServingHost:
         step attends over every token of the prompt, so what this host needs is
         every block, not the ones that happened to be new.
 
+        The KV that comes back is what the handoff is *measured* off -- the bytes
+        the transport just charged, added up off the tensors it returned. Beyond
+        that this method does nothing with it, and a deployment would: it would load
+        those blocks into the decode engine's paged cache and the batch would attend
+        over them. What is missing to do that here is a decode engine that holds KV
+        at all -- :class:`~kvcache_sim.data._decode.DecodeEngine` models a step's
+        *duration* and never touches a tensor -- so the honest thing is to say that
+        rather than to stash the list on an attribute nothing reads.
+
         Unless it prefilled the request itself, which the plan says outright. Then
         the chain is already here -- this host computed it and published it -- and
         the store's own rule for a local hit applies: nothing moves and nothing is
@@ -498,11 +531,6 @@ class ServingHost:
         """
         request = plan.request
         keys = list(request.block_keys)
-        # What the transport will move, from the one definition it charges against:
-        # one carrier per block, each the size the model predicts. Derived rather
-        # than read back off the ledger, which is the run's collector and mixes
-        # every host's transfers together.
-        nbytes = len(keys) * self.store.block_nbytes
         if plan.decode == plan.prefill:
             # Ours already. Tell the volume it was read, so its eviction ranking
             # sees a hit the store would otherwise never observe, and record a
@@ -513,7 +541,7 @@ class ServingHost:
                 self.decode_engine.admit(request)
             return
         try:
-            await self.store.fetch(self.me, keys)
+            kv = await self.store.fetch(self.me, keys)
         except KeyError:
             self.trace.record(
                 self._now(),
@@ -524,6 +552,12 @@ class ServingHost:
             )
             self.metrics.handed_off(request.id, self.me, 0, missed=True)
         else:
+            # Measured off the KV that arrived, not predicted from a block size
+            # this host was told once: the same tensors the transport just charged
+            # for are the ones counted here, so the reported handoff cannot drift
+            # from the charged one. Not read back off the ledger either -- that is
+            # the run's collector and mixes every host's transfers together.
+            nbytes = sum(b.numel() * b.element_size() for b in kv)
             self.trace.record(
                 self._now(),
                 "HANDOFF",

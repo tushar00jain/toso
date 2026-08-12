@@ -12,13 +12,19 @@
   drives it: the host constructs it, owns it, and is the only thing it reports to --
   control learns the decode load as a value the host forwards, not by holding this
   object;
-* :mod:`~kvcache_sim.data.store` -- what a KV block is stored as, and the verbs
-  that follow from it (publish / reuse / fetch) as real ``put_batch`` / ``touch``
-  / ``get_batch`` calls. Constructing one is where the block-size premise every
-  fetch is priced against gets checked. It is also the *only* path between two
-  serving hosts: a prefill host publishes a request's KV and its decode host
-  fetches it back, which is what makes the handoff a transfer with a price rather
-  than an argument to a method call.
+* :mod:`~kvcache_sim.data.store` -- publish / reuse / fetch, as real ``put_batch``
+  / ``touch`` / ``get_batch`` calls over whatever KV it is handed. It used to also
+  own *what a KV block is* and check that one was the size the model predicts;
+  both moved to the accelerator, which is the thing that produces the blocks (see
+  :mod:`~kvcache_sim.data._compute`). It is the *only* path between two serving
+  hosts: a prefill host publishes a request's KV and its decode host fetches it
+  back, which is what makes the handoff a transfer with a price rather than an
+  argument to a method call;
+* :mod:`~kvcache_sim.data._compute` and :mod:`~kvcache_sim.data._prefill` -- the
+  accelerator an engine runs on, and the prefill engine that runs on it. A forward
+  pass returns the KV it produced, so what a block *is* and how big one is are
+  answered by whatever implements that port -- a simulated run's meta tensors, a
+  deployment's attention output.
 
 The test for what belongs here: does it advance the clock or move bytes? A
 directory *read* does neither, so it is a control-plane view, not a verb here. So

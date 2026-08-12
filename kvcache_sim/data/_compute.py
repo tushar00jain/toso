@@ -18,6 +18,24 @@ one thing that port does not: fabric cost is *incurred* by the real client call 
 data plane already makes, so predicting it is enough. Nothing here makes a GPU busy
 on its own, so this both predicts and incurs.
 
+A forward pass produces KV, so this port hands it back
+--------------------------------------------------------
+:meth:`Accelerator.prefill` answers with the KV blocks the pass produced, and
+:attr:`Accelerator.block_tokens` says how many tokens one of them holds. Both are
+here rather than beside the store because the thing that knows what a forward pass
+*costs* is the thing that knows what it *produces*: the block size is the engine's
+own cache layout, and the tensors are the engine's own output. The store used to be
+told both -- it was constructed with a "carrier" and a token count and manufactured
+one identical stand-in per key -- which put the byte count that every fetch is
+priced against in the one object that computes nothing.
+
+So the serving host publishes what prefill handed it, and the store publishes what
+it is handed. A simulated accelerator returns ``device="meta"`` tensors: real
+``torch.Tensor`` objects of the right dtype and byte count with no storage behind
+them (:class:`kvcache_sim.workload._accelerator.SimulatedAccelerator`); a deployment
+returns the KV its attention kernels just wrote. Neither is a shape this port has to
+know about, which is the point of handing it back rather than describing it.
+
 One object is one accelerator
 -----------------------------
 A host has one, and hands it to whichever engines run on it. Whether its prefill
@@ -31,6 +49,9 @@ choose, not a flag an engine carries.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import List, Sequence
+
+import torch
 
 __all__ = ["Accelerator"]
 
@@ -57,6 +78,19 @@ class Accelerator(ABC):
     look merely fast.
     """
 
+    @property
+    @abstractmethod
+    def block_tokens(self) -> int:
+        """Tokens one KV block holds -- this engine's cache-page size.
+
+        A fact about how the engine lays its KV cache out, and therefore what
+        :meth:`prefill` returns one tensor per. Read off the accelerator rather
+        than configured a second time next to the store, because two numbers that
+        have to agree and are set in two places eventually do not: the store's copy
+        used to be what a request's recomputed prefix was measured with while this
+        one was what the KV was actually cut into.
+        """
+
     @abstractmethod
     def prefill_cost(self, tokens: int) -> float:
         """What prefilling ``tokens`` uncached tokens costs here."""
@@ -66,8 +100,32 @@ class Accelerator(ABC):
         """What one decode step over ``batch_size`` requests costs here."""
 
     @abstractmethod
-    async def prefill(self, tokens: int) -> None:
-        """Run a forward pass over ``tokens`` uncached tokens; return when done."""
+    async def prefill(
+        self, tokens: int, cached: Sequence[torch.Tensor] = ()
+    ) -> List[torch.Tensor]:
+        """Forward-pass ``tokens`` uncached tokens; answer with the KV that results.
+
+        ``cached`` is the KV this host pulled for the prefix in front of those
+        tokens -- blocks another host computed and this one fetched out of the store.
+        It is passed in rather than fetched here because getting it is a store call
+        and this port makes none; what an engine does with it is load it into the
+        cache the forward pass then attends over, which is why it comes back out in
+        the answer.
+
+        Answers with **one tensor per KV block this host now holds and did not
+        before**, in prompt order: the pulled prefix first, then the suffix this
+        pass computed. That is exactly the set the caller publishes, which is the
+        reason for the shape -- the alternative, returning only the newly computed
+        blocks and leaving the caller to splice the pulled ones back in front, puts
+        the ordering of a request's KV in the serving loop, where a silent
+        off-by-one would publish real bytes under the wrong keys.
+
+        A real engine holds its KV as one contiguous per-layer region and would
+        slice it; per-block is what the store wants and what a paged engine already
+        has, so it is what this port asks for. Returning the region plus a block
+        table was considered and rejected: it is a second description of the same
+        layout that only the caller would use, and only to cut it up again.
+        """
 
     @abstractmethod
     def claim_step(self, batch_size: int) -> float:
