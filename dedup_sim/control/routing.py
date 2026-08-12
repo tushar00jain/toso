@@ -87,6 +87,9 @@ class DedupPolicy(Policy):
         # one popleft cannot leave a half-applied cap behind the way an increment,
         # a comparison and a conditional pop could. See :meth:`_assign`.
         self._avail: Deque[str] = deque()
+        # Requesters that have already been offered their slots. A requester is
+        # offered once however many times it is assigned -- see :meth:`_offer`.
+        self._offered: Set[str] = set()
         # The (volume, key) publications this policy has planned and not yet seen
         # land: a requester it routes reads the key through into its own volume,
         # so from the moment it is routed it OWES that registration. This is the
@@ -189,12 +192,18 @@ class DedupPolicy(Policy):
     def _offer(self, requester: str) -> None:
         """Offer ``requester`` as a source for up to ``cap`` later peers.
 
-        Once: a requester re-assigned after its source was retired still holds the
-        slots it was given, and a second offer would let it be handed out past the
-        cap.
+        Once per requester, however many times it is assigned. A requester whose
+        source is retired is assigned afresh, and offering it again there would
+        hand it a second full batch of slots -- so one whose first batch had
+        already been consumed would go on to feed ``2 x cap`` peers. Tracked
+        separately from the queue because the queue only remembers the slots that
+        are *left*: an exhausted requester is absent from it and would otherwise
+        look like one that had never been offered at all.
         """
-        if requester not in self._avail:
-            self._avail.extend([requester] * self.cap)
+        if requester in self._offered:
+            return
+        self._offered.add(requester)
+        self._avail.extend([requester] * self.cap)
 
     # -- readiness ----------------------------------------------------------- #
     async def _registered(

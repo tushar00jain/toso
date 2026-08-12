@@ -309,6 +309,44 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
     assert selection.ready is not None  # r1's read-through is what it waits on
 
 
+def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
+    """Being assigned twice does not make a requester a source twice over.
+
+    A requester becomes a source for ``cap`` peers when it is first assigned one.
+    Retiring its own source drops its route, so its next ask is assigned afresh --
+    and an offer made there would hand it a whole second batch of slots. The
+    queue cannot catch that on its own, because a queue only remembers the slots
+    still *left*: a requester whose ``cap`` peers have all attached is absent from
+    it and looks exactly like one that was never offered. So it would go on to
+    feed ``2 x cap``, and the cap the run was configured with would not be the
+    one it got.
+    """
+    cap = 2
+
+    async def _fanout_across_a_retire() -> int:
+        directory = Directory(W="p")
+        policy = DedupPolicy(fanout_cap=cap)
+        # r0 pulls from the origin and publishes: a source for cap peers now.
+        await policy.select(directory, [KEY], "r0")
+        directory.publish("r0", KEY, policy)
+        served = 0
+        for i in range(cap):  # ...and every one of those slots is taken
+            if (await policy.select(directory, [KEY], f"r{i + 1}")).sources == ("r0",):
+                served += 1
+        # The origin drops the key, so r0's source holds nothing and owes nothing:
+        # it is retired, and r0 is assigned afresh on the ask after that.
+        directory.evict("p", KEY)
+        await policy.select(directory, [KEY], "r0")
+        await policy.select(directory, [KEY], "r0")
+        for i in range(2 * cap):
+            if (await policy.select(directory, [KEY], f"x{i}")).sources == ("r0",):
+                served += 1
+        return served
+
+    served, _trace = run_sim(_fanout_across_a_retire())
+    assert served == cap
+
+
 def test_the_policy_remembers_no_registrations():
     """What it keeps is per requester, not per (volume, key) ever registered.
 
