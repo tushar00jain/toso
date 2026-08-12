@@ -15,9 +15,11 @@ Every one of those is about *compute*: where work runs, whether it may run, and 
 the machines are doing. What becomes of the *data* -- which blocks the directory
 should hold, and which stop existing -- is not asked here. Publishing is a fact the
 serving host already has (the blocks past the reused prefix are the ones it just
-computed), and retention is a store question, asked of this object's other half:
-:meth:`_Base.evict`, which the volume reaches through the directory when it is
-actually out of room.
+computed), and retention is not asked of this surface at all: a volume that runs out
+of room drops its own coldest keys and tells the directory afterwards
+(:mod:`realsim.seams._retention`), with no control plane in the loop. Whether one
+should get a say -- it is the half that knows a key has three other copies, or that a
+version is dead -- is an open question, not a member of this class.
 
 Every argument and every return is a value. Nothing here takes a handle to a
 data-plane object, and nothing here is a field the data plane reads -- see
@@ -27,8 +29,16 @@ Routing models the cache-aware coordinator's serialized mailbox: the real
 directory read completes without suspending the loop, so the whole routing
 decision runs atomically before the next event -- routing sees a consistent
 directory snapshot (:class:`~kvcache_sim.control._view.PinnedKVView` makes that
-snapshot explicit). Prefill cost is deterministic, so the *predicted* TTFT used
-for routing equals the *actual* completion time.
+snapshot explicit).
+
+Prefill cost is deterministic, so on the default path the *predicted* TTFT used for
+routing is also the actual completion time. That is a property of the default path,
+not of the prediction: three things can move the executed cost off it -- a peer that
+evicted the planned blocks (the plan is recomputed), a pull served by a volume other
+than the one priced, and ``contention`` charging a busy link or device more than an
+idle one. :meth:`_Base._decide_prefill_finished` exists precisely because the two can
+diverge. The TTFT the metrics record is this prediction rather than a measurement,
+which is a deliberate choice and its consequences are spelled out in the README.
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM): route to the least-loaded instance;
   reuse only that instance's **local** cache; never pull a remote prefix.
@@ -425,6 +435,47 @@ class _Base(Policy, Coordinator):
         done = avail + transfer_t + prefill_t
         return queue_wait, done - now, done
 
+    def _candidate(
+        self,
+        request: Request,
+        inst: str,
+        now: float,
+        *,
+        match: int,
+        source: Optional[str] = None,
+        pull_keys: Sequence[str] = (),
+    ) -> Plan:
+        """Price prefilling ``request`` on ``inst`` reusing ``match`` blocks.
+
+        The arithmetic both schedulers do, and the only thing they share about a
+        candidate: what the reused prefix saves, what the suffix costs to compute,
+        what pulling ``pull_keys`` from ``source`` costs, and where all of that lands
+        in ``inst``'s predicted queue. It decides nothing -- which candidate wins is
+        the caller's, which is the only part the two schedulers disagree on.
+
+        Reserves nothing and mutates nothing, so a candidate that loses leaves no
+        trace (:meth:`_commit` is what records a decision actually taken).
+        """
+        cached = min(match * self.B, request.prompt_tokens)
+        uncached = request.prompt_tokens - cached
+        prefill_t = prefill_time(uncached, self.profile, self.model)
+        if source is not None and pull_keys:
+            xbytes = self.model.block_bytes(len(pull_keys), self.B)
+            # The one definition the transport also charges, so this prediction
+            # equals the time the real pull will cost.
+            transfer_t = self.transfer_cost.get_time(source, inst, xbytes)
+        else:
+            source, xbytes, transfer_t = None, 0, 0.0
+        queue_wait, ttft, done = self._predict(inst, now, transfer_t, prefill_t)
+        plan = Plan(
+            request, inst, "", match, cached, uncached, source, xbytes,
+            queue_wait, ttft, done, 0.0,
+        )
+        plan.prefill_t = prefill_t
+        plan.transfer_t = transfer_t
+        plan.pull_keys = list(pull_keys)
+        return plan
+
     # -- decode-side TBT prediction / admission -------------------------- #
     def _predicted_batch(self, d: str, done_time: float) -> int:
         """Predicted decode batch size on ``d`` seen by a request admitted at
@@ -458,6 +509,21 @@ class _Base(Policy, Coordinator):
             self.decode_ids, key=lambda d: (self._predicted_batch(d, done_time), d)
         )
         return (d, self._predicted_batch(d, done_time))
+
+    def _admit(self, plan: Plan) -> Optional[Plan]:
+        """Give a won candidate its decode instance, then apply the gates.
+
+        The tail both schedulers share: the decode side is chosen once, against the
+        prefill completion the winning candidate predicts, so it is not something a
+        candidate loop has to carry around for every alternative it discards.
+        """
+        plan.decode, plan.pred_batch = self._select_decode(plan.done_time)
+        plan.pred_tbt = (
+            decode_step_time(plan.pred_batch + 1, self.profile, self.model)
+            if self.tbt_enabled
+            else 0.0
+        )
+        return self._finalize_admission(plan)
 
     def _finalize_admission(self, plan: Plan) -> Optional[Plan]:
         """Apply the SLO gates, then commit. ``None`` == rejected."""
@@ -497,32 +563,16 @@ class LoadBalanceScheduler(_Base):
 
     async def _decide_route(self, demand: Route) -> Optional[Plan]:
         request = demand.request
-        now = self.view.now()
-        keys = list(request.block_keys)
-        prompt = request.prompt_tokens
         # Consult the real directory for per-instance prefix presence; the
         # baseline only reuses the instance it routes to (local-only cache), so
         # it never asks the source policy anything.
-        counts = await self.view.prefix_lengths(keys)
+        counts = await self.view.prefix_lengths(list(request.block_keys))
         pick = min(self.prefill_ids, key=lambda i: (self.busy_until[i], i))
-        match = counts.get(pick, 0)
-        cached = min(match * self.B, prompt)
-        uncached = prompt - cached
-        pt = prefill_time(uncached, self.profile, self.model)
-        qw, ttft, done = self._predict(pick, now, 0.0, pt)
-        d, pred_batch = self._select_decode(done)
-        pred_tbt = (
-            decode_step_time(pred_batch + 1, self.profile, self.model)
-            if self.tbt_enabled
-            else 0.0
+        return self._admit(
+            self._candidate(
+                request, pick, self.view.now(), match=counts.get(pick, 0)
+            )
         )
-        plan = Plan(
-            request, pick, d, match, cached, uncached, None, 0, qw, ttft, done, 0.0
-        )
-        plan.prefill_t = pt
-        plan.pred_tbt = pred_tbt
-        plan.pred_batch = pred_batch
-        return self._finalize_admission(plan)
 
 
 class CacheAwareScheduler(_Base):
@@ -542,7 +592,6 @@ class CacheAwareScheduler(_Base):
         request = demand.request
         now = self.view.now()
         keys = list(request.block_keys)
-        prompt = request.prompt_tokens
         # One directory snapshot for the whole decision: the candidate loop's
         # local matches and every source query below read the same state.
         view = self.view.pin(keys)
@@ -557,47 +606,22 @@ class CacheAwareScheduler(_Base):
             ranked = await self.source_policy.select(view, keys, inst)
             src_inst = ranked.sources[0] if ranked.sources else None
             src_len = prefix_counts.get(src_inst, 0) if src_inst is not None else 0
-            use_remote = (
+            if (
                 self.replicate
                 and src_inst is not None
                 and src_inst != inst
                 and src_len > local_len * self.balance_threshold
-            )
-            if use_remote:
-                gap_blocks = src_len - local_len
-                pull_keys = keys[local_len:src_len]
-                xbytes = self.model.block_bytes(gap_blocks, self.B)
-                # The one definition the transport also charges, so this
-                # prediction equals the time the real pull will cost.
-                xt = self.transfer_cost.get_time(src_inst, inst, xbytes)
-                cached = min(src_len * self.B, prompt)
-                uncached = prompt - cached
-                pt = prefill_time(uncached, self.profile, self.model)
-                qw, ttft, done = self._predict(inst, now, xt, pt)
-                src, match, xb = src_inst, src_len, xbytes
+            ):
+                # Worth pulling: reuse the peer's whole prefix and fetch the gap.
+                cand = self._candidate(
+                    request, inst, now, match=src_len,
+                    source=src_inst, pull_keys=keys[local_len:src_len],
+                )
             else:
-                pull_keys = []
-                cached = min(local_len * self.B, prompt)
-                uncached = prompt - cached
-                pt = prefill_time(uncached, self.profile, self.model)
-                xt = 0.0
-                qw, ttft, done = self._predict(inst, now, 0.0, pt)
-                src, match, xb = None, local_len, 0
-            cand = Plan(
-                request, inst, "", match, cached, uncached, src, xb, qw, ttft,
-                done, 0.0,
-            )
-            cand.prefill_t = pt
-            cand.transfer_t = xt
-            cand.pull_keys = list(pull_keys)
+                # Not worth it: reuse only what is already here and recompute.
+                cand = self._candidate(request, inst, now, match=local_len)
             if best is None or (cand.ttft, cand.prefill) < (best.ttft, best.prefill):
                 best = cand
 
         assert best is not None
-        best.decode, best.pred_batch = self._select_decode(best.done_time)
-        best.pred_tbt = (
-            decode_step_time(best.pred_batch + 1, self.profile, self.model)
-            if self.tbt_enabled
-            else 0.0
-        )
-        return self._finalize_admission(best)
+        return self._admit(best)
