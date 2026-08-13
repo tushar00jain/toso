@@ -2,13 +2,13 @@
 
 :class:`ServingHost` is **one serving instance**: its cache, its decode batch, its
 compute. A deployment runs one per host, and a host knows about exactly two other
-things: the store and the coordinator. It does not know about another host.
+things: the store and its control plane. It does not know about another host.
 
 Three legs, and the client walks them
 -------------------------------------
 A request can land on any host, and the host it lands on is rarely the host that
 should serve it: which instance holds the longest reusable prefix is a
-cluster-wide fact. So a host that receives a request asks the coordinator where it
+cluster-wide fact. So a host that receives a request asks control where it
 belongs (:meth:`ServingHost.route`) -- and then *answers with the address*. It does
 not call the host it named. The client does::
 
@@ -30,7 +30,7 @@ that sees both halves, and therefore the only one that can time the request.
 Consequences of the redirect model:
 
 * **A host holds no reference to another host.** A serving instance's whole outward
-  surface is the store's client and the coordinator's port.
+  surface is the store's client and the two control ports below.
 * **Reporting state does not travel.** Each host records what *it* did into the
   run's ledger, keyed by request id (the prefill host: the routing decision, the
   reuse, the publish; the decode host: the KV it pulled and the inter-token gaps),
@@ -48,18 +48,16 @@ ingress proxy, DNS -- so it is not here. The run's wiring stands in for it
 
 The lifecycle, once a host is prefilling:
 
-1. ask the coordinator to route the request (control), and record a rejection if
-   it refuses;
+1. ask control to route the request, and record a rejection if it refuses;
 2. if the plan pulls a remote prefix, drive a **real** ``get_batch`` (charging
    fabric via the cost model);
 3. submit the forward pass to this host's accelerator, which runs it when the
    device is free -- so the queue wait is *waited*, not slept from a number, and
    what the request actually waited is recorded next to what control predicted;
 4. publish what this host now holds and did not before -- a real ``put_batch``;
-5. tell the coordinator the clock the real ops actually reached;
-6. on the decode-simulating path, ask control whether the request may enter a
-   decode batch, and answer the client with the first token and the host that
-   will run the rest.
+5. tell control's model the clock the real ops actually reached;
+6. answer the client with the first token and, where the run models decode, the
+   address of the host the plan named to run the rest.
 
 ...and then, on that host:
 
@@ -99,14 +97,25 @@ Simplification (documented in SPEC): a block becomes reusable at prefill
 *completion*, not while in flight, so two requests racing for the same brand-new
 prefix may both compute it. Arrivals are typically spaced enough that this is rare.
 
-The coordinator is not on this host
------------------------------------
+Control is not on this host, and it is two services
+---------------------------------------------------
 Control runs as a service, so this plane reaches it the way it reaches the store:
-through a port, over calls that carry values. That port is
-:class:`~proposed.coordinator.Coordinator` and it is the *only* thing this module
-may touch on the control side -- ``check_structure.py`` rule 6 fails the build on a
-field read, a subscript or a ``getattr`` through it, since none of those survive
-the two planes being in different processes.
+through a port, over calls that carry values. There are two, and the split is
+between asking and telling:
+
+* :class:`~proposed.policy.Placement` -- the **question**: where should this run.
+  A question is answered, so it is called and waited for. The answer is a
+  :class:`~proposed.policy.Selection`, a value, and the one thing this plane takes
+  off it is its winner;
+* :class:`~proposed.deployment.ClusterModel` -- the **facts**: this host's decode
+  batch, its busy compute, the clock its prefill really reached. Nothing comes
+  back, and the reply is waited for anyway, because the next question has to be
+  decided against a model that has already folded the fact.
+
+Those two are the *only* things this module may touch on the control side --
+``check_structure.py`` rule 6 fails the build on a field read, a subscript or a
+``getattr`` through either, since none of those survive the planes being in
+different processes.
 
 So this plane owns the decode engine and *reports* it: every batch change goes out
 as a :class:`~kvcache_sim.control.scheduler.DecodeState` fact. The engine's
@@ -130,11 +139,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from proposed import Coordinator
+from proposed import ClusterModel, Placement
 
-from ..control.scheduler import (
-    AdmitDecode, ComputeBusy, DecodeState, Plan, PrefillFinished, Route,
-)
+from ..control.scheduler import ComputeBusy, DecodeState, Plan, PrefillFinished
 from ..report.metrics import Metrics, RequestResult
 from ..control.request import Request
 from ._decode import DecodeEngine
@@ -160,8 +167,12 @@ class ServingHost:
         store: the :class:`~kvcache_sim.data.store.KVStore` verbs. Also the *only*
             way KV reaches this host from another one: the prefill host publishes
             and the decode host fetches, with the store in between.
-        coordinator: the control plane, through its
-            :class:`~proposed.coordinator.Coordinator` port and nothing else.
+        placement: where a question goes -- the control plane, through its
+            :class:`~proposed.policy.Placement` port and nothing else.
+        cluster: where a fact goes -- control's model of the cluster, through its
+            :class:`~proposed.deployment.ClusterModel` port and nothing else. A
+            separate service because reporting is not asking, and the answers
+            control gives are only as good as what it has been told.
         trace: the run's shared trace.
         metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger --
             the collector each host writes its own half of a request's story into.
@@ -181,7 +192,8 @@ class ServingHost:
         self,
         me: str,
         store: KVStore,
-        coordinator: Coordinator,
+        placement: Placement,
+        cluster: ClusterModel,
         *,
         trace,
         metrics: Metrics,
@@ -191,7 +203,8 @@ class ServingHost:
     ) -> None:
         self.me = me
         self.store = store
-        self.coordinator: Coordinator = coordinator
+        self.placement: Placement = placement
+        self.cluster: ClusterModel = cluster
         self.trace = trace
         self.metrics = metrics
         self.prefill_engine = prefill
@@ -216,29 +229,34 @@ class ServingHost:
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
 
-    # -- what this host tells the coordinator about its decode side -------- #
-    def _decode_state(self, finishes: List[float]) -> None:
+    # -- what this host tells control's model about its decode side -------- #
+    async def _decode_state(self, finishes: List[float]) -> None:
         """Forward a changed decode batch. The engine reports here, not there."""
-        self.coordinator.observe.broadcast(DecodeState(self.me, tuple(finishes)))
+        await self.cluster.notify.call_one(DecodeState(self.me, tuple(finishes)))
 
-    def _compute_busy(self, until: float) -> None:
+    async def _compute_busy(self, until: float) -> None:
         """Forward this host's occupied compute timeline (coupled only)."""
-        self.coordinator.observe.broadcast(ComputeBusy(self.me, until))
+        await self.cluster.notify.call_one(ComputeBusy(self.me, until))
 
     # -- leg 1: the router role, which every host plays -------------------- #
     async def route(self, request: Request) -> Optional[Plan]:
         """A client's request landed here. Answer with where it should actually go.
 
         Which host should *serve* the request is a cluster-wide question about who
-        holds the longest reusable prefix, so every host asks the coordinator -- and
-        hands the answer back rather than acting on it.
+        holds the longest reusable prefix, so every host asks control -- and hands
+        the answer back rather than acting on it.
 
         Returns the :class:`~kvcache_sim.control.scheduler.Plan` for the client to
         take to :meth:`prefill` on ``plan.prefill``, or ``None`` when control refused
         the request outright. A refusal is recorded *here*: no other host will ever
         hear about this request.
+
+        Control answers with a ranking of the hosts it priced, so what this host
+        wants off it is :attr:`~proposed.policy.Selection.winner` -- the plan the
+        head was chosen with. A refusal is that selector's abstention, which names
+        nobody and so has no winner.
         """
-        plan = await self.coordinator.decide.call_one(Route(request))
+        plan = (await self.placement.select.call_one(request, self.me)).winner
         if plan is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"
@@ -262,14 +280,12 @@ class ServingHost:
         """Prefill ``plan``'s request here; answer with its first token and where next.
 
         Returns ``(next host, first token)``: the instance id the client should take
-        this plan to, or ``None`` when there is no next host -- either because this
-        run does not model decode at all, or because control refused the decode
-        admission, which makes this a *wasted* prefill and is recorded here as one.
+        this plan to, or ``None`` when there is no next host, which is a run that
+        does not model decode at all.
 
         The address is optional and the token is not: every request that reaches
-        this method gets prefilled, and a decode admission refused a moment later
-        does not un-produce its first token. That is what makes such a prefill
-        *wasted* rather than avoided.
+        this method gets prefilled, and a request that got this far was admitted
+        before any of it ran.
         """
         # Nothing is reserved on the accelerator here: it books the pass when it is
         # submitted and decode books its steps on the same occupancy, so one object
@@ -334,15 +350,15 @@ class ServingHost:
         # and "had no room" are the two outcomes a capacity sweep exists to tell
         # apart, and a hit rate cannot.
         row.published = await self.store.publish(self.me, fresh, kv)
-        # (4) tell control the clock the real ops actually reached -- the only thing
-        # that closes the loop between control's model of this host's queue and the
-        # queue, and the first news control gets that its prediction was wrong.
+        # (4) tell control's model the clock the real ops actually reached -- the
+        # only thing that closes the loop between the predicted queue for this host
+        # and the queue, and the first news control gets that it was wrong.
         #
-        # Awaited for the ordering, not the answer: the decode admission below must
-        # be decided by a coordinator that has already recorded this completion, and
-        # a one-way report would not guarantee that under a non-zero coordinator
-        # hop. The corrected tail it answers with is control's own model.
-        await self.coordinator.decide.call_one(PrefillFinished(self.me, self._now()))
+        # Awaited for the ordering, not the answer, which carries nothing: the next
+        # request routed against this host must be priced by a model that has
+        # already folded this completion, and a report left in flight is a model
+        # answering off a queue it knows to be wrong.
+        await self.cluster.notify.call_one(PrefillFinished(self.me, self._now()))
         return await self._prefill_done(plan, row), first_token
 
     def _recompute(self, plan: Plan, row: RequestResult) -> int:
@@ -414,19 +430,9 @@ class ServingHost:
                 f" (published {stored}blk){note}",
             )
             return None
-        # Decode-simulating path: control decides whether decode can honour the
-        # TBT SLO; the host performs (or skips) the admission.
-        if not await self.coordinator.decide.call_one(AdmitDecode(plan)):
-            row.accepted = False
-            row.decode_rejected = True
-            row.wasted_prefill = True
-            self.trace.record(
-                self._now(),
-                "REJECT",
-                f"{plan.request.id} decode rejected on {plan.decode}"
-                f" (TBT SLO; wasted prefill on {self.me}){note}",
-            )
-            return None
+        # Decode-simulating path: nothing is asked here. The plan already names the
+        # decode host, and the SLO that could have refused this request was decided
+        # against before its prefill ran.
         self.trace.record(
             self._now(),
             "DONE",

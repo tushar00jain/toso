@@ -366,8 +366,10 @@ stale *current*-occupancy snapshot (which slow prefills leave reading empty, so 
 piles onto one instance and blows the SLO). The `../kvcache_sim/` DES now models all of
 this — a batched `DecodeEngine` (per-step TBT rising with batch size, a `max_batch`
 VRAM cap, coupled vs. disaggregated compute timelines), a TBT SLO/target on the
-worst per-request inter-token gap, and the three admission modes (`off`/`early`/
-`predict`) — in its `disaggregation` and `early_rejection` scenarios (§5.8).
+worst per-request inter-token gap, and both admission modes (`early`/`predict`) — in
+its `disaggregation` and `early_rejection` scenarios (§5.8). Late-checking after the
+prefill is the behaviour this section argues against, so the DES does not implement
+it: every admission decision is taken at `schedule`, where a refusal costs nothing.
 
 ### 5.8 Sequence (two requests sharing a system prompt)
 

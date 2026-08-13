@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from proposed import ControlPlane, Endpoint, Policy, View
+from proposed import ControlPlane, Endpoint, Placement, Policy, View
 from sim_common import config
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
@@ -47,9 +47,11 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
-from realsim.seams.coordinator_handle import LocalCoordinatorHandle
-from realsim.seams.coordinator_service import CoordinatorService
+from realsim.seams.cluster_model_handle import LocalClusterModelHandle
+from realsim.seams.cluster_model_service import ClusterModelService
 from realsim.seams.link import ServiceHop
+from realsim.seams.placement_handle import LocalPlacementHandle
+from realsim.seams.placement_service import PlacementService
 from realsim.runner import ItemDispatch, Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -65,22 +67,26 @@ class Simulation:
         topology: ``node_id -> Endpoint``. The node id is also its storage-volume
             id in the real directory.
         control: the capability's control plane, or ``None`` for the plain path.
-            One object, installed wherever it can be reached from:
+            One object, reached from wherever it answers:
 
-            * if it is a :class:`~proposed.policy.Policy` it is installed in the
-              real controller's ``locate_volumes``, so it runs *in the directory
-              service* and a caller that just does ``client.get(K)`` is routed;
-            * if it declares ``attach(view, transfer_cost)`` it also senses and
-              prices through this stack, which only a control plane deciding more
-              than the store's question needs -- so it is fronted by a
-              :class:`~realsim.seams.coordinator_handle.LocalCoordinatorHandle` as
-              :attr:`coordinator_handle` and reached as its own service.
+            * the store's own selector runs *in the directory service*, installed
+              in the real controller's ``locate_volumes``, so a caller that just
+              does ``client.get(K)`` is routed. That is the control plane itself
+              when it is a :class:`~proposed.policy.Policy`, and otherwise the one
+              it names (:attr:`~proposed.plane.ControlPlane.policy`);
+            * a :class:`~proposed.policy.Placement` is the application's own
+              question, so it is fronted by a
+              :class:`~realsim.seams.placement_handle.LocalPlacementHandle` as
+              :attr:`placement_handle` and reached as its own service;
+            * a model of the cluster
+              (:attr:`~proposed.plane.ControlPlane.cluster`) is fronted too, as
+              :attr:`cluster_handle`, so the hosts report into it directly.
 
-            Both, for one object, is the interesting case: kvcache's coordinator
-            decides compute placement over the handle *and* answers "which peer
-            serves this prefix" in the directory, which is how the peer it priced
-            is the peer that serves the pull without anything being threaded
-            through the data plane to say so.
+            All three, for one object, is the interesting case: kvcache's scheduler
+            ranks prefill hosts over the handle *and* names the chain that answers
+            "which peer serves this prefix" in the directory, which is how the peer
+            it priced is the peer that serves the pull without anything being
+            threaded through the data plane to say so.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`;
             supplies every cost constant and each volume's byte capacity.
         trace: shared :class:`~sim_common.trace.Trace` (created if omitted).
@@ -114,13 +120,14 @@ class Simulation:
         self._quiet = quiet
         self._random_seed = random_seed
 
-        # The store: real controller + real volumes + real clients, one shared
-        # transport factory, and the policy hook inside locate_volumes.
+        # The store: real controller + real volumes + real clients, and one shared
+        # transport factory. What runs in the policy hook inside locate_volumes is
+        # installed below, once the control plane has been attached: a selector
+        # over this run's directory cannot exist before this run's directory does.
         self.mesh = Mesh(
             topology,
             profile=self.profile,
             trace=self.trace,
-            policy=control if isinstance(control, Policy) else None,
             real_directory=real_directory,
         )
         # Every transfer the transports charge lands in the run's one ledger.
@@ -131,28 +138,49 @@ class Simulation:
         self.view: View = self.mesh.view
         self.transfer_cost = ProfileTransferCost(self.mesh.topology, self.profile)
 
-        # The same ``control`` object, reached from the other side. It has already
-        # gone into the Mesh above if it answers the store's question, where the
-        # seam in front of the directory (LocalControllerHandle) consults it; what
-        # happens here is the second seam, for a control plane that also decides
-        # more than that. So: one object, two services, a handle built in one place
-        # only -- the directory's already existed.
-        #
-        # Every control plane is a proposed.ControlPlane, so it is attached by
-        # type rather than by sniffing for the method, and it runs last because
-        # attach hands over the view and the transfer-cost estimate. The handle is
-        # built for all of them; a control plane that runs only in the directory
-        # is simply never asked for it.
-        self.coordinator_handle: Optional[Any] = None
+        # The one ``control`` object, wired to each side that reaches it. Every
+        # control plane is a proposed.ControlPlane, so it is attached by type
+        # rather than by sniffing for the method, and attach runs first because it
+        # hands over the view and the transfer-cost estimate that everything below
+        # is derived from.
+        self.placement_handle: Optional[Any] = None
+        self.cluster_handle: Optional[Any] = None
         if isinstance(control, ControlPlane):
             control.attach(self.view, self.transfer_cost)
-            # What reaching this coordinator costs. Resolved once, here, because
-            # this is the one place a run's coordinator is built -- the same
-            # reason ``make_controller_adapter`` resolves the directory's.
-            self.coordinator_handle = LocalCoordinatorHandle(
-                CoordinatorService(control),
-                hop=ServiceHop(config.current().coordinator_rtt),
-            )
+            # The store's own question, answered inside locate_volumes by the seam
+            # in front of the directory (LocalControllerHandle). Checked and not
+            # assumed: the subject a directory hands down is keys, so a selector
+            # over anything else would be answering a question it was not asked.
+            store_side = control if isinstance(control, Policy) else control.policy
+            if store_side is not None:
+                if not isinstance(store_side, Policy):
+                    raise TypeError(
+                        f"{type(control).__name__}.policy is a "
+                        f"{type(store_side).__name__}, not a Policy: only a "
+                        f"selector over keys may run inside locate_volumes"
+                    )
+                self.mesh.controller_handle.install_policy(store_side)
+            # What reaching this control plane costs. Resolved once, here, because
+            # this is the one place a run's control services are built -- the same
+            # reason ``make_controller_adapter`` resolves the directory's. One
+            # distance for both of them: a model is held by the control plane that
+            # reads it, so a host reaching either crosses the same boundary.
+            hop = ServiceHop(config.current().control_rtt)
+            # The application's own question, which only a Placement answers. A
+            # control plane that runs solely in the directory has no such service.
+            if isinstance(control, Placement):
+                self.placement_handle = LocalPlacementHandle(
+                    PlacementService(control), hop=hop
+                )
+            # The other half of what a host says to control: a question goes to the
+            # placement, a fact goes to the model it corrects. Only a control plane
+            # that keeps one has it (``ControlPlane.cluster``), and it is read
+            # after ``attach`` because that is when a model learns which cluster it
+            # is of.
+            if control.cluster is not None:
+                self.cluster_handle = LocalClusterModelHandle(
+                    ClusterModelService(control.cluster), hop=hop
+                )
 
     @property
     def loop(self) -> AsyncEngine:

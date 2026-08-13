@@ -19,8 +19,8 @@ It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsi
   it is a real `put_batch` of those tensors, which records presence in the real
   directory. Being tensors is the point: `put_batch` types its value, sending a
   `Tensor`/`DTensor` down `Request.from_any` and anything else down
-  `Request.from_objects`, so a run that published a descriptor exercised the object
-  path no KV deployment takes. A remote-prefix pull is a real `client.get_batch`
+  `Request.from_objects`, so publishing a descriptor would exercise an object path
+  no KV deployment takes. A remote-prefix pull is a real `client.get_batch`
   driven through `realsim`'s transport seam and it hands the KV back; eviction
   removes presence via the real `notify_delete_batch`. A KV block is a directory key
   holding a tensor -- real types throughout, with no translation layer.
@@ -68,6 +68,7 @@ python -m kvcache_sim                  # all scenarios: INFO summaries only
 python -m kvcache_sim -v                # add the per-event trace (DEBUG)
 python -m kvcache_sim shared_prefix     # run a single scenario
 python -m kvcache_sim hotspot -v        # one scenario, with the trace
+python -m kvcache_sim hotspot --spread-reads   # spread reads over hot replicas
 python -m kvcache_sim --help            # usage + valid scenario names
 ```
 
@@ -77,6 +78,10 @@ python -m kvcache_sim --help            # usage + valid scenario names
 - `-v` / `--verbose` / `--debug` raises the log level to DEBUG so the `(a)` event
   trace prints (capped to the first 60 events per scenario); the default INFO level
   prints only the `(b)` summaries.
+- `--spread-reads` gives the **hotspot** scenario's cache-aware runs
+  `SpreadReadsPolicy` as their source ranking instead of longest-prefix-then-id, so
+  one replica of a hot prefix does not serve every read of it. Off by default: it
+  changes which replica answers, so it is not byte-identical.
 
 ## The scenarios
 
@@ -92,7 +97,7 @@ python -m kvcache_sim --help            # usage + valid scenario names
   cannot hold one request's own working set.
 - **hotspot** — one dominant tenant (extreme Zipf skew). Compares load-balance
   vs cache-aware **without** replication vs **with** replication. Replication lowers
-  prefill compute at the cost of KV fabric bytes. It no longer also lowers p90 TTFT:
+  prefill compute at the cost of KV fabric bytes. It does not also lower p90 TTFT:
   a dominant *tenant* is many dialogues with their own growing histories, which
   cache-aware routing already scatters, so there is no pile left to spread. The
   scenario says so where it prints.
@@ -111,13 +116,15 @@ python -m kvcache_sim --help            # usage + valid scenario names
   generated, so the disaggregated pool accumulates ~2.7x the blocks the coupled one
   does for identical load.
 - **early_rejection** — heavy decode load under a tight TBT SLO, comparing admission
-  policies `off`/`early`/`predict`. `off` late-checks decode load after prefill and so
-  wastes prefill on rejects; `early`/`predict` gate before prefill (no waste), but only
-  `predict` routes decode by the load foreseen at prefill completion, so it holds the
-  SLO where `early`'s stale snapshot cannot. The `decode KV blocks` row separates them
-  a third way, unlooked-for: routing by foreseen load happens to keep decode where the
-  prompt already is, so `predict` moves a third of the KV `early` does (520 vs 1600
-  blocks) while holding the SLO.
+  policies `early` and `predict`. Both gate at routing, before the prefill runs, so a
+  refusal costs no compute — late-checking after the prefill is the behaviour the
+  design argues against and is not implemented. A mode is not a branch the coordinator
+  tests either: it names whether the decode occupancy the **gate** is fed is predicted
+  forward (`predict`) or read off the last report (`early`), which is all that
+  separates the two. Neither rejects anything at this load, so what the table shows is
+  where each one's decode selection landed — the `decode KV blocks` row separates them
+  by more than any other, unlooked-for: routing by foreseen load happens to keep decode
+  nearer the prompt, so `predict` leaves 2179 blocks resident against `early`'s 2665.
 
 ## Testing
 
@@ -157,13 +164,12 @@ Five consequences, and they are the reason for the shape:
 - **The store *is* the handoff.** A decode host that did not prefill the prompt has
   none of its KV, so it fetches the whole block chain with a real `get_batch`, priced
   by the same cost model as every other transfer. That is the dominant cost in a real
-  prefill/decode-disaggregated system, and it used to be a free method call.
+  prefill/decode-disaggregated system.
 - **The client is still there at the last token, so it can time the request.** The
   decode leg returns when the request finishes, not when it is admitted to a batch, so
   the client stamps `now - arrival` onto the row — the one measurement no host can
-  make, since it spans both of them. That also deleted the run's drain plumbing: decode
-  no longer outlives the coroutine that asked for it, so the harness has nothing left
-  to wait for after the requests.
+  make, since it spans both of them. Decode therefore never outlives the coroutine
+  that asked for it, so the harness needs no drain phase after the requests.
 - **...and it is the only thing that holds the whole answer.** TTFT means time to the
   *first* token, and that token is sampled from the prefill's last position, so the
   prefill leg answers with it and the decode leg answers with the remaining
@@ -176,18 +182,23 @@ Five consequences, and they are the reason for the shape:
 The only calls a "serving engine" makes are:
 
 ```python
-plan = await coordinator.decide(Route(request))        # route; None => rejected
+plan = (await placement.select(request, me)).winner    # route; None => rejected
 ...                                                    # pull remote prefix + prefill
-completion = await coordinator.decide(Published(plan))  # which blocks to publish/evict
-await store.publish(completion.instance, completion.publish)
-busy = await coordinator.decide(PrefillFinished(completion.instance, now))
+await store.publish(plan.instance, fresh, kv)          # cache fill + decode handoff
+await cluster.notify(PrefillFinished(plan.instance, now))
 ```
 
-That is the whole `Coordinator` port: two members, `decide` and `observe`, with this
-application's questions carried as values (plus `AdmitDecode`, and the `ComputeBusy` /
-`DecodeState` facts). It is deliberately all a serving host may touch: control
-holds every instance's queue, cache and decode occupancy, so it runs as a service,
-not here. Everything crossing is a value, which is what lets the in-process call
+One question, asked once: the plan names the prefill host *and* the decode host, so
+everything a request needs is settled before any of it runs and no refusal can cost
+a prefill. Control answers with a `Selection` ranking every prefill host it priced,
+each one's plan under its id on the payload, so `winner` is the decision and an
+abstention (`Selection.of([])`) is the refusal.
+
+Two ports, one member each, split between asking and telling: `Placement.select`
+for the question (a `Request`) and `ClusterModel.notify` for the facts
+(`PrefillFinished`, `ComputeBusy`, `DecodeState`), every one of them a value. They
+are deliberately all a serving host may touch: control holds every instance's
+queue, cache and decode occupancy, so it runs as a service, not here. Everything crossing is a value, which is what lets the in-process call
 become an actor endpoint without either side changing shape. The scheduler only
 ever *decides*: it reads the real directory through a view (`locate_volumes`),
 returns a plan, and is told the outcome. Remote-prefix pulls
@@ -206,21 +217,32 @@ production, so a type all three planes pass (`Request`) belongs in `control/`.
 The test for which folder something belongs in is **does it advance the clock or
 move bytes?** — the decode engine sleeps and
 emits tokens, so it is data; the LRU only picks victims, so it is control; a
-directory read is control even though it awaits.
+directory read is control -- it does neither.
 
 ```
 kvcache_sim/
   control/                # DECIDES -- moves nothing, holds no client
-    scheduler.py          #   LoadBalance (baseline) + CacheAware coordinator,
-                          #   behind proposed.Coordinator, the port the data
-                          #   plane calls:
-                          #   prefill placement, pull-vs-recompute, SLO gates,
-                          #   decode placement; owns the PREDICTED prefill queue
-                          #   and its model of the decode load
+    scheduler.py          #   ONE scheduler behind proposed.Placement, the
+                          #   port the data plane calls: prefill placement,
+                          #   pull-vs-recompute, SLO gates, decode placement,
+                          #   every one of them priced against the cluster model
+                          #   below. LoadBalance (baseline) and CacheAware are
+                          #   presets of it -- two Placements, one naming a peer
+                          #   to pull from and one ranking the priced
+                          #   candidates, and admission as a list of gates
+    _cluster.py           #   KVClusterModel behind proposed.ClusterModel: the
+                          #   PREDICTED prefill queue, the observed decode
+                          #   batches, and what was promised against them. One
+                          #   per run, built in attach() and written only by
+                          #   notify(fact) -- the facts a host reports live here
+                          #   with the fold that applies them, and so do the
+                          #   reads everything that ranks hosts by load makes
     _pending.py           #   Reservations / RoutedPulls: what was decided and
                           #   not yet done. Each expires on its own terms, when
                           #   read -- so no decision method carries a sweep
-    _source.py            #   LongestPrefixPolicy: the one store question
+    _source.py            #   LongestPrefixPolicy (+ the opt-in
+                          #   SpreadReadsPolicy, which spreads reads over
+                          #   equally good replicas): the one store question
                           #   ("which peer serves this gap"), a proposed.Policy
     _view.py              #   KVView: per-instance prefix-run lengths, plus the
                           #   pinned snapshot one routing decision reads through
@@ -251,9 +273,8 @@ kvcache_sim/
     _prefill.py           #   PrefillEngine: what a forward pass costs and
                           #   submitting it -> the KV blocks this host now holds
                           #   and did not before, plus the request's first token.
-                          #   It no longer sleeps a queue wait: the pass waits for
-                          #   the device, so the wait is measured rather than
-                          #   taken from control's forecast
+                          #   The pass waits for the device, so the queue wait is
+                          #   measured rather than taken from control's forecast
     _decode.py            #   async DecodeEngine: batched, stepped decode -> TBT,
                           #   and the tokens each member generated plus the KV
                           #   they left on this host, handed to whoever admitted
@@ -311,18 +332,18 @@ plus the prefix-run read that express KV caching on a mesh.
   pause between them. The runner's `gather` gives concurrency across conversations;
   turns within one are strictly serial. Three consequences worth stating up front.
   (1) The reusable prefix **grows** and contains generated tokens, so the KV a decode
-  host publishes under `Request.continuation_keys` is now looked up and hit — ~15% of
+  host publishes under `Request.continuation_keys` is looked up and hit — ~15% of
   every matched block in the prefill-side scenarios and ~30% in the decode-side ones.
   (2) Only a conversation's first turn has an arrival this workload can state; every
   later one arrives when the run says it does. What stays fixed by the seed alone is
   *which* turns exist, what they contain and how long each user pauses, which is what
   keeps "same workload, different wiring" a fair comparison.
-  (3) The offered load is now **paced by the system**: at most one request per open
+  (3) The offered load is **paced by the system**: at most one request per open
   dialogue can be in flight, and anything that slows a turn down delays its successor.
-  Two scenario claims did not survive that and are withdrawn where they print
-  (hotspot's replication win, early_rejection's predicted-vs-stale decode routing);
-  both needed a burst a closed loop cannot offer. A related surprise: adding a
-  coordinator or client hop now *lowers* mean TTFT on the prefill-side workload,
+  Two scenario claims do not hold under it, and the scenarios say so where they
+  print (hotspot's replication win, early_rejection's predicted-vs-stale decode
+  routing); both need a burst a closed loop cannot offer. A related surprise:
+  adding a coordinator or client hop *lowers* mean TTFT on the prefill-side workload,
   because it throttles the load faster than it lengthens a queue. The hop's cost is
   measured end to end instead, which is the interval that contains it.
 - This optimizes **prefix reuse / TTFT / TBT under a cost model**; absolute numbers
@@ -353,19 +374,17 @@ plus the prefix-run read that express KV caching on a mesh.
   fetch runs after the prefill queue; if a peer evicted a planned block meanwhile,
   the read-through fetches only what remains present (the rest is recomputed) -- the
   faithful real-directory behavior. The peer it pulls *from* is the one the
-  coordinator priced: the run installs `LongestPrefixPolicy` in the directory and the
-  fetch names its source, so `locate_volumes` narrows to that peer. Without it the
+  coordinator priced: the run installs the *scheduler* in the directory, and its
+  `select` answers a fetch with the pull it already routed (falling back to
+  `LongestPrefixPolicy` when it routed none), so `locate_volumes` narrows to that
+  peer. Without it the
   client takes whichever holder the directory lists first, which for a block several
   instances hold (a shared system prompt, anything replicated) can be a different
   locality tier than the one the TTFT prediction was built on.
 - **The prefill queue is real, and it disagrees with the scheduler that predicted
-  it.** A request used to wait by *sleeping `plan.queue_wait`* — the number the
-  scheduler produced when it routed the request — and then sleeping its forward
-  pass. Nothing measured the queue, so a scheduler that mispredicted its own backlog
-  was right by construction in every column the wait lands in: TTFT, end-to-end, and
-  the next request's predicted queue. Now the forward pass is *submitted* to the
-  host's accelerator, after the KV fetch, and runs when that accelerator is free,
-  behind whatever prefill or decode step already has it. The wait is emergent, both
+  it.** The forward pass is *submitted* to the host's accelerator, after the KV
+  fetch, and runs when that accelerator is free, behind whatever prefill or decode
+  step already has it. Nothing sleeps a forecast, so the wait is emergent, both
   numbers are recorded per request (`predicted_queue_wait` and `queue_wait`), and the
   run can contradict control. It does. Mean over accepted requests:
 
@@ -392,33 +411,24 @@ plus the prefix-run read that express KV caching on a mesh.
   every transfer and the mean error is 0.007% — so this is a light-to-moderate-load
   effect, not an overload one.
 
-  What it moved, against the same runs before the queue existed: `early_rejection`'s
-  `predict` mode loses TBT attainment (86.2% → 81.9%), because routing decode by the
-  load foreseen *at prefill completion* is only as good as the prefill completion it
-  foresees — the clearest sign that a self-fulfilling wait was propping a result up.
-  `eviction` hit rates shift in both directions (34.9% → 32.7% at capacity 8,
-  51.5% → 55.2% at 16) as a small cache's publish/evict interleaving moves with the
-  queue. End-to-end barely moves where the queue is short (disaggregation
-  1.269 → 1.266, coupled 1.126 → 1.117). Everything else — the cache-aware-vs-baseline
-  story, the eviction curve's shape, the disaggregation trade — is unchanged.
-
-  There is no flag for the old behaviour, deliberately. A flag is for a genuine
-  alternative (`contention="none"` is a defensible model of an uncontended fabric);
-  sleeping a forecast is not an alternative model, it is just less true, and a second
-  path nobody runs is a second path everybody maintains. The run stays deterministic
-  because the queue is served in an explicitly sorted order — submission instant, then
-  request id — rather than in whichever order the event loop resumed its waiters.
+  It bounds what the decode-side results can be worth: `early_rejection`'s `predict`
+  mode routes decode by the load foreseen *at prefill completion*, so its TBT
+  attainment is only as good as the prefill completion it foresees. The run
+  stays deterministic because the queue is served in an explicitly sorted order —
+  submission instant, then request id — rather than in whichever order the event loop
+  resumed its waiters.
 - **The coordinator hop is free by default.** Control is a service, reached through
-  `realsim/seams/coordinator_handle.py` — so there is now somewhere to charge the round trip,
+  `realsim/seams/placement_handle.py` — so there is somewhere to charge the round trip,
   but `--coordinator-rtt` defaults to `0` and every call is inline. Turn it up and it
   is paid out and back before prefill can start: at `0.5` on the shared-prefix
   workload, mean TTFT goes 2.56 → 4.90 and the hit rate 0.734 → 0.704, because routing
   reads a directory snapshot one hop old and a just-published prefix is not there to
-  reuse yet. Both schedulers pay the same hop, so the comparison holds either way. Two
-  things the seam still does not model: the one-way `observe_*` sends are delivered
-  instantly (a real bus would leave control acting on a slightly stale decode picture,
-  and on a coupled instance there is one per decode step), and the recorded TTFT is
-  control's own prediction, so it moves with queueing rather than by exactly one RTT.
+  reuse yet. Both schedulers pay the same hop, so the comparison holds either way.
+  Reports pay it too, over the seam in front of the model they correct
+  (`realsim/seams/cluster_model_handle.py`, same distance): a decode batch change is
+  a round trip inside the step loop, so on a coupled instance every step pays one.
+  What the seam still does not model is that the recorded TTFT is control's own
+  prediction, so it moves with queueing rather than by exactly one RTT.
 - **The directory hop is free by default too**, and it is charged the same way
   (`--controller-rtt`, one `ServiceHop` per boundary). It is the hop every capability
   crosses on every `locate_volumes` / `notify_put_batch`, the baseline included. Note
@@ -432,53 +442,40 @@ plus the prefix-run read that express KV caching on a mesh.
   the fabric time and the storage/RAM staging are all charged — and none of it reaches
   either per-token column. Not TTFT, which is control's prediction made before any of
   it happens; not TBT, which is measured *between* decode tokens while the handoff
-  finishes before the first one. It used to land nowhere at all: the cost that
-  dominates a prefill/decode-disaggregated deployment was paid on the clock and
-  reported in no table, visible only as an indirect nudge to *when* requests joined
-  their batches. The `mean/p90 end-to-end` rows are the fix — arrival to last token,
-  measured by the client, the only interval that contains the handoff by construction.
-  On the disaggregation scenario the transfer itself is **~0.41s, ~26% of the 1.573
-  mean** (it was ~32% before the decode side started paying for its own residency,
-  which added 0.31s of local writes to the same column), against ~1% for the coupled
-  run, which mostly decodes where it prefilled and pays nothing. It is also enough to
-  flip the comparison: disaggregation wins TBT (0.028 vs 0.147) and *loses* end-to-end
-  (1.573 vs 1.212), which is the trade a dedicated decode pool actually makes.
-  Folding the handoff into TBT instead was tried: the first token
-  comes from the prefill host, so the transfer arguably *is* an inter-token gap. It
-  takes both disaggregation columns to `0.0%` attainment against a target of five
-  decode steps, which is a one-off migration swamping a per-token metric rather than a
-  finding, and it is not how the disaggregation literature measures either
-  (DistServe/Mooncake put KV migration in TTFT and keep TPOT for decode cadence). So:
-  charged on the clock, its bytes in their own column, its time in end-to-end.
-- **A decode host holds KV, so a decode host now pays for it.** Two things land on a
-  decode host and neither used to touch its volume: the block chain it pulls in to
-  attend over (a `get_batch` delivers bytes and stores nothing) and the KV its own
-  generation appends (one position per step, `ceil(n / block_tokens)` blocks, the
-  trailing partial one charged whole because a paged cache allocates whole blocks).
-  So decoding was free in capacity terms — a host could pull every chain it ever
-  served and generate forever inside a bounded volume without pressuring it, and
-  every eviction, hit-rate and capacity number a decode-simulating run reported was
-  flattered by exactly that. Both are now published on the decode host through the
-  same `publish` the prefill side uses, under the prompt's keys and under keys
-  continuing its chain (`Request.continuation_keys`) respectively, and both are
+  finishes before the first one. The `mean/p90 end-to-end` rows are where it lands —
+  arrival to last token, measured by the client, the only interval that contains the
+  handoff by construction. On the disaggregation scenario the transfer itself is
+  **~0.41s, ~26% of the 1.573 mean**, against ~1% for the coupled run, which mostly
+  decodes where it prefilled and pays nothing. It is enough to flip the comparison:
+  disaggregation wins TBT (0.028 vs 0.147) and *loses* end-to-end (1.573 vs 1.212),
+  which is the trade a dedicated decode pool actually makes. Folding the handoff into
+  TBT instead — the first token comes from the prefill host, so the transfer arguably
+  *is* an inter-token gap — takes both disaggregation columns to `0.0%` attainment
+  against a target of five decode steps, a one-off migration swamping a per-token
+  metric rather than a finding, and it is not how the disaggregation literature
+  measures either (DistServe/Mooncake put KV migration in TTFT and keep TPOT for
+  decode cadence). So: charged on the clock, its bytes in their own column, its time
+  in end-to-end.
+- **A decode host holds KV, so a decode host pays for it.** Two things land on one:
+  the block chain it pulls in to attend over (a `get_batch` delivers bytes and stores
+  nothing) and the KV its own generation appends (one position per step,
+  `ceil(n / block_tokens)` blocks, the trailing partial one charged whole because a
+  paged cache allocates whole blocks). Both are published on the decode host through
+  the same `publish` the prefill side uses — under the prompt's keys and under keys
+  continuing its chain (`Request.continuation_keys`) respectively — and both are
   evictable and refusable like anything else there. Published rather than held as
   unlookupable residency, for the same reason the prefill leg publishes a prefix it
   pulled: a host that holds a block says so, and the alternative is a second kind of
   occupancy the directory cannot see. Two consequences, both real: the decode host
   becomes a **replica** (a read-through cache, which is what the hotspot scenario's
   `replicate=True` buys deliberately on the prefill side), and decode **competes**
-  with cached prefixes for the volume. What moved: `disaggregation` end-to-end
-  1.266 → 1.573 and `early_rejection`'s wasted prefills 23 → 19 with SLO attainment
-  28.5% → 32.6% (`off`), 23.8% → 28.7% (`early`), 81.9% → 80.6% (`predict`) — the
-  admission moves are second-order, from decode admissions landing at different
-  instants, and nearly all of it is the *chain* rather than the generation (which is
-  one block per request at this block size). The four prefill-only scenarios are
-  byte-identical, because a run that does not model decode never reaches a decode
-  host. One limit remains, stated rather than fixed: the generation's bytes are
-  charged when it ends rather than as it grows (a publish inside the step loop would
-  stall every other batch member and invent a TBT effect the hardware does not have).
-  The other one — that nothing in this workload ever *looked up* a continuation key —
-  is closed; see the multi-turn bullet below.
+  with cached prefixes for the volume. Nearly all of that pressure is the *chain*
+  rather than the generation, which is one block per request at this block size, and
+  the four prefill-only scenarios never feel it because a run that does not model
+  decode never reaches a decode host. One limit, stated rather than fixed: the
+  generation's bytes are charged when it ends rather than as it grows (a publish
+  inside the step loop would stall every other batch member and invent a TBT effect
+  the hardware does not have).
 - **End-to-end is measured only where there is a last token to measure to.** The four
   prefill-only scenarios (`shared_prefix`, `eviction`, `hotspot`, `overload`) do not
   model decode, so the client's walk ends at prefill completion; stamping *that* under
@@ -510,9 +507,8 @@ plus the prefix-run read that express KV caching on a mesh.
   against `Request.output_tokens` asked for): today the pair is a consistency check,
   and the day a stopping rule or a preemption exists it is the answer.
 - **The client hops are free by default**, and are the only hops a request's journey
-  now has besides the coordinator's and the directory's: `TOSO_CLIENT_RTT` prices one
+  has besides the coordinator's and the directory's: `TOSO_CLIENT_RTT` prices one
   client↔host round trip, and a request makes three of them (route, prefill, decode).
-  It replaces the old `TOSO_HOST_RTT`, which priced a host-to-host forward — a boundary
-  that no longer exists, because hosts do not call each other. Same caveat as the
-  directory hop: TTFT is a prediction made before any of it is paid, so client latency
-  shows up in the wall clock and in later requests' queue waits, not in the TTFT column.
+  Same caveat as the directory hop: TTFT is a prediction made before any of it is
+  paid, so client latency shows up in the wall clock and in later requests' queue
+  waits, not in the TTFT column.

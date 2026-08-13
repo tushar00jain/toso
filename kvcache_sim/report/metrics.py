@@ -87,10 +87,8 @@ class RequestResult:
     prefill: str = ""
     reuse_source: Optional[str] = None
     tbt: float = 0.0                  # worst inter-token gap observed in decode
-    decode_rejected: bool = False    # shed at decode admission (TBT SLO)
-    wasted_prefill: bool = False     # prefill was spent, then decode rejected
     published: bool = True           # the prefix this request computed was cached
-    #: What the coordinator predicted this request would wait for its prefill
+    #: What control predicted this request would wait for its prefill
     #: host, taken off the plan it was routed with.
     predicted_queue_wait: float = 0.0
     #: What it actually waited: the time its forward pass spent queued for the
@@ -301,7 +299,7 @@ class Metrics(Ledger):
 
         Kept apart from :attr:`fabric_bytes` because the two answer different
         questions and only one of them is a choice. A prefix pull is reuse the
-        coordinator elected to buy instead of recomputing; a handoff is the price of
+        control elected to buy instead of recomputing; a handoff is the price of
         decoding somewhere other than where the prompt was prefilled, which
         disaggregation pays on every single request and cannot decline.
         """
@@ -353,16 +351,6 @@ class Metrics(Ledger):
     def tbt_slo_met(self, slo: float) -> float:
         """Fraction of accepted requests whose TBT met ``slo`` (1.0 if none)."""
         return self.fraction(lambda r: r.tbt <= slo, _accepted)
-
-    @property
-    def wasted_prefills(self) -> int:
-        """Requests whose prefill was computed, then shed at decode admission."""
-        return self.count(lambda r: r.wasted_prefill)
-
-    @property
-    def decode_rejections(self) -> int:
-        """Requests rejected at decode admission (TBT SLO)."""
-        return self.count(lambda r: r.decode_rejected)
 
     @property
     def decode_blocks(self) -> int:
@@ -479,41 +467,37 @@ def render_disaggregation(disagg: Metrics, coupled: Metrics,
     ])
 
 
-def render_early_rejection(off: Metrics, early: Metrics, predict: Metrics,
-                           slo: float) -> str:
-    """Render the off/early/predict early-rejection table.
+def render_early_rejection(early: Metrics, predict: Metrics, slo: float) -> str:
+    """Render the early/predict admission table.
 
-    Columns: wasted prefills (compute spent then decode-rejected), decode
-    rejections, accepted (decoded) count, TBT-SLO attainment, and what the client
-    actually waited. ``off`` wastes prefill; ``early``/``predict`` never do (they
-    reject before prefill) -- but only ``predict`` also holds the SLO, since it
-    routes decode by *predicted* load.
+    Columns: accepted (decoded) count, TBT-SLO attainment, what the client actually
+    waited, and the decode-side cache the run's decode selection filled. Both gate
+    before the prefill, so neither can spend compute on a request it then refuses
+    and the accepted row is what each one's forecast let through.
 
     End-to-end is here as well as in the disaggregation table because this
     comparison is the one where the per-token metric and the wait can disagree:
     an admission policy that spreads decode holds the inter-token gap by keeping
     batches small, which is a longer queue somewhere for somebody. The row says
     whether that trade shows up in what a caller experienced. Note what it does
-    *not* average over: a rejected request has no end-to-end latency at all, so
-    ``off``'s column describes the requests it kept, not the ones it shed.
+    *not* average over: a rejected request has no end-to-end latency at all, so a
+    column describes the requests its run kept.
 
     The decode-KV rows say what each policy's *routing* costs in cache. A request
     decoded somewhere other than where it was prefilled drags its whole chain onto
     the decode host's volume and leaves it there, so a policy that spreads decode
-    widely buys its TBT with somebody's capacity -- and the three columns differ by
-    more than 3x on it, which no other row in this table shows.
+    widely buys its TBT with somebody's capacity -- and the two columns differ more
+    on it than on any other row here.
     """
     def pct(x: float) -> str:
         return f"{100.0 * x:.1f}%"
 
     def row(label: str, fn) -> str:
-        return (f"  {label:22}{fn(off):>12}{fn(early):>12}{fn(predict):>12}")
+        return (f"  {label:22}{fn(early):>12}{fn(predict):>12}")
 
     return "\n".join([
         f"  TBT SLO = {slo:.3f} (3x the batch=1 baseline)",
-        f"  {'':22}{'off':>12}{'early':>12}{'predict':>12}",
-        row("wasted prefills", lambda m: m.wasted_prefills),
-        row("decode rejections", lambda m: m.decode_rejections),
+        f"  {'':22}{'early':>12}{'predict':>12}",
         row("accepted (decoded)", lambda m: len(m.accepted)),
         row("TBT SLO attainment", lambda m: pct(m.tbt_slo_met(slo))),
         row("mean end-to-end", lambda m: f"{m.mean_latency:.3f}"),

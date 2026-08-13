@@ -8,6 +8,12 @@
   prefills, pull-vs-recompute, the TTFT/TBT admission gates, where decode lands.
   These are *compute* decisions the store knows nothing about, which is why they
   are app code and not part of the shared policy interface;
+* :mod:`~kvcache_sim.control._cluster` -- what those decisions are made against: one
+  model of the cluster's load per run, behind :class:`proposed.ClusterModel`'s single
+  write verb. The facts a host reports are here with the fold that applies them, and
+  so are the reads everything that ranks or prices against that load makes;
+* :mod:`~kvcache_sim.control._pending` -- what was decided and not yet carried out,
+  each record expiring on its own terms as it is read;
 * :mod:`~kvcache_sim.control._source` -- the one part that *is* a store question,
   "which peer serves this prefix gap", as a :class:`proposed.policy.Policy`. It is
   used twice: the scheduler calls it to *price* a pull against recomputing, and
@@ -15,12 +21,10 @@
   was priced;
 * :mod:`~kvcache_sim.control._view` -- the single derived directory read the
   scheduler needs (per-instance prefix-run lengths, and the private prefix walk
-  behind them), plus the pinned snapshot one decision reads it through;
-* :mod:`~kvcache_sim.control._cache` -- per-instance LRU. It picks victims; it
-  does not delete anything.
+  behind them), plus the pinned snapshot one decision reads it through.
 
 Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and nothing
 reaches into the simulator -- all checked by the repo's contract lint. Control
-senses through a view and returns decisions; what actually happened comes back as
-an observation.
+senses through a view and answers questions; what actually happened arrives as a
+fact its hosts report into the model.
 """

@@ -173,18 +173,20 @@ putget_sim/     the unrouted put/get burst (no policy, no data plane) -- the m x
   report/         summary.py: fabric/wallclock summary + source->dest tree
   __main__.py     the Demo declaration (`python -m putget_sim`)
 proposed/       every contract that outlives the simulator; imports nothing
-  policy.py       Policy.select(view, keys, requester) -> ranked sources +
+  policy.py       Policy.select(keys, requester) -> ranked sources +
                   readiness, plus notice() to open a readiness gate. Naive (all
                   holders, directory order) is the default; the controller
                   consults it inside locate_volumes
-  coordinator.py  Coordinator -- an application's own control plane: decide(demand)
-                  answers or refuses, observe(fact) learns. The questions are the
-                  application's, so the two members fit any of them
-  view.py         View -- awaited, read-only observation: locate, topology and
-                  locality, the clock. Built over a Controller (locate_raw)
-  deployment.py   Deployment -- how data-plane code reaches its store
-  plane.py        ControlPlane -- attach(view, cost); DataPlane --
-                  after(requester, result), defaulting to no-op
+  view.py         View -- read-only observation: locate, topology and locality,
+                  the clock. Built over a Controller, and reads it through
+                  locate_raw alone
+  deployment.py   Deployment -- how data-plane code reaches its store; and each
+                  service as a caller reaches it -- Controller, StorageVolume,
+                  ClusterModel (notify(fact): the load a store cannot see,
+                  written by the hosts that make it)
+  plane.py        ControlPlane -- attach(view, cost) + cluster, the model a run
+                  puts a service in front of; DataPlane -- after(requester,
+                  result), defaulting to no-op
   cost.py         TransferCost -- what a fetch is predicted to cost
   topology.py     Endpoint / Tier / locality -- where a volume is
 domain/

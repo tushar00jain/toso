@@ -227,7 +227,7 @@ class Directory:
         self.by_key = {key: set(vols.split()) for key, vols in holders.items()}
 
     # -- the View surface DedupPolicy uses ---------------------------------- #
-    async def locate(self, keys):
+    def locate(self, keys):
         return {k: {v: None for v in sorted(self.by_key.get(k, ()))} for k in keys}
 
     @staticmethod
@@ -251,6 +251,16 @@ class Directory:
         self.by_key[key].discard(volume)
 
 
+def _sensing(directory: Directory, *, fanout_cap: int) -> DedupPolicy:
+    """A policy sensing through ``directory``, as a run's ``attach`` leaves it.
+
+    Nothing here is priced, so the transfer-cost half of the port is ``None``.
+    """
+    policy = DedupPolicy(fanout_cap=fanout_cap)
+    policy.attach(directory, None)
+    return policy
+
+
 def test_one_registration_releases_every_requester_waiting_on_it():
     """A fan-out cap over 1 means several requesters wait on the same peer.
 
@@ -262,9 +272,9 @@ def test_one_registration_releases_every_requester_waiting_on_it():
 
     async def _burst():
         directory = Directory(W="p")
-        policy = DedupPolicy(fanout_cap=2)
-        await policy.select(directory, [KEY], "r0")  # r0 <- p, the origin
-        waiters = [await policy.select(directory, [KEY], r) for r in ("r1", "r2")]
+        policy = _sensing(directory, fanout_cap=2)
+        await policy.select([KEY], "r0")  # r0 <- p, the origin
+        waiters = [await policy.select([KEY], r) for r in ("r1", "r2")]
         assert all(w.sources == ("r0",) for w in waiters)
         assert all(w.ready is not None for w in waiters), "neither is waiting"
 
@@ -299,12 +309,12 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
 
     async def _after_the_eviction():
         directory = Directory(W="p")
-        policy = DedupPolicy(fanout_cap=3)
-        await policy.select(directory, [KEY], "r0")  # r0 <- p
+        policy = _sensing(directory, fanout_cap=3)
+        await policy.select([KEY], "r0")  # r0 <- p
         directory.publish("r0", KEY, policy)  # r0's read-through lands
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
-        stale = await policy.select(directory, [KEY], "r1")
+        stale = await policy.select([KEY], "r1")
         # Nothing to wait for, and nobody to be sent to: the naive answer.
         assert stale.ready is None, "parked on a registration nobody owes"
         assert stale.sources is None
@@ -312,7 +322,7 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
 
         # r1 is a live source though -- it is fetching now -- so r2 attaches to it
         # rather than to the peer that was retired.
-        return await policy.select(directory, [KEY], "r2")
+        return await policy.select([KEY], "r2")
 
     selection, _trace = run_sim(_after_the_eviction())
     assert selection.sources == ("r1",)
@@ -335,21 +345,21 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
 
     async def _fanout_across_a_retire() -> int:
         directory = Directory(W="p")
-        policy = DedupPolicy(fanout_cap=cap)
+        policy = _sensing(directory, fanout_cap=cap)
         # r0 pulls from the origin and publishes: a source for cap peers now.
-        await policy.select(directory, [KEY], "r0")
+        await policy.select([KEY], "r0")
         directory.publish("r0", KEY, policy)
         served = 0
         for i in range(cap):  # ...and every one of those slots is taken
-            if (await policy.select(directory, [KEY], f"r{i + 1}")).sources == ("r0",):
+            if (await policy.select([KEY], f"r{i + 1}")).sources == ("r0",):
                 served += 1
         # The origin drops the key, so r0's source holds nothing and owes nothing:
         # it is retired, and r0 is assigned afresh on the ask after that.
         directory.evict("p", KEY)
-        await policy.select(directory, [KEY], "r0")
-        await policy.select(directory, [KEY], "r0")
+        await policy.select([KEY], "r0")
+        await policy.select([KEY], "r0")
         for i in range(2 * cap):
-            if (await policy.select(directory, [KEY], f"x{i}")).sources == ("r0",):
+            if (await policy.select([KEY], f"x{i}")).sources == ("r0",):
                 served += 1
         return served
 

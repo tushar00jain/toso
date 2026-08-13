@@ -11,23 +11,28 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
 - ``volume_service.VolumeService`` -- the storage server: a real ``InMemoryStore``
   behind the real ``StorageVolume`` endpoint bodies, plus this volume's residency
   and the capacity rule that asks control what to drop
-- ``coordinator_service.CoordinatorService`` -- the same for a coordinator: it
-  holds a capability's control plane (a ``proposed.Coordinator``) and answers the
-  caller's surface, ``proposed.deployment.Coordinator``
+- ``placement_service.PlacementService`` -- the same for the selector an
+  application's own hosts ask: it holds a capability's control plane and answers
+  its surface, ``proposed.Placement``
+- ``cluster_model_service.ClusterModelService`` -- the same for the model that
+  control plane decides against: it holds the application's
+  ``proposed.ClusterModel`` and folds the facts its hosts report
 - ``controller_handle.LocalControllerHandle`` -- what a caller holds for that
   service: one endpoint per member (``locate_volumes`` / ``notify_put_batch`` /
   ``keys``), reached through ``call_one`` / ``call`` / ``broadcast``.
 - ``volume_handle.LocalVolumeHandle`` -- the same for a storage volume
   (``put`` / ``get`` / ``handshake`` / ``delete`` / ``delete_batch`` / ``reset``).
-- ``coordinator_handle.LocalCoordinatorHandle`` -- the same for a coordinator
-  service (``decide`` / ``observe``), and the one of the three whose hop a run
-  gives a duration.
+- ``placement_handle.LocalPlacementHandle`` -- the same for a placement service
+  (``select``), whose hop a run gives a duration.
+- ``cluster_model_handle.LocalClusterModelHandle`` -- the same for a cluster model
+  (``notify``), at that same distance: the model is held by the control plane that
+  reads it.
 
 Each pair is a server and a reference to it, split because they are different
 shapes: a service has methods, a reference has endpoints, and in a deployment the
-first becomes an actor while the second becomes Monarch's own handle. All three
-services in a deployment are here, and each one's surface is declared in
-``proposed`` (``Controller``, ``StorageVolume``, ``Coordinator``).
+first becomes an actor while the second becomes Monarch's own handle. All four
+services a deployment runs are here, and each one's surface is declared in
+``proposed`` (``Controller``, ``StorageVolume``, ``Placement``, ``ClusterModel``).
 - ``dict_directory.DictDirectory`` -- a plain-``dict`` stand-in for the
   controller's ``Trie`` directory, presenting the same ``Mapping`` +
   ``keys().filter_by_prefix`` surface so the opt-in shim adapter can skip the

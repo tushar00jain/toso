@@ -38,3 +38,27 @@ comment, keep it fixed for the whole run, and keep any ordering seq-tie-broken.
 New fidelity/perf features default to the historical behavior (`contention="none"`,
 `collapse_charges=False`, `real_directory=True`, `trace=True`) so the default path
 stays byte-identical and nothing changes unless a run opts in.
+
+## Prose: the docs serve the code, not the other way round
+Comments and docstrings exist to make the code faster to read. Prose that does not
+do that is deleted, not shortened.
+
+Write:
+- what the thing is and how to use it, in as few words as it takes;
+- why it is **correct** when that is not obvious (an invariant, a tie-break, an
+  ordering constraint, a reason a race cannot happen);
+- what is **missing** — remaining work, a known gap, a limit worth trusting less.
+
+Do not write:
+- **history.** No "used to", "no longer", "previously", "this replaced", "a claim
+  withdrawn", "it was N, now it is M". A comment describes the code beside it, not
+  the code it replaced. Git holds the past.
+- **justification of a decision already visible in the code.** If the signature says
+  it, the docstring does not need a paragraph arguing for it.
+- **essays.** A class docstring that runs longer than the class is a design doc in
+  the wrong file; put it in `docs/` and link, or cut it.
+- restating what the next line plainly does.
+
+Rules of thumb: a module's prose should not exceed roughly a third of its lines; a
+docstring longer than ~15 lines needs a reason; one idea is stated **once**, in the
+one place it belongs, and cross-referenced from anywhere else that needs it.

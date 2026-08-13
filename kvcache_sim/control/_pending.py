@@ -1,6 +1,6 @@
 """Decisions taken but not yet carried out: :class:`Reservations`, :class:`RoutedPulls`.
 
-A coordinator that predicts has to remember what it has already promised, because
+A control plane that predicts has to remember what it has already promised, because
 the next decision is made against a cluster that has not finished doing the last
 one. Both records here are *self-expiring*, and expiry runs on the **read** rather
 than on the write: a routing decision reads before it writes, so sweeping on write
@@ -19,7 +19,7 @@ __all__ = ["Reservation", "Reservations", "RoutedPulls"]
 
 
 class Reservation(NamedTuple):
-    """A prefill this coordinator has committed to, and the decode it will join."""
+    """A prefill the scheduler has committed to, and the decode it will join."""
 
     prefill_done: float
     decode_id: str

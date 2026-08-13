@@ -96,7 +96,6 @@ class Mesh:
         registry: Optional[ResourceRegistry] = None,
         real_directory: Optional[bool] = None,
         on_transfer: Optional[OnTransfer] = None,
-        policy: Optional[Any] = None,
     ) -> None:
         self.topology: Dict[str, Endpoint] = dict(topology)
         self.ids: List[str] = sorted(self.topology)
@@ -113,13 +112,13 @@ class Mesh:
         # endpoint through :attr:`controller_handle`, which is the name the
         # ``Deployment`` port uses, rather than a second alias here.
         self.directory = make_controller_adapter(real_directory)
-        # A policy installed here IS a control plane, and this is where it runs:
-        # inside the endpoint's locate_volumes (see LocalControllerHandle._route).
-        # ``None`` is the naive answer -- every holder, directory order -- which
-        # is what the real directory returns unaided, so an unrouted mesh pays
-        # nothing for the hook.
-        if policy is not None:
-            self.controller_handle.install_policy(policy, self.view)
+        # No policy yet: a mesh answers for itself -- every holder, directory
+        # order -- until whoever assembled it installs one through
+        # ``controller_handle.install_policy``, which is where a control plane
+        # runs (inside the endpoint's locate_volumes, see
+        # LocalControllerHandle._route). An unrouted mesh pays nothing for the
+        # hook.
+        #
         # Each volume's byte capacity comes from the run's profile
         # (``storage_capacity_bytes``, default unbounded); the seam enforces it
         # against the aggregate resident working set, evicting its own coldest

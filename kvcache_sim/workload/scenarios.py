@@ -23,6 +23,7 @@ from realsim.demo import Console, Scenario
 from realsim.run import Result, Run
 from sim_common.trace import Trace
 
+from ..control._source import SpreadReadsPolicy
 from ..report.metrics import Metrics
 from ..report.summary import (
     CacheVsBaselineReport,
@@ -32,7 +33,7 @@ from ..report.summary import (
     HotspotReport,
 )
 from ._generator import make_workload
-from ._serving import BLOCK_TOKENS, coordinator, KVWorkload, serving_plane
+from ._serving import BLOCK_TOKENS, KVWorkload, scheduler, serving_plane
 
 __all__ = [
     "TRACE_LIMIT",
@@ -63,11 +64,14 @@ def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
     and cannot drift between them.
     """
     # The pools are a deployment fact and go to both planes: the data plane gives
-    # a host the engines its pools put on it, and the coordinator routes to the
+    # a host the engines its pools put on it, and control routes to the
     # same pools. ``coupled`` is a separate, fidelity question -- does this run
     # model a prefill and a decode step on one host as colliding? -- so it goes to
-    # the data plane alone, which answers it by sharing a timeline or not.
+    # the data plane alone, which answers it by sharing a timeline or not. So is
+    # ``max_batch``: a VRAM cap is a property of the device the batch runs on, and
+    # control never asks how large a batch may get -- only how large it is.
     coupled = knobs.pop("coupled", False)
+    max_batch = knobs.pop("max_batch", 8)
 
     # A per-run machine, so a scenario can give its volumes a different capacity.
     # The default is finite: a serving instance's KV memory is a real bound, and a
@@ -80,13 +84,13 @@ def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
         label,
         KVWorkload(topology, conversations),
         # One control plane, reached from both services: it decides compute
-        # placement through the coordinator seam, and answers the store's routing
-        # question through the directory it is installed in.
-        control=coordinator(kind, **knobs),
+        # placement through the placement seam, and answers the store's routing
+        # question through the chain it names in the directory.
+        control=scheduler(kind, **knobs),
         data=serving_plane(
             coupled=coupled,
             simulate_decode=knobs.get("simulate_decode", False),
-            max_batch=knobs.get("max_batch", 8),
+            max_batch=max_batch,
             prefill_pool=knobs.get("prefill_pool"),
             decode_pool=knobs.get("decode_pool"),
         ),
@@ -273,7 +277,14 @@ class Eviction(Scenario):
 
 
 class Hotspot(Scenario):
-    """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware."""
+    """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware.
+
+    ``--spread-reads`` swaps the source ranking the two cache-aware runs use, from
+    longest-prefix-then-id to :class:`~kvcache_sim.control._source.SpreadReadsPolicy`.
+    This scenario is where it can matter: extreme skew replicates one prefix, and
+    every replica of it ranks identically on prefix alone. Off by default, and only
+    here -- it changes which replica serves a read, so it is not byte-identical.
+    """
 
     name = "hotspot"
 
@@ -283,11 +294,19 @@ class Hotspot(Scenario):
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
         convs = _hotspot_workload(self.seed)
+        spread = getattr(args, "spread_reads", False)
+
+        def source():
+            """A *fresh* policy per run: the tally is per-run state, and two runs
+            sharing one would count each other's grants."""
+            return SpreadReadsPolicy() if spread else None
+
         return [
             _configure("baseline", topo, convs, "load_balance"),
-            _configure("no_replication", topo, convs, "cache_aware", replicate=False),
+            _configure("no_replication", topo, convs, "cache_aware", replicate=False,
+                 source_policy=source()),
             _configure("replication", topo, convs, "cache_aware",
-                 balance_threshold=1.2, replicate=True),
+                 balance_threshold=1.2, replicate=True, source_policy=source()),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
@@ -354,10 +373,10 @@ class Overload(Scenario):
 class Disaggregation(Scenario):
     """Disaggregating prefill from decode protects TBT (Mooncake's headline).
 
-    Both configs run with admission disabled (``slo_tbt=inf``, ``early_rejection=
-    "off"``) so every request is served and measured. Decode capacity is fixed (two
-    instances, ``DISAGG_MAX_BATCH`` each); the only difference is whether those two
-    instances also do prefill. Returns ``[disaggregated, coupled]``.
+    Both configs run with admission disabled (``slo_tbt=inf``, so the TBT gate can
+    refuse nobody) and every request is served and measured. Decode capacity is
+    fixed (two instances, ``DISAGG_MAX_BATCH`` each); the only difference is whether
+    those two instances also do prefill. Returns ``[disaggregated, coupled]``.
     """
 
     name = "disaggregation"
@@ -373,8 +392,7 @@ class Disaggregation(Scenario):
             block_tokens=BLOCK_TOKENS, output_tokens=12, seed=self.seed,
         )
         common = dict(
-            simulate_decode=True, slo_tbt=float("inf"), early_rejection="off",
-            max_batch=DISAGG_MAX_BATCH,
+            simulate_decode=True, slo_tbt=float("inf"), max_batch=DISAGG_MAX_BATCH,
         )
         return [
             _configure("disaggregated", topo, convs, "cache_aware",
@@ -422,7 +440,8 @@ class Disaggregation(Scenario):
 
 
 class EarlyRejection(Scenario):
-    """Predicting decode load avoids wasting prefill (off/early/predict)."""
+    """What the TBT gate is fed: current occupancy (``early``) or foreseen
+    (``predict``)."""
 
     name = "early_rejection"
 
@@ -441,25 +460,24 @@ class EarlyRejection(Scenario):
         )
         return [
             _configure(mode, topo, convs, "cache_aware", early_rejection=mode, **common)
-            for mode in ("off", "early", "predict")
+            for mode in ("early", "predict")
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
-        console.section("EARLY REJECTION: predict decode load, don't waste prefill")
-        console.info("Heavy decode load with a tight TBT SLO of %.3f. Three cache-aware runs",
+        console.section("EARLY REJECTION: gate decode admission on the load you foresee")
+        console.info("Heavy decode load with a tight TBT SLO of %.3f. Both cache-aware runs",
                      EARLY_SLO_TBT)
-        console.info("differ only in the admission policy. 'off' late-checks decode load AFTER")
-        console.info("prefill and rejects on a violation -- so each rejection is a wasted")
-        console.info("prefill (compute already spent). 'early' and 'predict' both gate at")
-        console.info("routing, before prefill, so neither ever wastes prefill; here neither")
-        console.info("rejects (both admit all), so both serve strictly more of the offered")
-        console.info("load. That is the whole of what separates them here.")
-        console.trace(results[2].trace, limit=TRACE_LIMIT)
+        console.info("gate at routing, before the prefill runs, so a refusal costs no compute;")
+        console.info("they differ only in the decode occupancy the gate is fed. 'early' reads")
+        console.info("the last report; 'predict' rolls it forward to this request's prefill")
+        console.info("completion, counting the prefills already promised that will have landed")
+        console.info("by then. Neither rejects anything at this load, so what the columns show")
+        console.info("is where each one's decode selection put the requests.")
+        console.trace(results[1].trace, limit=TRACE_LIMIT)
         console.summary(EarlyRejectionReport(results, EARLY_SLO_TBT))
-        console.info("(Signal: wasted prefill separates 'off' from the rest.)")
-        console.info("A CLAIM WITHDRAWN: that TBT attainment also separates 'predict' (routes")
-        console.info("on the load foreseen at prefill completion) from 'early' (routes on a")
-        console.info("current occupancy a slow prefill leaves reading empty). It does not on a")
+        console.info("A CLAIM WITHDRAWN: that TBT attainment separates 'predict' (routes on the")
+        console.info("load foreseen at prefill completion) from 'early' (routes on a current")
+        console.info("occupancy a slow prefill leaves reading empty). It does not on a")
         console.info("multi-turn stream, and the reason is structural rather than a matter of")
         console.info("degree. A conversation is a closed loop -- a user cannot send turn N+1")
         console.info("before turn N answers -- so at most one request per open dialogue is ever")
@@ -471,10 +489,9 @@ class EarlyRejection(Scenario):
         console.info("constants intended -- many more, shorter conversations -- and no such")
         console.info("change tried so far restores it across seeds, so it is left broken and")
         console.info("said out loud rather than tuned into looking fixed.")
-        console.info("The decode KV row is a third, unlooked-for difference between them, and")
-        console.info("it is the cost of the routing each one picked: a request decoded away")
-        console.info("from its prefill host drags that host's whole chain onto the decode")
-        console.info("host's volume and leaves it there, and that chain is now a conversation's")
-        console.info("history rather than a fixed 12 blocks. This capacity pressure is real:")
-        console.info("these volumes do evict under it, which the eviction sweep would show if")
-        console.info("it modelled decode.")
+        console.info("The decode KV row is the difference nobody went looking for, and it is the")
+        console.info("cost of the routing each one picked: a request decoded away from its")
+        console.info("prefill host drags that host's whole chain onto the decode host's volume")
+        console.info("and leaves it there, and that chain is a conversation's history rather")
+        console.info("than a fixed 12 blocks. This capacity pressure is real: these volumes do")
+        console.info("evict under it, which the eviction sweep would show if it modelled decode.")

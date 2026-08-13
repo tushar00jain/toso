@@ -11,7 +11,11 @@ pin the contract each one owes its callers:
    nothing, byte for byte, which is what lets a capability policy be swapped in
    as the only difference between two runs;
 3. a selection narrows a directory answer to its ranked sources, and withholds
-   the answer until its readiness gate opens;
+   the answer until its readiness gate opens -- and the combinators built on it
+   (``FirstMatch``) tells an *abstention* from the *naive answer*,
+   carry a wrapped selector's gate through, and wake every selector they hold,
+   whichever subtype (``Policy`` over keys, ``Placement`` over an application
+   payload) that selector is;
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -33,8 +37,10 @@ import torch
 from realsim.mesh import Mesh
 from realsim.simulation import Simulation
 from proposed import DataPlane
-from proposed import Policy, Selection
-from proposed.policy import NaivePolicy  # not exported: the base Policy is naive
+from proposed import Placement, Policy, Selection
+# Not re-exported by the package: what a deployment implements is one of the two
+# subtypes, and these are implementations of them (or the base they share).
+from proposed.policy import FirstMatch, NaivePolicy, Selector
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.transport import Endpoint
 from proposed import View
@@ -79,7 +85,7 @@ def test_view_reads_the_real_directory_topology_and_clock():
             sim.mesh.bind_source("a")
             await sim.mesh.client("a").put("W", _payload())
             await asyncio.sleep(2.0)
-            located = await view.locate(["W", "absent"])
+            located = view.locate(["W", "absent"])
             return located, view.now()
 
     (located, now) = _drive(sim, scenario())
@@ -100,10 +106,10 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
     seen: list[str] = []
 
     class _Counting(Policy):
-        async def select(self, view, keys, requester):
+        async def select(self, keys, requester):
             seen.append(requester)
             # Reading the directory from inside select must not recurse.
-            await view.locate(keys)
+            self.view.locate(keys)
             return Selection()
 
     sim = Simulation(_topology(), control=_Counting())
@@ -156,6 +162,81 @@ def test_naive_selection_leaves_a_directory_answer_untouched():
 
 
 # --------------------------------------------------------------------------
+# 2b. One base, two subjects: only a Policy reaches the controller.
+# --------------------------------------------------------------------------
+
+
+class _Answers:
+    """A ``select`` body: return the selection it was handed, remember who asked.
+
+    Shared by both subtypes below so that the *only* difference between them is
+    the base -- which is the claim under test here, and lets section 3b hand a
+    combinator either kind.
+    """
+
+    def __init__(self, selection: Selection | None = None) -> None:
+        self.selection = selection if selection is not None else Selection()
+        self.asked: list[str] = []
+        self.noticed: list[tuple[str, tuple[str, ...]]] = []
+
+    async def select(self, subject, requester):
+        self.asked.append(requester)
+        return self.selection
+
+    def notice(self, volume_id, keys):
+        self.noticed.append((volume_id, tuple(keys)))
+
+
+class _Fixed(_Answers, Policy):
+    """A policy that decides on command -- the store-question kind."""
+
+
+class _FixedPlacement(_Answers, Placement):
+    """The same body over an application payload -- the other kind."""
+
+
+def test_the_subtypes_add_nothing_of_their_own():
+    """The split is a marker, not a second interface, so it cannot drift apart."""
+    for kind in (Policy, Placement):
+        assert kind.__bases__ == (Selector,)
+        assert not vars(kind).keys() & {"select", "notice", "attach", "name"}
+
+
+def test_only_a_policy_is_consulted_by_the_controller():
+    """A selector over a subject the store cannot read must not answer for it."""
+
+    def _asked(control) -> list[str]:
+        sim = Simulation(_topology(), control=control)
+
+        async def scenario():
+            with sim.mesh.installed():
+                sim.mesh.bind_source("a")
+                await sim.mesh.client("a").put("W", _payload())
+                sim.mesh.bind_source("c")
+                await sim.mesh.client("c").get("W")
+
+        _drive(sim, scenario())
+        return control.asked
+
+    assert _asked(_Fixed()) == ["c"]
+    assert _asked(_FixedPlacement()) == []
+
+
+def test_an_installed_policy_is_attached_to_the_run_s_view():
+    """The sensor a policy is consulted with is the one it was brought up with.
+
+    A ``Policy`` is a ``ControlPlane``, so installing one in the directory and
+    attaching it are the same act of assembly -- which is what lets ``select`` take
+    a subject and a requester and no view. A policy installed but never attached
+    would sense through ``None``.
+    """
+    policy = _Fixed()
+    sim = Simulation(_topology(), control=policy)
+    assert policy.view is sim.view
+    assert isinstance(policy.view, View)
+
+
+# --------------------------------------------------------------------------
 # 3. Selection: ranking + readiness.
 # --------------------------------------------------------------------------
 
@@ -195,6 +276,86 @@ def test_selection_withholds_until_its_gate_opens():
     ok, _ = run_sim(scenario())
     assert ok
     assert order == ["opened", "released"]
+
+
+# --------------------------------------------------------------------------
+# 3b. Selector combinators: chaining and bounding, without a second verb.
+# --------------------------------------------------------------------------
+
+
+# The stand-ins are ``_Fixed`` / ``_FixedPlacement`` from section 2b: what a
+# wrapped selector *decides* is its own business, so a combinator only needs one
+# that decides on command and remembers that it was asked.
+
+
+def _select(selector: Selector, keys=("K",), requester="r") -> Selection:
+    """Run one ``select`` off any clock -- no store is involved."""
+    return asyncio.run(selector.select(list(keys), requester))
+
+
+def test_first_match_takes_the_first_answer_and_stops():
+    first, second = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
+    assert _select(FirstMatch([first, second])).sources == ("v0",)
+    assert second.asked == []  # never consulted: the chain had its answer
+
+
+def test_first_match_falls_through_an_empty_ranking():
+    """``Selection.of([])`` names nobody, so it is the abstention."""
+    abstains, answers = _Fixed(Selection.of([])), _Fixed(Selection.of(["v1"]))
+    assert _select(FirstMatch([abstains, answers])).sources == ("v1",)
+    assert answers.asked == ["r"]
+
+
+def test_first_match_stops_at_the_naive_answer():
+    """``Selection()`` is a decision -- the directory's -- not silence.
+
+    The opposite of the test above, and the distinction the combinator is built
+    on: an empty *ranking* names nobody, while ``sources=None`` names everybody.
+    """
+    naive, behind = _Fixed(Selection()), _Fixed(Selection.of(["v1"]))
+    assert _select(FirstMatch([naive, behind])).sources is None
+    assert behind.asked == []
+
+
+def test_an_exhausted_chain_abstains_so_chains_nest():
+    """Running out is not a decision, which is what keeps chaining associative."""
+    assert _select(FirstMatch([])).sources == ()
+    assert _select(FirstMatch([_Fixed(Selection.of([]))])).sources == ()
+
+    last = _Fixed(Selection.of(["v2"]))
+    inner = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of([]))])
+    assert _select(FirstMatch([inner, last])).sources == ("v2",)
+
+
+def test_first_match_keeps_the_winner_s_readiness_gate():
+    async def gate() -> None:
+        return None
+
+    chained = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"], ready=gate))])
+    assert _select(chained).ready is gate
+
+
+def test_first_match_notices_to_every_selector_even_unconsulted_ones():
+    """A wakeup is not a consultation: a gate behind the chain still has to open."""
+    front, behind = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
+    chained = FirstMatch([front, behind])
+    _select(chained)                      # behind is never asked ...
+    chained.notice("v9", ["K"])
+    assert front.noticed == behind.noticed == [("v9", ("K",))]  # ... but is told
+
+
+def test_a_combinator_holds_either_kind_and_is_neither():
+    """Mixing kinds is allowed because the mixture cannot reach the controller.
+
+    A combinator is a plain ``Selector`` whatever it wraps, so a chain of two
+    policies is no more installable than a chain of one and a placement -- which
+    is what makes the mixture harmless rather than something to reject.
+    """
+    mixed = FirstMatch([_Fixed(Selection.of([])), _FixedPlacement(Selection.of(["v1"]))])
+    assert _select(mixed).sources == ("v1",)
+    for combinator in (mixed, FirstMatch([_Fixed(Selection())])):
+        assert isinstance(combinator, Selector)
+        assert not isinstance(combinator, (Policy, Placement))
 
 
 # --------------------------------------------------------------------------

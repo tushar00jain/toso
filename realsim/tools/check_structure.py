@@ -33,13 +33,16 @@ Six rules, none of which a type system can express:
    exceptions.
 6. **A ``data/`` module may call a control port, never read it.** The planes run
    in different services, so what passes between them has to be something a wire
-   could carry. Calling a port the module imports from its sibling ``control/`` is
-   a request -- as is reading a member and invoking a send mode on it
+   could carry. Calling a port the module imports from its sibling ``control/``
+   (or one of the services ``proposed`` declares, :func:`_proposed_ports`) is a
+   request -- as is reading a member and invoking a send mode on it
    (``port.member.call_one(...)``), which is the shape a Monarch handle has.
    Reading a field for its value, handing a bound method out as a callback, or
-   ``getattr``-ing it are not. A port is any imported class that is
-   not a dataclass -- the values that legitimately cross are dataclasses, and
-   reading *their* fields is the point of sending them.
+   ``getattr``-ing it are not. A capability's own port is any imported class that
+   is not a dataclass -- the values that legitimately cross are dataclasses, and
+   reading *their* fields is the point of sending them. Today that leaves two
+   members on the whole control side of a serving host: ``select`` on the
+   selector it asks and ``notify`` on the model it reports into.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -51,7 +54,8 @@ above passed. Rule 5 is the answer, narrowed until it was worth enforcing:
 * over *all* public names it is unenforceable -- 78 hits, mostly correct as they
   stand: type aliases used only in this module's annotations (``MakePlane``,
   ``Edge``), rule tables that exist to be read (``BANNED_ALWAYS``), types a
-  caller receives without importing (``KVView.pin`` -> ``PinnedKVView``),
+  caller receives without importing (``ControlPlane.cluster`` -> a capability's
+  own model, which the run fronts with a service),
   exceptions a caller catches (``StorageCapacityExceeded``). A rule whose
   exception list is longer than its findings enforces nothing;
 * over public **functions** it is 12, because every category above is a class or
@@ -121,6 +125,7 @@ from realsim.tools.check_contract import (
 
 __all__ = [
     "SIM_SUFFIX",
+    "DEPLOYMENT_MOD",
     "REQUIRED_FILES",
     "REQUIRED_DIRS",
     "PLANE_DIRS",
@@ -144,6 +149,11 @@ __all__ = [
 # Packages whose shape is checked. A sim is a ``*_sim``; ``realsim`` is the
 # foundation and has a different (documented) shape.
 SIM_SUFFIX = "_sim"
+
+#: Where ``proposed`` declares its services as a *caller* reaches them -- one
+#: all-coroutine surface each. Half of what rule 6 calls a port (see
+#: :func:`_proposed_ports`).
+DEPLOYMENT_MOD = f"{PROPOSED_PKG}.deployment"
 
 #: What every sim package carries.
 REQUIRED_FILES = ("__init__.py", "__main__.py", "README.md")
@@ -423,26 +433,60 @@ def _is_dataclass(cls: ast.ClassDef) -> bool:
 
 
 def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
-    """Control-plane surfaces ``proposed`` declares, by their marker base.
+    """Surfaces ``proposed`` declares that a ``data/`` module reaches over a wire.
 
     A port that outlives the simulator lives in ``proposed`` rather than in a
-    capability's ``control/`` -- :class:`proposed.coordinator.Coordinator` is one.
-    Those are found structurally, not by name: the deciding half of a capability
-    derives :class:`proposed.plane.ControlPlane`, and nothing else in the package
-    does, so that base is the discriminator. A ``View``, a ``Selection`` or a
-    ``Deployment`` is therefore not a port, which is right -- reading a field off a
-    value the other plane handed over is exactly what values are for.
+    capability's ``control/`` -- :class:`proposed.policy.Placement` is one. Those
+    are found structurally, not by name, on either of two marks:
+
+    * it derives :class:`proposed.plane.ControlPlane` -- the deciding half of a
+      capability, and nothing else in the package does. Followed transitively,
+      because a surface may be declared one level down: a ``Placement`` is a
+      ``Selector`` is a ``ControlPlane``, and a rule that read only the direct base
+      would go quiet on exactly the subtypes a caller holds;
+    * it is declared in :mod:`proposed.deployment` and **every member it declares
+      is a coroutine** -- what a reference to another process offers, and what a
+      surface with a local read never is. That is how
+      :class:`proposed.deployment.ClusterModel` is caught: a host reports into it
+      and asks a selector, and the two are the same kind of reach.
+
+    So a ``View``, a ``Selection`` or a ``Deployment`` is not a port -- each has a
+    member a caller invokes here and now, and reading a field off a value the other
+    plane handed over is exactly what values are for. That is what keeps the answer
+    a selector gives readable: a ``Selection`` crossed the wire, so its ``winner``
+    is the data plane's to take. Nor is ``Controller`` a port, whose ``locate_raw``
+    is exactly such a member; nothing in a ``data/`` module holds one anyway, since
+    reaching the store is what a ``Deployment`` is for.
+
+    Bases are pooled per *name*, so the closure holds whichever module in the
+    package declares a link in the chain.
     """
-    out: Set[str] = set()
+    bases: Dict[str, Set[str]] = defaultdict(set)
+    remote: Set[str] = set()
     for dotted, tree in trees.items():
         if dotted.split(".")[0] != PROPOSED_PKG:
             continue
         for node in tree.body:
-            if isinstance(node, ast.ClassDef) and any(
-                isinstance(b, ast.Name) and b.id == "ControlPlane"
-                for b in node.bases
-            ):
-                out.add(node.name)
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases[node.name] |= {b.id for b in node.bases if isinstance(b, ast.Name)}
+            if dotted != DEPLOYMENT_MOD:
+                continue
+            members = [
+                m for m in node.body
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            if members and all(isinstance(m, ast.AsyncFunctionDef) for m in members):
+                remote.add(node.name)
+    out: Set[str] = set(remote)
+    growing = True
+    while growing:
+        reached = {
+            name for name, parents in bases.items()
+            if "ControlPlane" in parents or parents & out
+        }
+        growing = not reached <= out
+        out |= reached
     return out
 
 
@@ -453,7 +497,7 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     A ``Plan``, a ``Completion`` or a ``Request`` crossing the plane boundary is a
     *value* and its fields are meant to be read; those are dataclasses. A port is
     an object living in the other plane, and in this codebase that is a plain
-    class -- ``Policy`` and ``Coordinator`` both, following the same convention
+    class -- ``Policy`` and ``Placement`` both, following the same convention
     torchstore uses for ``TorchStoreStrategy``. So the discriminator is the
     dataclass decorator, not a base: it keeps holding when a port stops being a
     ``Protocol`` and becomes an ordinary base class.
@@ -461,7 +505,7 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     Two sources, because a port can outlive the simulator. A capability's own
     ``control/`` declares the capability-specific ones; ``proposed`` declares the
     ones that are part of the upstream ask, and a ``data/`` module reaches those by
-    package import (``from proposed import Coordinator``). Both are policed the
+    package import (``from proposed import Placement``). Both are policed the
     same, so moving a port from the first place to the second does not quietly stop
     rule 6 from applying -- which is what would happen if this only looked at
     ``control/``.

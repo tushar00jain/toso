@@ -60,7 +60,9 @@ COPIED_FROM_UPSTREAM = [
 
 #: Members that are the *ask* -- declared here because torchstore would have to gain
 #: them. ``locate_raw`` is ``locate_volumes`` with the policy hook skipped, which is
-#: what a controller hands its own policy through a ``View``.
+#: what a controller hands its own policy through a ``View``, and it is asked for as
+#: a plain **synchronous local method**: a directory read that cannot suspend is
+#: what makes a routing decision atomic without a lock.
 THE_ASK = ["locate_raw"]
 
 
@@ -75,16 +77,27 @@ def _digest(name: str) -> str:
     ).hexdigest()[:32]
 
 
-def _declared() -> list[str]:
+def _members() -> list[str]:
     return [
         name for name in vars(ProposedController)
         if not name.startswith("_") and callable(getattr(ProposedController, name))
     ]
 
 
+def _declared() -> list[str]:
+    """What ``Controller`` copies from upstream."""
+    return [name for name in _members() if name not in THE_ASK]
+
+
+def _asked() -> list[str]:
+    """What it adds: the proposal."""
+    return [name for name in _members() if name in THE_ASK]
+
+
 def test_proposed_controller_declares_the_real_surface():
     """Every copied member exists upstream, spelled the same way."""
-    assert sorted(_declared()) == sorted(COPIED_FROM_UPSTREAM + THE_ASK), _declared()
+    assert sorted(_declared()) == sorted(COPIED_FROM_UPSTREAM), _declared()
+    assert sorted(_asked()) == sorted(THE_ASK), _asked()
     for name in COPIED_FROM_UPSTREAM:
         assert name in RealController.__dict__, (
             f"proposed.Controller declares {name!r}, which the real Controller "
@@ -113,6 +126,35 @@ def test_the_ask_is_still_an_ask():
         )
 
 
+def test_the_ask_is_a_local_synchronous_read():
+    """What torchstore is asked for is a method, not an endpoint or a coroutine.
+
+    A directory read that cannot suspend is what a control plane's atomicity rests
+    on (``dedup_sim.control.routing._assign``,
+    ``kvcache_sim.control.scheduler._Scheduler._decide_route``), so ``async`` here
+    would not be a detail: it would put the interleaving back. Nothing reaches it
+    across a boundary either -- it is absent from the handle, which is what a caller
+    holds.
+    """
+    service = ControllerService(RealController())
+    handle = LocalControllerHandle(service)
+    for name in THE_ASK:
+        declared = getattr(ProposedController, name)
+        assert not inspect.iscoroutinefunction(declared), (
+            f"proposed.Controller.{name} is a coroutine: the ask is a plain local "
+            f"read, and awaiting it would let a second decision interleave"
+        )
+        assert not inspect.iscoroutinefunction(getattr(service, name)), (
+            f"{name} is a coroutine on the service, so the service no longer "
+            f"implements the surface it is meant to"
+        )
+        assert not hasattr(handle, name), (
+            f"the handle offers {name}: the unrouted read has no caller across the "
+            f"boundary, and one reaching it there would be routed nowhere and "
+            f"charged a hop"
+        )
+
+
 def test_the_mirrored_bodies_are_still_the_ones_we_mirrored():
     """A verbatim copy has to be told when the original changes."""
     for name, expected in MIRRORED_BODIES.items():
@@ -132,10 +174,11 @@ def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
     (``locate_volumes.call_one(...)``); collapsing those into methods would break
     every real caller, which is why the two are separate objects.
 
-    The handle carries every member a *caller* reaches, which is all of them but
-    ``locate_raw``: the only reader of the unrouted read is the policy running inside
-    the service, sensing through a ``View`` built over the service itself, so nothing
-    crosses the boundary the handle stands for.
+    The handle carries every member a *caller* reaches, and ``locate_raw`` is not
+    one: the only reader of the unrouted read is the policy running inside the
+    service, sensing through a ``View`` built over the service itself, so nothing
+    crosses the boundary the handle stands for. Which is why it is asked for as a
+    plain synchronous method -- see :func:`test_the_ask_is_a_local_synchronous_read`.
     """
     service = ControllerService(RealController())
     handle = LocalControllerHandle(service)
@@ -144,7 +187,7 @@ def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
             f"{name} is not a coroutine on the service: that is the surface "
             f"proposed.Controller declares, and the service is what implements it"
         )
-    for name in [n for n in _declared() if n != "locate_raw"]:
+    for name in _declared():
         endpoint = getattr(handle, name)
         assert hasattr(endpoint, "call_one") and hasattr(endpoint, "call"), (
             f"{name} on the handle is not endpoint-shaped: a caller reaches an "

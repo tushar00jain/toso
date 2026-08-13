@@ -9,6 +9,7 @@ per-instance clients on the shared deterministic async engine.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 
 import pytest
@@ -20,15 +21,19 @@ from kvcache_sim.control._view import KVView, _longest_prefix_run
 from kvcache_sim.workload._accelerator import (
     BLOCK_TOKENS, SimulatedAccelerator, TOKEN_DTYPE, token_tensor,
 )
+from realsim.seams.cluster_model_handle import LocalClusterModelHandle
+from realsim.seams.cluster_model_service import ClusterModelService
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data.store import KVStore
 from kvcache_sim.control.request import Request
+from proposed import Policy
+from proposed.policy import PolicyChain
+from kvcache_sim.control._source import LongestPrefixPolicy, SpreadReadsPolicy
 from kvcache_sim.control.scheduler import (
-    AdmitDecode, ComputeBusy, DecodeState, LoadBalanceScheduler,
-    PrefillFinished, Route,
+    ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished, _LocalOnly,
 )
 from kvcache_sim.workload._generator import _block_keys_for, make_workload
 from kvcache_sim.tests._run import (
@@ -40,6 +45,8 @@ from kvcache_sim.tests._run import (
     run_overload,
     run_shared_prefix,
 )
+from kvcache_sim.__main__ import KVCacheDemo
+from kvcache_sim.workload import scenarios
 from kvcache_sim.workload.scenarios import (
     DISAGG_TARGET_TBT,
     _make_topology,
@@ -267,10 +274,10 @@ def test_real_directory_prefix_presence_and_eviction():
         with sim.mesh.installed():
             await store.publish("s0", list(keys[:3]), _kv(3))  # s0: 3 leading blocks
             await store.publish("s1", list(keys[:1]), _kv(1))  # s1 holds 1
-            counts = await view.prefix_lengths(list(keys))
+            counts = view.prefix_lengths(list(keys))
             assert counts == {"s0": 3, "s1": 1}
             await _evict(sim.mesh, "s0", [keys[1]])    # break s0's run at index 1
-            counts2 = await view.prefix_lengths(list(keys))
+            counts2 = view.prefix_lengths(list(keys))
             assert counts2 == {"s0": 1, "s1": 1}
         return True
 
@@ -279,6 +286,36 @@ def test_real_directory_prefix_presence_and_eviction():
     finally:
         sim.loop.close()
     assert ok
+
+
+# 2a. One decision, one directory. A routing decision reads the prefix runs once
+#     for its own candidate loop and again from every selector it consults, and
+#     all of those must see the same directory or the prices are not comparable.
+#     The snapshot is scoped state on the view because that is what those selectors
+#     sense through, so it has to be visible for the decision and gone after it.
+def test_a_pinned_view_serves_one_snapshot_and_releases_it():
+    topo = _make_topology(2)
+    keys = _block_keys_for("m0", [0, 1, 2, 3])
+
+    sim = Simulation(topo)
+    store = KVStore(sim.mesh)
+    view = KVView(sim.view.directory, sim.topology)
+
+    async def scenario():
+        with sim.mesh.installed():
+            await store.publish("s0", list(keys), _kv(len(keys)))
+            with view.pinned(list(keys)):
+                pinned = view.prefix_lengths(list(keys))
+                await _evict(sim.mesh, "s0", [keys[1]])
+                held = view.prefix_lengths(list(keys))
+            return pinned, held, view.prefix_lengths(list(keys))
+
+    try:
+        pinned, held, after = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+    assert pinned == held == {"s0": 4}   # the snapshot, not the eviction under it
+    assert after == {"s0": 1}            # ...and the live directory once released
 
 
 # 2b. A pull is all-or-nothing. A plan is made when the request arrives and the
@@ -410,7 +447,7 @@ def test_a_prefix_that_does_not_fit_is_reported_as_not_cached():
     assert refused.hit_rate == 0.0
 
 
-# 7c. A request is served where the coordinator says, not where it landed.
+# 7c. A request is served where control says, not where it landed.
 def test_a_request_is_served_by_its_plan_host_not_the_host_it_landed_on():
     """Every host routes, so where a request lands does not decide where it runs.
 
@@ -581,10 +618,9 @@ def test_a_request_with_no_decode_tokens_finishes_immediately():
 # 13. Disaggregation protects served-request TBT from prefill interference.
 def test_disaggregation_protects_tbt():
     disagg, coupled = run_disaggregation()
-    # Both serve the identical load with no decode rejection (admission disabled).
+    # Both serve the identical load: the TBT SLO is infinite, so nothing is shed.
     for r in (disagg, coupled):
         assert len(r.ledger.accepted) == len(r.ledger.results)
-        assert r.ledger.decode_rejections == 0
     # A dedicated decode pool holds the TBT target for (nearly) every served
     # request; coupling prefill into decode makes a real fraction miss it.
     assert disagg.ledger.tbt_slo_met(DISAGG_TARGET_TBT) >= 0.95
@@ -593,45 +629,34 @@ def test_disaggregation_protects_tbt():
             > coupled.ledger.tbt_slo_met(DISAGG_TARGET_TBT))
 
 
-# 14. Early rejection avoids wasted prefill. The second half of this scenario --
-#     that 'predict' also holds the TBT SLO where 'early' cannot -- did not survive
-#     a closed-loop workload; see the docstring.
-def test_early_rejection_avoids_wasted_prefill():
-    """Gating before prefill never wastes it. Gating on *foreseen* load: no longer
-    separable here.
+# 14. Both admission modes gate before the prefill; what separates them is the
+#     occupancy the gate is fed, and here that shows in routing rather than in TBT.
+def test_the_two_admission_modes_gate_before_prefill_and_route_differently():
+    """Gating at routing never spends compute on a refusal; foreseeing the load
+    changes where decode goes.
 
-    The first claim is the scenario's structural one and is untouched: 'off' asks
-    about decode load after the prefill has been computed, so every refusal it
-    issues is compute already spent, and 'early'/'predict' ask at routing and
-    therefore cannot waste any.
+    The first claim is structural and is what admission is *for*: both modes ask
+    before the prefill runs, so every request that reaches a decode batch was
+    admitted while a refusal would still have been free, and both serve the whole
+    offered load at this SLO.
 
-    The second claim -- 'predict' routes decode by the load foreseen at prefill
-    completion and so holds the SLO where 'early' reads a stale, near-empty
-    occupancy and piles decode onto one instance -- required a burst, and a
-    conversation-per-item workload cannot offer one. At most one request per open
-    dialogue can be in flight, because a user cannot send turn N+1 before turn N
-    answers, so this scenario's 160 requests arrive as ~22 concurrent conversations
-    rather than as an arrival stream at rate 20. With decode occupancy never far
-    from what a stale snapshot reports, the two policies route almost identically:
-    across four seeds the attainment gap is noise and its sign changes. Asserting a
-    direction here would be asserting a seed.
-
-    This is not a scenario whose numbers moved; it is a scenario whose *mechanism*
-    is not exercised by a workload that paces itself. Restoring it means offering
-    the concurrency its constants intended -- many more, shorter conversations --
-    and no constant change tried so far restores it robustly across seeds, so it is
-    reported as an open item rather than tuned into looking fixed.
+    The second is what the lookahead buys, and it is not the TBT column. 'predict'
+    routes decode by the load foreseen at prefill completion and 'early' by a
+    current occupancy a slow prefill leaves reading empty, so the two put requests
+    on different hosts -- visible in the KV each run's decode side ends up holding.
+    Attainment is deliberately not asserted a direction: a conversation-per-item
+    workload keeps at most one request per open dialogue in flight, so occupancy is
+    never far from what a stale snapshot reports and across four seeds the gap is
+    noise whose sign changes. Asserting one would be asserting a seed.
     """
-    off, early, predict = run_early_rejection()
-    # 'off' late-checks decode load after prefill -> some prefills are wasted.
-    assert off.ledger.wasted_prefills > 0
-    assert off.ledger.decode_rejections == off.ledger.wasted_prefills
-    # 'early'/'predict' gate before prefill -> never waste it, and here neither
-    # rejects at all, so they serve strictly more of the offered load.
-    assert early.ledger.wasted_prefills == 0
-    assert predict.ledger.wasted_prefills == 0
-    assert len(early.ledger.accepted) > len(off.ledger.accepted)
-    assert len(predict.ledger.accepted) > len(off.ledger.accepted)
+    early, predict = run_early_rejection()
+    # Nothing is refused after its prefill, because nothing is asked after it: both
+    # runs serve every request they were offered.
+    for result in (early, predict):
+        assert len(result.ledger.accepted) == len(result.ledger.results)
+    # The lookahead is not cosmetic: it lands decode elsewhere, and the decode-side
+    # residency is where that shows.
+    assert early.ledger.decode_blocks != predict.ledger.decode_blocks
 
 
 # 13b. The handoff between prefill and decode goes through the STORE.
@@ -712,7 +737,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
     return value only because the directory has to be read before the loop closes
     and five of these callers do not care.
 
-    A real coordinator is wired in because a decode batch *reports itself*: the
+    A real control plane is wired in because a decode batch *reports itself*: the
     host forwards every batch change to control, so a stub ``None`` would fail on
     the first admission rather than on anything this is testing.
     """
@@ -738,7 +763,8 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
         prompt_tokens=2 * BLOCK_TOKENS, output_tokens=output_tokens,
     )
     host = ServingHost(
-        "s1", store, sim.coordinator_handle, trace=sim.trace, metrics=sim.ledger,
+        "s1", store, sim.placement_handle, sim.cluster_handle,
+        trace=sim.trace, metrics=sim.ledger,
         decode=(
             DecodeEngine(SimulatedAccelerator(), max_batch=8) if engine else None
         ),
@@ -757,8 +783,8 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
             )
             if probe is not None:
                 view = KVView(sim.view.directory, sim.topology)
-                probe["chain"] = await view.prefix_lengths(keys)
-                probe["generated"] = await view.prefix_lengths(
+                probe["chain"] = view.prefix_lengths(keys)
+                probe["generated"] = view.prefix_lengths(
                     list(request.continuation_keys(1))
                 )
             return asyncio.get_running_loop().time(), tokens
@@ -1012,14 +1038,23 @@ def test_the_client_times_every_served_request_end_to_end():
         assert result.ledger.mean_latency > 0
         assert result.ledger.pct_latency(90) >= result.ledger.mean_latency * 0.5
 
-    # A request that was shed has no last token, so it gets no fabricated
-    # duration -- and, more to the point, no waiter: 'off' rejects 22 requests
-    # after their prefill, and the run still ends.
-    off, _early, _predict = run_early_rejection()
-    shed = [r for r in off.ledger.results if r.decode_rejected]
-    assert shed, "no request was shed, so the assertion would be vacuous"
-    assert all(r.latency == 0.0 for r in shed)
-    assert all(r.latency > 0.0 for r in off.ledger.accepted)
+    # A request that was refused has no last token, so it gets no fabricated
+    # duration -- and, more to the point, no waiter: the run still ends. Both
+    # outcomes have to be in one run for the contrast to mean anything, so this is a
+    # decode-modelling run under a TTFT SLO tight enough to shed about half of it.
+    convs = make_workload(
+        num_requests=40, num_conversations=10, system_blocks=1, conv_base_blocks=1,
+        query_blocks=2, arrival_rate=20.0, block_tokens=BLOCK_TOKENS,
+        output_tokens=4, seed=5,
+    )
+    mixed = run(
+        _make_topology(2), convs, "cache_aware",
+        simulate_decode=True, max_batch=4, slo_ttft=3.0,
+    ).ledger
+    refused = [r for r in mixed.results if not r.accepted]
+    assert refused and mixed.accepted, "one outcome is missing, so this is vacuous"
+    assert all(r.latency == 0.0 for r in refused)
+    assert all(r.latency > 0.0 for r in mixed.accepted)
 
 
 def test_a_run_that_does_not_model_decode_reports_no_end_to_end():
@@ -1227,15 +1262,16 @@ def test_a_serving_host_cannot_reach_another_serving_host():
 
     accepted = set(inspect.signature(ServingHost.__init__).parameters) - {"self"}
     assert accepted == {
-        "me", "store", "coordinator", "trace", "metrics", "prefill", "decode",
-        "models_decode",
+        "me", "store", "placement", "cluster", "trace", "metrics", "prefill",
+        "decode", "models_decode",
     }
 
     sim = Simulation(_make_topology(2))
     store = KVStore(sim.mesh)
     hosts = {
         i: ServingHost(
-            i, store, sim.coordinator_handle, trace=sim.trace, metrics=sim.ledger
+            i, store, sim.placement_handle, sim.cluster_handle,
+            trace=sim.trace, metrics=sim.ledger,
         )
         for i in sim.ids
     }
@@ -1327,52 +1363,52 @@ def test_new_scenarios_deterministic():
     assert d1.ledger.mean_tbt == d2.ledger.mean_tbt
     assert c1.ledger.mean_tbt == c2.ledger.mean_tbt
 
-    off1, early1, predict1 = run_early_rejection(seed=3)
-    off2, early2, predict2 = run_early_rejection(seed=3)
-    for a, b in ((off1, off2), (early1, early2), (predict1, predict2)):
+    early1, predict1 = run_early_rejection(seed=3)
+    early2, predict2 = run_early_rejection(seed=3)
+    for a, b in ((early1, early2), (predict1, predict2)):
         assert a.trace.render() == b.trace.render()
-        assert a.ledger.wasted_prefills == b.ledger.wasted_prefills
+        assert len(a.ledger.accepted) == len(b.ledger.accepted)
         assert a.ledger.mean_tbt == b.ledger.mean_tbt
 
 
-# 16. The coordinator seam: control is a service, so the hop is somewhere to
+# 16. The control seam: control is a service, so the hop is somewhere to
 #     charge. At the default (0) it is inline and changes nothing; given a
 #     duration it is paid out and back before prefill can start, so it lands in
 #     TTFT -- the number this capability exists to move.
-def test_coordinator_rtt_defaults_to_free_and_byte_identical():
+def test_control_rtt_defaults_to_free_and_byte_identical():
     baseline = run_shared_prefix(seed=1)[0]
-    with config.overrides(coordinator_rtt=0.0):
+    with config.overrides(control_rtt=0.0):
         explicit = run_shared_prefix(seed=1)[0]
     assert explicit.trace.render() == baseline.trace.render()
     assert explicit.ledger.mean_ttft == baseline.ledger.mean_ttft
 
 
-def test_coordinator_rtt_lands_in_the_wait_and_costs_reuse():
-    """A distant coordinator costs the caller time *and* hit rate.
+def test_control_rtt_lands_in_the_wait():
+    """A distant control plane costs the caller time: every turn pays the round trip.
 
-    Time because every leg of every turn pays the round trip, and hit rate because
-    routing then reads a directory snapshot one hop old, so a prefix another
-    request has just published is not there to reuse yet.
+    Measured end to end, on a decode-modelling run. TTFT will not show it, and not
+    because the hop is free: TTFT here is control's *predicted* queue-plus-prefill,
+    and a conversation is a closed loop, so delaying a turn delays its successor,
+    offers the cluster less work per second and shortens its queues. Mean TTFT on
+    that workload therefore *falls* monotonically as the hop grows (1.86 -> 1.56 ->
+    1.42 at 0 / 0.5 / 2.0), which is the textbook closed-loop response.
+    Arrival-to-last-token is the interval that actually contains the hop, and it is
+    the one a caller experiences, so it is what is asserted.
 
-    Measured end to end, on a decode-modelling run, and that is the change. This
-    used to assert on ``mean_ttft`` over the shared-prefix workload, and under a
-    multi-turn workload that assertion is not merely fragile -- it is false, and
-    for a reason worth stating rather than routing around. TTFT here is control's
-    *predicted* queue-plus-prefill, and a conversation is a closed loop: delay a
-    turn and its successor arrives later too, so a slower system is offered less
-    work per second and its queues are shorter. Mean TTFT on that workload
-    therefore *falls* monotonically as the hop grows (1.86 -> 1.56 -> 1.42 at
-    0 / 0.5 / 2.0), which is the textbook closed-loop response and not the hop
-    getting cheaper. Arrival-to-last-token is the interval that actually contains
-    the hop, and it is the one a caller experiences, so it is what is asserted.
+    Reuse is left unasserted for the same closed-loop reason, and it is worth being
+    explicit that the hop does not cost any: routing does read a directory snapshot
+    one hop old, but the pacing hands that back with interest -- the next turn of a
+    dialogue arrives later, by which time more of the cluster's publishes have
+    landed -- and the hit rate drifts *up* with the hop here (0.843 -> 0.845 ->
+    0.849 at 0 / 0.5 / 2.0). The two effects are of the same small size and the sign
+    is the workload's, not the seam's.
     """
     free = run_disaggregation(seed=0)[0]
-    with config.overrides(coordinator_rtt=0.5):
+    with config.overrides(control_rtt=0.5):
         distant = run_disaggregation(seed=0)[0]
     assert distant.ledger.mean_latency > free.ledger.mean_latency
-    assert distant.ledger.hit_rate < free.ledger.hit_rate
     # The comparison still holds -- both schedulers pay the same hop.
-    with config.overrides(coordinator_rtt=0.5):
+    with config.overrides(control_rtt=0.5):
         cache_aware, load_balance = run_shared_prefix(seed=1)
     assert cache_aware.ledger.hit_rate > load_balance.ledger.hit_rate
     assert cache_aware.ledger.mean_ttft < load_balance.ledger.mean_ttft
@@ -1393,7 +1429,7 @@ def test_client_rtt_defaults_to_free_and_byte_identical():
 def test_a_distant_client_delays_the_request_and_costs_reuse():
     """Three round trips per turn, paid before each leg can start.
 
-    The same two effects the coordinator hop has and measured the same way, for
+    The same two effects the control hop has and measured the same way, for
     the reason the test above spells out: TTFT is a prediction made before any hop
     is paid, and on a self-pacing workload it moves the wrong way anyway. What the
     hops are inside is the caller's own interval, and three of them per turn at
@@ -1406,7 +1442,7 @@ def test_a_distant_client_delays_the_request_and_costs_reuse():
     assert distant.ledger.hit_rate < free.ledger.hit_rate
 
 
-# 17. The peer that serves a pull is the peer the coordinator priced.
+# 17. The peer that serves a pull is the peer control priced.
 #     Control ranks candidates by prefix and prices the pull at that peer's
 #     locality tier (NVLink within a node, RDMA across). The store cannot know
 #     that: `locate_volumes` returns every holder and the client takes the first,
@@ -1437,13 +1473,13 @@ def test_a_pull_is_served_by_the_peer_that_was_priced():
     assert _unplanned_edges(replicated) == 0
 
 
-# 18. The source policy serves both its callers' views.
-#     The scheduler hands it a KVView (pinned, so one decision reads one
-#     snapshot); the controller can only hand it the plain View the mesh built,
-#     because a prefix run is a KV-cache notion the store has no reason to know.
-#     It used to require the first, so the ranking branch raised AttributeError on
-#     the second -- unreachable only because the controller-side call always
-#     carries a chosen source and short-circuits before touching the view.
+# 18. The source policy serves either view it can be attached to.
+#     The scheduler attaches a KVView, whose snapshot one routing decision pins; a
+#     run installing this policy on its own can only attach the plain View the mesh
+#     built, because a prefix run is a KV-cache notion the store has no reason to
+#     know. The ranking branch is the only place the two differ, and a
+#     controller-side call carries an already-chosen source and short-circuits
+#     before reaching it -- so nothing but this test holds the plain view up.
 def test_the_source_policy_accepts_a_plain_view():
     from kvcache_sim.control._source import LongestPrefixPolicy
     from realsim.simulation import Simulation
@@ -1451,13 +1487,15 @@ def test_the_source_policy_accepts_a_plain_view():
     topo = _make_topology(2)
     sim = Simulation(topo)
     keys = _block_keys_for("m0", [0, 1])
+    policy = LongestPrefixPolicy()
+    policy.attach(sim.view, sim.transfer_cost)
 
     async def scenario():
         with sim.mesh.installed():
-            empty = await LongestPrefixPolicy().select(sim.view, keys, "s0")
+            empty = await policy.select(keys, "s0")
             store = KVStore(sim.mesh)
             await store.publish("s1", list(keys), _kv(len(keys)))
-            ranked = await LongestPrefixPolicy().select(sim.view, keys, "s0")
+            ranked = await policy.select(keys, "s0")
         return empty, ranked
 
     try:
@@ -1468,8 +1506,169 @@ def test_the_source_policy_accepts_a_plain_view():
     assert ranked.sources == ("s1",)            # ...and now the holder is ranked
 
 
+# 19. Spreading reads: the opt-in source policy breaks the prefix tie on load.
+#     Reuse value is a property of the prefix, so replicas of a hot prefix rank
+#     identically and the id tie-break sends every read to the same host.
+#     SpreadReadsPolicy counts the grants it issued -- its own bookkeeping, since
+#     nothing in the repo observes per-volume load -- and lets that settle the tie,
+#     under a bound that keeps a genuinely longer prefix winning.
+def _replicated(holders, blocks, *, num=4):
+    """A sim where each of ``holders`` holds ``blocks[holder]`` leading blocks.
+
+    Returns ``(sim, keys)``; the caller drives its own scenario on ``sim.loop`` and
+    closes it. Publishing is the same real ``put_batch`` every other test here
+    uses, so the prefix runs the policy reads come out of the real directory.
+    """
+    sim = Simulation(_make_topology(num))
+    keys = _block_keys_for("m0", list(range(max(blocks.values()))))
+
+    async def fill():
+        with sim.mesh.installed():
+            store = KVStore(sim.mesh)
+            for holder in holders:
+                held = keys[: blocks[holder]]
+                await store.publish(holder, list(held), _kv(len(held)))
+
+    sim.loop.run_until_complete(fill())
+    return sim, keys
+
+
+def _select_heads(sim, policy, keys, *, count, gap=0.0):
+    """The head of ``count`` successive rankings, ``gap`` virtual seconds apart."""
+    policy.attach(sim.view, sim.transfer_cost)
+
+    async def scenario():
+        heads = []
+        with sim.mesh.installed():
+            for _ in range(count):
+                heads.append((await policy.select(keys, "s0")).sources[0])
+                if gap:
+                    await asyncio.sleep(gap)
+        return heads
+
+    return sim.loop.run_until_complete(scenario())
+
+
+def test_spread_reads_rotates_between_equal_prefix_replicas():
+    """Three replicas of one prefix, so the ranking has nothing else to go on."""
+    sim, keys = _replicated(["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 4})
+    try:
+        heads = _select_heads(sim, SpreadReadsPolicy(), keys, count=6)
+        # ...and the same replicas under the default policy, which cannot spread.
+        stuck = _select_heads(sim, LongestPrefixPolicy(), keys, count=6)
+    finally:
+        sim.loop.close()
+    assert heads == ["s1", "s2", "s3", "s1", "s2", "s3"]   # id order, then rotate
+    assert stuck == ["s1"] * 6                             # every read, one host
+
+
+def test_spread_reads_still_prefers_a_materially_longer_prefix():
+    """Load may shave off ``max_discount`` blocks and no more.
+
+    s2 holds twice the prefix and is granted every read regardless: the discount is
+    bounded, so the cost signal can settle a tie but never outvote reuse.
+    """
+    sim, keys = _replicated(["s1", "s2"], {"s1": 2, "s2": 4})
+    try:
+        heads = _select_heads(sim, SpreadReadsPolicy(max_discount=1), keys, count=5)
+        # A discount wide enough to cover the gap does trade reuse away, and only
+        # once it has been fully spent -- stated here because it is the knob's
+        # meaning, not a defect.
+        wide = _select_heads(sim, SpreadReadsPolicy(max_discount=4), keys, count=3)
+    finally:
+        sim.loop.close()
+    assert heads == ["s2"] * 5
+    assert wide == ["s2", "s2", "s1"]
+
+
+def test_spread_reads_forgets_a_grant_once_its_window_passes():
+    """A grant is a window, not a running total, so load cannot accumulate.
+
+    Back-to-back the policy rotates; spaced further apart than the window, every
+    read finds an empty tally and the id tie-break answers again -- which is the
+    difference between "recently routed there" and "has ever been routed there".
+    """
+    sim, keys = _replicated(["s1", "s2"], {"s1": 4, "s2": 4})
+    try:
+        prompt = _select_heads(sim, SpreadReadsPolicy(window=1.0), keys, count=4)
+        aged = _select_heads(
+            sim, SpreadReadsPolicy(window=1.0), keys, count=4, gap=2.0
+        )
+        # window <= 0 is no memory at all: the default policy's ranking, exactly.
+        forgetful = _select_heads(sim, SpreadReadsPolicy(window=0.0), keys, count=4)
+    finally:
+        sim.loop.close()
+    assert prompt == ["s1", "s2", "s1", "s2"]
+    assert aged == ["s1"] * 4
+    assert forgetful == ["s1"] * 4
+
+
+def test_spread_reads_ranks_deterministically():
+    """Same grants, same clock, same ranking -- every time, whole list.
+
+    The rank key ends in the instance id, so no two sources can compare equal and
+    nothing is left for dict or arrival order to decide. Asserted over the full
+    ranking rather than the head, because a caller that rejects the first source
+    reads the rest of it.
+    """
+    async def rankings(sim, keys):
+        policy = SpreadReadsPolicy()
+        policy.attach(sim.view, sim.transfer_cost)
+        out = []
+        with sim.mesh.installed():
+            for _ in range(5):
+                out.append((await policy.select(keys, "s0")).sources)
+        return out
+
+    holders, blocks = ["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 3}
+    first_sim, keys = _replicated(holders, blocks)
+    try:
+        first = first_sim.loop.run_until_complete(rankings(first_sim, keys))
+    finally:
+        first_sim.loop.close()
+    second_sim, keys = _replicated(holders, blocks)
+    try:
+        second = second_sim.loop.run_until_complete(rankings(second_sim, keys))
+    finally:
+        second_sim.loop.close()
+    assert first == second
+    assert first[0] == ("s1", "s2", "s3")   # prefix first, id breaks the s1/s2 tie
+    assert all(len(set(r)) == len(r) == 3 for r in first)
+
+
+def test_the_spread_reads_flag_reaches_a_scenario_run():
+    """The opt-in entry point, exercised from the flag to the ledger.
+
+    ``python -m kvcache_sim hotspot --spread-reads``: the demo declares the flag,
+    the scenario reads it off the parsed command line and gives each cache-aware
+    run its *own* policy, and which peer serves a pull changes. What does not
+    change is that a *planned* pull is fetched from the peer it was priced against
+    -- the ranking sits behind the routed-pull memo in the scheduler's chain, so a
+    different ranking cannot redirect a pull already decided.
+    """
+    parser = argparse.ArgumentParser()
+    KVCacheDemo().flags(parser)
+    args = parser.parse_args(["--spread-reads"])
+
+    aware = scenarios.Hotspot(0).runs(args)[1:]
+    policies = [run.control.source_policy for run in aware]
+    assert all(isinstance(p, SpreadReadsPolicy) for p in policies)
+    assert policies[0] is not policies[1], "a shared tally would count both runs"
+
+    def pull_sources(result):
+        return sorted(
+            (r.reuse_source for r in result.ledger.rows if r.reuse_source)
+        )
+
+    default = run_hotspot(seed=0)[2]
+    spread = run_hotspot(seed=0, args=args)[2]
+    assert pull_sources(spread) != pull_sources(default)
+    assert _unplanned_edges(spread) == 0
+
+
 # --------------------------------------------------------------------------
-# The coordinator surface: two members, this application's questions as values.
+# The two control surfaces: questions to the selector, facts to the model,
+# both carrying this application's payloads as values.
 # --------------------------------------------------------------------------
 
 
@@ -1481,8 +1680,14 @@ def _scheduler(n: int = 2):
     return sim, sched
 
 
-def test_decide_dispatches_each_demand_to_its_own_handler():
-    """One member, three questions, told apart by the demand's type."""
+def test_one_selection_names_both_of_a_request_s_hosts():
+    """One member, one question, answered before anything runs.
+
+    A plan names the prefill host *and* the decode host, which is what lets the
+    whole admission decision be taken at the door: there is no second ask, so there
+    is no outcome that costs a prefill. It rides in the payload of a ranking over
+    every prefill host, so the answer says what was compared as well as what won.
+    """
     sim, sched = _scheduler()
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
@@ -1491,65 +1696,93 @@ def test_decide_dispatches_each_demand_to_its_own_handler():
 
     async def scenario():
         with sim.mesh.installed():
-            plan = await sched.decide(Route(request))
-            admitted = await sched.decide(AdmitDecode(plan))
-            tail = await sched.decide(PrefillFinished(plan.prefill, 42.0))
-        return plan, admitted, tail
+            return await sched.select(request, "s0")
 
     try:
-        plan, admitted, tail = sim.loop.run_until_complete(scenario())
+        selection = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    assert plan is not None and plan.prefill in sched.ids
-    assert admitted is True                       # no TBT SLO in this run
-    assert tail == 42.0                            # the corrected queue tail, echoed
+    assert sorted(selection.sources) == sorted(sched.prefill_ids)
+    plan = selection.winner
+    assert plan is not None
+    assert plan.prefill == selection.sources[0]
+    assert plan.prefill in sched.ids
+    assert plan.decode in sched.ids
 
 
-def test_observe_dispatches_each_fact_and_answers_nothing():
-    """The learning half: it corrects the model and returns None."""
-    sim, sched = _scheduler()
-    try:
-        assert sched.observe(ComputeBusy("s0", 7.0)) is None
-        assert sched.busy_until["s0"] == 7.0
-        assert sched.observe(DecodeState("s1", (1.0, 2.0))) is None
-        assert sched._occupancy("s1") == 2
-    finally:
-        sim.loop.close()
+def test_a_refusal_is_the_abstention_every_selector_here_uses():
+    """An SLO miss names nobody -- the same empty answer, so nothing special to read.
 
-
-def test_a_subclass_answer_is_the_answer_that_runs():
-    """The dispatch table binds per instance, so overriding an answer suffices.
-
-    ``functools.singledispatchmethod`` would fail this silently: it captures the
-    function registered on the base class, so a subclass redefining the handler is
-    ignored and the base answer runs instead. Both schedulers override exactly this
-    way, so the trap would be invisible in a passing suite.
+    ``Selection.of([])`` rather than a second kind of reply: a caller reads the
+    winner either way, and there being none *is* the refusal.
     """
     sim = Simulation(_make_topology(2))
-
-    class Fixed(LoadBalanceScheduler):
-        async def _decide_route(self, demand):
-            return "overridden"
-
-    sched = Fixed(block_tokens=512)
+    sched = LoadBalanceScheduler(block_tokens=512, slo_ttft=0.0)
     sched.attach(sim.view, sim.transfer_cost)
+    request = _request(
+        id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
+        block_keys=tuple(_block_keys_for("m0", [0, 1])),
+    )
+
+    async def scenario():
+        with sim.mesh.installed():
+            return await sched.select(request, "s0")
+
     try:
-        answer = sim.loop.run_until_complete(sched.decide(Route(request=None)))
+        selection = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    assert answer == "overridden"
+    assert selection.sources == ()
+    assert selection.winner is None
 
 
-@pytest.mark.parametrize("member,payload", [("decide", "Route"), ("observe", 3)])
-def test_an_unknown_payload_is_refused_not_guessed(member, payload):
-    """A demand this application does not define must fail loudly at the surface."""
+def test_notify_dispatches_each_fact_and_answers_nothing():
+    """The learning half: each fact lands in the cluster model and answers None.
+
+    Told over the handle a host holds, not to the object, so what is exercised is
+    the surface a report really crosses.
+    """
+    sim, sched = _scheduler()
+    cluster = LocalClusterModelHandle(ClusterModelService(sched.cluster))
+    assert cluster.model is sched.cluster, "the handle refers to the run's one model"
+
+    async def scenario():
+        assert await cluster.notify.call_one(ComputeBusy("s0", 7.0)) is None
+        assert sched.cluster.busy_until["s0"] == 7.0
+        assert await cluster.notify.call_one(DecodeState("s1", (1.0, 2.0))) is None
+        assert sched.cluster.occupancy("s1") == 2
+        # A completion raises the tail and never lowers it.
+        await cluster.notify.call_one(PrefillFinished("s0", 3.0))
+        assert sched.cluster.busy_until["s0"] == 7.0
+
+    try:
+        sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+
+
+def test_an_unknown_fact_is_refused_not_guessed():
+    """A fact this application does not define fails loudly at the surface."""
     sim, sched = _scheduler()
     try:
-        with pytest.raises(TypeError, match="does not answer|is not told"):
-            result = getattr(sched, member)(payload)
-            if member == "decide":
-                sim.loop.run_until_complete(result)
+        with pytest.raises(TypeError, match="is not told"):
+            sim.loop.run_until_complete(
+                sched.cluster.notify("not a fact")
+            )
     finally:
         sim.loop.close()
+
+
+def test_the_store_side_chain_is_a_policy_and_refuses_anything_else():
+    """What the run installs in the directory selects over keys, and says so.
+
+    The chain is the scheduler's -- it holds the pull this scheduler priced -- but
+    it is the controller that consults it, so being a ``Policy`` is the claim that
+    makes installing it legal, and it is checked rather than asserted in prose.
+    """
+    _sim, sched = _scheduler()
+    assert isinstance(sched.policy, Policy)
+    with pytest.raises(TypeError, match="every link must be a Policy"):
+        PolicyChain([LongestPrefixPolicy(), _LocalOnly()])
 
 

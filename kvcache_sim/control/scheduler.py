@@ -1,67 +1,63 @@
-"""Schedulers under test: ``LoadBalanceScheduler`` and ``CacheAwareScheduler``.
+"""One scheduler, two presets: ``LoadBalanceScheduler`` / ``CacheAwareScheduler``.
 
-Both implement :class:`~proposed.coordinator.Coordinator`, whose two members --
-``decide`` and ``observe`` -- are the whole surface the data plane may touch. This
-application's demands and facts::
+Both are a :class:`~proposed.policy.Placement`, whose one member -- ``select`` --
+is the whole surface the data plane may *ask*. This application's one question::
 
-    await decide(Route(request))        -> Plan | None   # None == rejected (SLO)
-    await decide(AdmitDecode(plan))     -> True | None   # may it enter a decode batch
-    await decide(PrefillFinished(i, t)) -> float         # the corrected queue tail
-    observe(ComputeBusy(i, until))                       # a decode step's actual end
-    observe(DecodeState(i, finishes))                    # who is decoding, until when
+    await select(request, me) -> Selection    # prefill hosts, best first,
+                                              # payload {host: Plan}
 
-All of them are about *compute*: where work runs, whether it may run, and what the
-machines are doing. Data placement is not asked here -- the serving host already
-knows which blocks it computed, and a volume that runs out of room drops its own
-coldest keys and tells the directory afterwards (:mod:`realsim.seams._retention`).
-Every argument and return is a value; nothing here holds a handle to a data-plane
-object.
+The ranking is real -- every prefill instance is priced -- and the winner's
+:class:`Plan` rides in the payload, so a caller wanting the decision reads
+:attr:`~proposed.policy.Selection.winner` and never indexes the ranking. A refusal
+(an SLO miss) is the abstention every selector here uses, ``Selection.of([])``.
 
-* ``LoadBalanceScheduler`` (baseline, ~vLLM): route to the least-loaded instance;
-  reuse only that instance's **local** cache; never pull a remote prefix.
-* ``CacheAwareScheduler``: route to minimize predicted TTFT using the **global**
-  prefix-match directory, optionally pulling a remote prefix (whose *source* is
-  chosen by :class:`~kvcache_sim.control._source.LongestPrefixPolicy`) under a
-  balance threshold.
+A plan names both of the request's hosts, so it is asked once and before anything
+runs -- which is what makes a refusal cost nothing.
 
-A routing decision runs atomically: the directory read completes without suspending
-the loop, so the whole decision sees one consistent snapshot
-(:class:`~kvcache_sim.control._view.PinnedKVView` makes that explicit).
+What a host *reports* is not asked and is not answered, so it does not come here:
+a fact goes to the model it corrects (:mod:`kvcache_sim.control._cluster`), which
+this scheduler reads and the run gives a service of its own.
+
+The question is about *compute*; data placement is not asked here -- the serving
+host already knows which blocks it computed, and a volume that runs out of room
+drops its own coldest keys and tells the directory afterwards
+(:mod:`realsim.seams._retention`). Every argument and return is a value.
+
+Both names are *presets* of one scheduler, parameterized on two axes, each a
+:class:`~proposed.policy.Placement`: **reuse**, consulted per candidate for "name a
+peer to pull a prefix from, or nobody", and **the ranking**, asked which of the
+priced candidates wins.
+
+* ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
+  reuse only that instance's **local** cache, whatever a peer may hold.
+* ``CacheAwareScheduler`` = pull under a balance threshold, lowest predicted TTFT,
+  over the **global** prefix-match directory. Which peer serves the gap is a policy
+  again (:mod:`kvcache_sim.control._source`).
+
+Admission is a setting rather than an axis: ``early_rejection`` names what the TBT
+gate is fed -- the decode occupancy of the moment (``early``) or the occupancy
+predicted at prefill completion (``predict``).
 
 Control's model of the cluster
 ------------------------------
-Nothing here executes -- no client, no volume, no deployment, no decode engine. What
-the scheduler knows about the running cluster is a *model* corrected by
-observations, never a live read:
+Nothing here executes, and nothing here is a live read. Every host this scheduler
+ranks, prices or gates, it judges against one
+:class:`~kvcache_sim.control._cluster.KVClusterModel` -- the predicted prefill
+queues and the observed decode batches, and what keeps each of them true.
 
-* the **prefill queue** (:attr:`_Base.busy_until`) is predicted -- routing reserves
-  an instance until the TTFT it predicted -- and corrected by
-  :class:`PrefillFinished`. The data plane measures the real wait independently, and
-  the two are recorded side by side
-  (:attr:`kvcache_sim.report.metrics.RequestResult.queue_wait` against
-  ``predicted_queue_wait``). They diverge by construction:
-  :meth:`_Base._candidate` prices a candidate as ``queue -> transfer -> prefill``
-  and reserves the instance for all three, so a remote pull is charged to a device
-  that is idle while the fabric works. On a **coupled** instance prefill and decode
-  share one accelerator, so the data plane also mirrors each decode step back as
-  :class:`ComputeBusy`;
-* **decode occupancy** (:attr:`_Base._decode_finishes`) is a per-instance list of
-  estimated finish times, replaced wholesale by :class:`DecodeState` whenever a
-  batch changes.
-
-The TTFT the metrics record is this prediction rather than a measurement -- a
-deliberate choice, spelled out in the README. Prefill cost is deterministic, so on
-the default path the prediction is also the actual completion time; a peer that
-evicted the planned blocks, a pull served by a volume other than the one priced, or
-``contention`` can each move the executed cost off it.
+The TTFT the metrics record is therefore the prediction, not a measurement (the
+README says why). Prefill cost is deterministic, so on the default path the two
+agree; an evicted block, a pull served by another volume, or ``contention`` can
+each move the executed cost off it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
-from proposed import Coordinator, Endpoint, Policy, Selection
+from proposed import Endpoint, Placement, Policy, Selection
+from proposed.policy import PolicyChain
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -69,14 +65,14 @@ from domain import (
 )
 from proposed import TransferCost
 
-from ._pending import Reservations, RoutedPulls
+from ._cluster import (
+    Committed, ComputeBusy, DecodeState, KVClusterModel, PrefillFinished,
+)
 from ._view import KVView
 from ._source import LongestPrefixPolicy
 from .request import Request
 
 __all__ = [
-    "Route",
-    "AdmitDecode",
     "PrefillFinished",
     "ComputeBusy",
     "DecodeState",
@@ -86,65 +82,9 @@ __all__ = [
 ]
 
 
-# -- what this application asks its coordinator, and tells it ---------------- #
-# Three demands and two facts. Frozen values, so they cross a process boundary
-# unchanged and cannot be edited after they are handed over.
-
-
-@dataclass(frozen=True)
-class Route:
-    """*Where should this request run?* Answered with a :class:`Plan`, or refused."""
-
-    request: Request
-
-
-@dataclass(frozen=True)
-class AdmitDecode:
-    """*May this request enter its decode batch?* Answered ``True`` / ``None``.
-
-    Asked after prefill, so a refusal here has already cost the prefill -- which is
-    what a surface that could answer *not yet* would avoid, and cannot today.
-    """
-
-    plan: "Plan"
-
-
-@dataclass(frozen=True)
-class PrefillFinished:
-    """*Prefill really finished at this clock -- what is the queue tail now?*
-
-    The only thing that tells this coordinator its model of an instance's prefill
-    queue was wrong. ``now`` is an independent measurement (the host's accelerator
-    serialises its own passes) and is routinely earlier than the ``done_time``
-    routing reserved.
-
-    A demand rather than a fact so the caller can rely on the *await* for ordering:
-    the decode admission it asks next must be decided by a coordinator that has
-    already recorded this completion.
-    """
-
-    inst: str
-    now: float
-
-
-@dataclass(frozen=True)
-class ComputeBusy:
-    """A decode step occupied a **coupled** instance's compute until ``until``."""
-
-    inst: str
-    until: float
-
-
-@dataclass(frozen=True)
-class DecodeState:
-    """``inst``'s live decode batch, as one estimated finish time per request.
-
-    Its length is the occupancy and its values answer "still decoding at ``t``?".
-    Reported whenever the batch changes.
-    """
-
-    inst: str
-    finishes: Tuple[float, ...]
+# -- what this application's control plane answers with ---------------------- #
+# The answer is here; the facts a host reports are with the model they write
+# (:mod:`kvcache_sim.control._cluster`).
 
 
 @dataclass
@@ -173,41 +113,242 @@ class Plan:
     def local_blocks(self) -> int:
         """Blocks the prefill host already held: the match, minus what it pulls.
 
-        Derived rather than a field: the data plane needs it three times over (the
-        reuse to report, the suffix to publish, the prefix to fall back on when a
-        planned pull turns out to be gone) and all three have to agree.
+        Derived rather than a field: the data plane needs it three times over (reuse
+        to report, suffix to publish, prefix to fall back on when a planned pull is
+        gone) and all three have to agree.
         """
         return self.match_blocks - len(self.pull_keys)
 
 
-class _Base(Policy, Coordinator):
-    """Shared state + prediction/commit helpers for both schedulers.
+# -- the first axis: which peer a prefix is pulled from ---------------------- #
+# Everything a routing decision does is the same whichever scheduler is running.
+# What differs is the two axes and which admission gates are installed.
+#
+# Both axes are :class:`~proposed.policy.Placement`s, because the subject is what
+# tells the two selector kinds apart (:mod:`proposed.policy`) and these subjects are
+# the application's: this request, and the candidates this scheduler priced. Neither
+# is ever installed in the controller. What is not a selection at all is the rest of
+# what a scheduler decides -- admission and the SLO gates answer yes or no, and a
+# ranked set of sources cannot say that. This first axis answers only the
+# store-shaped half -- name a peer to pull from, or nobody -- and the scheduler
+# prices what comes back, which is the line :mod:`kvcache_sim.control._source`
+# already draws. A placement's ``select`` is awaited inside the decision's pinned
+# snapshot (:meth:`_Scheduler.select`), so it runs to completion without
+# suspending.
 
-    Both control-plane jobs in one object. As a :class:`~proposed.policy.Policy` the
-    run installs it in the directory and the controller consults it there
-    (:meth:`select`); as a :class:`~proposed.coordinator.Coordinator` a serving host
-    reaches it as a service. One object on purpose: the peer it prices a pull
-    against is the peer it later tells the directory to serve, with nothing threaded
-    through the data plane to carry that between them.
+
+class _LocalOnly(Placement):
+    """Name nobody, ever -- the baseline reuses only what a host already holds.
+
+    ``Selection.of([])``, which is :class:`~proposed.policy.FirstMatch`'s
+    *abstention*: no source, so the caller recomputes the gap. Deliberately not
+    ``Selection()``, which is a decision meaning every holder in directory order.
+    """
+
+    name = "local-only"
+
+    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+        return Selection.of([])
+
+
+class _PullLongestPrefix(Placement):
+    """Name the best peer when its prefix beats recomputing the gap locally.
+
+    Only when that peer's run is more than ``threshold`` times the requester's own
+    -- the balancing threshold. A pull is charged to the prefill instance's queue,
+    so one that saves little compute still costs the whole wait, and without the
+    threshold every request would chase the longest match onto one instance.
+
+    The peer ranking itself is delegated (:mod:`kvcache_sim.control._source`) and
+    only the pull-versus-recompute judgement is here. This ``select`` is consulted
+    per candidate while the scheduler prices, and never installed anywhere, unlike
+    :attr:`_Scheduler.policy`, which answers the *store* with the peer this one
+    named.
+
+    Abstains when the ranking's head is the requester itself: a source is a peer,
+    and a host does not pull what it already holds -- that prefix is its local
+    match, and no shorter peer behind it could be worth pulling either.
+    """
+
+    name = "pull-longest-prefix"
+
+    def __init__(self, threshold: float, source_policy: Policy) -> None:
+        self.threshold = threshold
+        self.source_policy = source_policy
+
+    def attach(self, view: Any, transfer_cost: Any) -> None:
+        """Sense through the view, and bring up the ranking this defers to."""
+        super().attach(view, transfer_cost)
+        self.source_policy.attach(view, transfer_cost)
+
+    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+        """The one peer worth pulling from, or an abstention.
+
+        Reads the runs off the view rather than being told them: the decision
+        pinned it, so this is the same snapshot and costs no directory read.
+        """
+        counts = self.view.prefix_lengths(list(keys))
+        ranked = await self.source_policy.select(keys, requester)
+        src = ranked.sources[0] if ranked.sources else None
+        if src is None or src == requester:
+            return Selection.of([])
+        if counts.get(src, 0) <= counts.get(requester, 0) * self.threshold:
+            return Selection.of([])  # not worth the transfer: recompute it
+        return Selection.of([src])
+
+
+# -- the second axis: which priced candidate wins ---------------------------- #
+
+
+def _ranked(candidates: Sequence[Tuple[str, Any]]) -> Selection:
+    """``(instance, its price)`` in rank order, as a selection carrying the prices."""
+    return Selection.of([i for i, _ in candidates], payload=dict(candidates))
+
+
+class _Ranking(Placement):
+    """Rank candidates the scheduler has already priced, best first.
+
+    Pricing them here instead would pull the reuse placement, the transfer cost and
+    the profile in with it, which is most of a scheduler.
+
+    Handed the run's cluster model, since a ranking may want a signal the price has
+    already folded the clock into (:class:`_LeastLoaded`). Built where that model is
+    (:meth:`_Scheduler.attach`), which is why a preset names the kind rather than
+    building one.
+    """
+
+    def __init__(self, cluster: KVClusterModel) -> None:
+        self.cluster = cluster
+
+
+class _LeastLoaded(_Ranking):
+    """The shortest predicted prefill queue, whatever reuse bought (the baseline).
+
+    Ranks on ``busy_until`` rather than the candidate's ``queue_wait``, which is
+    that tail clamped at the clock: two instances idle since different moments both
+    wait zero, so the choice would fall to the id tie-break and a different one
+    would win. This scheduler's claim is that it picks by load and nothing else.
+    """
+
+    name = "least-loaded"
+
+    async def select(self, plans: Sequence[Plan], requester: str) -> Selection:
+        tails = self.cluster.busy_until
+        ordered = sorted(plans, key=lambda p: (tails[p.prefill], p.prefill))
+        return _ranked([(p.prefill, p) for p in ordered])
+
+
+class _MinTTFT(_Ranking):
+    """The lowest predicted queue + transfer + prefill -- why reuse is *priced*
+    rather than preferred: a longer match on a busier instance can still lose."""
+
+    name = "min-ttft"
+
+    async def select(self, plans: Sequence[Plan], requester: str) -> Selection:
+        ordered = sorted(plans, key=lambda p: (p.ttft, p.prefill))
+        return _ranked([(p.prefill, p) for p in ordered])
+
+
+class _LeastBatch(Placement):
+    """The smallest predicted decode batch (instance id tie-break).
+
+    The other host pick of a routing decision, and the same shape as the axis above:
+    the scheduler predicts each candidate's batch
+    (:meth:`_Scheduler._predicted_batch`) and this ranks what came back. Not an axis
+    -- both presets pick a decode instance this way.
+    """
+
+    name = "least-batch"
+
+    async def select(
+        self, batches: Sequence[Tuple[str, int]], requester: str
+    ) -> Selection:
+        return _ranked(sorted(batches, key=lambda c: (c[1], c[0])))
+
+
+#: An admission gate: does this plan clear one SLO? Installed as a list --
+#: :attr:`_Scheduler._gates` -- rather than tested behind a mode string, so no
+#: decision below has a mode to branch on. A gate holds no settings of its own, so
+#: it is handed the model it gates against.
+_Gate = Callable[[Plan, "_Scheduler"], bool]
+
+
+def _ttft_gate(plan: Plan, sched: "_Scheduler") -> bool:
+    """The TTFT SLO. The one gate every run installs."""
+    return plan.ttft <= sched.slo_ttft
+
+
+def _predicted_tbt_gate(plan: Plan, sched: "_Scheduler") -> bool:
+    """The TBT SLO, on the batch this request is predicted to join.
+
+    Runs at routing, before the prefill: what it refuses costs nothing, which is the
+    whole of why admission is decided here and not once the compute has been spent.
+    """
+    return plan.pred_tbt <= sched.slo_tbt
+
+
+class _RoutedPull(Policy):
+    """The peer a fetch's pull was already priced against, or an abstention.
+
+    Answering the store from what routing decided, rather than deciding twice:
+    re-deriving would not even agree (routing ranks over the request's whole block
+    chain, the fetch names only the gap), and naming a different holder would
+    charge a cross-node read for a same-node prediction. A caller with no routed
+    pull falls through to the ranking behind this link.
+
+    Reading it **consumes** it (:meth:`~kvcache_sim.control._cluster.KVClusterModel.claim`
+    expires the record on a match), so this belongs at the head of a
+    :class:`~proposed.policy.FirstMatch` chain and under no combinator that can drop
+    an answer. In that one position spending and using coincide: a link that answers
+    wins the chain, an abstention matched nothing and spends nothing. Under one that
+    could reject the peer, the record would be gone and the fetch would fall through
+    to a ranking that never saw it.
+
+    """
+
+    name = "routed-pull"
+
+    def __init__(self, cluster: KVClusterModel) -> None:
+        self._cluster = cluster
+
+    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+        peer = self._cluster.claim(requester, keys)
+        return Selection.of([peer] if peer is not None else [])
+
+
+class _Scheduler(Placement):
+    """The pricing, ranking and admission both schedulers share.
+
+    Both control-plane jobs in one object. As a
+    :class:`~proposed.policy.Placement` a serving host asks it as a service
+    (:meth:`select`); through :attr:`policy` it also hands the run the store-shaped
+    chain the controller consults inside ``locate_volumes``. One object on purpose:
+    the peer it prices a pull against is the peer that chain later tells the
+    directory to serve, with nothing threaded through the data plane to carry that
+    between them.
 
     Args:
-        view: a :class:`~kvcache_sim.control._view.KVView` -- the only way this
-            object sees the world.
+        reuse / rank: the two axes a preset picks (see above), both
+            :class:`~proposed.policy.Placement`s this object consults while forming
+            the one answer :meth:`select` gives. ``rank`` is the *kind*, since the
+            load it reads exists only once :meth:`attach` has run.
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
-        slo_ttft / slo_tbt: admission gates.
+        slo_ttft / slo_tbt: what the gates hold a plan to.
         simulate_decode: whether the run models batched decode at all.
-        max_batch: VRAM cap the data plane's decode batch will use; control needs
-            it only to reason about admission.
-        early_rejection: ``"off"`` | ``"early"`` | ``"predict"``.
-        source_policy: the :class:`~proposed.policy.Policy` that ranks peers for a
-            prefix pull (default :class:`~kvcache_sim.control._source.LongestPrefixPolicy`).
+        early_rejection: ``"early"`` | ``"predict"`` -- whether the decode occupancy
+            the TBT gate is fed is the one observed now or the one predicted at
+            prefill completion.
+        source_policy: ranks peers for a prefix pull
+            (default :class:`~kvcache_sim.control._source.LongestPrefixPolicy`).
     """
 
     def __init__(
         self,
         *,
+        reuse: Placement,
+        rank: Type[_Ranking],
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
@@ -216,8 +357,7 @@ class _Base(Policy, Coordinator):
         slo_ttft: float = float("inf"),
         slo_tbt: float = float("inf"),
         simulate_decode: bool = False,
-        max_batch: int = 8,
-        early_rejection: str = "off",
+        early_rejection: str = "early",
         source_policy: Optional[Any] = None,
     ) -> None:
         self.B = block_tokens
@@ -226,184 +366,150 @@ class _Base(Policy, Coordinator):
         self.source_policy = (
             source_policy if source_policy is not None else LongestPrefixPolicy()
         )
+        self._reuse = reuse
+        self._rank_kind = rank
+        self._decode_rank = _LeastBatch()
         self._prefill_pool = prefill_pool
         self._decode_pool = decode_pool
         self.slo_ttft = slo_ttft
         self.slo_tbt = slo_tbt
-        self.early_rejection = early_rejection
-        self.max_batch = max_batch
         self.tbt_enabled = simulate_decode
+        if early_rejection not in ("early", "predict"):
+            # Refused rather than read as "not predict": admission is gated at
+            # routing whatever a caller passes, so a mode this does not know is a
+            # caller expecting a rule this scheduler has no way to apply.
+            raise ValueError(
+                f"unknown early_rejection {early_rejection!r}: the choice is what "
+                f"the TBT gate is fed, 'early' or 'predict'"
+            )
+        # Which gates this run installs. A run that does not model decode has no
+        # batch to hold to a TBT SLO, so it installs only the TTFT one.
+        self._gates: List[_Gate] = [_ttft_gate]
+        if simulate_decode:
+            self._gates.append(_predicted_tbt_gate)
+        # The admission mode is spent here and never read again. Both modes install
+        # the same gates and differ only in the decode occupancy fed to them:
+        # "predict" rolls it forward to prefill completion, counting the prefills
+        # promised that will have landed by then. That moves where decode lands even
+        # with no SLO to miss, so it is a fidelity setting of the model rather than
+        # an admission rule.
+        self._lookahead = simulate_decode and early_rejection == "predict"
         # Filled by attach(): the run knows its servers only once its stack exists.
-        self.view: Any = None
         self.transfer_cost: Optional[TransferCost] = None
         self.topo: Dict[str, Endpoint] = {}
         self.ids: List[str] = []
-        self.busy_until: Dict[str, float] = {}
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
-        self._decode_finishes: Dict[str, List[float]] = {}
-        # Decided but not yet carried out: prefills promised, and pulls priced
-        # against a peer. Both self-expire (:mod:`kvcache_sim.control._pending`).
-        self._reserved = Reservations()
-        self._routed = RoutedPulls()
+        self.cluster: Optional[KVClusterModel] = None
+        self._rank: Optional[_Ranking] = None
+        #: :attr:`proposed.plane.ControlPlane.policy` -- who serves a fetch, for
+        #: the run to install in the directory. Built by :meth:`attach`.
+        self.policy: Optional[PolicyChain] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view, transfer_cost: TransferCost) -> None:
-        """Receive the ports this coordinator senses and prices through.
+        """Receive the ports this control plane senses and prices through.
 
         Two-phase so a scenario can declare a control plane as an object
         (``MyControl(knobs)``) and let the run hand it the stack afterwards.
 
         The view is upgraded to a :class:`~kvcache_sim.control._view.KVView` here:
         prefix runs are this capability's notion, not the store's.
+
+        The run's one :class:`~kvcache_sim.control._cluster.KVClusterModel` is built
+        here as well: this is where the instances become known, and this runs once
+        per run, so nothing else is placed to build a second (empty) one -- and an
+        empty one would report every host idle, which is a run that looks healthy
+        and is wrong. Everything that ranks, prices or gates is handed that one
+        model.
         """
         self.view = KVView(view.directory, view.topology)
-        # Priced through the protocol rather than a simulator function: a simulated
-        # run passes one priced off the same model the transport charges, a
-        # deployment its measured numbers.
+        # A protocol rather than a simulator function: a deployment supplies its own
+        # measured numbers.
         self.transfer_cost = transfer_cost
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
-        # PREDICTED prefill queue tail over ALL instances (the prefill and decode
-        # pools may each be a subset). Corrected by the data plane's observations.
-        self.busy_until = {i: 0.0 for i in self.ids}
+        # Over ALL instances: the prefill and decode pools may each be a subset.
+        self.cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
+        self._rank = self._rank_kind(self.cluster)
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
         )
         self.decode_ids = (
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
-        # Control's model of the decode side: instance -> one estimated finish
-        # time per request decoding or queued there. Empty until the data plane
-        # reports, which it does whenever a batch changes.
-        self._decode_finishes = {i: [] for i in self.ids}
-        # demand/fact type -> the bound method that handles it, so dispatch
-        # resolves through this instance's MRO and a subclass need only override.
-        self._answers = {
-            Route: self._decide_route,
-            AdmitDecode: self._decide_admit_decode,
-            PrefillFinished: self._decide_prefill_finished,
-        }
-        self._facts = {
-            ComputeBusy: self._observe_compute_busy,
-            DecodeState: self._observe_decode_state,
-        }
+        # Who serves a fetch: the pull already priced for this caller, else the
+        # ranking. A chain rather than an ``if``, so the fall-through is
+        # :class:`~proposed.policy.FirstMatch`'s abstention rule and not a second
+        # copy of it here, and a :class:`~proposed.policy.PolicyChain` because the
+        # directory is going to be handed it and both links select over keys.
+        self.policy = PolicyChain([_RoutedPull(self.cluster), self.source_policy])
+        # Every selector this one consults senses through the same view, which is
+        # what lets one routing decision pin one directory snapshot for all of them
+        # (:meth:`~kvcache_sim.control._view.KVView.pinned`). The chain is attached
+        # here too, not by whoever installs it: it is this object's, and the view it
+        # senses through has to be the view the decision pinned.
+        for selector in (self._reuse, self._rank, self._decode_rank, self.policy):
+            selector.attach(self.view, transfer_cost)
 
-    # -- proposed.Coordinator: two members, one per kind of interaction ---- #
-    async def decide(self, demand: Any) -> Optional[Any]:
-        """:class:`~proposed.coordinator.Coordinator` -- answer ``demand``.
+    # -- proposed.Placement: one member, for the question ------------------ #
+    async def select(self, request: Request, requester: str) -> Selection:
+        """Where should ``request`` run? Price every prefill instance, rank them.
 
-        Dispatch is on the demand's type, through the table bound in :meth:`attach`.
-        (Not ``functools.singledispatchmethod``: it captures the function registered
-        on this class, so a subclass redefining one is silently ignored.)
+        The prefill hosts best first, with each one's :class:`Plan` under its id in
+        :attr:`~proposed.policy.Selection.payload`; the head's plan is the one that
+        was admitted and committed, so a caller reads
+        :attr:`~proposed.policy.Selection.winner`. An SLO miss abstains
+        (``Selection.of([])``) -- there is no host this request may run on, and a
+        refusal costs nothing because nothing has run.
+
+        Atomic: every read is off one pinned directory snapshot
+        (:meth:`~kvcache_sim.control._view.KVView.pinned`) and one clock read, so the
+        prices are comparable, and the bookkeeping it writes needs nothing locked.
+        Pricing a candidate reserves nothing (:meth:`_candidate`), so the losers leave
+        no trace and the winner is chosen after the whole field is known.
+
+        ``requester`` is the host the request landed on, which no part of this
+        decision reads: where a request *should* run is a fact about the cluster,
+        not about who was asked.
         """
-        answer = self._answers.get(type(demand))
-        if answer is None:
-            raise TypeError(
-                f"{type(self).__name__} does not answer {type(demand).__name__}: "
-                f"this application's demands are "
-                f"{', '.join(sorted(d.__name__ for d in self._answers))}"
-            )
-        return await answer(demand)
+        now = self.view.now()
+        keys = list(request.block_keys)
+        with self.view.pinned(keys):
+            counts = self.view.prefix_lengths(keys)
+            plans: List[Plan] = []
+            for inst in self.prefill_ids:
+                chosen = await self._reuse.select(keys, inst)
+                match, src, pull = self._priced_reuse(counts, keys, inst, chosen)
+                plans.append(self._candidate(
+                    request, inst, now, match=match, source=src, pull_keys=pull
+                ))
+            ranked = await self._rank.select(plans, request.id)
+        admitted = await self._admit(ranked.winner)
+        return ranked if admitted is not None else Selection.of([])
 
-    def observe(self, fact: Any) -> None:
-        """:class:`~proposed.coordinator.Coordinator` -- learn that ``fact`` happened."""
-        learn = self._facts.get(type(fact))
-        if learn is None:
-            raise TypeError(
-                f"{type(self).__name__} is not told {type(fact).__name__}: this "
-                f"application's facts are "
-                f"{', '.join(sorted(f.__name__ for f in self._facts))}"
-            )
-        learn(fact)
+    @staticmethod
+    def _priced_reuse(
+        counts: Dict[str, int], keys: Sequence[str], inst: str, chosen: Selection
+    ) -> Tuple[int, Optional[str], Sequence[str]]:
+        """What a reuse selection buys ``inst``: ``(match, source, pull_keys)``.
 
-    async def _decide_route(self, demand: Route) -> Optional["Plan"]:
-        """Where should this request run? Answered by whichever scheduler this is."""
-        raise NotImplementedError(
-            f"{type(self).__name__} answers no Route: a scheduler decides where a "
-            f"request runs"
-        )
-
-    async def _decide_admit_decode(self, demand: AdmitDecode) -> Optional[bool]:
-        """May this accepted request enter its decode batch now?
-
-        ``None`` when decode cannot honour the TBT SLO. In ``off`` mode this is the
-        only TBT gate, so a refusal here means the prefill was already spent: a
-        *wasted* prefill.
+        Derived here and not in the policy, because naming a peer is where a
+        policy's job ends: how much of this prompt that peer's prefix covers is
+        arithmetic over the snapshot this scheduler already read. An abstention --
+        and a selection naming ``inst`` itself, which is not a pull -- leaves the
+        local match to recompute from.
         """
-        plan = demand.plan
-        if not self.tbt_enabled:
-            return True
-        if self.early_rejection == "off":
-            pred = decode_step_time(
-                self._occupancy(plan.decode) + 1, self.profile, self.model
-            )
-            if pred > self.slo_tbt:
-                return None  # late reject -> wasted prefill
-        return True
-
-    async def _decide_prefill_finished(self, demand: PrefillFinished) -> float:
-        """Correct the predicted queue with the clock the real ops reached.
-
-        Routing reserved this instance until the *predicted* ``done_time``; the
-        executed time differs when the pull finds fewer blocks resident, is served
-        by a different peer, is slowed by contention, or when the prediction's own
-        arithmetic about the wait was simply wrong.
-
-        Raises the tail and never lowers it. An early completion leaves the instance
-        looking busier than it is until the next request is routed against it,
-        whereas lowering on one report would under-count the prefills this
-        coordinator has promised and not yet seen finish. Answers with the tail.
-        """
-        if demand.now > self.busy_until[demand.inst]:
-            self.busy_until[demand.inst] = demand.now
-        return self.busy_until[demand.inst]
-
-    def _observe_compute_busy(self, fact: ComputeBusy) -> None:
-        """A decode step on a **coupled** instance occupied its compute.
-
-        Only the data plane knows whether prefill and decode share a timeline. A
-        disaggregated host never reports this, so decode never touches its
-        predicted prefill queue.
-        """
-        self.busy_until[fact.inst] = fact.until
-
-    def _observe_decode_state(self, fact: DecodeState) -> None:
-        """Replace control's model of ``inst``'s decode batch."""
-        self._decode_finishes[fact.inst] = list(fact.finishes)
-
-    # -- the store's questions, answered from what we already decided ----- #
-    async def select(
-        self, view: Any, keys: Sequence[str], requester: str
-    ) -> Selection:
-        """:class:`~proposed.policy.Policy` -- who serves ``keys`` for ``requester``.
-
-        This coordinator priced the pull against a specific peer's locality tier
-        before asking for the bytes, so it answers with that decision rather than
-        deciding twice: re-deriving would not even agree (routing ranks over the
-        request's whole block chain, the fetch names only the gap), and naming a
-        different holder would charge a cross-node read for a same-node prediction.
-
-        Falls through to the ranking when this caller has no routed pull.
-        """
-        peer = self._routed.claim(requester, keys)
-        if peer is not None:
-            return Selection.of([peer])
-        return await self.source_policy.select(self.view or view, list(keys), requester)
-
-    # -- reading the model the facts above maintain ----------------------- #
-    def _occupancy(self, inst: str) -> int:
-        """Requests currently decoding or queued on ``inst``."""
-        return len(self._decode_finishes.get(inst, ()))
-
-    def _predict_occupancy(self, inst: str, at_t: float) -> int:
-        """How many of those are estimated to still be decoding at ``at_t``."""
-        return sum(1 for f in self._decode_finishes.get(inst, ()) if f > at_t)
+        local = counts.get(inst, 0)
+        src = chosen.sources[0] if chosen.sources else None
+        if src is None or src == inst:
+            return local, None, ()
+        return counts[src], src, keys[local:counts[src]]
 
     # -- prediction (no mutation) ---------------------------------------- #
     def _predict(self, inst: str, now: float, transfer_t: float, prefill_t: float):
         """Return ``(queue_wait, ttft, done_time)`` without reserving the server."""
-        avail = max(now, self.busy_until[inst])
+        avail = max(now, self.cluster.busy_until[inst])
         queue_wait = avail - now
         done = avail + transfer_t + prefill_t
         return queue_wait, done - now, done
@@ -420,21 +526,17 @@ class _Base(Policy, Coordinator):
     ) -> Plan:
         """Price prefilling ``request`` on ``inst`` reusing ``match`` blocks.
 
-        What the reused prefix saves, what the suffix costs to compute, what pulling
-        ``pull_keys`` from ``source`` costs, and where all of that lands in
-        ``inst``'s predicted queue. Which candidate wins is the caller's, and is the
-        only part the two schedulers disagree on.
-
         Reserves nothing and mutates nothing, so a losing candidate leaves no trace
-        (:meth:`_commit` records a decision actually taken).
+        (:class:`~kvcache_sim.control._cluster.Committed` records a decision actually
+        taken). Which candidate wins is the ranking's business (:class:`_Ranking`).
         """
         cached = min(match * self.B, request.prompt_tokens)
         uncached = request.prompt_tokens - cached
         prefill_t = prefill_time(uncached, self.profile, self.model)
         if source is not None and pull_keys:
             xbytes = self.model.block_bytes(len(pull_keys), self.B)
-            # Same cost model the transport charges, so this prediction equals what
-            # the real pull will cost.
+            # The cost model the transport charges, so this prediction is what the
+            # real pull will cost.
             transfer_t = self.transfer_cost.get_time(source, inst, xbytes)
         else:
             source, xbytes, transfer_t = None, 0, 0.0
@@ -454,139 +556,93 @@ class _Base(Policy, Coordinator):
         ``done_time`` (its prefill completion). Drives TBT prediction."""
         if not self.tbt_enabled:
             return 0
-        if self.early_rejection == "predict":
-            n = self._predict_occupancy(d, done_time)
-            # Requests whose prefill has not landed are invisible to the observed
-            # decode state; the outstanding reservations stand in for them.
-            for res in self._reserved.pending(self.view.now()):
-                if (
-                    res.decode_id == d
-                    and res.prefill_done <= done_time
-                    and res.prefill_done
-                    + max(0, res.output_tokens - 1)
-                    * decode_step_time(1, self.profile, self.model)
-                    > done_time
-                ):
-                    n += 1
-            return n
-        return self._occupancy(d)
+        if not self._lookahead:
+            return self.cluster.occupancy(d)
+        n = self.cluster.predict_occupancy(d, done_time)
+        # Requests whose prefill has not landed are invisible to the observed
+        # decode state; the outstanding reservations stand in for them.
+        for res in self.cluster.pending(self.view.now()):
+            if (
+                res.decode_id == d
+                and res.prefill_done <= done_time
+                and res.prefill_done
+                + max(0, res.output_tokens - 1)
+                * decode_step_time(1, self.profile, self.model)
+                > done_time
+            ):
+                n += 1
+        return n
 
-    def _select_decode(self, done_time: float) -> Tuple[str, int]:
-        """Pick the decode instance with the smallest predicted batch (id tie-break)."""
-        if not self.tbt_enabled:
-            return (min(self.decode_ids), 0)
-        d = min(
-            self.decode_ids, key=lambda d: (self._predicted_batch(d, done_time), d)
-        )
-        return (d, self._predicted_batch(d, done_time))
+    async def _select_decode(self, plan: Plan) -> Tuple[str, int]:
+        """Where ``plan`` decodes, and the batch it was predicted to meet there.
 
-    def _admit(self, plan: Plan) -> Optional[Plan]:
-        """Give a won candidate its decode instance, then apply the gates.
+        Priced here and ranked by :class:`_LeastBatch`. With decode unmodelled every
+        candidate prices at zero, so the ranking's id tie-break is the whole of the
+        choice.
+        """
+        batches = [
+            (d, self._predicted_batch(d, plan.done_time)) for d in self.decode_ids
+        ]
+        chosen = await self._decode_rank.select(batches, plan.request.id)
+        d = chosen.sources[0]
+        return (d, chosen.payload[d])
+
+    async def _admit(self, plan: Plan) -> Optional[Plan]:
+        """Give the won candidate its decode instance, gate it, commit it.
 
         The decode side is chosen once, against the winning candidate's predicted
-        prefill completion -- not per candidate in the loop.
+        prefill completion -- not per candidate in the loop. ``None`` == rejected,
+        and rejected here costs nothing: this runs before the prefill does.
         """
-        plan.decode, plan.pred_batch = self._select_decode(plan.done_time)
+        plan.decode, plan.pred_batch = await self._select_decode(plan)
         plan.pred_tbt = (
             decode_step_time(plan.pred_batch + 1, self.profile, self.model)
             if self.tbt_enabled
             else 0.0
         )
-        return self._finalize_admission(plan)
-
-    def _finalize_admission(self, plan: Plan) -> Optional[Plan]:
-        """Apply the SLO gates, then commit. ``None`` == rejected."""
-        if plan.ttft > self.slo_ttft:
+        if not all(gate(plan, self) for gate in self._gates):
             return None
-        if (
-            self.tbt_enabled
-            and self.early_rejection in ("early", "predict")
-            and plan.pred_tbt > self.slo_tbt
-        ):
-            return None
-        return self._commit(plan)
-
-    # -- commit ----------------------------------------------------------- #
-    def _commit(self, plan: Plan) -> Plan:
-        """Reserve the prefill server for an accepted plan (decode admitted later).
-
-        Records only; nothing is swept or expired here -- each record expires when
-        it is read (:mod:`kvcache_sim.control._pending`).
-        """
-        # The peer this pull was priced against, for when the directory asks (see
-        # :meth:`select`). Recorded at commit, so a dropped plan leaves nothing.
-        if plan.reuse_source is not None and plan.pull_keys:
-            self._routed.route(plan.prefill, plan.pull_keys, plan.reuse_source)
-        self.busy_until[plan.prefill] = plan.done_time
-        if self.early_rejection == "predict" and self.tbt_enabled:
-            self._reserved.reserve(
-                plan.done_time, plan.decode, plan.request.output_tokens
-            )
+        # Accepted: the model holds the instances this plan spoke for, and remembers
+        # the peer its pull was priced against for when the directory asks
+        # (:class:`_RoutedPull`).
+        #
+        # The local write, not the endpoint a host reports over: control is in the
+        # model's process, and a plain call is what keeps this decision atomic.
+        self.cluster._notify_impl(Committed(plan))
         return plan
 
 
-class LoadBalanceScheduler(_Base):
-    """Baseline: route to the least-loaded instance; local-only cache reuse."""
+# -- the two schedulers, as the settings that make them ---------------------- #
+# Names rather than behaviours: everything either one does is above, and each is
+# one choice on each axis. A third combination is composed, not subclassed.
 
-    async def _decide_route(self, demand: Route) -> Optional[Plan]:
-        request = demand.request
-        # Per-instance prefix presence from the real directory. The baseline reuses
-        # only the instance it routes to, so it never asks the source policy.
-        counts = await self.view.prefix_lengths(list(request.block_keys))
-        pick = min(self.prefill_ids, key=lambda i: (self.busy_until[i], i))
-        return self._admit(
-            self._candidate(
-                request, pick, self.view.now(), match=counts.get(pick, 0)
-            )
+
+class LoadBalanceScheduler(_Scheduler):
+    """Baseline (~vLLM): least-loaded instance, local-only cache reuse."""
+
+    def __init__(self, **knobs: Any) -> None:
+        super().__init__(reuse=_LocalOnly(), rank=_LeastLoaded, **knobs)
+
+
+class CacheAwareScheduler(_Scheduler):
+    """Cache-aware: global prefix-match routing under a balance threshold.
+
+    ``replicate=False`` (which isolates replication's contribution in the demo) is
+    never pulling at all, so it is the baseline's reuse placement rather than a flag
+    the candidate loop tests.
+    """
+
+    def __init__(self, *, balance_threshold: float = 1.5, replicate: bool = True,
+                 **knobs: Any) -> None:
+        # One source policy, held by the scheduler (which answers the directory
+        # with the peer it chose) and by the reuse placement (which chose it).
+        source = knobs.pop("source_policy", None) or LongestPrefixPolicy()
+        super().__init__(
+            reuse=(
+                _PullLongestPrefix(balance_threshold, source) if replicate
+                else _LocalOnly()
+            ),
+            rank=_MinTTFT,
+            source_policy=source,
+            **knobs,
         )
-
-
-class CacheAwareScheduler(_Base):
-    """Cache-aware coordinator: global prefix-match routing under a balance threshold."""
-
-    def __init__(self, *args, balance_threshold: float = 1.5, replicate: bool = True,
-                 **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        # Pull a remote prefix only when it is > threshold x the candidate's local
-        # match; otherwise prefer recompute (the balancing threshold).
-        self.balance_threshold = balance_threshold
-        # When False, never pull a remote prefix (always recompute a missing
-        # prefix locally). Used to isolate replication's contribution in the demo.
-        self.replicate = replicate
-
-    async def _decide_route(self, demand: Route) -> Optional[Plan]:
-        request = demand.request
-        now = self.view.now()
-        keys = list(request.block_keys)
-        # One directory snapshot for the whole decision: the candidate loop's
-        # local matches and every source query below read the same state.
-        view = self.view.pin(keys)
-        prefix_counts = await view.prefix_lengths()
-
-        best: Optional[Plan] = None
-        for inst in self.prefill_ids:
-            local_len = prefix_counts.get(inst, 0)
-            # The one store question in this decision: which peer would serve the
-            # gap? Pull-vs-recompute and placement are ours.
-            ranked = await self.source_policy.select(view, keys, inst)
-            src_inst = ranked.sources[0] if ranked.sources else None
-            src_len = prefix_counts.get(src_inst, 0) if src_inst is not None else 0
-            if (
-                self.replicate
-                and src_inst is not None
-                and src_inst != inst
-                and src_len > local_len * self.balance_threshold
-            ):
-                # Worth pulling: reuse the peer's whole prefix and fetch the gap.
-                cand = self._candidate(
-                    request, inst, now, match=src_len,
-                    source=src_inst, pull_keys=keys[local_len:src_len],
-                )
-            else:
-                # Not worth it: reuse only what is already here and recompute.
-                cand = self._candidate(request, inst, now, match=local_len)
-            if best is None or (cand.ttft, cand.prefill) < (best.ttft, best.prefill):
-                best = cand
-
-        assert best is not None
-        return self._admit(best)

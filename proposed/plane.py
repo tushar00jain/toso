@@ -6,8 +6,11 @@ declaring both is the whole proposal in miniature: a capability is written
 *against* torchstore rather than *into* it, so writing one should mean
 implementing these and nothing else.
 
-* :class:`ControlPlane` -- the deciding half's one lifecycle member: knobs at
-  construction, the stack's ports at :meth:`ControlPlane.attach`;
+* :class:`ControlPlane` -- the deciding half's lifecycle: knobs at construction,
+  the stack's ports at :meth:`ControlPlane.attach`, and the two things a run
+  harvests off it once attached -- the model it decides against
+  (:attr:`ControlPlane.cluster`), to put a service in front of, and the store's
+  own selector (:attr:`ControlPlane.policy`), to install in the directory;
 * :class:`DataPlane` -- the executing half's one member,
   :meth:`DataPlane.after`: what the capability does once a transfer has landed.
   The transfer itself is an ordinary client call and needs no interface.
@@ -40,7 +43,9 @@ plane's thumb, which is the coupling this split exists to remove.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
+
+from proposed.deployment import ClusterModel
 
 __all__ = ["ControlPlane", "DataPlane"]
 
@@ -84,9 +89,24 @@ class ControlPlane:
     ``set_storage_volumes``.
 
     The default is real behaviour, not a stub: a control plane that decides from
-    what it is asked -- a :class:`~proposed.policy.Policy` handed a view per call --
-    needs no ports of its own and inherits this no-op.
+    what it is asked -- a :class:`~proposed.policy.Placement` ranking the values in
+    its subject -- needs no ports of its own and inherits this no-op.
     """
+
+    #: The picture this control plane decides against, if it keeps one. Read after
+    #: :meth:`attach` by whoever assembles the run, and given a service of its own
+    #: so the application's hosts can report into it without a question being asked.
+    #: ``None`` -- the default -- is a control plane that models nothing between
+    #: calls, so there is nothing for a host to correct and no service to stand up.
+    cluster: Optional[ClusterModel] = None
+
+    #: The :class:`~proposed.policy.Policy` this control plane wants consulted
+    #: inside ``locate_volumes``, if it *names* one rather than *being* one. Read
+    #: after :meth:`attach`, since a selector over the run's directory cannot be
+    #: built before the run has one. ``None`` -- the default -- leaves the
+    #: directory answering for itself, which is also what a control plane that is
+    #: itself a policy leaves here: the run installs that one directly.
+    policy: Optional[Any] = None
 
     def attach(self, view: Any, transfer_cost: Any) -> None:
         """Receive the ports this control plane senses and prices through."""

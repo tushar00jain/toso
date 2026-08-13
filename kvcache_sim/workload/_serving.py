@@ -5,7 +5,7 @@ Two separate things, deliberately:
 * :class:`KVWorkload` is *the work* -- a stream of conversations, one
   :class:`~realsim.runner.WorkItem` per conversation at its first turn's arrival
   time. It builds no store, no scheduler and no plane;
-* :func:`coordinator` and :func:`serving_plane` are the *capability wiring*, one
+* :func:`scheduler` and :func:`serving_plane` are the *capability wiring*, one
   per plane: the scheduler over the view, and the store plus one
   :class:`~kvcache_sim.data.serving.ServingHost` per instance over it. Both are
   factories because they reach for the view, the mesh and the ledger, none of
@@ -52,10 +52,11 @@ had to keep the loop alive for the tail, and nothing was left holding the reques
 to measure it.
 
 They are two functions because they are two services. The plane factory does not
-build the scheduler; it takes ``sim.coordinator_handle``, the handle
-:meth:`realsim.run.Run.execute` put in front of whatever :func:`coordinator`
-returned. A scenario names both on a :class:`~realsim.run.Run`: same workload,
-different wiring, which is exactly what "cache-aware vs load-balance" means.
+build the scheduler; it takes ``sim.placement_handle`` and ``sim.cluster_handle``,
+the handles :meth:`realsim.run.Run.execute` put in front of whatever
+:func:`scheduler` returned and of the model it decides against. A scenario names
+both functions on a :class:`~realsim.run.Run`: same workload, different wiring,
+which is exactly what "cache-aware vs load-balance" means.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ from typing import Callable, Dict, List, Optional
 from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
-from proposed import Endpoint
+from proposed import Endpoint, Policy
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.simulation import Simulation
@@ -89,7 +90,7 @@ from ..report.metrics import Metrics
 # match in blocks -- and a run that told the two different numbers would route on
 # one geometry and store in another.
 
-__all__ = ["BLOCK_TOKENS", "coordinator", "KVWorkload", "serving_plane"]
+__all__ = ["BLOCK_TOKENS", "KVWorkload", "scheduler", "serving_plane"]
 
 
 class KVWorkload(Workload):
@@ -139,7 +140,7 @@ class KVWorkload(Workload):
         ]
 
 
-def coordinator(
+def scheduler(
     kind: str,
     *,
     balance_threshold: float = 1.5,
@@ -147,22 +148,30 @@ def coordinator(
     slo_ttft: float = float("inf"),
     slo_tbt: float = float("inf"),
     simulate_decode: bool = False,
-    max_batch: int = 8,
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
-    early_rejection: str = "off",
+    early_rejection: str = "early",
+    source_policy: Optional[Policy] = None,
 ) -> object:
     """This run's **control plane**, as an object a scenario can just declare.
 
-    ``kind`` is ``"cache_aware"`` (the coordinator under test) or
+    ``kind`` is ``"cache_aware"`` (the scheduler under test) or
     ``"load_balance"`` (the baseline). Knobs only: the stack's ports arrive later
-    through :meth:`~kvcache_sim.control.scheduler._Base.attach`, which is what
+    through :meth:`~kvcache_sim.control.scheduler._Scheduler.attach`, which is what
     lets this be a value rather than a factory the harness must call at the right
-    moment. The :class:`~realsim.run.Run` installs it in the directory (it answers
-    the store's routing question) *and* fronts it with a
-    :class:`~realsim.seams.coordinator_handle.LocalCoordinatorHandle` (it decides compute
-    placement) -- one object, reached through the seam of whichever service is
-    asking.
+    moment. The :class:`~realsim.run.Run` fronts it with a
+    :class:`~realsim.seams.placement_handle.LocalPlacementHandle` (it decides
+    compute placement) *and* installs the chain it names in the directory (that
+    answers the store's routing question) -- one object, reached through the seam
+    of whichever service is asking.
+
+    ``source_policy`` is the one knob that is an object rather than a value: which
+    peer serves a prefix gap is a :class:`~proposed.policy.Policy`, and it keeps
+    state across the decisions it makes
+    (:class:`~kvcache_sim.control._source.SpreadReadsPolicy`). ``None`` -- the
+    default -- is :class:`~kvcache_sim.control._source.LongestPrefixPolicy`. Give
+    each run its own: two runs sharing one would tally each other's grants and
+    neither would reproduce alone.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
@@ -172,10 +181,10 @@ def coordinator(
         slo_ttft=slo_ttft,
         slo_tbt=slo_tbt,
         simulate_decode=simulate_decode,
-        max_batch=max_batch,
         prefill_pool=prefill_pool,
         decode_pool=decode_pool,
         early_rejection=early_rejection,
+        source_policy=source_policy,
     )
     if kind == "cache_aware":
         return CacheAwareScheduler(
@@ -191,7 +200,7 @@ class _ServingEndpoints:
     connection, a stub, a Monarch handle over its actor -- as one
     :class:`~realsim.seams.link.LocalEndpoint` per member, over a shared
     :class:`~realsim.seams.link.ServiceHop`. A client is off the box, so reaching a
-    host is a boundary like reaching the directory or the coordinator and is
+    host is a boundary like reaching the directory or the control plane and is
     charged like one: free by default, so a run that does not ask for the fidelity
     is byte-identical.
 
@@ -226,8 +235,8 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
     every instance and buy nothing back.
 
     Note what it deliberately does *not* do: it never looks at the block keys. An
-    arrival policy that routed by cache contents would be doing the coordinator's
-    job with none of the coordinator's information, and the comparison this whole
+    arrival policy that routed by cache contents would be doing control's job
+    with none of control's information, and the comparison this whole
     package exists to make would be measuring itself.
 
     Deterministic across runs and platforms: ``crc32`` of the conversation id, not
@@ -292,15 +301,14 @@ class _Client:
     replaced.
 
     Note what it carries. The :class:`~kvcache_sim.control.scheduler.Plan` -- a
-    value the coordinator issued, which is exactly the kind of thing a client is
+    value control issued, which is exactly the kind of thing a client is
     handed and hands back (a routing token, a session ticket) and which nothing
     here reads for a decision.
 
     It also does not second-guess an address. ``prefill`` answers with the decode
-    host rather than the client reading ``plan.decode``, because the plan is what
-    control *predicted* and the prefill host may have been refused the admission
-    since -- ``None`` means the journey ends here, and the host that ended it has
-    already said why in the ledger.
+    host rather than the client reading ``plan.decode``, because whether there is a
+    next leg at all is the serving host's answer and not a field to interpret --
+    ``None`` means the journey ends here.
 
     Args:
         hosts: ``instance id -> _ServingEndpoints``. References, not objects: a
@@ -442,7 +450,7 @@ def serving_plane(
             # not, which is what ``coupled=False`` on a host in both pools means.
             prefill_compute = compute if coupled else accelerator()
             hosts[instance] = ServingHost(
-                instance, store, sim.coordinator_handle,
+                instance, store, sim.placement_handle, sim.cluster_handle,
                 trace=sim.trace, metrics=sim.ledger,
                 prefill=(
                     PrefillEngine(prefill_compute)

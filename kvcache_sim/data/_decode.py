@@ -34,11 +34,11 @@ Admission answers with a completion
 -----------------------------------
 The step loop is a task, so it outlives the call that fed it -- but that is how the
 batch is driven, not a licence for the request to outlive its caller.
-:meth:`DecodeEngine.admit` hands back a future resolved when that request emits its
-last token, which is what lets the caller stay on the request long enough to stamp
+:meth:`DecodeEngine.admit` returns when that request emits its last token, which is
+what lets the caller stay on the request long enough to stamp
 arrival-to-last-token (:mod:`kvcache_sim.workload._serving`).
 
-That future resolves with a :class:`Generated`: **the tokens this engine produced**,
+It answers with a :class:`Generated`: **the tokens this engine produced**,
 accumulated per batch member as the steps land, and **the KV those tokens left
 behind**, in whole blocks
 (:meth:`kvcache_sim.data._compute.Accelerator.generated_kv`). The host publishes the
@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 import torch
 
@@ -70,7 +70,7 @@ __all__ = ["DecodeEngine", "Generated"]
 class Generated:
     """What a decode batch produced for one request: its tokens and its KV.
 
-    The value :meth:`DecodeEngine.admit`'s completion resolves with. A named pair
+    The value :meth:`DecodeEngine.admit` answers with. A named pair
     rather than a 2-tuple of ``List[torch.Tensor]``: unpacked the wrong way round it
     would publish tokens under block keys and answer the client with KV, and both
     halves would typecheck all the way down.
@@ -124,20 +124,23 @@ class DecodeEngine:
         max_batch: VRAM cap on this host's decode batch.
         on_finish: called ``(request, tbt_max)`` when a request emits its last
             token. Telemetry, not control flow: the *caller* learns its request
-            finished from the future :meth:`admit` gave it, while this tells the
-            owning host what the gaps were so it can write its half of the row. It
-            runs before the future resolves (see :meth:`_finish`).
-        on_compute_busy: called ``(until)`` every time a step occupies this
+            finished by :meth:`admit` returning, while this tells the owning host
+            what the gaps were so it can write its half of the row. It runs first
+            (see :meth:`_finish`).
+        on_compute_busy: awaited ``(until)`` every time a step occupies this
             host's compute timeline. The host passes this only when it is
             **coupled**, i.e. prefill shares that timeline; a disaggregated host
             leaves it ``None``.
-        on_state: called ``(finishes)`` whenever the batch changes, with one
+        on_state: awaited ``(finishes)`` whenever the batch changes, with one
             estimated finish time per request decoding or queued here. The host
-            forwards it to the coordinator, which is how control knows the decode
+            forwards it to control's model, which is how control knows the decode
             load without holding this object.
 
     Both callbacks are the plane's, not control's: this engine reports to its
-    owner on the same host, and the owner decides what to send onward.
+    owner on the same host, and the owner decides what to send onward. Awaited
+    because the owner sends them over a hop, and a report fired off as a task would
+    reorder the run; what that costs is the step loop's, which is where a report to
+    another service really lands.
     """
 
     def __init__(
@@ -146,8 +149,8 @@ class DecodeEngine:
         *,
         max_batch: int,
         on_finish: Optional[Callable[[Request, float], None]] = None,
-        on_compute_busy: Optional[Callable[[float], None]] = None,
-        on_state: Optional[Callable[[List[float]], None]] = None,
+        on_compute_busy: Optional[Callable[[float], Awaitable[None]]] = None,
+        on_state: Optional[Callable[[List[float]], Awaitable[None]]] = None,
     ) -> None:
         self.max_batch = max_batch
         # Batch=1 baseline step time for the decode-load prediction (each remaining
@@ -166,7 +169,7 @@ class DecodeEngine:
         self._step_task: Optional["asyncio.Task"] = None
 
     # -- what we report about ourselves ------------------------------------ #
-    def _report(self) -> None:
+    async def _report(self) -> None:
         """Push this host's batch state to whoever is listening (the host).
 
         One estimated finish time per request decoding or queued here, under the
@@ -177,41 +180,38 @@ class DecodeEngine:
         """
         if self.on_state is None:
             return
-        self.on_state([
+        await self.on_state([
             a.last_token_time + a.remaining * self._base_step
             for a in self.batch + self.pending
         ])
 
     # -- lifecycle -------------------------------------------------------- #
-    def admit(self, request: Request) -> "asyncio.Future":
+    async def admit(self, request: Request) -> Generated:
         """Enter ``request`` into this host's decode batch; answer with its tokens.
 
-        The first token was produced by prefill (TTFT); decode generates the
-        remaining ``output_tokens - 1``. A request with <= 1 output token needs no
-        decode and finishes immediately with an empty :class:`Generated`: nothing
-        was left to generate, so no tokens and no KV.
+        Returns when its **last token** lands, with a :class:`Generated` -- the
+        tokens this engine produced and the KV they left on this host. The first
+        token was produced by prefill (TTFT); decode generates the remaining
+        ``output_tokens - 1``. A request with <= 1 output token needs no decode and
+        finishes immediately with an empty :class:`Generated`: nothing was left to
+        generate, so no tokens and no KV.
 
-        The answer is a future resolved with a :class:`Generated` -- **the tokens
-        this engine produced and the KV they left on this host** -- when the request
-        emits its last token. A future rather than a third callback: ``on_finish``
-        and ``on_state`` are telemetry broadcast to the owning host, whereas this is
-        the answer to one specific admission, and a caller filtering a broadcast for
-        its own id would be reassembling a return value by hand.
-
-        Both ways out of here resolve it exactly once and both do it *after*
-        ``on_finish`` has run (see :meth:`_finish`). A step task that dies resolves
-        every outstanding one with the exception rather than leaving a caller parked
-        forever (:meth:`_abandon`).
+        Inside, the wait is on the slot's own future, which is what lets the step
+        loop -- a task, so that it outlives this call -- retire one member without
+        knowing who admitted it. Both ways out resolve that future exactly once and
+        both do it *after* ``on_finish`` has run (see :meth:`_finish`); a step task
+        that dies resolves every outstanding one with the exception rather than
+        leaving a caller parked forever (:meth:`_abandon`).
         """
         loop = asyncio.get_running_loop()
         done: "asyncio.Future" = loop.create_future()
         remaining = max(0, request.output_tokens - 1)
         if remaining == 0:
             # Never in the batch, so never in a step: retired on the clock instant
-            # it arrived, and with no step there is no position of KV either. The
-            # caller still gets a future; awaiting a resolved one costs nothing.
+            # it arrived, and with no step there is no position of KV either.
+            # Awaiting an already-resolved future costs nothing.
             self._finish(request, 0.0, done, [])
-            return done
+            return await done
         a = _Active(
             request=request,
             remaining=remaining,
@@ -222,9 +222,9 @@ class DecodeEngine:
             self.batch.append(a)
         else:
             self.pending.append(a)  # VRAM full: wait counts against TBT
-        self._report()
+        await self._report()
         self._ensure_stepping()
-        return done
+        return await done
 
     def _finish(
         self,
@@ -278,9 +278,9 @@ class DecodeEngine:
                 # schedule around it.
                 step_end = self.compute.claim_step(len(members))
                 if self.on_compute_busy is not None:
-                    self.on_compute_busy(step_end)
+                    await self.on_compute_busy(step_end)
                 await self.compute.wait_until(step_end)
-                self._step_complete(members, step_end)
+                await self._step_complete(members, step_end)
         except BaseException as exc:      # noqa: BLE001 -- re-raised below
             self._abandon(exc)
             raise
@@ -304,7 +304,7 @@ class DecodeEngine:
         self.batch.clear()
         self.pending.clear()
 
-    def _step_complete(self, members: List[_Active], step_end: float) -> None:
+    async def _step_complete(self, members: List[_Active], step_end: float) -> None:
         """Emit one token for each member; retire finished; promote pending.
 
         The tokens come from the accelerator that just ran the step, one per member
@@ -326,4 +326,4 @@ class DecodeEngine:
         # A freed VRAM slot admits the next queued request (still counting its wait).
         while self.pending and len(self.batch) < self.max_batch:
             self.batch.append(self.pending.pop(0))
-        self._report()
+        await self._report()

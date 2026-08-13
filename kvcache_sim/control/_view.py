@@ -6,7 +6,7 @@ instance hold contiguously?* -- because a cache is only useful as a contiguous
 prefix. That is a KV-cache notion, not a store notion, so it is a subclass here
 rather than a field on the base view.
 
-:class:`PinnedKVView` is the second half of the same idea. A routing decision reads
+:meth:`KVView.pinned` is the second half of the same idea. A routing decision reads
 the prefix runs several times -- once for the candidate loop's local matches, once
 per candidate when it asks the source :class:`~proposed.policy.Policy` which peer
 would serve the gap -- and all of them must see the *same* directory state or the
@@ -16,11 +16,14 @@ request, not once per read.
 
 from __future__ import annotations
 
-from typing import AbstractSet, Dict, List, Optional, Sequence
+from contextlib import contextmanager
+from typing import (
+    AbstractSet, Dict, Iterator, List, Optional, Sequence, Tuple,
+)
 
 from proposed import View
 
-__all__ = ["prefix_lengths_of", "KVView", "PinnedKVView"]
+__all__ = ["prefix_lengths_of", "KVView"]
 
 
 def _longest_prefix_run(block_keys: Sequence[str], present: AbstractSet[str]) -> int:
@@ -45,8 +48,9 @@ def prefix_lengths_of(
 
     Split from the read that feeds it: :meth:`KVView.prefix_lengths` reads the
     directory (or serves a pinned snapshot), while
-    :class:`~kvcache_sim.control._source.LongestPrefixPolicy` is handed a plain
-    :class:`~proposed.view.View` and reads it itself. One definition either way.
+    :class:`~kvcache_sim.control._source.LongestPrefixPolicy` may be attached to a
+    plain :class:`~proposed.view.View` and reads it itself. One definition either
+    way.
     """
     keys = list(block_keys)
     if not keys:
@@ -61,44 +65,48 @@ def prefix_lengths_of(
 class KVView(View):
     """A :class:`~proposed.view.View` plus per-instance prefix-run lengths."""
 
-    async def prefix_lengths(self, block_keys: Sequence[str]) -> Dict[str, int]:
+    #: The keys one decision pinned and the runs it read for them, while
+    #: :meth:`pinned` holds; ``None`` outside such a decision.
+    _snapshot: Optional[Tuple[List[str], Dict[str, int]]] = None
+
+    def prefix_lengths(self, block_keys: Sequence[str]) -> Dict[str, int]:
         """``instance -> leading blocks of ``block_keys`` it holds contiguously``.
 
         Computed from the real ``locate_volumes`` result
         (``{key -> {volume_id -> StorageInfo}}``); the run stops at the first
         missing block, and instances holding none of the first block are omitted.
+        Served from the pinned snapshot while one is held.
         """
         keys = list(block_keys)
-        if not keys:
-            return {}
-        return prefix_lengths_of(await self.locate(keys), keys)
+        if self._snapshot is not None:
+            pinned_keys, counts = self._snapshot
+            assert keys == pinned_keys, (
+                "a pinned view answers for the keys it was pinned to; one decision "
+                "reads one snapshot"
+            )
+            return counts
+        return prefix_lengths_of(self.locate(keys), keys)
 
-    def pin(self, block_keys: Sequence[str]) -> "PinnedKVView":
-        """A view of this one directory snapshot, for one routing decision."""
-        return PinnedKVView(self, block_keys)
+    @contextmanager
+    def pinned(self, block_keys: Sequence[str]) -> Iterator[None]:
+        """Read the directory once, and serve that snapshot for the block.
 
+        Scoped state on the view rather than a snapshot object passed around,
+        because every selector a decision consults senses through this same view
+        (:meth:`~proposed.policy.Selector.attach`) and would otherwise read past the
+        snapshot into the live directory.
 
-class PinnedKVView(KVView):
-    """A :class:`KVView` whose prefix runs are read once and then reused.
-
-    Everything else (``locate``, topology, the clock) delegates to the view it
-    was pinned from.
-    """
-
-    def __init__(self, base: KVView, block_keys: Sequence[str]) -> None:
-        super().__init__(base.directory, base.topology)
-        self._base = base
-        self._keys: List[str] = list(block_keys)
-        self._counts: Optional[Dict[str, int]] = None
-
-    async def prefix_lengths(
-        self, block_keys: Optional[Sequence[str]] = None
-    ) -> Dict[str, int]:
-        """The pinned snapshot's prefix runs (the argument is the pinned keys)."""
-        assert block_keys is None or list(block_keys) == self._keys, (
-            "a pinned view answers for the keys it was pinned to; pin a new one "
-            "for a different request"
-        )
-        if self._counts is None:
-            self._counts = await self._base.prefix_lengths(self._keys)
-        return self._counts
+        Sound because one decision cannot be interleaved with another: the directory
+        read underneath it is a plain synchronous method
+        (:meth:`~proposed.deployment.Controller.locate_raw`), so there is no
+        suspension point between the pin and its release. Should one ever appear,
+        the assertions fire -- here on a second decision entering, in
+        :meth:`prefix_lengths` on a read of other keys arriving inside one.
+        """
+        assert self._snapshot is None, "a decision already holds this view's snapshot"
+        keys = list(block_keys)
+        self._snapshot = (keys, prefix_lengths_of(self.locate(keys), keys))
+        try:
+            yield
+        finally:
+            self._snapshot = None

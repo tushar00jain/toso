@@ -1,48 +1,52 @@
-"""One question, one interface: which volume serves these keys, and when?
+"""One question, two subjects: which sources serve this, and when::
 
-Both capabilities in this repo ask the store the same thing. ``dedup_sim`` wants
-a reader routed to a *peer* that is about to hold the key; ``kvcache_sim`` wants
-the peer holding the longest reusable prefix, priced against recomputing it. The
-answer in both cases is a ranked list of sources plus the moment they become
-usable, so there is one interface:
+    Selector.select(subject, requester) -> Selection
 
-    Policy.select(view, keys, requester) -> Selection
+The answer is always a ranked list of sources plus the moment they become usable
+(and, for a selector handed candidates it did not price, what each one priced at).
+What differs is the subject, and that difference is a type:
 
-and two places it is invoked:
+* :class:`Policy` -- the subject is **keys**, so the question is the store's:
+  which volume serves these bytes. ``dedup_sim`` wants a reader routed to a *peer*
+  about to hold the key, ``kvcache_sim`` the peer holding the longest reusable
+  prefix. The only kind installable in the controller.
+* :class:`Placement` -- the subject is an application payload, so the question is
+  the application's: which peer to source a prefix from, which host prefills,
+  which host decodes. Never installed in the controller; an application's hosts
+  reach one as a service of its own.
 
-* **inside the controller's ``locate_volumes`` body**, after it reads the real
-  directory and before it answers -- so a scenario that just calls
-  ``client.get(K)`` is routed without knowing a policy exists. This is where the
-  "and when" matters: a :class:`Selection` may carry a readiness gate, and the
-  controller withholds its answer until that gate opens. Blocking the response is
-  something a real controller can do (it is the same shape as waiting for a
-  shard to commit), and it needs no client change;
-* **directly from an app**, when the app wants to *price* the alternatives rather
-  than be handed one -- ``kvcache_sim`` compares "pull from the best peer"
-  against "recompute locally" before it commits to either.
+Two subtypes rather than one generic interface because a controller consults a
+:class:`Policy` inside ``locate_volumes``: with a single type, a selector whose
+subject is not keys could be installed there, and :class:`Selection` would be a
+union serving neither caller. The subtype is the marker.
 
-What deliberately does not go through it: compute placement, admission and SLO
-gates. Those are decisions the store knows nothing about; the moment ``select``
-answers them it becomes a union type serving neither caller.
+Admission and SLO gates are neither: an answer that is not a ranked set of sources
+does not belong in a :class:`Selection` at all. A gate rides *with* one instead --
+a selector that refuses abstains (``Selection.of([])``), and what it would have
+answered is simply not in the ranking.
 
-:class:`NaivePolicy` is **naive**: every holder, in directory order -- which is
-exactly the answer the real ``Controller`` already gives, so its selection is the
-empty one and the directory's own answer is returned untouched. That is what makes
-"no policy installed" and "``NaivePolicy`` installed" byte-identical runs.
+Selectors compose: :class:`FirstMatch` orders them and takes the first answer. It
+wraps either kind and *is* a plain :class:`Selector` whatever it wraps, so a chain
+mixing the two kinds is possible and harmless -- and thereby barred from the
+controller, the one place the mixture would matter. A chain whose links are all
+policies is a :class:`PolicyChain`, which is a :class:`Policy` and may be installed.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
-    Any, Awaitable, Callable, Dict, Optional, Protocol, Sequence, Tuple,
+    Any, Awaitable, Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple,
 )
 
 from proposed.plane import ControlPlane
 from proposed.view import View
 
-__all__ = ["Ready", "Selection", "DecisionLog", "Policy", "NaivePolicy"]
+__all__ = [
+    "Ready", "Selection", "DecisionLog", "Selector", "Policy", "Placement",
+    "NaivePolicy", "FirstMatch", "PolicyChain",
+]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
 # usable. ``None`` means "usable now".
@@ -51,25 +55,54 @@ Ready = Callable[[], Awaitable[None]]
 
 @dataclass(frozen=True)
 class Selection:
-    """Ranked sources for a set of keys, plus when they become usable.
+    """Ranked sources for one subject, plus when they become usable.
 
     Args:
         sources: volume ids, best first. ``None`` -- the default -- means *every
-            holder, in directory order*: the naive answer, and also what the real
-            directory returns on its own, so a ``None`` selection leaves the
-            controller's answer untouched.
-        ready: optional gate awaited before the answer is released. A policy that
-            routes a requester to a peer which has not registered yet returns the
-            peer here plus a gate that opens when it does.
+            holder, in directory order*, which is what the real directory returns
+            on its own, so a ``None`` selection leaves the controller's answer
+            untouched.
+        ready: optional gate awaited before the answer is released, for a policy
+            that routes a requester to a peer which has not registered yet.
+        payload: ``source id -> what this selector holds about that source``,
+            application-defined because this package cannot read an application's
+            values. A ranking alone loses what produced it, and a selector handed
+            alternatives somebody else priced has to give the winner's price back
+            with it. Keyed by id rather than parallel to ``sources``, so a selection
+            cannot be built out of step with itself; empty for a selector that only
+            ranks.
     """
 
     sources: Optional[Tuple[str, ...]] = None
     ready: Optional[Ready] = None
+    payload: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def of(cls, sources: Sequence[str], *, ready: Optional[Ready] = None) -> "Selection":
+    def of(
+        cls,
+        sources: Sequence[str],
+        *,
+        ready: Optional[Ready] = None,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> "Selection":
         """A selection ranking ``sources`` best-first."""
-        return cls(sources=tuple(sources), ready=ready)
+        return cls(
+            sources=tuple(sources), ready=ready, payload=dict(payload or {})
+        )
+
+    @property
+    def winner(self) -> Optional[Any]:
+        """What the best-ranked source was chosen *with*, or ``None`` if none was.
+
+        The payload under the head of :attr:`sources`, so a caller wanting the one
+        answer does not have to index a ranking to reach it. ``None`` covers all
+        three ways there is no such thing: an abstention, the default selection
+        (which names no source in particular), and a selector that ranks without
+        pricing.
+        """
+        if not self.sources:
+            return None
+        return self.payload.get(self.sources[0])
 
     async def wait(self) -> None:
         """Block until the chosen sources are usable (returns at once if ready)."""
@@ -99,60 +132,179 @@ class DecisionLog(Protocol):
     """Somewhere a policy can explain itself.
 
     Optional and never load-bearing: a policy must behave identically with none
-    attached. Declared here so a policy can be handed one without naming the
-    simulator's trace -- a deployment would pass its own logger.
+    attached. Declared here so a policy need not name the simulator's trace.
     """
 
     def record(self, at: float, kind: str, message: str) -> None:
         ...
 
 
-class Policy(ControlPlane, ABC):
-    """Source-selection policy: the interface a controller consults.
+class Selector(ControlPlane, ABC):
+    """Rank the sources that should serve a subject, and say when they are usable.
 
-    Abstract, so what a policy *is* and what the naive answer *does* are two
-    things: :class:`NaivePolicy` is the implementation of "the directory answers
-    for itself". Override :meth:`notice` too if the routing has to wait for a
-    source to appear.
+    Everything shared by the two kinds lives here -- ``select``, ``notice``, the
+    :class:`~proposed.plane.ControlPlane` lifecycle -- so :class:`Policy` and
+    :class:`Placement` cannot drift apart. Implement one of those; only the
+    combinators below sit on the base itself.
+
+    Override :meth:`notice` too if the selection has to wait for a source to
+    appear.
     """
 
-    name = "policy"
+    name = "selector"
+
+    #: What this selector senses through: ``None`` until :meth:`attach`, and never
+    #: read by one that ranks only what it is handed.
+    view: Optional[View] = None
+
+    def attach(self, view: Any, transfer_cost: Any) -> None:
+        """Keep the view this selector reads the directory through.
+
+        A selector consulted inside ``locate_volumes`` runs on the same side as the
+        service consulting it, so the sensor is the run's and not a per-call
+        argument: one selector, one view, whoever asks.
+        """
+        self.view = view
 
     @abstractmethod
-    async def select(
-        self, view: View, keys: Sequence[str], requester: str
-    ) -> Selection:
-        """Rank the volumes that should serve ``keys`` for ``requester``."""
+    async def select(self, subject: Any, requester: str) -> Selection:
+        """Rank the sources that should serve ``subject`` for ``requester``.
+
+        ``Any``, because what a subject *is* is the subtype's claim: keys for a
+        :class:`Policy`, an application's own values for a :class:`Placement`.
+        """
 
     def notice(self, volume_id: str, keys: Sequence[str]) -> None:
         """The real directory just gained ``keys`` on ``volume_id``.
 
         Called by the controller on every real registration
-        (``notify_put_batch``). Default: nothing. A policy whose answer is
+        (``notify_put_batch``). Default: nothing. A selector whose answer is
         withheld until a planned peer registers opens its readiness gate here.
 
         There is deliberately no counterpart for a *de*-registration
-        (``notify_delete_batch``, which is how a full volume says what it
-        evicted). This hook exists to deliver a **wakeup**, and nothing waits for
-        a key to disappear; a policy that needs to know who holds a key right now
-        reads the directory when it forms its answer, which is the only reading
+        (``notify_delete_batch``). This hook delivers a **wakeup**, and nothing
+        waits for a key to disappear; a selector that needs to know who holds a key
+        right now reads the directory as it forms its answer, the only reading
         that survives an eviction.
         """
 
+
+class Policy(Selector):
+    """A selector whose subject is **keys**: which volume serves these bytes.
+
+    The store's own question, and the only kind a controller may install in
+    ``locate_volumes``. Adds no member to :class:`Selector`; being this type *is*
+    the claim that ``subject`` is a set of keys, which is what makes installing one
+    checkable (``isinstance(control, Policy)`` at the seam).
+    """
+
+
+class Placement(Selector):
+    """A selector whose subject is an **application payload**.
+
+    An application question that happens to be a selection -- which peer to source
+    a prefix from, which host prefills, which host decodes. Adds no member to
+    :class:`Selector`; being this type instead of :class:`Policy` is what keeps it
+    out of the controller, where a subject the store cannot read would make
+    ``locate_volumes`` answer a question it was not asked.
+
+    One that an application's own hosts ask is given a service of its own by the
+    run (:mod:`realsim.seams.placement_service`), so the subject and the answer
+    both have to be values a wire could carry: the ranking is source ids, and what
+    the winner was chosen with rides in :attr:`Selection.payload`.
+    """
 
 
 class NaivePolicy(Policy):
     """Every holder, in directory order, usable now.
 
-    That is precisely the real directory's own answer, so this returns the empty
-    :class:`Selection` rather than re-deriving it -- installing it is free and
-    byte-identical to installing no policy at all. A caller that wants the list
-    spelled out can read it off ``view.holders(await view.locate(keys), key)``.
+    Precisely the real directory's own answer, so this returns the empty
+    :class:`Selection` rather than re-deriving it: installing it is byte-identical
+    to installing no policy at all.
     """
 
     name = "naive"
 
-    async def select(
-        self, view: View, keys: Sequence[str], requester: str
-    ) -> Selection:
+    async def select(self, keys: Sequence[str], requester: str) -> Selection:
         return Selection()
+
+
+class FirstMatch(Selector):
+    """Ask each selector in order; the first one that answers is the answer.
+
+    A :class:`Selection` can be empty in two ways, and they mean opposite things:
+
+    * ``Selection()`` -- ``sources is None`` -- is *every holder, in directory
+      order*, the decision :class:`NaivePolicy` makes. It **wins the chain**, and
+      the selectors behind it are never consulted.
+    * ``Selection.of([])`` names nobody. That is the **abstention**, and it falls
+      through.
+
+    An exhausted chain abstains in turn, which keeps chaining associative:
+    ``FirstMatch([FirstMatch([a, b]), c])`` still reaches ``c``, as it could not if
+    the inner chain's exhaustion arrived looking like a decision. A chain that
+    should always answer ends with a :class:`NaivePolicy`. The winner is returned
+    exactly as built, so a readiness gate rides along untouched.
+
+    :meth:`notice` goes to **every** wrapped selector, including ones this chain
+    has never reached, because it delivers a *wakeup*, not a consultation: one
+    sitting behind an earlier answer has requesters parked on gates that nothing
+    but its own ``notice`` opens. The fan-out is synchronous and in chain order,
+    with no ``await`` in it, so no registration can interleave with another's
+    delivery.
+
+    Args:
+        selectors: consulted left to right. An empty chain is legal and abstains.
+    """
+
+    name = "first-match"
+
+    def __init__(self, selectors: Sequence[Selector]) -> None:
+        self.selectors: Tuple[Selector, ...] = tuple(selectors)
+
+    def attach(self, view: Any, transfer_cost: Any) -> None:
+        """Hand the stack's ports to every wrapped selector, answering or not.
+
+        Same reason as :meth:`notice`: one that senses through a view of its own
+        must be brought up even if it never answers.
+        """
+        for selector in self.selectors:
+            selector.attach(view, transfer_cost)
+
+    async def select(self, subject: Any, requester: str) -> Selection:
+        """The first non-abstaining answer, or an abstention if there is none."""
+        for selector in self.selectors:
+            selection = await selector.select(subject, requester)
+            if selection.sources is None or selection.sources:
+                return selection
+        return Selection.of([])
+
+    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
+        """Fan the registration out to every wrapped selector."""
+        for selector in self.selectors:
+            selector.notice(volume_id, keys)
+
+
+class PolicyChain(FirstMatch, Policy):
+    """A :class:`FirstMatch` every link of which selects over keys, so it does too.
+
+    Installable in the controller, which a plain chain is not. The claim is checked
+    at construction rather than trusted, so being this type says exactly what
+    :class:`Policy` says: a ``locate_volumes`` hands its subject down every link,
+    and one that read it as anything but keys would answer a question the directory
+    did not ask.
+
+    Args:
+        selectors: consulted left to right; each must be a :class:`Policy`.
+    """
+
+    name = "policy-chain"
+
+    def __init__(self, selectors: Sequence[Selector]) -> None:
+        super().__init__(selectors)
+        wrong = [type(s).__name__ for s in self.selectors if not isinstance(s, Policy)]
+        if wrong:
+            raise TypeError(
+                f"a PolicyChain selects over keys, so every link must be a Policy; "
+                f"{', '.join(wrong)} {'is' if len(wrong) == 1 else 'are'} not"
+            )

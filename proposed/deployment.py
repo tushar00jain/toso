@@ -33,7 +33,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
-    "Controller", "Coordinator", "Deployment", "StorageFull", "StorageVolume",
+    "ClusterModel", "Controller", "Deployment", "StorageFull", "StorageVolume",
 ]
 
 
@@ -74,15 +74,40 @@ class Controller(Protocol):
     The difference between this protocol and torchstore's class *is* the ask, and
     it is two things. One cannot be declared: ``locate_volumes`` gains a hook that
     consults a :class:`~proposed.policy.Policy`, which changes no signature, so it
-    is stated here instead. The other can be, and is: :meth:`locate_raw`, the same
-    directory read with that hook skipped. Every other member below already exists
-    upstream, spelled the same way.
+    is stated here instead. The other is :meth:`locate_raw`, the same directory read
+    with that hook skipped. Every other member already exists upstream, spelled the
+    same way.
 
     A caller does not hold one of these -- it holds a :class:`ControllerHandle`.
     torchstore's ``Controller`` implements this; under simulation the two bodies
     Monarch will not let us invoke off-actor are mirrored privately inside
     :class:`realsim.seams.controller_handle.LocalControllerHandle`.
     """
+
+    def locate_raw(
+        self,
+        keys: Sequence[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
+        """``{key -> {volume_id -> StorageInfo}}``, *unrouted*: no policy consulted.
+
+        A controller implementing this proposal needs both reads. This is the one it
+        hands its own policy, through a :class:`~proposed.view.View`: a policy
+        sensing the directory must see it as it *is*, and reading it back through
+        ``locate_volumes`` would re-enter the hook the policy is being called from.
+
+        **Not a coroutine, and that is load-bearing.** A directory read cannot
+        suspend, so everything a control plane does between reading the directory
+        and writing its own bookkeeping runs to completion before the next
+        requester's does -- which is what lets a routing decision be a
+        read-modify-write with no lock (``dedup_sim.control.routing``) and lets a
+        set of priced candidates be comparable
+        (``kvcache_sim.control.scheduler``). It is a plain local method for the same
+        reason it can be one: the only caller is the controller's own policy,
+        sensing through a view built over the directory in this process, so nothing
+        crosses a boundary and there is nothing to wait for.
+        """
 
     async def locate_volumes(
         self,
@@ -91,25 +116,6 @@ class Controller(Protocol):
         require_fully_committed: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
         """``{key -> {volume_id -> StorageInfo}}``, routed."""
-
-    async def locate_raw(
-        self,
-        keys: Sequence[str],
-        missing_ok: bool = False,
-        require_fully_committed: bool = True,
-    ) -> Dict[str, Dict[str, Any]]:
-        """The same read, *unrouted*: no policy consulted.
-
-        A controller implementing this proposal needs both reads. This is the one it
-        hands its own policy, through a :class:`~proposed.view.View`: a policy
-        sensing the directory must see it as it *is*, and reading it back through
-        ``locate_volumes`` would re-enter the hook the policy is being called from.
-
-        It is on this surface and not a protocol of its own because the object that
-        has it is the object that answers ``locate_volumes`` -- one directory
-        service, read two ways. A caller that is not the controller's own policy has
-        no reason to reach for it.
-        """
 
     async def notify_put_batch(
         self, requests: Sequence[Any], storage_volume_id: str
@@ -128,11 +134,43 @@ class Controller(Protocol):
         """Every registered key, or those under ``prefix``."""
 
 
+class ClusterModel(Protocol):
+    """An application's picture of its own cluster, as a caller reaches it.
+
+    The peer of :class:`Controller` on the application's side. That one holds
+    residency -- which volume holds which key -- and is written as volumes publish
+    and evict; this one holds what no directory can see: how deep an instance's
+    queue is, who is working and until when, what has been promised and not yet
+    done. It is written as the hosts report what they did.
+
+    One member, because being told is the only thing a *caller* does to a model.
+    What decides against it is a :class:`~proposed.policy.Placement`, and what it
+    may show is read off the model itself: the reads are the application's, since a
+    queue tail and a decode occupancy are one application's vocabulary, and
+    :class:`~proposed.view.View` is the *store's* sensor, which cannot see load at
+    all.
+
+    The fact is ``Any`` for the reason given at the top of this module: this
+    package cannot import an application, so what a host reports is the
+    application's own type.
+    """
+
+    async def notify(self, fact: Any) -> None:
+        """Fold ``fact`` in. The reply carries nothing.
+
+        Awaited, like :meth:`Controller.notify_put_batch` and for the same reason:
+        a reporter whose next question must be decided against this fact gets that
+        ordering from the reply. Sending it one-way would order it only at the
+        sender, and over any distance at all the question would arrive first.
+        """
+
+
 class StorageVolume(Protocol):
     """The store's *storage* service, as a caller reaches it.
 
     The third service in a deployment, beside :class:`Controller` (which knows who
-    holds what) and :class:`Coordinator` (which decides): the one that actually holds
+    holds what) and the application's own :class:`~proposed.policy.Placement`
+    (which decides): the one that actually holds
     bytes. torchstore has this class -- ``torchstore.storage_volume.StorageVolume``,
     an actor whose endpoints each delegate to an ``InMemoryStore`` -- and, as with
     ``Controller``, never declares the surface a caller depends on. So this is that
@@ -192,50 +230,6 @@ class StorageVolume(Protocol):
 
     async def reset(self) -> None:
         """Drop everything this volume holds."""
-
-
-class Coordinator(Protocol):
-    """A control plane that runs as its own service, as a caller reaches it.
-
-    The mirror of :class:`Controller`, for the other service a caller talks to.
-    Where that one is a directory torchstore already has, this one is a coordinator
-    an application spawns: it holds the cluster-wide picture a single host cannot --
-    every instance's queue, cache and load -- and serializes the decisions that read
-    it.
-
-    Every member is ``async``, like :class:`Controller`'s -- a service handles a
-    message, and whether the *sender* waits for the answer is the sender's choice
-    (``call_one`` versus ``broadcast``), not something the surface decides.
-
-    Declared as methods, like :class:`Controller`, because that is where the
-    signatures live. A caller holds a reference rather than the object, so the call
-    goes through an endpoint (``decide.call_one(demand)``,
-    ``observe.broadcast(fact)``); upstream that reference is Monarch's handle over an
-    ``Actor`` carrying one ``@endpoint`` per member below, each forwarding to the
-    plain object -- decorate the shim, not the deciding logic, or its members become
-    ``EndpointProperty`` descriptors that cannot be invoked off-actor. That tax is on
-    display in :mod:`realsim.seams.controller_service`, which exists because
-    torchstore decorated ``Controller``'s own methods.
-
-    Two members, matching :class:`proposed.coordinator.Coordinator` exactly. It used
-    to name one member per question a KV-cache scheduler asks -- ``schedule``,
-    ``decode_admission``, three ``observe_*`` -- which put one application's
-    vocabulary in the store's contract, and in the seam that carries it, and left the
-    author's half and this half to be kept in step by hand. With the questions moved
-    into the *payload*, there is nothing application-specific in either half to
-    drift, and a second application reaches its coordinator across the same two
-    endpoints without a line changing here or in the seam.
-
-    The payloads are ``Any`` for the reason given at the top of this module: a
-    demand, an answer and a fact are the application's types, and this package cannot
-    import an application any more than it can import torchstore.
-    """
-
-    async def decide(self, demand: Any) -> Optional[Any]:
-        """Ask the control plane to answer ``demand``; ``None`` is a refusal."""
-
-    async def observe(self, fact: Any) -> None:
-        """Report ``fact``. The reply carries nothing; ``broadcast`` and do not wait."""
 
 
 class Deployment(Protocol):

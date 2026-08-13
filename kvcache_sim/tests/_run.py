@@ -40,8 +40,9 @@ def run_shared_prefix(seed: int = 0) -> List[Result]:
     return results(scenarios.SharedPrefix(seed).runs())
 
 
-def run_hotspot(seed: int = 0) -> List[Result]:
-    return results(scenarios.Hotspot(seed).runs())
+def run_hotspot(seed: int = 0, args=None) -> List[Result]:
+    """``args`` is the parsed command line, for the ``--spread-reads`` shape."""
+    return results(scenarios.Hotspot(seed).runs(args))
 
 
 def run_overload(seed: int = 0) -> List[Result]:

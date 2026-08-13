@@ -84,13 +84,13 @@ class DisaggregationReport(Report):
 
 
 class EarlyRejectionReport(Report):
-    """``[off, early, predict]``, against a TBT SLO."""
+    """``[early, predict]``, against a TBT SLO."""
 
     def __init__(self, results: Sequence[Result], slo_tbt: float) -> None:
-        self.off, self.early, self.predict = results
+        self.early, self.predict = results
         self.slo_tbt = slo_tbt
 
     def render(self) -> str:
         return render_early_rejection(
-            self.off.ledger, self.early.ledger, self.predict.ledger, self.slo_tbt
+            self.early.ledger, self.predict.ledger, self.slo_tbt
         )

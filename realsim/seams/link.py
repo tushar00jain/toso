@@ -2,12 +2,11 @@
 
 Every `[S]` seam in this package stands in for something that is an actor
 endpoint in a deployment -- :class:`~realsim.seams.controller_handle.LocalControllerHandle`
-for the directory, :class:`~realsim.seams.coordinator_handle.LocalCoordinatorHandle` for a
-capability's coordinator. Standing in for an endpoint means two things: dispatch
+for the directory, :class:`~realsim.seams.placement_handle.LocalPlacementHandle` for a
+capability's control plane. Standing in for an endpoint means two things: dispatch
 to a real object in this process, and *be the place the distance is charged*.
-The first was written twice; the second only once, so the coordinator hop could
-be priced and the controller hop was silently free for every capability, the
-baseline included. This is the second half, factored out.
+This is the second half, factored out, so that every boundary a run crosses is
+priced in one place instead of each handle inventing its own.
 
 A hop is deliberately not a transport. The transport seam charges *bytes* against
 network, storage and RAM (:mod:`realsim.seams.transport`); this charges the

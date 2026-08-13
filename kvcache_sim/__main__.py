@@ -21,11 +21,13 @@ file only declares the demo:
   * disaggregation  -- dedicated decode pool holds the TBT SLO; coupling prefill
                        into decode stalls it (Mooncake's headline).
   * early_rejection -- gating decode admission at routing avoids wasting prefill
-                       (off/early/predict). The TBT half of that comparison does
+                       (early/predict). The TBT half of that comparison does
                        not survive a self-pacing workload -- see its show().
 """
 
 from __future__ import annotations
+
+import argparse
 
 from realsim.demo import Console, Demo
 
@@ -58,6 +60,16 @@ class KVCacheDemo(Demo):
             Disaggregation(),
             EarlyRejection(),
         ]
+
+    def flags(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--spread-reads", action="store_true",
+            help="give the hotspot scenario's cache-aware runs SpreadReadsPolicy "
+            "as their source ranking instead of longest-prefix-then-id, so one "
+            "replica of a hot prefix does not serve every read of it. Off by "
+            "default: it changes which replica answers, so it is not "
+            "byte-identical.",
+        )
 
     def takeaway(self, console: Console) -> None:
         console.section("TAKEAWAY")

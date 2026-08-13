@@ -142,10 +142,10 @@ realsim/
   mesh.py                     # Mesh — multi-client wiring: per-node volumes + real clients,
                               #   one directory + registry, one shared transport factory
                               #   MeshView is the base every consumer of a mesh shares
-  policy.py                   # Policy.select(view, keys, requester) -> ranked sources +
+  policy.py                   # Policy.select(keys, requester) -> ranked sources +
                               #   readiness. Naive is the default; consulted inside the
                               #   real locate_volumes body
-  view.py                     # View — awaited read-only observation: locate, topology and
+  view.py                     # View — read-only observation: locate, topology and
                               #   locality, the clock. No mutation
   plane.py                    # ControlPlane — attach(view, cost); DataPlane —
                               #   after(requester, result), defaulting to real
@@ -424,15 +424,16 @@ directory handle, trace, profile, registry, install).
 
 ### `policy.py` / `view.py` / `plane.py` / `runner.py` — the components under design
 
-- **`Policy.select(view, keys, requester) -> Selection`.** One interface,
+- **`Policy.select(keys, requester) -> Selection`.** One interface,
   answering one question: which volume serves these keys for this requester, and
   *when* is it usable. A `Selection` is a ranked list of sources plus an optional
   **readiness gate**. It is invoked in two named places: inside the real
   controller's `locate_volumes` body, after it reads the directory and before it
   returns (so a scenario that just calls `client.get(K)` is routed without knowing
   a policy exists, and the controller can *withhold* its answer until the gate
-  opens); and directly from an app through the `View`, when the app wants to price
-  the alternatives rather than be handed one. The default implementation is
+  opens); and directly from an app, when the app wants to price the alternatives
+  rather than be handed one. Either way the selector senses through the `View`
+  it was attached with, so the caller passes a subject and a requester. The default implementation is
   **naive** — every holder, in directory order — which is precisely what the real
   directory answers unaided, so installing it is byte-identical to installing
   nothing.

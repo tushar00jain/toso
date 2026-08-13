@@ -59,11 +59,11 @@ class LocalControllerHandle:
         """The real ``Controller`` behind the service, for tests asserting on it."""
         return self.service.controller
 
-    def install_policy(self, policy: Any, view: Any) -> None:
+    def install_policy(self, policy: Any) -> None:
         """Install a control plane in the service this refers to.
 
         The policy runs in the *service* and is stored there; this exists for the
         one caller that holds a handle and not a service
         (:class:`realsim.mesh.Mesh`, assembling a run).
         """
-        self.service.install_policy(policy, view)
+        self.service.install_policy(policy)

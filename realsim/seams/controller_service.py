@@ -35,6 +35,11 @@ runs first (:meth:`locate_raw`), then the policy is asked which of the directory
 volumes should serve this requester, and the answer is *withheld* until the chosen
 source is usable. With no policy installed -- the default -- ``locate_volumes`` is
 exactly the mirrored real body.
+
+The policy is asked for a decision and handed no sensor: it runs on this side, so
+it senses through the :class:`~proposed.view.View` the run attached it to
+(:meth:`proposed.policy.Selector.attach`), which reads :meth:`locate_raw` and
+therefore cannot re-enter the hook it is being called from.
 """
 
 from __future__ import annotations
@@ -54,26 +59,15 @@ class ControllerService:
         policy: the :class:`~proposed.policy.Policy` this service consults inside
             :meth:`locate_volumes`. ``None`` -- the default -- leaves the directory
             answering for itself, which is what the naive policy says anyway.
-        view: the :class:`~proposed.view.View` that policy senses through. It reads
-            :meth:`locate_raw`, so a policy reading the directory back does not
-            re-enter the hook it is being called from.
     """
 
-    def __init__(
-        self,
-        controller,
-        *,
-        policy: Optional[Any] = None,
-        view: Optional[Any] = None,
-    ) -> None:
+    def __init__(self, controller, *, policy: Optional[Any] = None) -> None:
         self.controller = controller
         self._policy = policy
-        self._view = view
 
-    def install_policy(self, policy: Any, view: Any) -> None:
+    def install_policy(self, policy: Any) -> None:
         """Install a control plane in this service after construction."""
         self._policy = policy
-        self._view = view
 
     # -- proposed.deployment.Controller ------------------------------------- #
     async def locate_volumes(
@@ -85,12 +79,12 @@ class ControllerService:
         """The real ``locate_volumes`` body, then the routing hook."""
         selection = await self.route(keys)
         if selection is None:
-            return await self.locate_raw(keys, missing_ok, require_fully_committed)
+            return self.locate_raw(keys, missing_ok, require_fully_committed)
         # Withhold the answer until the chosen source is usable. The directory is
         # re-read afterwards because waiting is exactly what lets it change: the
         # source the policy picked registers while we are blocked here.
         await selection.wait()
-        located = await self.locate_raw(keys, missing_ok, require_fully_committed)
+        located = self.locate_raw(keys, missing_ok, require_fully_committed)
         return selection.narrow(located)
 
     async def notify_put_batch(
@@ -133,8 +127,8 @@ class ControllerService:
         return c.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
 
     # -- the control-plane call site, and the surface's other read ---------- #
-    # ``route`` is this service's own; ``locate_raw`` is the rest of
-    # proposed.deployment.Controller, kept next to the hook it exists to avoid.
+    # ``route`` is this service's own; ``locate_raw`` is the surface's other
+    # read, kept next to the hook it exists to avoid.
     async def route(self, keys: Sequence[str]) -> Optional[Any]:
         """Ask the installed control plane who should serve ``keys``.
 
@@ -151,9 +145,9 @@ class ControllerService:
         requester = factory.current_requester()
         if requester is None:
             return None
-        return await self._policy.select(self._view, list(keys), requester)
+        return await self._policy.select(list(keys), requester)
 
-    async def locate_raw(
+    def locate_raw(
         self,
         keys: Sequence[str],
         missing_ok: bool = False,
@@ -162,9 +156,10 @@ class ControllerService:
         """The real ``locate_volumes`` body, unrouted (the sensor read).
 
         :meth:`proposed.deployment.Controller.locate_raw` -- the one member of that
-        surface torchstore does not have yet, and what a ``View`` reads: deliberately
-        not the routed read, so a policy sensing the directory cannot re-enter the
-        hook it is being called from.
+        surface torchstore does not have yet, and what a ``View`` reads: not the
+        routed read, so a policy sensing the directory cannot re-enter the hook it is
+        being called from, and not a coroutine, so forming an answer against it
+        cannot be interleaved with forming another.
         """
         # Mirrors Controller.locate_volumes @endpoint body verbatim
         # (torchstore/controller.py, the body after the docstring):

@@ -279,7 +279,7 @@ def test_name_privacy_rule_actually_examines_the_tree():
 
 _PORT_CONTROL = (
     "from dataclasses import dataclass\n\n\n"
-    "class Coordinator:\n"
+    "class Scheduler:\n"
     "    async def complete(self, plan): ...\n\n\n"
     "@dataclass\n"
     "class Plan:\n    prefill: str\n"
@@ -295,17 +295,17 @@ def _port_pkg(root, plane_src):
 
 
 def test_structure_lint_flags_every_way_data_read_the_control_port(tmp_path):
-    """Rule 6 fires on all four crossings the coordinator port replaced."""
+    """Rule 6 fires on every shape of read: getattr, field, bound method, subscript."""
     pkgs = _port_pkg(tmp_path, (
-        "from ..control.sched import Coordinator, Plan\n\n\n"
+        "from ..control.sched import Scheduler, Plan\n\n\n"
         "class Plane:\n"
-        "    def __init__(self, coordinator: Coordinator) -> None:\n"
-        "        self.coordinator = coordinator\n"
-        "        self.tbt = getattr(coordinator, 'tbt_enabled', False)\n"
-        "        self.ids = coordinator.decode_ids\n"
-        "        self.cb = coordinator.observe_compute_busy\n"
+        "    def __init__(self, scheduler: Scheduler) -> None:\n"
+        "        self.scheduler = scheduler\n"
+        "        self.tbt = getattr(scheduler, 'tbt_enabled', False)\n"
+        "        self.ids = scheduler.decode_ids\n"
+        "        self.cb = scheduler.observe_compute_busy\n"
         "    def go(self, plan: Plan) -> None:\n"
-        "        self.coordinator.busy_until[plan.prefill]\n"
+        "        self.scheduler.busy_until[plan.prefill]\n"
     ))
     violations = check_structure.check_plane_ports(tmp_path, pkgs)
     assert [v.code for v in violations] == ["data-reads-control-port"] * 4
@@ -320,13 +320,13 @@ def test_structure_lint_accepts_the_endpoint_form(tmp_path):
     accept it, or the honest spelling would be the one it flags.
     """
     pkgs = _port_pkg(tmp_path / "e", (
-        "from ..control.sched import Coordinator, Plan\n\n\n"
+        "from ..control.sched import Scheduler, Plan\n\n\n"
         "class Plane:\n"
-        "    def __init__(self, coordinator: Coordinator) -> None:\n"
-        "        self.coordinator: Coordinator = coordinator\n"
+        "    def __init__(self, scheduler: Scheduler) -> None:\n"
+        "        self.scheduler: Scheduler = scheduler\n"
         "    async def go(self, plan: Plan) -> None:\n"
-        "        await self.coordinator.complete.call_one(plan)\n"
-        "        self.coordinator.observe.broadcast(plan)\n"
+        "        await self.scheduler.complete.call_one(plan)\n"
+        "        self.scheduler.notify.broadcast(plan)\n"
     ))
     assert check_structure.check_plane_ports(tmp_path / "e", pkgs) == []
 
@@ -334,25 +334,30 @@ def test_structure_lint_accepts_the_endpoint_form(tmp_path):
 def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
     """A call is a request; a dataclass that crossed is meant to be read."""
     pkgs = _port_pkg(tmp_path, (
-        "from ..control.sched import Coordinator, Plan\n\n\n"
+        "from ..control.sched import Scheduler, Plan\n\n\n"
         "class Plane:\n"
-        "    def __init__(self, coordinator: Coordinator) -> None:\n"
-        "        self.coordinator: Coordinator = coordinator\n"
+        "    def __init__(self, scheduler: Scheduler) -> None:\n"
+        "        self.scheduler: Scheduler = scheduler\n"
         "    async def go(self, plan: Plan) -> None:\n"
-        "        self.coordinator.complete(plan)\n"
-        "        await self.coordinator.schedule(plan)\n"
+        "        self.scheduler.complete(plan)\n"
+        "        await self.scheduler.schedule(plan)\n"
         "        return plan.prefill\n"
     ))
     assert check_structure.check_plane_ports(tmp_path, pkgs) == []
 
 
-def test_plane_port_rule_actually_resolves_the_real_port():
-    """Vacuous unless it finds the real Coordinator and the plane that holds it.
+def test_plane_port_rule_actually_resolves_the_real_ports():
+    """Vacuous unless it finds both real ports and the plane that holds them.
 
-    The port is imported from ``proposed``, not from a sibling ``control/``, so this
-    also pins the half of :func:`_control_ports` that follows a package import: were
-    it to look only at ``control/``, rule 6 would go quiet on kvcache's data plane
-    instead of failing.
+    A serving host reaches control twice -- it asks a ``Placement`` and reports to
+    a ``ClusterModel`` -- and each is found on its own mark: the first derives
+    ``ControlPlane`` two levels up (``Placement`` -> ``Selector`` ->
+    ``ControlPlane``), which is why the closure is transitive; the second is one of
+    the all-coroutine services ``proposed.deployment`` declares. Both are imported
+    from ``proposed`` rather than from a sibling ``control/``, so this also pins the
+    half of :func:`_control_ports` that follows a package import: were it to look
+    only at ``control/``, rule 6 would go quiet on kvcache's data plane instead of
+    failing.
     """
     root, pkgs = check_structure.REPO_ROOT, check_structure.GRAPH_PKGS
     mods = check_structure._module_map(root, pkgs)
@@ -362,13 +367,17 @@ def test_plane_port_rule_actually_resolves_the_real_port():
     tree = ast.parse((root / rel).read_text())
     trees = {
         dotted: ast.parse((root / mods[dotted]).read_text())
-        for dotted in ("kvcache_sim.control.scheduler", "proposed.coordinator")
+        for dotted in (
+            "kvcache_sim.control.scheduler",
+            "proposed.policy",
+            "proposed.deployment",
+        )
     }
     ports = check_structure._control_ports(rel, tree, mods, trees)
-    assert ports == {"Coordinator"}, ports
-    # ...and that the plane's field is recognised as holding one.
+    assert ports == {"Placement", "ClusterModel"}, ports
+    # ...and that the plane's fields are recognised as holding them.
     _local, attrs = check_structure._port_names(tree, ports)
-    assert "coordinator" in attrs, attrs
+    assert {"placement", "cluster"} <= attrs, attrs
 
 
 def test_structure_lint_reads_a_layout_block():

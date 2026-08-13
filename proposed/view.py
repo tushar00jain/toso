@@ -2,8 +2,8 @@
 
 A :class:`~proposed.policy.Policy` never touches a client, a volume or the
 mesh -- it is given a ``View`` and returns a decision. The ``View`` is the sensor
-half of that contract: awaited *reads* of state that already exists, and no
-mutation of any kind.
+half of that contract: *reads* of state that already exists, and no mutation of any
+kind.
 
 What the base view offers, and why that is all it offers
 --------------------------------------------------------
@@ -15,7 +15,7 @@ What the base view offers, and why that is all it offers
   who holds a key and how far away they are, the two inputs every source
   decision has needed so far.
 * :meth:`now` -- the running loop's clock, because a decision has to be timed
-  where it is *made*: a coordinator is handed a request and no timestamp, since
+  where it is *made*: a selector is handed a subject and no timestamp, since
   over a non-zero hop the sender's stamp is already stale and comparing it against
   every instance's queue would read the cluster in the past.
 
@@ -27,18 +27,17 @@ the base type would make it a union serving neither caller -- and per-node
 *load* is the same trap twice over: the KV-cache scheduler's load signal is its
 own predicted prefill queue (a control-plane model, not an observation) and the
 dedup policy's is its planned tree, so a base ``load()`` would be a stub with two
-incompatible meanings. It is left out until a caller can observe one.
+incompatible meanings. It is left out until a caller can observe one: an
+application ranking by load reads that beside this view, off its own
+:class:`~proposed.deployment.ClusterModel`.
 
 Construction
 ------------
-A view is built from a :class:`~proposed.deployment.Controller` and a topology. The
-controller is *declared* rather than left as ``Any``: the proposal states what it
-needs from a controller instead of silently depending on the shape of whatever the
-simulator happens to pass. Only one member of that surface is used here --
-``locate_raw``, the unrouted read -- and it lives on the controller rather than in a
-narrower protocol beside it, because the object that has it is the same object that
-answers ``locate_volumes``. ``realsim`` builds one via ``Mesh.view``; a real
-controller would build one over itself.
+A view is built from a :class:`~proposed.deployment.Controller` and a topology,
+and reads the first through ``locate_raw`` alone. That surface is *declared* rather
+than left as ``Any``, so the proposal states what it needs instead of silently
+depending on the shape of whatever the simulator happens to pass. ``realsim``
+builds one via ``Mesh.view``; a real controller would build one over itself.
 """
 
 from __future__ import annotations
@@ -53,13 +52,12 @@ __all__ = ["View"]
 
 
 class View:
-    """Awaited, read-only observation of the real directory and topology.
+    """Read-only observation of the real directory and topology.
 
     Args:
-        directory: the directory service to read -- anything satisfying
+        directory: the directory to read -- anything satisfying
             :class:`~proposed.deployment.Controller`. In the simulator that is the
-            controller service, in a deployment the controller itself; either way
-            only :meth:`~proposed.deployment.Controller.locate_raw` is used.
+            controller service, in a deployment the controller itself.
         topology: ``volume_id -> Endpoint``; the volume id is the directory
             identity, the endpoint is what locality is priced against.
     """
@@ -76,17 +74,18 @@ class View:
         """The directory this view reads, so a derived view can rebuild over it."""
         return self._directory
 
-    async def locate(self, keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    def locate(self, keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """``key -> {volume_id -> StorageInfo}`` from the REAL directory.
 
         Missing keys are simply absent (``missing_ok=True``): a sensor reports
         what is there, it does not raise at the observer. Reads the raw
         controller body, so the routing hook a policy may be installed behind is
-        not re-entered.
+        not re-entered -- and cannot suspend, which is what a decision formed
+        against it relies on (:meth:`~proposed.deployment.Controller.locate_raw`).
         """
         if not keys:
             return {}
-        return await self._directory.locate_raw(list(keys), missing_ok=True)
+        return self._directory.locate_raw(list(keys), missing_ok=True)
 
     @staticmethod
     def holders(located: Dict[str, Dict[str, Any]], key: str) -> List[str]:

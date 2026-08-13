@@ -98,18 +98,21 @@ class SimConfig:
     collapse_charges: bool = False
 
     # One-way latency of a service boundary, charged by realsim.seams.link's
-    # ServiceHop: ``coordinator_rtt`` for a serving host reaching its coordinator
-    # (LocalCoordinatorHandle), ``controller_rtt`` for anyone reaching the directory
+    # ServiceHop: ``control_rtt`` for a serving host reaching its control plane --
+    # both the selector it asks (LocalPlacementHandle) and the model it reports
+    # into (LocalClusterModelHandle), which sit at one distance because the
+    # control plane holding the model is what reads it -- and ``controller_rtt``
+    # for anyone reaching the directory
     # (LocalControllerHandle) -- which is every capability, the baseline included,
     # and every consultation of a policy installed there. Like ``contention``
     # these are fidelity knobs that DO change measured timing, and deliberately
     # so: a request pays a hop out and back before it can proceed, so a
-    # coordinator hop lands in TTFT, which is the number kvcache exists to move.
+    # control hop lands in TTFT, which is the number kvcache exists to move.
     # ``0.0`` (the default) makes a hop inline -- awaiting a coroutine that never
     # suspends does not yield -- so the default path is byte-identical to calling
     # the object directly. One value per boundary for the whole run; the delivery
     # lag of one-way sends is not modelled (see the handles' docstrings).
-    coordinator_rtt: float = 0.0
+    control_rtt: float = 0.0
     controller_rtt: float = 0.0
     # ``client_rtt`` is the fourth boundary: a client reaching a serving host. It
     # used to be ``host_rtt``, one serving host reaching another, and it was
@@ -163,9 +166,9 @@ def _from_env() -> dict:
     collapse_charges = _bool_env("TOSO_COLLAPSE_CHARGES")
     if collapse_charges is not None:
         out["collapse_charges"] = collapse_charges
-    coordinator_rtt = os.environ.get("TOSO_COORDINATOR_RTT")
-    if coordinator_rtt is not None:
-        out["coordinator_rtt"] = float(coordinator_rtt)
+    control_rtt = os.environ.get("TOSO_CONTROL_RTT")
+    if control_rtt is not None:
+        out["control_rtt"] = float(control_rtt)
     controller_rtt = os.environ.get("TOSO_CONTROLLER_RTT")
     if controller_rtt is not None:
         out["controller_rtt"] = float(controller_rtt)

@@ -120,13 +120,13 @@ class Run:
               mesh is built, which is why an object rather than a factory;
             * a :data:`MakeControl` factory runs **in its own service**, built
               over the assembled stack and fronted by a
-              :class:`~realsim.seams.coordinator_handle.LocalCoordinatorHandle` as
-              ``sim.coordinator_handle``. This is kvcache: its scheduler holds every
+              :class:`~realsim.seams.placement_handle.LocalPlacementHandle` as
+              ``sim.placement_handle``. This is kvcache: its scheduler holds every
               instance's queue, cache and decode occupancy, so it needs
               ``sim.view`` and cannot be built before the stack.
 
             A capability whose control plane runs in *both* places passes a
-            sequence of the two, which is what kvcache does: the coordinator
+            sequence of the two, which is what kvcache does: the placement
             decides where to prefill, and a
             :class:`~kvcache_sim.control._source.LongestPrefixPolicy` in the
             directory narrows the pull to the peer the coordinator already priced
@@ -140,9 +140,9 @@ class Run:
         data: builds this run's :class:`~realsim.runner.ItemDispatch` onto the
             assembled stack -- how the executing half is driven, and where a
             capability's :class:`~proposed.plane.DataPlane` is plugged in.
-            ``None`` -> the plain path: run each item, nothing around it. It reaches that control plane through
-            ``sim.coordinator_handle``,
-            never by being handed the object.
+            ``None`` -> the plain path: run each item, nothing around it. It
+            reaches that control plane through ``sim.placement_handle``, never by
+            being handed the object.
         profile / trace / ledger: the run's target machine, event trace and
             outcome ledger. A capability with a richer outcome row passes its own
             ``Ledger`` subclass. A control plane that records into the same trace

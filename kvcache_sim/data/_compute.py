@@ -78,8 +78,7 @@ class Accelerator(ABC):
     and then sleeps exactly that long, which is what makes a simulated run's
     charged time equal its predicted time.
 
-    A base class rather than a ``Protocol``, for the reason
-    :class:`proposed.coordinator.Coordinator` gives: the protocols in this repo are
+    A base class rather than a ``Protocol``: the protocols in this repo are
     surfaces a caller *reaches*, behind a handle whose real implementation is
     somebody else's class. This is a surface somebody *writes*, in this process, so
     an implementation should say so in its bases and be told at construction when it

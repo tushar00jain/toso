@@ -47,9 +47,7 @@ a gather of ``client.get(K)``, with no idea a policy exists.
 from __future__ import annotations
 
 from collections import deque
-from typing import (
-    Any, Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple,
-)
+from typing import Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
 from proposed import DecisionLog, Policy, Selection
 
@@ -101,9 +99,7 @@ class DedupPolicy(Policy):
         self._ready = Readiness()
 
     # -- decide -------------------------------------------------------------- #
-    async def select(
-        self, view: Any, keys: Sequence[str], requester: str
-    ) -> Selection:
+    async def select(self, keys: Sequence[str], requester: str) -> Selection:
         """Route ``requester`` to a peer (or, if it is first, to a holder)."""
         # Asking is the promise: this requester is about to fetch these keys and the
         # read-through plane publishes what it fetched, so it now owes the directory
@@ -113,7 +109,7 @@ class DedupPolicy(Policy):
         self._promised.update((requester, key) for key in keys)
         source = self._route.get(requester)
         if source is None:
-            source = await self._assign(view, keys, requester)
+            source = self._assign(keys, requester)
             if source is None:
                 # Nobody holds it and no peer is planned to: let the directory
                 # answer for itself (the naive selection).
@@ -121,7 +117,7 @@ class DedupPolicy(Policy):
             self._route[requester] = source
             if self.trace is not None:
                 self.trace.record(
-                    view.now(), "route", f"{requester} <- {source}"
+                    self.view.now(), "route", f"{requester} <- {source}"
                 )
         # The answer's shape depends on what the source owes:
         facts = [(source, key) for key in keys]
@@ -129,22 +125,25 @@ class DedupPolicy(Policy):
             # It owes every key, so the wait is bounded by its read-through. Still a
             # directory read, because it may already hold a key it is about to
             # republish -- then there is nothing to wait for.
-            ready = await self._ready.gate(
-                facts, lambda f: self._registered(view, f)
-            )
+            async def registered(wanted: Sequence[Hashable]) -> List[Hashable]:
+                # A readiness probe is awaited because the truth it reads may live
+                # somewhere that travels. This one is the local directory.
+                return self._registered(wanted)
+
+            ready = await self._ready.gate(facts, registered)
             return Selection.of([source], ready=ready)
         # It owes nothing, so a gate here could outlive the run -- nothing would
         # ever record it. Usable only if it holds every key right now, which is the
         # ordinary case: this is how a requester routed to a pre-existing holder is
         # answered.
-        if len(await self._registered(view, facts)) == len(facts):
+        if len(self._registered(facts)) == len(facts):
             return Selection.of([source])
         # Holds nothing, owes nothing: a peer that published and has since evicted.
         # Waiting would hang and naming it would route a reader to a volume with
         # nothing to serve, so it stops being a source.
-        return self._retire(view, requester, source)
+        return self._retire(requester, source)
 
-    def _retire(self, view: Any, requester: str, source: str) -> Selection:
+    def _retire(self, requester: str, source: str) -> Selection:
         """Drop a source nothing is coming from, and answer naively this once.
 
         The requester keeps no route to it, so its next ask is assigned afresh --
@@ -153,20 +152,17 @@ class DedupPolicy(Policy):
         self._avail = deque(peer for peer in self._avail if peer != source)
         self._route.pop(requester, None)
         if self.trace is not None:
-            self.trace.record(view.now(), "retire", f"{source} holds nothing")
+            self.trace.record(self.view.now(), "retire", f"{source} holds nothing")
         return Selection()
 
-    async def _assign(
-        self, view: Any, keys: Sequence[str], requester: str
-    ) -> Optional[str]:
+    def _assign(self, keys: Sequence[str], requester: str) -> Optional[str]:
         """Pick this requester's source and fold it into the read-through tree.
 
-        Safe without a lock only because nothing awaited here ever suspends: a
-        ``View``'s directory read is the controller's own unrouted body, which
-        contains no ``await``, so this runs to completion before the next
-        requester's does -- the serialized mailbox a real controller would give it.
-        A directory that could suspend would make the queue below a check-then-act
-        race, and the cap would be exceeded rather than enforced.
+        Safe without a lock because it cannot suspend
+        (:meth:`~proposed.deployment.Controller.locate_raw`), so it runs to completion
+        before the next requester's does -- the serialized mailbox a real controller
+        would give it. A directory read that could suspend would make the queue below
+        a check-then-act race, and the cap would be exceeded rather than enforced.
         """
         if self._avail:
             # A peer is already planned to hold the key: take the oldest free slot
@@ -176,15 +172,15 @@ class DedupPolicy(Policy):
             return source
         # First requester: the closest volume that already holds every key -- the
         # one hop whose source is an origin, and the 1x fabric cost.
-        located = await view.locate(keys)
-        holders = set(view.holders(located, keys[0]))
+        located = self.view.locate(keys)
+        holders = set(self.view.holders(located, keys[0]))
         for key in keys[1:]:
-            holders &= set(view.holders(located, key))
+            holders &= set(self.view.holders(located, key))
         holders.discard(requester)
         if not holders:
             return None
         self._offer(requester)
-        return view.nearest(sorted(holders), requester)
+        return self.view.nearest(sorted(holders), requester)
 
     def _offer(self, requester: str) -> None:
         """Offer ``requester`` as a source for up to ``cap`` later peers.
@@ -202,20 +198,18 @@ class DedupPolicy(Policy):
         self._avail.extend([requester] * self.cap)
 
     # -- readiness ----------------------------------------------------------- #
-    async def _registered(
-        self, view: Any, facts: Sequence[Hashable]
-    ) -> List[Hashable]:
+    def _registered(self, facts: Sequence[Hashable]) -> List[Hashable]:
         """Which of these ``(volume, key)`` pairs the directory holds *now*.
 
         The truth a readiness gate is opened against, read rather than remembered: a
         source that registered a key and later evicted it does not hold it, and a
         requester routed there waits for the read-through that brings it back.
         """
-        located = await view.locate([key for _volume, key in facts])
+        located = self.view.locate([key for _volume, key in facts])
         return [
             (volume, key)
             for volume, key in facts
-            if volume in view.holders(located, key)
+            if volume in self.view.holders(located, key)
         ]
 
     def notice(self, volume_id: str, keys: Sequence[str]) -> None:
