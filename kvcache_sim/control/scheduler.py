@@ -2,10 +2,9 @@
 
 Both are a :class:`~proposed.policy.Placement`, whose one member -- ``select`` --
 is the whole surface the data plane may *ask*. Beside either runs a second control
-plane -- a chain headed by :class:`RoutedPull` -- which is what the *directory*
-consults; a run installs the two together
-(:func:`kvcache_sim.workload._serving.scheduler`) and they meet only at the
-cluster model.
+plane, :class:`FetchRouting`, which is what the *directory* consults; a run
+installs the two together (:func:`kvcache_sim.workload._serving.scheduler`) and
+they meet only at the cluster model.
 
 This application's one question::
 
@@ -63,6 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 from proposed import Endpoint, Placement, Policy, Selection
+from proposed.policy import PolicyChain
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -74,7 +74,6 @@ from ._cluster import (
     Committed, ComputeBusy, DecodeState, KVClusterModel, PrefillFinished,
 )
 from ._view import KVView
-from ._source import LongestPrefixPolicy
 from .request import Request
 
 __all__ = [
@@ -83,6 +82,7 @@ __all__ = [
     "DecodeState",
     "Plan",
     "RoutedPull",
+    "FetchRouting",
     "predicts_decode",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
@@ -183,8 +183,8 @@ class _PullLongestPrefix(Placement):
     The peer ranking itself is delegated (:mod:`kvcache_sim.control._source`) and
     only the pull-versus-recompute judgement is here. This ``select`` is consulted
     per candidate while the scheduler prices, and never installed anywhere, unlike
-    the store-side chain headed by :class:`RoutedPull`, which answers the *store*
-    with the peer this one named.
+    the store-side plane (:class:`FetchRouting`), which answers the *store* with
+    the peer this one named.
 
     Abstains when the ranking's head is the requester itself: a source is a peer,
     and a host does not pull what it already holds -- that prefix is its local
@@ -339,16 +339,42 @@ class RoutedPull(Policy):
         return Selection.of([peer] if peer is not None else [])
 
 
+class FetchRouting(PolicyChain):
+    """This capability's **store-side control plane**: who serves a fetch.
+
+    What a run installs in the directory, beside the scheduler it installs as a
+    service. The pull the scheduler already priced for this caller
+    (:class:`RoutedPull`), else ``source``'s ranking of whoever holds the longest
+    prefix.
+
+    A chain rather than an ``if``, so the fall-through is
+    :class:`~proposed.policy.FirstMatch`'s abstention rule and not a second copy of
+    it here, and a :class:`~proposed.policy.PolicyChain` because the directory is
+    handed this and both links select over keys.
+
+    Args:
+        cluster: the run's model, which the scheduler records a priced pull into.
+            The whole of what the two planes share.
+        source: ranks the holders of a prefix. The same object a pulling
+            scheduler's reuse placement names a peer with, so the peer chosen
+            while pricing is the peer this answers with.
+    """
+
+    name = "fetch-routing"
+
+    def __init__(self, cluster: KVClusterModel, source: Policy) -> None:
+        super().__init__([RoutedPull(cluster), source])
+
+
 class _Scheduler(Placement):
     """The pricing, ranking and admission both schedulers share.
 
     A :class:`~proposed.policy.Placement`, and only that: a serving host asks it as
     a service (:meth:`select`). What the *directory* is told is a second control
     plane the run installs beside this one
-    (a chain headed by :class:`RoutedPull`), and the two meet at the model -- this
-    one prices a pull and records it, that one answers the fetch with it -- so
-    nothing is threaded through the data plane to carry it and neither object holds
-    the other.
+    (:class:`FetchRouting`), and the two meet at the model -- this one prices a
+    pull and records it, that one answers the fetch with it -- so nothing is
+    threaded through the data plane to carry it and neither object holds the other.
 
     Args:
         reuse / rank: the two axes a preset picks (see above), both
@@ -363,8 +389,6 @@ class _Scheduler(Placement):
         early_rejection: ``"early"`` | ``"predict"`` -- whether the decode occupancy
             the TBT gate is fed is the one observed now or the one predicted at
             prefill completion.
-        source_policy: ranks peers for a prefix pull
-            (default :class:`~kvcache_sim.control._source.LongestPrefixPolicy`).
         cluster: the run's one :class:`~kvcache_sim.control._cluster.KVClusterModel`,
             when a caller is building the store-side plane against it too and so
             has to make it first. ``None`` -- the default -- builds it in
@@ -385,15 +409,11 @@ class _Scheduler(Placement):
         slo_tbt: float = float("inf"),
         simulate_decode: bool = False,
         early_rejection: str = "early",
-        source_policy: Optional[Any] = None,
         cluster: Optional[KVClusterModel] = None,
     ) -> None:
         self.B = block_tokens
         self.profile = profile
         self.model = model
-        self.source_policy = (
-            source_policy if source_policy is not None else LongestPrefixPolicy()
-        )
         self._reuse = reuse
         self._rank_kind = rank
         self._decode_rank = _LeastBatch()
@@ -464,14 +484,15 @@ class _Scheduler(Placement):
         # what lets one routing decision pin one directory snapshot for all of them
         # (:meth:`~kvcache_sim.control._view.KVView.pinned`).
         #
-        # ``source_policy`` is also a link of the store-side chain, which the run
-        # attaches to the plain view it hands every control plane. This attach is
-        # what leaves it sensing through the pinned one, so a run listing the two
-        # planes puts this one **last** -- a source ranking a decision consults
-        # inside its pin must not read past the snapshot into the live directory.
+        # A reuse placement that ranks peers brings up the ranking it defers to
+        # (:meth:`_PullLongestPrefix.attach`), and that ranking is also a link of
+        # the store-side chain, which the run attaches to the plain view it hands
+        # every control plane. This attach is the one that leaves it sensing through
+        # the pinned view, so a run listing the two planes puts this one **last**:
+        # a ranking a decision consults inside its pin must not read past the
+        # snapshot into the live directory.
         for selector in (self._reuse, self._rank, self._decode_rank):
             selector.attach(self.view, transfer_cost)
-        self.source_policy.attach(self.view, transfer_cost)
 
     # -- proposed.Placement: one member, for the question ------------------ #
     async def select(self, request: Request, requester: str) -> Selection:
@@ -651,19 +672,28 @@ class CacheAwareScheduler(_Scheduler):
     ``replicate=False`` (which isolates replication's contribution in the demo) is
     never pulling at all, so it is the baseline's reuse placement rather than a flag
     the candidate loop tests.
+
+    Args:
+        source_policy: ranks peers for a prefix pull, and the same object the
+            store-side plane answers a fetch with, so the peer named while pricing
+            is the peer the directory serves. Read only through the reuse
+            placement, which is why ``replicate=False`` never asks it anything.
+
+            Required, and deliberately without a default: the ranking has to be the
+            *same object* the run gives :class:`FetchRouting`, so whoever builds the
+            pair chooses it (:func:`kvcache_sim.workload._serving.scheduler`). A
+            default here would be a second one, and a scheduler pricing against a
+            ranking the directory does not consult is a pull charged to a peer that
+            never serves it.
     """
 
-    def __init__(self, *, balance_threshold: float = 1.5, replicate: bool = True,
-                 **knobs: Any) -> None:
-        # One source policy, held by the scheduler (which answers the directory
-        # with the peer it chose) and by the reuse placement (which chose it).
-        source = knobs.pop("source_policy", None) or LongestPrefixPolicy()
+    def __init__(self, *, source_policy: Policy, balance_threshold: float = 1.5,
+                 replicate: bool = True, **knobs: Any) -> None:
         super().__init__(
             reuse=(
-                _PullLongestPrefix(balance_threshold, source) if replicate
+                _PullLongestPrefix(balance_threshold, source_policy) if replicate
                 else _LocalOnly()
             ),
             rank=_MinTTFT,
-            source_policy=source,
             **knobs,
         )

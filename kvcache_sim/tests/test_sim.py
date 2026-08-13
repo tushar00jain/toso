@@ -1652,9 +1652,10 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     args = parser.parse_args(["--spread-reads"])
 
     aware = scenarios.Hotspot(0).runs(args)[1:]
-    # The scheduler is the run's Placement; both planes hold the one source policy.
+    # The ranking is the last link of the store-side plane, which is where it is
+    # reachable: the scheduler only sees it through the reuse placement that pulls.
     policies = [
-        next(p for p in run.control if isinstance(p, Placement)).source_policy
+        next(p for p in run.control if isinstance(p, Policy)).selectors[-1]
         for run in aware
     ]
     assert all(isinstance(p, SpreadReadsPolicy) for p in policies)

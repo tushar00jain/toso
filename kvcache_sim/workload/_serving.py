@@ -68,7 +68,6 @@ from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
 from proposed import Endpoint, Policy
-from proposed.policy import PolicyChain
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.simulation import Simulation
@@ -79,7 +78,7 @@ from ..control._cluster import KVClusterModel
 from ..control._source import LongestPrefixPolicy
 from ..control.request import Request
 from ..control.scheduler import (
-    CacheAwareScheduler, LoadBalanceScheduler, RoutedPull, predicts_decode,
+    CacheAwareScheduler, FetchRouting, LoadBalanceScheduler, predicts_decode,
 )
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from ..data._decode import DecodeEngine
@@ -204,23 +203,18 @@ def scheduler(
         prefill_pool=prefill_pool,
         decode_pool=decode_pool,
         early_rejection=early_rejection,
-        source_policy=source,
         cluster=cluster,
     )
     if kind == "cache_aware":
+        # The ranking goes to the scheduler only because its reuse placement is
+        # what names a peer; the baseline never pulls and never asks one.
         placement = CacheAwareScheduler(
-            balance_threshold=balance_threshold, replicate=replicate, **knobs
+            balance_threshold=balance_threshold, replicate=replicate,
+            source_policy=source, **knobs
         )
     else:
         placement = LoadBalanceScheduler(**knobs)
-    # The store-side plane: who serves a fetch. The pull the scheduler already
-    # priced for this caller (read out of the model it recorded it in), else
-    # ``source``'s ranking of whoever holds the longest prefix. A chain rather than
-    # an ``if``, so the fall-through is :class:`~proposed.policy.FirstMatch`'s
-    # abstention rule and not a second copy of it here, and a
-    # :class:`~proposed.policy.PolicyChain` because the directory is going to be
-    # handed it and both links select over keys.
-    return [PolicyChain([RoutedPull(cluster), source]), placement]
+    return [FetchRouting(cluster, source), placement]
 
 
 class _ServingEndpoints:
