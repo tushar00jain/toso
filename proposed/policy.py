@@ -25,11 +25,18 @@ does not belong in a :class:`Selection` at all. A gate rides *with* one instead 
 a selector that refuses abstains (``Selection.of([])``), and what it would have
 answered is simply not in the ranking.
 
-Selectors compose: :class:`FirstMatch` orders them and takes the first answer. It
-wraps either kind and *is* a plain :class:`Selector` whatever it wraps, so a chain
-mixing the two kinds is possible and harmless -- and thereby barred from the
-controller, the one place the mixture would matter. A chain whose links are all
-policies is a :class:`PolicyChain`, which is a :class:`Policy` and may be installed.
+Selectors compose two ways, and neither one is a selector holding another:
+
+* :class:`FirstMatch` picks between alternatives -- ask each in order, take the
+  first answer. It wraps either kind and *is* a plain :class:`Selector` whatever
+  it wraps, so a chain mixing the two kinds is possible and harmless -- and
+  thereby barred from the controller, the one place the mixture would matter. A
+  chain whose links are all policies is a :class:`PolicyChain`, which is a
+  :class:`Policy` and may be installed.
+* :class:`Refine` funnels a single answer -- one selector's ranking, narrowed by
+  each :class:`Refinement` behind it. That is how a test an application owns is
+  applied to a ranking the store produced, with the composition in the object
+  that holds both rather than inside either.
 """
 
 from __future__ import annotations
@@ -46,6 +53,7 @@ from proposed.view import View
 __all__ = [
     "Ready", "Selection", "DecisionLog", "Selector", "Policy", "Placement",
     "NaivePolicy", "FirstMatch", "PolicyChain",
+    "Refinement", "Refine", "AbstainOnSelf", "TakeHead",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -108,6 +116,19 @@ class Selection:
         """Block until the chosen sources are usable (returns at once if ready)."""
         if self.ready is not None:
             await self.ready()
+
+    def only(self, sources: Sequence[str]) -> "Selection":
+        """This selection cut down to ``sources``, in the order given.
+
+        The readiness gate rides along and each kept source keeps its price, so
+        one selection narrowed by somebody else still answers for whoever built it.
+        """
+        kept = tuple(sources)
+        return Selection(
+            sources=kept,
+            ready=self.ready,
+            payload={s: self.payload[s] for s in kept if s in self.payload},
+        )
 
     def narrow(
         self, located: Dict[str, Dict[str, Any]]
@@ -308,3 +329,114 @@ class PolicyChain(FirstMatch, Policy):
                 f"a PolicyChain selects over keys, so every link must be a Policy; "
                 f"{', '.join(wrong)} {'is' if len(wrong) == 1 else 'are'} not"
             )
+
+
+class Refinement(ControlPlane, ABC):
+    """Narrow a ranking some selector already produced.
+
+    Not a :class:`Selector`: it has no subject of its own, and ``select`` has
+    nowhere to put an incoming ranking. :class:`Refine` is what holds the selector,
+    which is what keeps one selector from holding another.
+
+    Senses through the run's view like anything else in a chain (:meth:`attach`).
+    There is no ``notice`` counterpart: a refinement opens no readiness gate, it
+    carries through the one the ranking arrived with.
+    """
+
+    name = "refinement"
+
+    #: What this refinement reads to decide: ``None`` until :meth:`attach`.
+    view: Optional[View] = None
+
+    def attach(self, view: Any, transfer_cost: Any) -> None:
+        self.view = view
+
+    @abstractmethod
+    async def refine(
+        self, selection: Selection, subject: Any, requester: str
+    ) -> Selection:
+        """``selection``, narrowed. Handed the subject too, since a test may read it.
+
+        Called only with a selection that names at least one source, so an
+        implementation may index the head without checking.
+        """
+
+
+class Refine(Selector):
+    """One selector's ranking, put through each :class:`Refinement` in turn.
+
+    A plain :class:`Selector` whatever it wraps, for :class:`FirstMatch`'s reason:
+    narrowing a policy's ranking with an application's test asks something the
+    store cannot read, and being neither subtype is what bars the result from the
+    controller.
+
+    A step that abstains (``Selection.of([])``) ends the funnel -- the steps behind
+    it are not consulted and the abstention is the answer. ``Selection()``, every
+    holder in directory order, is the one thing a step cannot narrow, so a source
+    that answers with one in front of a step raises rather than silently handing
+    back an unfiltered ranking.
+
+    Args:
+        source: produces the ranking. Either kind of selector.
+        steps: applied left to right.
+    """
+
+    name = "refine"
+
+    def __init__(self, source: Selector, *steps: Refinement) -> None:
+        self.source = source
+        self.steps: Tuple[Refinement, ...] = tuple(steps)
+
+    def attach(self, view: Any, transfer_cost: Any) -> None:
+        """Hand the stack's ports to the source and every step."""
+        super().attach(view, transfer_cost)
+        self.source.attach(view, transfer_cost)
+        for step in self.steps:
+            step.attach(view, transfer_cost)
+
+    async def select(self, subject: Any, requester: str) -> Selection:
+        """The source's ranking narrowed by every step, or the first abstention."""
+        selection = await self.source.select(subject, requester)
+        for step in self.steps:
+            if selection.sources is None:
+                raise ValueError(
+                    f"{self.source.name} named every holder in directory order, "
+                    f"which {step.name} cannot narrow: refine a source that ranks"
+                )
+            if not selection.sources:
+                return selection
+            selection = await step.refine(selection, subject, requester)
+        return selection
+
+    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
+        """To the source alone: a step has no gate of its own to open."""
+        self.source.notice(volume_id, keys)
+
+
+class AbstainOnSelf(Refinement):
+    """Abstain when the ranking's head is the requester itself.
+
+    A source is a peer, and a requester does not fetch what it already holds. The
+    whole selection goes rather than just the head: the ranking preferred the
+    requester, so nothing behind it is preferred to what the requester has.
+    """
+
+    name = "abstain-on-self"
+
+    async def refine(
+        self, selection: Selection, subject: Any, requester: str
+    ) -> Selection:
+        if selection.sources[0] == requester:
+            return Selection.of([])
+        return selection
+
+
+class TakeHead(Refinement):
+    """Keep the best-ranked source and drop the rest, price and gate intact."""
+
+    name = "take-head"
+
+    async def refine(
+        self, selection: Selection, subject: Any, requester: str
+    ) -> Selection:
+        return selection.only(selection.sources[:1])

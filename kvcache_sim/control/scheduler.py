@@ -29,9 +29,9 @@ drops its own coldest keys and tells the directory afterwards
 (:mod:`realsim.seams._retention`). Every argument and return is a value.
 
 Both names are *presets* of one scheduler, parameterized on two axes, each a
-:class:`~proposed.policy.Placement`: **reuse**, consulted per candidate for "name a
-peer to pull a prefix from, or nobody", and **the ranking**, asked which of the
-priced candidates wins.
+selector this one consults and neither installable in the directory: **reuse**,
+consulted per candidate for "name a peer to pull a prefix from, or nobody", and
+**the ranking**, asked which of the priced candidates wins.
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
@@ -62,7 +62,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 from proposed import Endpoint, Placement, Policy, Selection
-from proposed.policy import PolicyChain
+from proposed.policy import (
+    AbstainOnSelf, PolicyChain, Refine, Refinement, Selector, TakeHead,
+)
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -145,17 +147,20 @@ class Plan:
 # Everything a routing decision does is the same whichever scheduler is running.
 # What differs is the two axes and which admission gates are installed.
 #
-# Both axes are :class:`~proposed.policy.Placement`s, because the subject is what
-# tells the two selector kinds apart (:mod:`proposed.policy`) and these subjects are
-# the application's: this request, and the candidates this scheduler priced. Neither
-# is ever installed in the controller. What is not a selection at all is the rest of
-# what a scheduler decides -- admission and the SLO gates answer yes or no, and a
-# ranked set of sources cannot say that. This first axis answers only the
-# store-shaped half -- name a peer to pull from, or nobody -- and the scheduler
-# prices what comes back, which is the line :mod:`kvcache_sim.control._source`
-# already draws. A placement's ``select`` is awaited inside the decision's pinned
-# snapshot (:meth:`_Scheduler.select`), so it runs to completion without
-# suspending.
+# Neither axis is ever installed in the controller. The second is a
+# :class:`~proposed.policy.Placement`, because the subject is what tells the two
+# selector kinds apart (:mod:`proposed.policy`) and its subject is the application's:
+# the candidates this scheduler priced. This first axis answers only the store-shaped
+# half -- name a peer to pull from, or nobody -- so it is the source ranking
+# (:mod:`kvcache_sim.control._source`, a real Policy) under the one test that is not
+# the store's: is pulling worth more than recomputing here. That composition is a
+# :class:`~proposed.policy.Refine`, a plain Selector, which is what keeps it out of
+# the controller without either half holding the other.
+#
+# What is not a selection at all is the rest of what a scheduler decides --
+# admission and the SLO gates answer yes or no, and a ranked set of sources cannot
+# say that. An axis's ``select`` is awaited inside the decision's pinned snapshot
+# (:meth:`_Scheduler.select`), so it runs to completion without suspending.
 
 
 class _LocalOnly(Placement):
@@ -172,50 +177,37 @@ class _LocalOnly(Placement):
         return Selection.of([])
 
 
-class _PullLongestPrefix(Placement):
-    """Name the best peer when its prefix beats recomputing the gap locally.
+class _LongerThanLocal(Refinement):
+    """Abstain unless the head's prefix beats recomputing the gap locally.
 
-    Only when that peer's run is more than ``threshold`` times the requester's own
-    -- the balancing threshold. A pull is charged to the prefill instance's queue,
-    so one that saves little compute still costs the whole wait, and without the
-    threshold every request would chase the longest match onto one instance.
+    Its run must be more than ``threshold`` times the requester's own -- the
+    balancing threshold. A pull is charged to the prefill instance's queue, so one
+    that saves little compute still costs the whole wait, and without the threshold
+    every request would chase the longest match onto one instance.
 
-    The peer ranking itself is delegated (:mod:`kvcache_sim.control._source`) and
-    only the pull-versus-recompute judgement is here. This ``select`` is consulted
-    per candidate while the scheduler prices, and never installed anywhere, unlike
-    the store-side plane (:class:`FetchRouting`), which answers the *store* with
-    the peer this one named.
+    Judges the head and abstains for the whole ranking rather than filtering peer
+    by peer. A ranking is not obliged to be in raw-run order
+    (:class:`~kvcache_sim.control._source.SpreadReadsPolicy` discounts a busy
+    source), so the sources behind the head are the ones it preferred *less*, and
+    promoting one on a longer raw run would overrule the ranking from outside it.
 
-    Abstains when the ranking's head is the requester itself: a source is a peer,
-    and a host does not pull what it already holds -- that prefix is its local
-    match, and no shorter peer behind it could be worth pulling either.
+    Reads the runs off the view rather than being told them: the decision pinned
+    it, so this is the same snapshot and costs no directory read.
     """
 
-    name = "pull-longest-prefix"
+    name = "longer-than-local"
 
-    def __init__(self, threshold: float, source_policy: Policy) -> None:
+    def __init__(self, threshold: float) -> None:
         self.threshold = threshold
-        self.source_policy = source_policy
 
-    def attach(self, view: Any, transfer_cost: Any) -> None:
-        """Sense through the view, and bring up the ranking this defers to."""
-        super().attach(view, transfer_cost)
-        self.source_policy.attach(view, transfer_cost)
-
-    async def select(self, keys: Sequence[str], requester: str) -> Selection:
-        """The one peer worth pulling from, or an abstention.
-
-        Reads the runs off the view rather than being told them: the decision
-        pinned it, so this is the same snapshot and costs no directory read.
-        """
+    async def refine(
+        self, selection: Selection, keys: Any, requester: str
+    ) -> Selection:
         counts = self.view.prefix_lengths(list(keys))
-        ranked = await self.source_policy.select(keys, requester)
-        src = ranked.sources[0] if ranked.sources else None
-        if src is None or src == requester:
-            return Selection.of([])
-        if counts.get(src, 0) <= counts.get(requester, 0) * self.threshold:
+        head = selection.sources[0]
+        if counts.get(head, 0) <= counts.get(requester, 0) * self.threshold:
             return Selection.of([])  # not worth the transfer: recompute it
-        return Selection.of([src])
+        return selection
 
 
 # -- the second axis: which priced candidate wins ---------------------------- #
@@ -377,10 +369,10 @@ class _Scheduler(Placement):
     threaded through the data plane to carry it and neither object holds the other.
 
     Args:
-        reuse / rank: the two axes a preset picks (see above), both
-            :class:`~proposed.policy.Placement`s this object consults while forming
-            the one answer :meth:`select` gives. ``rank`` is the *kind*, since the
-            load it reads exists only once :meth:`attach` has run.
+        reuse / rank: the two axes a preset picks (see above), both consulted while
+            forming the one answer :meth:`select` gives, and neither installable in
+            the controller. ``rank`` is the *kind*, since the load it reads exists
+            only once :meth:`attach` has run.
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -398,7 +390,7 @@ class _Scheduler(Placement):
     def __init__(
         self,
         *,
-        reuse: Placement,
+        reuse: Selector,
         rank: Type[_Ranking],
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
@@ -484,9 +476,9 @@ class _Scheduler(Placement):
         # what lets one routing decision pin one directory snapshot for all of them
         # (:meth:`~kvcache_sim.control._view.KVView.pinned`).
         #
-        # A reuse placement that ranks peers brings up the ranking it defers to
-        # (:meth:`_PullLongestPrefix.attach`), and that ranking is also a link of
-        # the store-side chain, which the run attaches to the plain view it hands
+        # A reuse axis that ranks peers brings up the source ranking it funnels
+        # (:meth:`~proposed.policy.Refine.attach`), and that ranking is also a link
+        # of the store-side chain, which the run attaches to the plain view it hands
         # every control plane. This attach is the one that leaves it sensing through
         # the pinned view, so a run listing the two planes puts this one **last**:
         # a ranking a decision consults inside its pin must not read past the
@@ -691,7 +683,13 @@ class CacheAwareScheduler(_Scheduler):
                  replicate: bool = True, **knobs: Any) -> None:
         super().__init__(
             reuse=(
-                _PullLongestPrefix(balance_threshold, source_policy) if replicate
+                Refine(
+                    source_policy,
+                    AbstainOnSelf(),
+                    _LongerThanLocal(balance_threshold),
+                    TakeHead(),
+                )
+                if replicate
                 else _LocalOnly()
             ),
             rank=_MinTTFT,

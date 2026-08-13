@@ -135,7 +135,7 @@ class SpreadReadsPolicy(LongestPrefixPolicy):
     the raw grant count decides, so two identical replicas alternate indefinitely
     instead of reverting to id order once the discount saturates. The discount ranks
     and does nothing else: the scheduler prices the winner against the run length it
-    read from the directory itself (``counts[src]`` in ``_PullLongestPrefix``), so a
+    read from the directory itself (``_LongerThanLocal`` in the scheduler), so a
     discounted source can never report a shorter prefix than it holds into the
     pull-versus-recompute decision.
 

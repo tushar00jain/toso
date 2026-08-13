@@ -17,9 +17,10 @@ simulator, ``proposed`` is the design being argued for.
   default :class:`~proposed.policy.NaivePolicy` returns the directory's own
   answer, so an installed policy changes nothing until one is written. It, the
   combinators beside it -- :class:`~proposed.policy.FirstMatch` (try selectors in
-  order) and :class:`~proposed.policy.PolicyChain` (the same over keys, so
-  installable) -- and the :class:`~proposed.policy.Selector` base they are typed
-  on are reached
+  order), :class:`~proposed.policy.PolicyChain` (the same over keys, so
+  installable) and :class:`~proposed.policy.Refine` (one selector's ranking,
+  narrowed by the tests behind it) -- and the
+  :class:`~proposed.policy.Selector` base they are typed on are reached
   through the module rather than re-exported here: what a deployment has to
   *implement* is one of the two subtypes above.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the

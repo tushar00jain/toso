@@ -11,11 +11,13 @@ pin the contract each one owes its callers:
    nothing, byte for byte, which is what lets a capability policy be swapped in
    as the only difference between two runs;
 3. a selection narrows a directory answer to its ranked sources, and withholds
-   the answer until its readiness gate opens -- and the combinators built on it
-   (``FirstMatch``) tells an *abstention* from the *naive answer*,
-   carry a wrapped selector's gate through, and wake every selector they hold,
-   whichever subtype (``Policy`` over keys, ``Placement`` over an application
-   payload) that selector is;
+   the answer until its readiness gate opens -- and the two combinators built on
+   it tell an *abstention* from the *naive answer*, carry a wrapped selector's
+   gate through, and wake every selector they hold, whichever subtype (``Policy``
+   over keys, ``Placement`` over an application payload) that selector is.
+   ``FirstMatch`` picks between alternatives; ``Refine`` funnels one ranking
+   through the tests behind it, and is barred from the controller for the same
+   reason;
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -40,7 +42,9 @@ from proposed import DataPlane
 from proposed import Placement, Policy, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
-from proposed.policy import FirstMatch, NaivePolicy, Selector
+from proposed.policy import (
+    AbstainOnSelf, FirstMatch, NaivePolicy, Refine, Refinement, Selector, TakeHead,
+)
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.transport import Endpoint
 from proposed import View
@@ -356,6 +360,104 @@ def test_a_combinator_holds_either_kind_and_is_neither():
     for combinator in (mixed, FirstMatch([_Fixed(Selection())])):
         assert isinstance(combinator, Selector)
         assert not isinstance(combinator, (Policy, Placement))
+
+
+# --------------------------------------------------------------------------
+# 3c. Refine: the other composition -- one ranking, narrowed step by step.
+# --------------------------------------------------------------------------
+
+
+class _Step(Refinement):
+    """A refinement that narrows on command, and remembers it was asked."""
+
+    def __init__(self, selection: Selection | None = None) -> None:
+        self.selection = selection
+        self.seen: list[tuple[tuple[str, ...], str]] = []
+
+    async def refine(self, selection, subject, requester):
+        self.seen.append((selection.sources, requester))
+        return self.selection if self.selection is not None else selection
+
+
+def test_refine_puts_the_ranking_through_every_step_in_order():
+    first = _Step(Selection.of(["v1", "v2"]))
+    second = _Step(Selection.of(["v2"]))
+    funnel = Refine(_Fixed(Selection.of(["v0", "v1", "v2"])), first, second)
+
+    assert _select(funnel).sources == ("v2",)
+    assert first.seen == [(("v0", "v1", "v2"), "r")]
+    assert second.seen == [(("v1", "v2"), "r")]  # handed what the first left
+
+
+def test_an_abstaining_step_ends_the_funnel():
+    """``Selection.of([])`` names nobody, so there is nothing left to narrow."""
+    behind = _Step()
+    funnel = Refine(_Fixed(Selection.of(["v0"])), _Step(Selection.of([])), behind)
+
+    assert _select(funnel).sources == ()
+    assert behind.seen == []
+
+
+def test_refine_refuses_a_ranking_that_names_everybody():
+    """``Selection()`` is the directory's whole answer, which no step can narrow.
+
+    The opposite reading from ``FirstMatch``, where it is the decision that wins
+    the chain. Handing one to a step would quietly return an unnarrowed ranking,
+    so it is a wiring error and says so.
+    """
+    with pytest.raises(ValueError, match="cannot narrow"):
+        _select(Refine(_Fixed(Selection()), _Step()))
+
+    # ... and with nothing behind it there is no narrowing to contradict.
+    assert _select(Refine(_Fixed(Selection()))).sources is None
+
+
+def test_a_narrowed_selection_keeps_its_gate_and_the_prices_it_kept():
+    """What a step drops is sources, not what the source said about them."""
+
+    async def gate() -> None:
+        return None
+
+    ranked = Selection.of(["v0", "v1"], ready=gate, payload={"v0": 7, "v1": 9})
+    narrowed = _select(Refine(_Fixed(ranked), TakeHead()))
+
+    assert narrowed.sources == ("v0",)
+    assert narrowed.ready is gate
+    assert narrowed.winner == 7
+    assert "v1" not in narrowed.payload  # dropped with the source it priced
+
+
+def test_abstain_on_self_drops_the_whole_ranking_not_just_the_head():
+    """A requester ranked first is preferred to every peer behind it."""
+    ranked = _Fixed(Selection.of(["r", "v1"]))
+    assert _select(Refine(ranked, AbstainOnSelf(), TakeHead())).sources == ()
+    assert _select(Refine(ranked, AbstainOnSelf(), TakeHead()), requester="v0") \
+        .sources == ("r",)
+
+
+def test_refine_brings_up_the_source_and_every_step():
+    """One view for the whole funnel: a step senses through what the source did."""
+    source, step = _Fixed(), _Step()
+    funnel = Refine(source, step)
+    funnel.attach("a-view", "a-cost")
+
+    assert funnel.view is source.view is step.view == "a-view"
+
+
+def test_refine_notices_only_to_the_source():
+    """A step opens no gate of its own, so a wakeup has nowhere else to go."""
+    source = _Fixed(Selection.of(["v0"]))
+    Refine(source, _Step()).notice("v9", ["K"])
+    assert source.noticed == [("v9", ("K",))]
+
+
+def test_refine_is_a_plain_selector_whatever_it_narrows():
+    """Same bar as ``FirstMatch``: narrowing a policy's ranking with an
+    application's test asks something the store cannot read, so the result is
+    barred from the controller by being neither subtype."""
+    funnel = Refine(_Fixed(Selection.of(["v0"])), TakeHead())
+    assert isinstance(funnel, Selector)
+    assert not isinstance(funnel, (Policy, Placement))
 
 
 # --------------------------------------------------------------------------
