@@ -27,9 +27,9 @@ from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
-from kvcache_sim.data.store import KVStore
+from kvcache_sim.data._store import KVStore
 from kvcache_sim.control.request import Request
-from proposed import AnySelector, KeySelector
+from proposed import ControlPlane, KeySelector
 from proposed.selector import KeySelectorChain
 from kvcache_sim.control._source import LongestPrefixKeySelector, SpreadReadsKeySelector
 from kvcache_sim.control.scheduler import (
@@ -708,14 +708,18 @@ def test_the_decode_host_fetches_its_kv_out_of_the_store():
 #      forever -- a hung run rather than a failed test, which is the worst shape a
 #      bug can take here. So the paths are enumerated rather than sampled through
 #      a scenario.
-def _plan(request: Request, *, prefill: str, decode: str):
-    """A minimal accepted plan. This exercises the decode leg, not the router."""
-    from kvcache_sim.control.scheduler import Plan
+def _answer(request: Request, *, prefill: str, decode: str):
+    """A minimal accepted decision. Exercises the decode leg, not the router."""
+    from kvcache_sim.control.scheduler import Plan, Response
 
-    return Plan(
-        request=request, prefill=prefill, decode=decode, match_blocks=0,
-        cached_tokens=0, uncached_tokens=request.prompt_tokens, reuse_source=None,
-        transfer_bytes=0, queue_wait=0.0, ttft=0.0, done_time=0.0, decode_done=0.0,
+    return Response(
+        prefill=prefill,
+        decode=decode,
+        plan=Plan(
+            match_blocks=0, cached_tokens=0,
+            uncached_tokens=request.prompt_tokens, reuse_source=None,
+            transfer_bytes=0, queue_wait=0.0, ttft=0.0, done_time=0.0,
+        ),
     )
 
 
@@ -749,7 +753,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
 
     sim = Simulation(
         _make_topology(2),
-        control=LoadBalanceScheduler(
+        placement=LoadBalanceScheduler(
             block_tokens=BLOCK_TOKENS, simulate_decode=True
         ),
         profile=_replace(
@@ -764,13 +768,14 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
         prompt_tokens=2 * BLOCK_TOKENS, output_tokens=output_tokens,
     )
     host = ServingHost(
-        "s1", store, sim.placement_handle, sim.cluster_handle,
+        "s1",
         trace=sim.trace, metrics=sim.ledger,
         decode=(
             DecodeEngine(SimulatedAccelerator(), max_batch=8) if engine else None
         ),
         models_decode=engine,
     )
+    host.attach(sim)
 
     async def scenario():
         with sim.mesh.installed():
@@ -780,7 +785,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
             # test stands in for it -- the decode side amends, it never creates.
             sim.ledger.add(RequestResult(id=request.id, accepted=True))
             tokens = await host.decode(
-                _plan(request, prefill=prefill, decode="s1")
+                request, _answer(request, prefill=prefill, decode="s1")
             )
             if probe is not None:
                 view = KVView(sim.view.directory, sim.topology)
@@ -1263,19 +1268,17 @@ def test_a_serving_host_cannot_reach_another_serving_host():
 
     accepted = set(inspect.signature(ServingHost.__init__).parameters) - {"self"}
     assert accepted == {
-        "me", "store", "placement", "cluster", "trace", "metrics", "prefill",
-        "decode", "models_decode",
+        "me", "trace", "metrics", "prefill", "decode", "models_decode",
+    }
+    # The ports are not among them: they arrive off the deployment at attach.
+    assert set(inspect.signature(ServingHost.attach).parameters) - {"self"} == {
+        "deployment",
     }
 
     sim = Simulation(_make_topology(2))
-    store = KVStore(sim.mesh)
-    hosts = {
-        i: ServingHost(
-            i, store, sim.placement_handle, sim.cluster_handle,
-            trace=sim.trace, metrics=sim.ledger,
-        )
-        for i in sim.ids
-    }
+    hosts = {i: ServingHost(i, trace=sim.trace, metrics=sim.ledger) for i in sim.ids}
+    for host in hosts.values():
+        host.attach(sim)
     try:
         for host in hosts.values():
             for name, held in vars(host).items():
@@ -1654,10 +1657,7 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     aware = scenarios.Hotspot(0).runs(args)[1:]
     # The ranking is the last link of the store-side plane, which is where it is
     # reachable: the scheduler only sees it through the reuse placement that pulls.
-    selectors = [
-        next(p for p in run.control if isinstance(p, KeySelector)).selectors[-1]
-        for run in aware
-    ]
+    selectors = [run.control.selectors[-1] for run in aware]
     assert all(isinstance(p, SpreadReadsKeySelector) for p in selectors)
     assert selectors[0] is not selectors[1], "a shared tally would count both runs"
 
@@ -1686,13 +1686,13 @@ def _scheduler(n: int = 2):
     return sim, sched
 
 
-def test_one_selection_names_both_of_a_request_s_hosts():
+def test_one_answer_names_both_of_a_request_s_hosts():
     """One member, one question, answered before anything runs.
 
-    A plan names the prefill host *and* the decode host, which is what lets the
+    One answer names the prefill host *and* the decode host, which is what lets the
     whole admission decision be taken at the door: there is no second ask, so there
-    is no outcome that costs a prefill. It rides in the payload of a ranking over
-    every prefill host, so the answer says what was compared as well as what won.
+    is no outcome that costs a prefill. The two selections behind it stay inside the
+    scheduler: what leaves is the winner of each, and the price of the one that won.
     """
     sim, sched = _scheduler()
     request = _request(
@@ -1702,25 +1702,31 @@ def test_one_selection_names_both_of_a_request_s_hosts():
 
     async def scenario():
         with sim.mesh.installed():
-            return await sched.select(request, "s0")
+            # The ranking first: committing the decision moves the load the ranking
+            # is read off, so asking afterwards would price a different field.
+            return (
+                await sched._select_prefill(request),
+                await sched.decide(request, "s0"),
+            )
 
     try:
-        selection = sim.loop.run_until_complete(scenario())
+        ranked, response = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    assert sorted(selection.sources) == sorted(sched.prefill_ids)
-    plan = selection.winner
-    assert plan is not None
-    assert plan.prefill == selection.sources[0]
-    assert plan.prefill in sched.ids
-    assert plan.decode in sched.ids
+    assert response.prefill in sched.prefill_ids
+    assert response.decode in sched.decode_ids
+    assert response.plan.ttft > 0.0
+    # ...and the prefill host is the head of the selection it came from, which ranked
+    # every instance in the pool.
+    assert sorted(ranked.sources) == sorted(sched.prefill_ids)
+    assert response.prefill == ranked.sources[0]
 
 
-def test_a_refusal_is_the_abstention_every_selector_here_uses():
-    """An SLO miss names nobody -- the same empty answer, so nothing special to read.
+def test_a_refusal_is_a_decision_not_taken():
+    """An SLO miss answers ``None``: there is no decision to read anything off.
 
-    ``Selection.of([])`` rather than a second kind of reply: a caller reads the
-    winner either way, and there being none *is* the refusal.
+    A decider refuses by not deciding, which is a different thing from a selection
+    that names nobody -- there is no ranking here to be empty.
     """
     sim = Simulation(_make_topology(2))
     sched = LoadBalanceScheduler(block_tokens=512, slo_ttft=0.0)
@@ -1732,14 +1738,13 @@ def test_a_refusal_is_the_abstention_every_selector_here_uses():
 
     async def scenario():
         with sim.mesh.installed():
-            return await sched.select(request, "s0")
+            return await sched.decide(request, "s0")
 
     try:
-        selection = sim.loop.run_until_complete(scenario())
+        response = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    assert selection.sources == ()
-    assert selection.winner is None
+    assert response is None
 
 
 def test_notify_dispatches_each_fact_and_answers_nothing():
@@ -1786,9 +1791,10 @@ def test_the_store_side_chain_is_a_key_selector_and_refuses_anything_else():
     ``KeySelector`` is the claim that makes installing this one legal -- checked here
     rather than asserted in prose, and checked again at every link.
     """
-    planes = scheduler("cache_aware", _make_topology(2))
-    assert [isinstance(p, KeySelector) for p in planes] == [True, False]
-    assert [isinstance(p, AnySelector) for p in planes] == [False, True]
+    routing, sched = scheduler("cache_aware", _make_topology(2))
+    assert isinstance(routing, KeySelector)          # installable, and says so
+    assert not isinstance(sched, KeySelector)        # asked by hosts, not the store
+    assert isinstance(sched, ControlPlane)
     with pytest.raises(TypeError, match="every link must be a KeySelector"):
         KeySelectorChain([LongestPrefixKeySelector(), _LocalOnly()])
 

@@ -141,7 +141,7 @@ visible from which folders exist and how thick they are:
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
 | `control/` — what is decided | `routing.py`: one `KeySelector.select` — a ranked source plus a readiness gate | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement) + `selector.py` (the source `KeySelector`) + `cache.py` (LRU) + `view.py` (prefix runs) |
-| `data/` — what executes | `read_through.py`: one `DataPlane.after` — a local put | `serving.py` (the per-request lifecycle) + `decode.py` (the batched decode engine) + `store.py` (the KV directory verbs) |
+| `data/` — what executes | `read_through.py`: one `DataPlane.after` — a local put | `serving.py` (the per-request lifecycle) + `decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |
 | domain model + cost layer | **absent** — no served model to describe; charges realsim's cost model directly through the transport seam | `domain/llm.py` (shared — the LLM's flop terms, KV block byte size, and token→time) |

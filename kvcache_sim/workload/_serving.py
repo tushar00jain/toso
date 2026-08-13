@@ -52,7 +52,7 @@ had to keep the loop alive for the tail, and nothing was left holding the reques
 to measure it.
 
 They are two functions because they are two services. The plane factory does not
-build the scheduler; it takes ``sim.placement_handle`` and ``sim.cluster_handle``,
+build the scheduler; it takes ``sim.control_plane_handle`` and ``sim.cluster_handle``,
 the handles :meth:`realsim.run.Run.execute` put in front of whatever
 :func:`scheduler` returned and of the model it decides against. A scenario names
 both functions on a :class:`~realsim.run.Run`: same workload, different wiring,
@@ -63,11 +63,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
-from proposed import Endpoint, KeySelector
+from proposed import ControlPlane, Endpoint, KeySelector
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.simulation import Simulation
@@ -84,7 +84,6 @@ from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from ..data._decode import DecodeEngine
 from ..data._prefill import PrefillEngine
 from ..data.serving import ServingHost
-from ..data.store import KVStore
 from ..report.metrics import Metrics
 
 # ``BLOCK_TOKENS`` is imported rather than declared: how much of a prompt one KV
@@ -157,7 +156,7 @@ def scheduler(
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
     source_selector: Optional[KeySelector[None]] = None,
-) -> List[object]:
+) -> Tuple[FetchRouting, ControlPlane]:
     """This run's **two control planes**, as objects a scenario can just declare.
 
     ``kind`` is ``"cache_aware"`` (the scheduler under test) or ``"load_balance"``
@@ -165,19 +164,21 @@ def scheduler(
     :meth:`~proposed.plane.ControlPlane.attach`, which is what lets these be values
     rather than factories the harness must call at the right moment.
 
-    Two planes because kvcache decides in two places, and where a plane is reached
-    from is its type. The :class:`~realsim.run.Run` fronts the
-    :class:`~proposed.selector.AnySelector` with a
-    :class:`~realsim.seams.placement_handle.LocalPlacementHandle` (it decides
-    compute placement) and installs the :class:`~proposed.selector.KeySelector` in the
-    directory (it answers the store's routing question). They share the cluster
-    model, which is why it is built here: the scheduler prices a pull and records
-    it there, and the chain answers the fetch with it.
+    Two planes because kvcache decides in two places, and each goes to the
+    :class:`~realsim.run.Run` argument that says which: ``control`` installs the
+    :class:`FetchRouting` chain in the directory (it answers the store's routing
+    question), ``placement`` fronts the scheduler with a
+    :class:`~realsim.seams.control_plane_handle.LocalControlPlaneHandle` (its hosts ask it
+    where to run). Returned in that order. They share the cluster model, which is
+    why it is built here: the scheduler prices a pull and records it there, and the
+    chain answers the fetch with it.
 
-    **Ordered.** The scheduler is last because both planes bring up the one
-    ``source_selector``, and the scheduler's attach is the one that leaves it sensing
-    through the pinned :class:`~kvcache_sim.control._view.KVView` a routing decision
-    reads (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`).
+    Both bring up the one ``source_selector``, and the scheduler's attach is the one
+    that must come last -- it leaves that ranking sensing through the pinned
+    :class:`~kvcache_sim.control._view.KVView` a routing decision reads
+    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`). ``Run`` attaches
+    ``control`` before ``placement``, so passing them as those two arguments is what
+    orders them.
 
     ``source_selector`` is the one knob that is an object rather than a value: which
     peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and it keeps
@@ -214,7 +215,7 @@ def scheduler(
         )
     else:
         placement = LoadBalanceScheduler(**knobs)
-    return [FetchRouting(cluster, source), placement]
+    return FetchRouting(cluster, source), placement
 
 
 class _ServingEndpoints:
@@ -291,10 +292,11 @@ class _Client:
 
     Three legs per turn, which is nearly the rest of it::
 
-        plan = await hosts[landed(request)].route(request)      # "prefill is B"
-        decode, first = await hosts[plan.prefill].prefill(plan)  # "decode is C"
-        rest = await hosts[decode].decode(plan)                 # ...returns at the
-                                                                # last token
+        answer = await hosts[landed(request)].route(request)   # "prefill is B"
+        decode, first = await hosts[answer.prefill].prefill(     # "decode is C"
+            request, answer)
+        rest = await hosts[decode].decode(request, answer)       # ...returns at the
+                                                                 # last token
         metrics.completed(request.id, now - request.arrival, 1 + len(rest))
 
     The last line is the rest of it, and it is the one measurement this object is
@@ -324,13 +326,13 @@ class _Client:
     the run to finish are the same act, and the drain is gone rather than
     replaced.
 
-    Note what it carries. The :class:`~kvcache_sim.control.scheduler.Plan` -- a
-    value control issued, which is exactly the kind of thing a client is
-    handed and hands back (a routing token, a session ticket) and which nothing
-    here reads for a decision.
+    Note what it carries: the request it made, and beside it the
+    :class:`~kvcache_sim.control.scheduler.Response` control issued -- exactly the
+    kind of thing a client is handed and hands back (a routing token, a session
+    ticket) and which nothing here reads for a decision.
 
     It also does not second-guess an address. ``prefill`` answers with the decode
-    host rather than the client reading ``plan.decode``, because whether there is a
+    host rather than the client reading ``response.decode``, because whether there is a
     next leg at all is the serving host's answer and not a field to interpret --
     ``None`` means the journey ends here.
 
@@ -395,20 +397,25 @@ class _Client:
         return is a journey that ended, not one abandoned: the host that ended it
         recorded why, and neither leaves anything decoding behind this coroutine.
         """
-        plan = await self.hosts[self.landed(request)].route.call_one(request)
-        if plan is None:
+        answer = await self.hosts[self.landed(request)].route.call_one(request)
+        if answer is None:
             return  # refused at the door; the host that refused recorded it
         # The prefill leg answers with both: the first token it produced, and the
         # address of whoever generates the rest. The token comes back even when the
         # address does not -- a prefill that happened is a prefill that emitted one.
-        decode, first_token = await self.hosts[plan.prefill].prefill.call_one(plan)
+        decode, first_token = await self.hosts[answer.prefill].prefill.call_one(
+            request, answer
+        )
         if decode is None:
             # Nothing after prefill: no decode modelled, or it was shed. The client
             # holds one token and the run models no more of this request, so there
             # is nothing to report -- the same reason the latency below is not
             # stamped on this path, and not a place to invent a shorter one.
             return
-        output = [first_token, *await self.hosts[decode].decode.call_one(plan)]
+        output = [
+            first_token,
+            *await self.hosts[decode].decode.call_one(request, answer),
+        ]
         # Stamped only here, on the one path where a last token exists. A refused
         # request has no end-to-end latency and a prefill-only run has no last
         # token, so both leave the field at its default rather than reporting a
@@ -451,11 +458,11 @@ def serving_plane(
     """
 
     def build(sim: Simulation) -> ItemDispatch:
-        # The simulation *is* the deployment: it vends the client for an instance
-        # and holds the directory, and that is the whole of what the store needs.
-        # What a KV block is -- and how big one is -- is the accelerator's answer
-        # below, so there is nothing left for the run to hand the store.
-        store = KVStore(sim.mesh)
+        # The simulation *is* the deployment (:class:`~proposed.deployment.Deployment`):
+        # it vends the client for an instance, holds the directory, and carries the
+        # two control services a host reaches. So each host is handed it and takes
+        # what it needs (:meth:`~kvcache_sim.data.serving.ServingHost.attach`) --
+        # nothing here plumbs a port.
         hop = ServiceHop(config.current().client_rtt)
         hosts: Dict[str, ServingHost] = {}
 
@@ -474,7 +481,7 @@ def serving_plane(
             # not, which is what ``coupled=False`` on a host in both pools means.
             prefill_compute = compute if coupled else accelerator()
             hosts[instance] = ServingHost(
-                instance, store, sim.placement_handle, sim.cluster_handle,
+                instance,
                 trace=sim.trace, metrics=sim.ledger,
                 prefill=(
                     PrefillEngine(prefill_compute)
@@ -486,6 +493,7 @@ def serving_plane(
                 ),
                 models_decode=simulate_decode,
             )
+            hosts[instance].attach(sim)
         # The endpoints exist only on the client side, so there is no cycle to
         # close: every host was fully constructed above, knowing nothing about any
         # other, and this loop just gives the client a way to reach each of them.

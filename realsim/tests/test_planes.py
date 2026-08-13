@@ -40,7 +40,7 @@ import torch
 from realsim.mesh import Mesh
 from realsim.simulation import Simulation
 from proposed import DataPlane
-from proposed import AnySelector, Key, KeySelector, Selection
+from proposed import AnySelector, ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
@@ -48,6 +48,7 @@ from proposed.selector import (
     Refinement, Selector, TakeHead,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
+from realsim.seams.link import LocalEndpoint
 from realsim.seams.transport import Endpoint
 from proposed import View
 from sim_common.async_engine import run_sim
@@ -313,23 +314,26 @@ def test_a_registration_reaches_a_subscriber_before_the_put_returns():
 
 
 def test_only_a_key_selector_is_consulted_by_the_controller():
-    """A selector over a subject the store cannot read must not answer for it."""
+    """A selector over a subject the store cannot read may not answer for it.
 
-    def _asked(control) -> list[str]:
-        sim = Simulation(_topology(), control=control)
+    The installed plane is consulted on every ``get``; one whose subject is an
+    application payload is refused at assembly instead, so there is no run in which
+    the directory hands it keys.
+    """
+    control = _Fixed()
+    sim = Simulation(_topology(), control=control)
 
-        async def scenario():
-            with sim.mesh.installed():
-                sim.mesh.bind_source("a")
-                await sim.mesh.client("a").put("W", _payload())
-                sim.mesh.bind_source("c")
-                await sim.mesh.client("c").get("W")
+    async def scenario():
+        with sim.mesh.installed():
+            sim.mesh.bind_source("a")
+            await sim.mesh.client("a").put("W", _payload())
+            sim.mesh.bind_source("c")
+            await sim.mesh.client("c").get("W")
 
-        _drive(sim, scenario())
-        return control.asked
-
-    assert _asked(_Fixed()) == ["c"]
-    assert _asked(_FixedPlacement()) == []
+    _drive(sim, scenario())
+    assert control.asked == ["c"]
+    with pytest.raises(TypeError, match="must be a KeySelector"):
+        Simulation(_topology(), control=_FixedPlacement())
 
 
 def test_an_installed_selector_is_attached_to_the_run_s_view():
@@ -344,6 +348,88 @@ def test_an_installed_selector_is_attached_to_the_run_s_view():
     sim = Simulation(_topology(), control=selector)
     assert selector.view is sim.view
     assert isinstance(selector.view, View)
+
+
+# --------------------------------------------------------------------------
+# 2c. Two planes, two arguments: which side reaches a plane is what it was passed as.
+# --------------------------------------------------------------------------
+
+
+class _Decides(ControlPlane):
+    """An application's own plane: answers what it was built with, remembers who asked.
+
+    A plain :class:`~proposed.plane.ControlPlane`, because what it answers with is
+    between it and the hosts that ask -- ``kvcache_sim``'s scheduler answers with the
+    winners of two selections, which is not a ``Selection`` at all.
+    """
+
+    def __init__(self, answer: Any = "decided") -> None:
+        self.answer = answer
+        self.asked: list[str] = []
+
+    async def decide(self, subject, requester):
+        self.asked.append(requester)
+        return self.answer
+
+
+def test_a_placement_plane_is_fronted_as_the_application_s_own_service():
+    """Reached over the hop, by the member it declares.
+
+    Nothing looks up its type: it is the ``placement`` argument, so it is the plane
+    an application's hosts ask, and the handle offers ``decide`` for one that answers
+    with its own value.
+    """
+    plane = _Decides()
+    sim = Simulation(_topology(), placement=plane)
+    assert sim.control_plane_handle is not None
+    assert sim.control_plane_handle.control is plane
+    answer = _drive(sim, sim.control_plane_handle.decide.call_one("subject", "a"))
+    assert answer == "decided"
+    assert plane.asked == ["a"]
+
+
+def test_a_handle_offers_the_members_the_plane_declares_and_no_others():
+    """The seam is written once for every capability, however many questions it asks.
+
+    ``ControlPlane`` declares a lifecycle and no questions, so the service and the
+    handle read the plane's own public coroutines instead of naming any: a capability
+    adding a second question adds nothing to ``realsim/seams``. Underscored members
+    are the plane's working, and ``attach`` is the run's, so neither is reachable.
+    """
+
+    class _Two(ControlPlane):
+        async def decide(self, subject, requester):
+            return "decided"
+
+        async def price(self, subject, requester):
+            return "priced"
+
+        async def _internal(self):           # its own working, not a question
+            return "no"
+
+        def ready(self):                     # not awaited, so not a question
+            return True
+
+    sim = Simulation(_topology(), placement=_Two())
+    handle = sim.control_plane_handle
+    assert handle.asked == ("decide", "price")
+    assert _drive(sim, handle.price.call_one("subject", "a")) == "priced"
+    for hidden in ("_internal", "ready", "attach", "cluster"):
+        assert not isinstance(getattr(handle, hidden, None), LocalEndpoint)
+
+
+def test_only_a_key_selector_may_be_installed_in_the_directory():
+    """``control`` runs inside ``locate_volumes``, so its subject has to be keys.
+
+    A plane that decides an application's own question is passed as ``placement``;
+    handing it to the directory instead would answer a question the store never
+    asked, so the claim is checked rather than assumed.
+    """
+    with pytest.raises(TypeError, match="must be a KeySelector"):
+        Simulation(_topology(), control=_Decides())
+    # ...and the store-side plane is not fronted as a service of its own.
+    sim = Simulation(_topology(), control=_Fixed())
+    assert sim.control_plane_handle is None
 
 
 # --------------------------------------------------------------------------

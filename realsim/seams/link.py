@@ -2,7 +2,8 @@
 
 Every `[S]` seam in this package stands in for something that is an actor
 endpoint in a deployment -- :class:`~realsim.seams.controller_handle.LocalControllerHandle`
-for the directory, :class:`~realsim.seams.placement_handle.LocalPlacementHandle` for a
+for the directory,
+:class:`~realsim.seams.control_plane_handle.LocalControlPlaneHandle` for a
 capability's control plane. Standing in for an endpoint means two things: dispatch
 to a real object in this process, and *be the place the distance is charged*.
 This is the second half, factored out, so that every boundary a run crosses is

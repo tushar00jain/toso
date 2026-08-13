@@ -46,7 +46,7 @@ from sim_common.cost_model import DEFAULT_PROFILE, _get_time, MachineProfile
 from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
-from kvcache_sim.data.store import KVStore
+from kvcache_sim.data._store import KVStore
 from kvcache_sim.workload._accelerator import (
     SimulatedAccelerator, TOKEN_DTYPE, token_tensor,
 )

@@ -1,4 +1,4 @@
-"""What a caller holds to reach a placement: :class:`LocalPlacementHandle`.
+"""What a caller holds to reach a control plane: :class:`LocalControlPlaneHandle`.
 
 The **client** side, and only that -- the third of the pair this package builds for
 each service (see :mod:`realsim.seams.controller_handle`,
@@ -11,29 +11,30 @@ handle, over calls that carry values.
 
 This class is that reference, for a service living in this process instead of
 another one: an endpoint per member of
-:class:`realsim.seams.placement_service.PlacementService` -- the server side, which
-holds the deciding object -- and the single place a round trip is charged. In a
+:class:`realsim.seams.control_plane_service.ControlPlaneService` -- the server side,
+which holds the deciding object -- and the single place a round trip is charged. In a
 deployment it is Monarch's own handle and nothing on either side changes shape,
 which is what the ``Local`` in the name is for: it names the three siblings that
 disappear, not a different kind of thing.
 
-One endpoint per member of the surface -- and there is one
-----------------------------------------------------------
-The member is :class:`proposed.selector.AnySelector`'s: ``select``. Naming it here is
-not the harness knowing what a capability decided -- it is the harness knowing the
-port, which lives in ``proposed`` exactly so both sides can be written without
-either knowing the other. Same as
-:class:`realsim.seams.controller_handle.LocalControllerHandle` and its five. The
-questions are subject and the answers are :class:`~proposed.selector.Selection`
-payload, so this file is done: any application, one endpoint. What a host reports
-is not a question and reaches its own service
+One endpoint per member of the surface, and the surface is the plane's
+---------------------------------------------------------------------
+The members are not named here. They are read off the plane the service holds
+(:func:`~realsim.seams.control_plane_service.asked_of`) and turned into one endpoint
+each, because *which* questions a capability answers is the capability's to say --
+:class:`~realsim.seams.controller_handle.LocalControllerHandle` can name its five
+because the directory's surface is declared in ``proposed``, and a control plane's is
+not. So a capability written next needs no change here, however many questions it
+answers.
+
+What a host reports is not a question and reaches its own service
 (:mod:`realsim.seams.cluster_model_handle`).
 
 Calls and sends
 ---------------
 The member comes back as a :class:`~realsim.seams.link.LocalEndpoint`, so the
 *caller* chooses how to send, exactly as it would with Monarch:
-``select.call_one(subject, me)`` is a call, awaited, paying the hop twice because
+``decide.call_one(subject, me)`` is a call, awaited, paying the hop twice because
 the caller is blocked out and back.
 
 That is why the surface is endpoints and not methods. A handle offering methods
@@ -65,14 +66,15 @@ from typing import Any, Optional
 
 from realsim.seams.link import LocalEndpoint, ServiceHop
 
-__all__ = ["LocalPlacementHandle"]
+__all__ = ["LocalControlPlaneHandle"]
 
 
-class LocalPlacementHandle:
-    """A reference to a :class:`PlacementService` living in this process.
+class LocalControlPlaneHandle:
+    """A reference to a :class:`ControlPlaneService` living in this process.
 
     Args:
-        service: the placement service this refers to.
+        service: the control-plane service this refers to. Its ``asked`` names the
+            members to build endpoints for.
         hop: what reaching it costs. ``None`` is a free hop, which is what a test
             wanting a control plane and nothing else wants; a run builds one from
             :attr:`sim_common.config.SimConfig.control_rtt`.
@@ -81,7 +83,10 @@ class LocalPlacementHandle:
     def __init__(self, service: Any, *, hop: Optional[ServiceHop] = None) -> None:
         self.service = service
         self.hop = hop if hop is not None else ServiceHop()
-        self.select = LocalEndpoint(service.select, self.hop)
+        #: The members this handle offers, in the order the endpoints were built.
+        self.asked = tuple(service.asked)
+        for name in self.asked:
+            setattr(self, name, LocalEndpoint(getattr(service, name), self.hop))
 
     @property
     def control(self) -> Any:

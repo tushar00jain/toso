@@ -6,8 +6,8 @@ The answer is always volume ids, best first, plus the moment they become usable
 (and, for a selector handed candidates it did not price, what each one priced at).
 What differs is the **subject**, and every selector names its own in its header::
 
-    class RoutedPull(KeySelector[None]):           # keys, ranked without pricing
-    class _Scheduler(AnySelector[Request, Plan]):  # an application's, priced
+    class RoutedPull(KeySelector[None]):        # keys, ranked without pricing
+    class Hosts(AnySelector[Request, Plan]):    # an application's subject, priced
 
 Two of those subjects are *types* as well, because a run reaches a selector by
 which one it is:
@@ -303,7 +303,7 @@ class AnySelector(Selector[_S, _P]):
     ``locate_volumes`` answer a question it was not asked.
 
     One that an application's own hosts ask is given a service of its own by the
-    run (:mod:`realsim.seams.placement_service`), so the subject and the answer
+    run (:mod:`realsim.seams.control_plane_service`), so the subject and the answer
     both have to be values a wire could carry: the ranking is source ids, and what
     the winner was chosen with rides in :attr:`Selection.payload`.
     """

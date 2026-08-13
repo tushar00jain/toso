@@ -33,9 +33,9 @@ the workload supplies the work; :meth:`realsim.run.Run.execute` pairs the two.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from proposed import ControlPlane, Endpoint, AnySelector, KeySelector, View
+from proposed import Endpoint, KeySelector, View
 from sim_common import config
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
@@ -50,8 +50,8 @@ from realsim.mesh import Mesh
 from realsim.seams.cluster_model_handle import LocalClusterModelHandle
 from realsim.seams.cluster_model_service import ClusterModelService
 from realsim.seams.link import ServiceHop
-from realsim.seams.placement_handle import LocalPlacementHandle
-from realsim.seams.placement_service import PlacementService
+from realsim.seams.control_plane_handle import LocalControlPlaneHandle
+from realsim.seams.control_plane_service import ControlPlaneService
 from realsim.runner import ItemDispatch, Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -60,70 +60,36 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = ["Simulation"]
 
 
-def _as_planes(control: Optional[Any]) -> Sequence[Any]:
-    """``control`` as the sequence of planes it is, one or several.
-
-    A control plane may itself be a sequence (a chain is one), so the test is for
-    a list or tuple and not for iterability.
-    """
-    if control is None:
-        return ()
-    if isinstance(control, (list, tuple)):
-        return tuple(control)
-    return (control,)
-
-
-def _one(planes: Sequence[Any], role: type, doing: str) -> Optional[Any]:
-    """The one plane filling ``role``, or ``None``.
-
-    Two is refused rather than resolved by position: which of them the run reached
-    would be a fact about the order a capability happened to list them in.
-    """
-    filling = [p for p in planes if isinstance(p, role)]
-    if len(filling) > 1:
-        raise TypeError(
-            f"{len(filling)} control planes are a {role.__name__} "
-            f"({', '.join(type(p).__name__ for p in filling)}): one may {doing}"
-        )
-    return filling[0] if filling else None
-
-
 class Simulation:
     """One assembled stack: clock, mesh, view, ledger, cost estimate.
 
     Args:
         topology: ``node_id -> Endpoint``. The node id is also its storage-volume
             id in the real directory.
-        control: the capability's control plane, or ``None`` for the plain path.
-            One object, or a sequence of them when a capability decides in more
-            than one place. Each is attached, and then each is wired to the side
-            that reaches it:
+        control: the plane that runs **in the directory service**, installed in the
+            real controller's ``locate_volumes``, so a caller that just does
+            ``client.get(K)`` is routed. Must be a
+            :class:`~proposed.selector.KeySelector`, which is what claims a subject
+            the directory can hand down. ``None`` leaves the directory answering
+            for itself.
+        placement: the plane the **application's own hosts ask**, fronted by a
+            :class:`~realsim.seams.control_plane_handle.LocalControlPlaneHandle` as
+            :attr:`control_plane_handle` and reached as its own service. Any
+            :class:`~proposed.plane.ControlPlane`: what it answers with is between
+            it and the hosts that ask. ``None`` for a capability that decides only
+            inside the directory.
 
-            * the store's own selector runs *in the directory service*, installed
-              in the real controller's ``locate_volumes``, so a caller that just
-              does ``client.get(K)`` is routed. That is whichever control plane is
-              a :class:`~proposed.selector.KeySelector`;
-            * a :class:`~proposed.selector.AnySelector` is the application's own
-              question, so it is fronted by a
-              :class:`~realsim.seams.placement_handle.LocalPlacementHandle` as
-              :attr:`placement_handle` and reached as its own service;
-            * a model of the cluster
-              (:attr:`~proposed.plane.ControlPlane.cluster`) is fronted too, as
-              :attr:`cluster_handle`, so the hosts report into it directly.
+            Two arguments rather than a list, so each plane's role is the parameter
+            it was passed as. dedup is ``control`` alone; kvcache is both, and the
+            pair is the interesting case: a scheduler its hosts ask over the handle,
+            and beside it a chain in the directory answering "which peer serves this
+            prefix". They share the model the first writes and the second reads, so
+            the peer control priced is the peer that serves the pull, with nothing
+            threaded through the data plane to say so.
 
-            dedup is one object filling the first role; kvcache is two, and the
-            pair is the interesting case: a scheduler ranking prefill hosts over
-            the handle, and beside it a chain answering "which peer serves this
-            prefix" in the directory. They share the model the first writes and
-            the second reads, so the peer control priced is the peer that serves
-            the pull, with nothing threaded through the data plane to say so.
-
-            Attached in the order given, which matters when the two share a
-            selector: the last attach is the view it senses through.
-
-            At most one of each role. Two planes claiming the same one is a
-            capability that has not decided who answers, and it is refused here
-            rather than resolved by position.
+            A model of the cluster (:attr:`~proposed.plane.ControlPlane.cluster`) is
+            fronted too, as :attr:`cluster_handle`, so the hosts report into it
+            directly; one of the two planes may keep one.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`;
             supplies every cost constant and each volume's byte capacity.
         trace: shared :class:`~sim_common.trace.Trace` (created if omitted).
@@ -139,6 +105,7 @@ class Simulation:
         topology: Dict[str, Endpoint],
         *,
         control: Optional[Any] = None,
+        placement: Optional[Any] = None,
         profile: Optional[MachineProfile] = None,
         trace: Optional[Trace] = None,
         ledger: Optional[Ledger] = None,
@@ -175,36 +142,46 @@ class Simulation:
         self.view: View = self.mesh.view
         self.transfer_cost = ProfileTransferCost(self.mesh.topology, self.profile)
 
-        # The ``control`` planes, each wired to the side that reaches it. Every
-        # control plane is a proposed.ControlPlane, so each is attached by type
-        # rather than by sniffing for the method, and every attach runs before any
-        # wiring below: attach hands over the view and the transfer-cost estimate
-        # that everything below is derived from, and a plane may not be brought up
-        # against a stack another plane has not finished joining.
-        self.placement_handle: Optional[Any] = None
+        # The planes, each named by the argument that says which side reaches it.
+        # Both are attached before any wiring below: attach hands over the view and
+        # the transfer-cost estimate that everything below is derived from, and a
+        # plane may not be brought up against a stack another plane has not
+        # finished joining.
+        #
+        # ``control`` first and ``placement`` second, which matters when the two
+        # share a selector: the last attach is the view it senses through, and a
+        # decision that pins a snapshot must not consult a ranking reading past it
+        # (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`).
+        self.control_plane_handle: Optional[Any] = None
         self.cluster_handle: Optional[Any] = None
-        planes = [p for p in _as_planes(control) if isinstance(p, ControlPlane)]
+        planes = tuple(p for p in (control, placement) if p is not None)
         for plane in planes:
             plane.attach(self.view, self.transfer_cost)
         # The store's own question, answered inside locate_volumes by the seam in
-        # front of the directory (LocalControllerHandle). Selected by type and not
-        # by position: the subject a directory hands down is keys, so being a
-        # KeySelector is the claim that makes a plane installable there.
-        store_side = _one(planes, KeySelector, "run inside locate_volumes")
-        if store_side is not None:
-            self.mesh.controller_handle.install_selector(store_side)
+        # front of the directory (LocalControllerHandle). The subject a directory
+        # hands down is keys, so being a KeySelector is the claim that makes a plane
+        # installable there -- checked, because installing one that reads its subject
+        # as anything else would answer a question the directory did not ask.
+        if control is not None:
+            if not isinstance(control, KeySelector):
+                raise TypeError(
+                    f"{type(control).__name__} is installed in locate_volumes, so "
+                    f"it must be a KeySelector; pass an application's own plane as "
+                    f"placement="
+                )
+            self.mesh.controller_handle.install_selector(control)
         # What reaching a control plane costs. Resolved once, here, because this is
         # the one place a run's control services are built -- the same reason
         # ``make_controller_adapter`` resolves the directory's. One distance for
         # all of them: a model is held by the control plane that reads it, so a
         # host reaching any of them crosses the same boundary.
         hop = ServiceHop(config.current().control_rtt)
-        # The application's own question, which only a AnySelector answers. A
-        # capability that runs solely in the directory has no such service.
-        placement = _one(planes, AnySelector, "answer the application's question")
+        # The application's own question, fronted as a service of its own. A
+        # capability that runs solely in the directory passes no ``placement`` and
+        # gets none.
         if placement is not None:
-            self.placement_handle = LocalPlacementHandle(
-                PlacementService(placement), hop=hop
+            self.control_plane_handle = LocalControlPlaneHandle(
+                ControlPlaneService(placement), hop=hop
             )
         # The other half of what a host says to control: a question goes to the
         # placement, a fact goes to the model it corrects. Only a plane that keeps
@@ -213,7 +190,7 @@ class Simulation:
         modelled = [p for p in planes if p.cluster is not None]
         if len(modelled) > 1:
             raise TypeError(
-                f"{len(modelled)} control planes keep a cluster model "
+                f"both control planes keep a cluster model "
                 f"({', '.join(type(p).__name__ for p in modelled)}): the hosts "
                 f"report into one, so a run has one to front"
             )
@@ -230,6 +207,25 @@ class Simulation:
                 trace=self.trace, quiet=self._quiet, random_seed=self._random_seed
             )
         return self._loop
+
+    # -- proposed.Deployment: what a data plane is attached to --------------- #
+    # The store's three members delegate to the mesh, so an assembled stack *is* a
+    # :class:`~proposed.deployment.Deployment`: a capability's data plane is handed
+    # this one object (:meth:`~proposed.plane.DataPlane.attach`) and finds on it the
+    # store to call, the control plane to ask (:attr:`control_plane_handle`) and the
+    # model to report into (:attr:`cluster_handle`).
+    def client_for(self, node_id: str) -> Any:
+        """The torchstore client for ``node_id``, ready to be driven."""
+        return self.mesh.client_for(node_id)
+
+    def volume_handle(self, node_id: str) -> Any:
+        """A reference to ``node_id``'s storage volume."""
+        return self.mesh.volume_handle(node_id)
+
+    @property
+    def controller_handle(self) -> Any:
+        """A reference to the directory service."""
+        return self.mesh.controller_handle
 
     # -- the pieces a capability wires itself to ---------------------------- #
     @property

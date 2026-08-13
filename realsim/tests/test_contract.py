@@ -349,10 +349,11 @@ def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
 def test_plane_port_rule_actually_resolves_the_real_ports():
     """Vacuous unless it finds both real ports and the plane that holds them.
 
-    A serving host reaches control twice -- it asks a ``AnySelector`` and reports to
-    a ``ClusterModel`` -- and each is found on its own mark: the first derives
-    ``ControlPlane`` two levels up (``AnySelector`` -> ``Selector`` ->
-    ``ControlPlane``), which is why the closure is transitive; the second is one of
+    A serving host reaches control twice -- it asks a ``ControlPlane`` and reports
+    to a ``ClusterModel`` -- and each is found on its own mark: the first *is* the
+    base every port derives (and a ``AnySelector`` would derive it two levels up,
+    ``AnySelector`` -> ``Selector`` -> ``ControlPlane``, which is why the closure is
+    transitive); the second is one of
     the all-coroutine services ``proposed.deployment`` declares. Both are imported
     from ``proposed`` rather than from a sibling ``control/``, so this also pins the
     half of :func:`_control_ports` that follows a package import: were it to look
@@ -369,12 +370,13 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
         dotted: ast.parse((root / mods[dotted]).read_text())
         for dotted in (
             "kvcache_sim.control.scheduler",
+            "proposed.plane",
             "proposed.selector",
             "proposed.deployment",
         )
     }
     ports = check_structure._control_ports(rel, tree, mods, trees)
-    assert ports == {"AnySelector", "ClusterModel"}, ports
+    assert ports == {"ControlPlane", "ClusterModel"}, ports
     # ...and that the plane's fields are recognised as holding them.
     _local, attrs = check_structure._port_names(tree, ports)
     assert {"placement", "cluster"} <= attrs, attrs

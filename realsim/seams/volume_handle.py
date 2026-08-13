@@ -2,7 +2,8 @@
 
 The **client** side, and only that -- the third of the pair this package builds for
 each service (see :mod:`realsim.seams.controller_handle`,
-:mod:`realsim.seams.placement_handle`). A caller does not hold a storage volume; it
+:mod:`realsim.seams.control_plane_handle`). A caller does not hold a storage volume;
+it
 holds a reference to one, and Monarch's reference is not the same shape as the actor:
 ``@endpoint`` turns each method into an ``EndpointProperty``, so the attribute
 resolves to an endpoint object and the call reads

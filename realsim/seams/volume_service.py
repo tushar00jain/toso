@@ -2,7 +2,8 @@
 
 The **server** side of a storage volume, and the third of the same pair this package
 builds twice already (:mod:`realsim.seams.controller_service`,
-:mod:`realsim.seams.placement_service`). In a deployment this is a Monarch actor:
+:mod:`realsim.seams.control_plane_service`). In a deployment this is a Monarch
+actor:
 a process holding an ``InMemoryStore``, receiving messages, and answering them. Here
 it is a plain object holding the same real store in this process, with the same
 methods, receiving ordinary calls instead of messages.

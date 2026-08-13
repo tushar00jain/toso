@@ -41,8 +41,8 @@ Six rules, none of which a type system can express:
    ``getattr``-ing it are not. A capability's own port is any imported class that
    is not a dataclass -- the values that legitimately cross are dataclasses, and
    reading *their* fields is the point of sending them. Today that leaves two
-   members on the whole control side of a serving host: ``select`` on the
-   selector it asks and ``notify`` on the model it reports into.
+   members on the whole control side of a serving host: ``decide`` on the
+   control plane it asks and ``notify`` on the model it reports into.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -485,7 +485,10 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
             ]
             if members and all(isinstance(m, ast.AsyncFunctionDef) for m in members):
                 remote.add(node.name)
-    out: Set[str] = set(remote)
+    # ``ControlPlane`` seeds the closure rather than being reached by it: it is the
+    # base every port derives, and a ``data/`` module holding a plane it cannot name
+    # more precisely annotates it with exactly this.
+    out: Set[str] = set(remote) | {"ControlPlane"}
     growing = True
     while growing:
         reached = {
@@ -504,7 +507,8 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     A ``Plan``, a ``Completion`` or a ``Request`` crossing the plane boundary is a
     *value* and its fields are meant to be read; those are dataclasses. A port is
     an object living in the other plane, and in this codebase that is a plain
-    class -- ``KeySelector`` and ``AnySelector`` both, following the same convention
+    class -- ``ControlPlane``, ``KeySelector`` and ``AnySelector`` alike, following
+    the same convention
     torchstore uses for ``TorchStoreStrategy``. So the discriminator is the
     dataclass decorator, not a base: it keeps holding when a port stops being a
     ``Protocol`` and becomes an ordinary base class.
@@ -547,21 +551,32 @@ def _port_names(tree: ast.Module, ports: Set[str]) -> tuple:
     attrs: Set[str] = set()
 
     def named(ann) -> bool:
-        """Is this annotation a port, however it names its type parameters?
+        """Does this annotation name a port anywhere inside it?
 
-        ``AnySelector[Request, Plan]`` is the port ``AnySelector``: reading only the
-        bare ``Name`` would leave this rule blind to exactly the attributes a
-        ``data/`` module holds a control plane in.
+        The whole annotation is walked rather than read as a bare ``Name``, because
+        the two shapes a ``data/`` module actually writes are both compound:
+        ``AnySelector[Request, Plan]`` names its type parameters, and
+        ``Optional[ControlPlane]`` is a port that is ``None`` until
+        :meth:`~proposed.plane.DataPlane.attach`. Reading only the outermost name
+        would leave this rule blind to exactly the attributes it exists to police.
+
+        Wider than it strictly needs to be, deliberately: ``Dict[str, SomePort]``
+        counts too, so a collection of ports is policed like one port.
+        Over-reporting is the safe direction for a rule whose failure mode is going
+        quiet.
         """
-        if isinstance(ann, ast.Subscript):
-            ann = ann.value
-        if isinstance(ann, ast.Name):
-            return ann.id in ports
-        return (
-            isinstance(ann, ast.Constant)
-            and isinstance(ann.value, str)
-            and ann.value.partition("[")[0] in ports
-        )
+        if ann is None:
+            return False
+        for node in ast.walk(ann):
+            if isinstance(node, ast.Name) and node.id in ports:
+                return True
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value.partition("[")[0] in ports
+            ):
+                return True
+        return False
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

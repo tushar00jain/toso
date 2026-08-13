@@ -12,9 +12,8 @@ simulator, ``proposed`` is the design being argued for.
   which volume serves a requester and may withhold the answer until that volume is
   usable; a :class:`~proposed.selector.AnySelector` takes an application's own
   subject (which host prefills, which peer a prefix comes from) and is never
-  installed -- an application's hosts ask one as a service of its own, so it is
-  also the whole of what a control plane offers them. A selector that is neither
-  is consulted by another selector and reached from nowhere. The
+  installed -- an application's hosts ask one as a service of its own. A selector
+  that is neither is consulted by another selector and reached from nowhere. The
   default :class:`~proposed.selector.NaiveKeySelector` returns the directory's own
   answer, so an installed selector changes nothing until one is written. It, the
   combinators beside it -- :class:`~proposed.selector.FirstMatch` (try selectors in

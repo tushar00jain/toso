@@ -1,22 +1,23 @@
 """One scheduler, two presets: ``LoadBalanceScheduler`` / ``CacheAwareScheduler``.
 
-Both are a :class:`~proposed.selector.AnySelector`, whose one member -- ``select`` --
-is the whole surface the data plane may *ask*. Beside either runs a second control
-plane, :class:`FetchRouting`, which is what the *directory* consults; a run
-installs the two together (:func:`kvcache_sim.workload._serving.scheduler`) and
-they meet only at the cluster model.
+Both are a plain :class:`~proposed.plane.ControlPlane`, whose one member --
+``decide`` -- is the whole surface the data plane may *ask*. Beside either runs a
+second control plane, :class:`FetchRouting`, which is what the *directory* consults;
+a run is handed the two separately (:func:`kvcache_sim.workload._serving.scheduler`)
+and they meet only at the cluster model.
 
 This application's one question::
 
-    await select(request, me) -> Selection[Plan]   # prefill hosts, best first
+    await decide(request, me) -> Optional[Response]
 
-The ranking is real -- every prefill instance is priced -- and the winner's
-:class:`Plan` rides in the payload, so a caller wanting the decision reads
-:attr:`~proposed.selector.Selection.winner` and never indexes the ranking. A refusal
-(an SLO miss) is the abstention every selector here uses, ``Selection.of([])``.
+Not a selector, because the decision is made of **two** selections and a selection
+holds one: the prefill hosts this scheduler priced, and the decode hosts it ranked
+against the winner among them. Both rankings are real, and both stay here -- what
+leaves is the winner of each and the price of the one that won (:class:`Response`),
+since nothing outside asks what lost. A refusal (an SLO miss) is ``None``.
 
-A plan names both of the request's hosts, so it is asked once and before anything
-runs -- which is what makes a refusal cost nothing.
+One ask settles both halves, before anything runs -- which is what makes a refusal
+cost nothing.
 
 What a host *reports* is not asked and is not answered, so it does not come here:
 a fact goes to the model it corrects (:mod:`kvcache_sim.control._cluster`), which
@@ -60,7 +61,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from proposed import AnySelector, Endpoint, Key, KeySelector, Selection, VolumeId
+from proposed import ControlPlane, Endpoint, Key, KeySelector, Selection, VolumeId
 from proposed.selector import (
     AbstainOnSelf, KeySelectorChain, Refine, Refinement, Selector, TakeHead,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "ComputeBusy",
     "DecodeState",
     "Plan",
+    "Response",
     "RoutedPull",
     "FetchRouting",
     "predicts_decode",
@@ -111,11 +113,13 @@ def predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
 
 @dataclass
 class Plan:
-    """A routing decision for one request (or a rejection when ``None``)."""
+    """What prefilling one request on one instance was priced at.
 
-    request: Request
-    prefill: str                 # chosen prefill instance id
-    decode: str                  # chosen decode instance id
+    One candidate's price and nothing else: which instance this is, and which one
+    decodes, are the two selections' winners and live on the :class:`Response`. Every
+    field here is about the prefill, so a losing candidate is a complete value too.
+    """
+
     match_blocks: int            # reused prefix length (blocks)
     cached_tokens: int
     uncached_tokens: int
@@ -124,12 +128,9 @@ class Plan:
     queue_wait: float
     ttft: float                  # time-to-first-token (queue + transfer + prefill)
     done_time: float             # absolute sim time prefill completes
-    decode_done: float
     prefill_t: float = 0.0       # prefill compute duration
     transfer_t: float = 0.0      # predicted remote-pull fetch duration
     pull_keys: List[str] = field(default_factory=list)  # gap blocks to fetch
-    pred_tbt: float = 0.0        # predicted time-between-tokens at admission
-    pred_batch: int = 0          # predicted decode batch size at admission
 
     @property
     def local_blocks(self) -> int:
@@ -142,6 +143,29 @@ class Plan:
         return self.match_blocks - len(self.pull_keys)
 
 
+@dataclass(frozen=True)
+class Response:
+    """Where one request runs: the winner of each selection, and the price of one.
+
+    What :meth:`_Scheduler.decide` answers and the only part of a decision that
+    travels. The rankings behind it stay inside the scheduler: nothing outside asks
+    what lost.
+
+    Args:
+        prefill / decode: the two instances chosen, one from each selection.
+        plan: what prefilling on ``prefill`` was priced at.
+        pred_batch / pred_tbt: the decode batch this request was predicted to meet
+            and the inter-token gap that implies. Read by the TBT gate, which is why
+            they are here and not on the plan -- they are the decode side's.
+    """
+
+    prefill: VolumeId
+    decode: VolumeId
+    plan: Plan
+    pred_batch: int = 0
+    pred_tbt: float = 0.0
+
+
 # -- the first axis: which peer a prefix is pulled from ---------------------- #
 # Everything a routing decision does is the same whichever scheduler is running.
 # What differs is the two axes and which admission gates are installed.
@@ -152,7 +176,7 @@ class Plan:
 # not the store's: is pulling worth more than recomputing here. That composition is a
 # :class:`~proposed.selector.Refine`, a plain Selector, which is what keeps it out of
 # the controller without either half holding the other. Its ``select`` is awaited
-# inside the decision's pinned snapshot (:meth:`_Scheduler.select`), so it runs to
+# inside the pinned snapshot (:meth:`_Scheduler._select_prefill`), so it runs to
 # completion without suspending.
 #
 # The second axis is below, and is a sort key rather than a selector: it ranks what
@@ -266,25 +290,25 @@ def _by_batch(candidate: _Batched) -> Tuple:
     return (batch, instance)
 
 
-#: An admission gate: does this plan clear one SLO? Installed as a list --
+#: An admission gate: does this decision clear one SLO? Installed as a list --
 #: :attr:`_Scheduler._gates` -- rather than tested behind a mode string, so no
 #: decision below has a mode to branch on. A gate holds no settings of its own, so
 #: it is handed the model it gates against.
-_Gate = Callable[[Plan, "_Scheduler"], bool]
+_Gate = Callable[["Response", "_Scheduler"], bool]
 
 
-def _ttft_gate(plan: Plan, sched: "_Scheduler") -> bool:
+def _ttft_gate(response: "Response", sched: "_Scheduler") -> bool:
     """The TTFT SLO. The one gate every run installs."""
-    return plan.ttft <= sched.slo_ttft
+    return response.plan.ttft <= sched.slo_ttft
 
 
-def _predicted_tbt_gate(plan: Plan, sched: "_Scheduler") -> bool:
+def _predicted_tbt_gate(response: "Response", sched: "_Scheduler") -> bool:
     """The TBT SLO, on the batch this request is predicted to join.
 
     Runs at routing, before the prefill: what it refuses costs nothing, which is the
     whole of why admission is decided here and not once the compute has been spent.
     """
-    return plan.pred_tbt <= sched.slo_tbt
+    return response.pred_tbt <= sched.slo_tbt
 
 
 class RoutedPull(KeySelector[None]):
@@ -345,11 +369,12 @@ class FetchRouting(KeySelectorChain[None]):
         super().__init__([RoutedPull(cluster), source])
 
 
-class _Scheduler(AnySelector[Request, Plan]):
+class _Scheduler(ControlPlane):
     """The pricing, ranking and admission both schedulers share.
 
-    A :class:`~proposed.selector.AnySelector`, and only that: a serving host asks it as
-    a service (:meth:`select`). What the *directory* is told is a second control
+    A :class:`~proposed.plane.ControlPlane` and nothing more specific: a serving
+    host asks it as a service (:meth:`decide`), which is the whole of its surface.
+    What the *directory* is told is a second control
     plane the run installs beside this one
     (:class:`FetchRouting`), and the two meet at the model -- this one prices a
     pull and records it, that one answers the fetch with it -- so nothing is
@@ -357,7 +382,7 @@ class _Scheduler(AnySelector[Request, Plan]):
 
     Args:
         reuse / rank: the two axes a preset picks (see above), both used while
-            forming the one answer :meth:`select` gives. ``reuse`` is a selector
+            forming the one answer :meth:`decide` gives. ``reuse`` is a selector
             and ``rank`` a sort key (:data:`_RankKey`), which is why only the first
             is attached. It names a peer for a candidate's block keys and prices
             nothing (``Selector[Sequence[Key], None]``): what a peer is worth is
@@ -467,49 +492,59 @@ class _Scheduler(AnySelector[Request, Plan]):
         # (:meth:`~proposed.selector.Refine.attach`), and that ranking is also a link
         # of the store-side chain, which the run attaches to the plain view it hands
         # every control plane. This attach is the one that leaves it sensing through
-        # the pinned view, so a run listing the two planes puts this one **last**:
-        # a ranking a decision consults inside its pin must not read past the
-        # snapshot into the live directory.
+        # the pinned view, so it has to run **second**: a ranking a decision consults
+        # inside its pin must not read past the snapshot into the live directory.
+        # A run attaches its ``control`` plane before its ``placement`` plane, so
+        # passing this one as ``placement`` is what orders the two.
         self._reuse.attach(self.view, transfer_cost)
 
-    # -- proposed.AnySelector: one member, for the question ------------------ #
-    async def select(self, request: Request, requester: str) -> Selection[Plan]:
-        """Where should ``request`` run? Price every prefill instance, rank them.
+    # -- the one member a serving host asks ---------------------------------- #
+    async def decide(self, request: Request, requester: str) -> Optional[Response]:
+        """Where should ``request`` run? Both selections, or ``None`` if refused.
 
-        The prefill hosts best first, with each one's :class:`Plan` under its id in
-        :attr:`~proposed.selector.Selection.payload`; the head's plan is the one that
-        was admitted and committed, so a caller reads
-        :attr:`~proposed.selector.Selection.winner`. An SLO miss abstains
-        (``Selection.of([])``) -- there is no host this request may run on, and a
+        The decode side is chosen against the *winning* prefill candidate's predicted
+        completion, so the second selection is asked once and after the first -- which
+        is the whole reason a decision here is a :class:`Response` and not a
+        selection: two answers, and a selection holds one.
+
+        ``None`` is an SLO miss. There is no host this request may run on, and the
         refusal costs nothing because nothing has run.
+
+        ``requester`` is the host the request landed on, which no part of this
+        decision reads: where a request *should* run is a fact about the cluster,
+        not about who was asked.
+        """
+        prefill = await self._select_prefill(request)
+        decode = await self._select_decode(prefill.winner)
+        return self._admit(request, prefill, decode)
+
+    async def _select_prefill(self, request: Request) -> Selection[Plan]:
+        """Every prefill instance, priced and ranked best first.
+
+        Each one's :class:`Plan` rides under its id in
+        :attr:`~proposed.selector.Selection.payload`, so the answer says what was
+        compared as well as what won.
 
         Atomic: every read is off one pinned directory snapshot
         (:meth:`~kvcache_sim.control._view.KVView.pinned`) and one clock read, so the
         prices are comparable, and the bookkeeping it writes needs nothing locked.
         Pricing a candidate reserves nothing (:meth:`_candidate`), so the losers leave
         no trace and the winner is chosen after the whole field is known.
-
-        ``requester`` is the host the request landed on, which no part of this
-        decision reads: where a request *should* run is a fact about the cluster,
-        not about who was asked.
         """
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
             counts = self.view.prefix_lengths(keys)
-            plans: List[Plan] = []
+            candidates: List[_Priced] = []
             for inst in self.prefill_ids:
                 chosen = await self._reuse.select(keys, inst)
                 match, src, pull = self._priced_reuse(counts, keys, inst, chosen)
-                plans.append(self._candidate(
+                candidates.append((inst, self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
-                ))
-            candidates: List[_Priced] = [(plan.prefill, plan) for plan in plans]
-            ranked = Selection.priced(sorted(
+                )))
+            return Selection.priced(sorted(
                 candidates, key=lambda candidate: self._rank(candidate, self)
             ))
-        admitted = await self._admit(ranked.winner)
-        return ranked if admitted is not None else Selection.of([])
 
     @staticmethod
     def _priced_reuse(
@@ -566,8 +601,7 @@ class _Scheduler(AnySelector[Request, Plan]):
             source, xbytes, transfer_t = None, 0, 0.0
         queue_wait, ttft, done = self._predict(inst, now, transfer_t, prefill_t)
         plan = Plan(
-            request, inst, "", match, cached, uncached, source, xbytes,
-            queue_wait, ttft, done, 0.0,
+            match, cached, uncached, source, xbytes, queue_wait, ttft, done,
         )
         plan.prefill_t = prefill_t
         plan.transfer_t = transfer_t
@@ -597,33 +631,44 @@ class _Scheduler(AnySelector[Request, Plan]):
                 n += 1
         return n
 
-    async def _select_decode(self, plan: Plan) -> Tuple[str, int]:
-        """Where ``plan`` decodes, and the batch it was predicted to meet there.
+    async def _select_decode(self, plan: Plan) -> Selection[int]:
+        """Decode instances, each with the batch a request admitted at ``plan``'s
+        completion is predicted to meet there.
 
-        Priced here and sorted by :func:`_by_batch`. With decode unmodelled every
-        candidate prices at zero, so the id tie-break is the whole of the choice.
+        Ranked by :func:`_by_batch`. With decode unmodelled every candidate prices at
+        zero, so the id tie-break is the whole of the choice.
         """
         batches = [
             (d, self._predicted_batch(d, plan.done_time)) for d in self.decode_ids
         ]
-        chosen = Selection.priced(sorted(batches, key=_by_batch))
-        d = chosen.sources[0]
-        return (d, chosen.payload[d])
+        return Selection.priced(sorted(batches, key=_by_batch))
 
-    async def _admit(self, plan: Plan) -> Optional[Plan]:
-        """Give the won candidate its decode instance, gate it, commit it.
+    def _admit(
+        self,
+        request: Request,
+        prefill: Selection[Plan],
+        decode: Selection[int],
+    ) -> Optional[Response]:
+        """The two winners as one :class:`Response`, gated and committed.
 
-        The decode side is chosen once, against the winning candidate's predicted
-        prefill completion -- not per candidate in the loop. ``None`` == rejected,
-        and rejected here costs nothing: this runs before the prefill does.
+        Assembled before the gates rather than after, so the value the gates judge is
+        the value the answer carries. ``None`` == rejected, and rejected here costs
+        nothing: this runs before the prefill does.
         """
-        plan.decode, plan.pred_batch = await self._select_decode(plan)
-        plan.pred_tbt = (
-            decode_step_time(plan.pred_batch + 1, self.profile, self.model)
-            if self.tbt_enabled
-            else 0.0
+        instance = decode.sources[0]
+        batch = decode.payload[instance]
+        response = Response(
+            prefill=prefill.sources[0],
+            decode=instance,
+            plan=prefill.winner,
+            pred_batch=batch,
+            pred_tbt=(
+                decode_step_time(batch + 1, self.profile, self.model)
+                if self.tbt_enabled
+                else 0.0
+            ),
         )
-        if not all(gate(plan, self) for gate in self._gates):
+        if not all(gate(response, self) for gate in self._gates):
             return None
         # Accepted: the model holds the instances this plan spoke for, and remembers
         # the peer its pull was priced against for when the directory asks
@@ -631,8 +676,8 @@ class _Scheduler(AnySelector[Request, Plan]):
         #
         # The local write, not the endpoint a host reports over: control is in the
         # model's process, and a plain call is what keeps this decision atomic.
-        self.cluster._notify_impl(Committed(plan))
-        return plan
+        self.cluster._notify_impl(Committed(response, request.output_tokens))
+        return response
 
 
 # -- the two schedulers, as the settings that make them ---------------------- #

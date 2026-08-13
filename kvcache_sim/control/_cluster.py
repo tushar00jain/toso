@@ -37,7 +37,7 @@ from proposed import ClusterModel
 from ._pending import Reservation, Reservations, RoutedPulls
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .scheduler import Plan
+    from .scheduler import Response
 
 __all__ = [
     "ComputeBusy",
@@ -92,13 +92,16 @@ class DecodeState:
 
 @dataclass(frozen=True)
 class Committed:
-    """A plan the scheduler accepted: its instances are now spoken for.
+    """A decision the scheduler accepted: its instances are now spoken for.
 
     The one fact control tells itself. Sent at commit rather than while pricing,
-    so a candidate that lost -- or a plan a gate refused -- leaves nothing behind.
+    so a candidate that lost -- or a decision a gate refused -- leaves nothing
+    behind. Carries ``output_tokens`` because a decode reservation is as long as the
+    generation, and the request itself is not part of the answer.
     """
 
-    plan: "Plan"
+    response: "Response"
+    output_tokens: int
 
 
 class KVClusterModel(ClusterModel):
@@ -196,16 +199,18 @@ class KVClusterModel(ClusterModel):
             self._busy_until[fact.inst] = fact.now
 
     def _committed(self, fact: Committed) -> None:
-        """Hold the prefill instance for an accepted plan, and note its pull."""
-        plan = fact.plan
+        """Hold the prefill instance for an accepted decision, and note its pull."""
+        plan = fact.response.plan
         # The peer this pull was priced against, for when the directory asks
         # (:meth:`claim`).
         if plan.reuse_source is not None and plan.pull_keys:
-            self._routed.route(plan.prefill, plan.pull_keys, plan.reuse_source)
-        self._busy_until[plan.prefill] = plan.done_time
+            self._routed.route(
+                fact.response.prefill, plan.pull_keys, plan.reuse_source
+            )
+        self._busy_until[fact.response.prefill] = plan.done_time
         if self._lookahead:
             self._reserved.reserve(
-                plan.done_time, plan.decode, plan.request.output_tokens
+                plan.done_time, fact.response.decode, fact.output_tokens
             )
 
     # -- what ranking against the load reads -------------------------------- #

@@ -11,9 +11,9 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
 - ``volume_service.VolumeService`` -- the storage server: a real ``InMemoryStore``
   behind the real ``StorageVolume`` endpoint bodies, plus this volume's residency
   and the capacity rule that asks control what to drop
-- ``placement_service.PlacementService`` -- the same for the selector an
-  application's own hosts ask: it holds a capability's control plane and answers
-  its surface, ``proposed.AnySelector``
+- ``control_plane_service.ControlPlaneService`` -- the same for the control plane an
+  application's own hosts ask: it holds it and forwards whichever members the plane
+  itself declares, since what a capability answers is not ``proposed``'s to name
 - ``cluster_model_service.ClusterModelService`` -- the same for the model that
   control plane decides against: it holds the application's
   ``proposed.ClusterModel`` and folds the facts its hosts report
@@ -22,8 +22,8 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
   ``keys``), reached through ``call_one`` / ``call`` / ``broadcast``.
 - ``volume_handle.LocalVolumeHandle`` -- the same for a storage volume
   (``put`` / ``get`` / ``handshake`` / ``delete`` / ``delete_batch`` / ``reset``).
-- ``placement_handle.LocalPlacementHandle`` -- the same for a placement service
-  (``select``), whose hop a run gives a duration.
+- ``control_plane_handle.LocalControlPlaneHandle`` -- the same for a control-plane
+  service, one endpoint per member it forwards, whose hop a run gives a duration.
 - ``cluster_model_handle.LocalClusterModelHandle`` -- the same for a cluster model
   (``notify``), at that same distance: the model is held by the control plane that
   reads it.
@@ -32,7 +32,7 @@ Each pair is a server and a reference to it, split because they are different
 shapes: a service has methods, a reference has endpoints, and in a deployment the
 first becomes an actor while the second becomes Monarch's own handle. All four
 services a deployment runs are here, and each one's surface is declared in
-``proposed`` (``Controller``, ``StorageVolume``, ``AnySelector``, ``ClusterModel``).
+``proposed`` (``Controller``, ``StorageVolume``, ``ControlPlane``, ``ClusterModel``).
 - ``dict_directory.DictDirectory`` -- a plain-``dict`` stand-in for the
   controller's ``Trie`` directory, presenting the same ``Mapping`` +
   ``keys().filter_by_prefix`` surface so the opt-in shim adapter can skip the

@@ -180,7 +180,7 @@ class ClusterModel(Protocol):
     done. It is written as the hosts report what they did.
 
     One member, because being told is the only thing a *caller* does to a model.
-    What decides against it is a :class:`~proposed.selector.AnySelector`, and what it
+    What decides against it is the application's own control plane, and what it
     may show is read off the model itself: the reads are the application's, since a
     queue tail and a decode occupancy are one application's vocabulary, and
     :class:`~proposed.view.View` is the *store's* sensor, which cannot see load at
@@ -205,7 +205,7 @@ class StorageVolume(Protocol):
     """The store's *storage* service, as a caller reaches it.
 
     The third service in a deployment, beside :class:`Controller` (which knows who
-    holds what) and the application's own :class:`~proposed.selector.AnySelector`
+    holds what) and the application's own control plane
     (which decides): the one that actually holds
     bytes. torchstore has this class -- ``torchstore.storage_volume.StorageVolume``,
     an actor whose endpoints each delegate to an ``InMemoryStore`` -- and, as with
@@ -269,7 +269,13 @@ class StorageVolume(Protocol):
 
 
 class Deployment(Protocol):
-    """The store, as application code sees it."""
+    """The store and the control plane, as application code sees them.
+
+    What a :meth:`~proposed.plane.DataPlane.attach` is handed: everything an
+    executing half reaches that is not its own. A capability's data plane is written
+    against this and against nothing a harness owns, which is what lets the same
+    plane run under the simulator and over a real deployment.
+    """
 
     def client_for(self, node_id: str) -> Any:
         """The torchstore client for ``node_id``, ready to be driven.
@@ -308,5 +314,32 @@ class Deployment(Protocol):
         production Monarch's handle over the ``Controller`` actor, under simulation
         :class:`realsim.seams.controller_handle.LocalControllerHandle` over a
         :class:`realsim.seams.controller_service.ControllerService`.
+        """
+        ...
+
+    @property
+    def control_plane_handle(self) -> Any:
+        """A reference to the control plane this application's hosts ask.
+
+        Untyped for :attr:`controller_handle`'s reason -- a reference, whose shape
+        Monarch declares -- and one endpoint per member the plane declares, since
+        what a capability answers is the capability's to name
+        (:class:`~proposed.plane.ControlPlane`).
+
+        Here rather than handed to a data plane separately: a host reaching its
+        control plane is reaching *this deployment's* control plane, and a plane
+        that had to be given the two ports one at a time could not be constructed
+        before whoever knew about both. ``None`` when the deployment stands up no
+        such service, which is a capability deciding only inside the directory.
+        """
+        ...
+
+    @property
+    def cluster_handle(self) -> Any:
+        """A reference to the model this application's hosts report into.
+
+        The other half of what a host says to control -- a question goes to
+        :attr:`control_plane_handle`, a fact goes here
+        (:class:`ClusterModel`). ``None`` when the control plane keeps no model.
         """
         ...

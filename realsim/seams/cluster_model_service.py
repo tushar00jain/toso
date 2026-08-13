@@ -2,7 +2,8 @@
 
 The **server** side of the model a control plane decides against, and the fourth of
 the pair this package builds for each service
-(:mod:`realsim.seams.controller_service`, :mod:`realsim.seams.placement_service`,
+(:mod:`realsim.seams.controller_service`,
+:mod:`realsim.seams.control_plane_service`,
 :mod:`realsim.seams.volume_service`). In a deployment this is a Monarch actor: a
 process holding the model, receiving the facts its hosts report, and folding them.
 Here it is a plain object holding that same model in this process, with the same

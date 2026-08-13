@@ -75,7 +75,7 @@ Steps 7 and 8 close the same hole. Everywhere in this model, KV that lands on a
 host is registered on that host's volume: a prefill host publishes the suffix it
 computed *and* the prefix it pulled, because it holds both. The decode host pulls
 an entire block chain in and generates more KV on top of it, so it publishes both
-too, through the same :meth:`~kvcache_sim.data.store.KVStore.publish` -- evictable
+too, through the same :meth:`~kvcache_sim.data._store.KVStore.publish` -- evictable
 by the same LRU, refusable by the same bounded volume. Otherwise a decode host has
 unbounded free memory and no capacity, eviction or hit-rate number ever feels it.
 
@@ -103,10 +103,11 @@ Control runs as a service, so this plane reaches it the way it reaches the store
 through a port, over calls that carry values. There are two, and the split is
 between asking and telling:
 
-* :class:`~proposed.selector.AnySelector` -- the **question**: where should this run.
+* :class:`~proposed.plane.ControlPlane` -- the **question**: where should this run.
   A question is answered, so it is called and waited for. The answer is a
-  :class:`~proposed.selector.Selection`, a value, and the one thing this plane takes
-  off it is its winner;
+  :class:`~kvcache_sim.control.scheduler.Response` -- a value naming both of the
+  request's hosts, and what prefilling on the first was priced at -- which this plane
+  carries to each leg beside the request it already holds;
 * :class:`~proposed.deployment.ClusterModel` -- the **facts**: this host's decode
   batch, its busy compute, the clock its prefill really reached. Nothing comes
   back, and the reply is waited for anyway, because the next question has to be
@@ -139,19 +140,21 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from proposed import ClusterModel, AnySelector
+from proposed import ClusterModel, ControlPlane, DataPlane, Deployment
 
-from ..control.scheduler import ComputeBusy, DecodeState, Plan, PrefillFinished
+from ..control.scheduler import (
+    ComputeBusy, DecodeState, Plan, PrefillFinished, Response,
+)
 from ..report.metrics import Metrics, RequestResult
 from ..control.request import Request
 from ._decode import DecodeEngine
 from ._prefill import PrefillEngine
-from .store import KVStore
+from ._store import KVStore
 
 __all__ = ["ServingHost"]
 
 
-class ServingHost:
+class ServingHost(DataPlane):
     """One serving instance: its cache, its decode batch, its compute.
 
     The running loop's ``time()`` is the only clock (virtual under simulation).
@@ -161,18 +164,14 @@ class ServingHost:
     the three answer with an *address* rather than doing the next thing themselves,
     so nothing here needs a way to reach another host.
 
+    A :class:`~proposed.plane.DataPlane`, so the three things it reaches -- the
+    store, the control plane it asks, the model it reports into -- arrive together
+    at :meth:`attach` off the one deployment that has them all, rather than being
+    plumbed in by whoever builds the hosts.
+
     Args:
         me: this host's instance id -- the only one this object holds. A plan may
             name others, but they are addresses to hand back to a client.
-        store: the :class:`~kvcache_sim.data.store.KVStore` verbs. Also the *only*
-            way KV reaches this host from another one: the prefill host publishes
-            and the decode host fetches, with the store in between.
-        placement: where a question goes -- the control plane, through its
-            :class:`~proposed.selector.AnySelector` port and nothing else.
-        cluster: where a fact goes -- control's model of the cluster, through its
-            :class:`~proposed.deployment.ClusterModel` port and nothing else. A
-            separate service because reporting is not asking, and the answers
-            control gives are only as good as what it has been told.
         trace: the run's shared trace.
         metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger --
             the collector each host writes its own half of a request's story into.
@@ -191,9 +190,6 @@ class ServingHost:
     def __init__(
         self,
         me: str,
-        store: KVStore,
-        placement: AnySelector[Request, Plan],
-        cluster: ClusterModel,
         *,
         trace,
         metrics: Metrics,
@@ -202,9 +198,10 @@ class ServingHost:
         models_decode: bool = False,
     ) -> None:
         self.me = me
-        self.store = store
-        self.placement: AnySelector[Request, Plan] = placement
-        self.cluster: ClusterModel = cluster
+        # Filled by attach(): none of the three exists before the deployment does.
+        self.store: Optional[KVStore] = None
+        self.placement: Optional[ControlPlane] = None
+        self.cluster: Optional[ClusterModel] = None
         self.trace = trace
         self.metrics = metrics
         self.prefill_engine = prefill
@@ -226,6 +223,23 @@ class ServingHost:
             if self.coupled:
                 self.decode_engine.on_compute_busy = self._compute_busy
 
+    # -- proposed.DataPlane: the deployment hands over what this host reaches -- #
+    def attach(self, deployment: Deployment) -> None:
+        """Take the store, the control plane and the model off ``deployment``.
+
+        One object rather than three arguments: a host reaching its control plane is
+        reaching *this deployment's* control plane, so whoever builds the hosts has
+        nothing to plumb and cannot pair a host with the wrong run's services.
+
+        The store is built here, over that same deployment, because
+        :class:`~kvcache_sim.data._store.KVStore` is the KV-shaped reading of the
+        store's verbs and holds nothing else -- a host per process builds its own,
+        and so does each of a simulation's.
+        """
+        self.store = KVStore(deployment)
+        self.placement = deployment.control_plane_handle
+        self.cluster = deployment.cluster_handle
+
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
 
@@ -239,25 +253,23 @@ class ServingHost:
         await self.cluster.notify.call_one(ComputeBusy(self.me, until))
 
     # -- leg 1: the router role, which every host plays -------------------- #
-    async def route(self, request: Request) -> Optional[Plan]:
+    async def route(self, request: Request) -> Optional[Response]:
         """A client's request landed here. Answer with where it should actually go.
 
         Which host should *serve* the request is a cluster-wide question about who
         holds the longest reusable prefix, so every host asks control -- and hands
         the answer back rather than acting on it.
 
-        Returns the :class:`~kvcache_sim.control.scheduler.Plan` for the client to
-        take to :meth:`prefill` on ``plan.prefill``, or ``None`` when control refused
-        the request outright. A refusal is recorded *here*: no other host will ever
-        hear about this request.
+        Returns control's :class:`~kvcache_sim.control.scheduler.Response` for the
+        client to take to :meth:`prefill` on ``response.prefill``, or ``None`` when
+        control refused the request outright. A refusal is recorded *here*: no other
+        host will ever hear about this request.
 
-        Control answers with a ranking of the hosts it priced, so what this host
-        wants off it is :attr:`~proposed.selector.Selection.winner` -- the plan the
-        head was chosen with. A refusal is that selector's abstention, which names
-        nobody and so has no winner.
+        The request itself is not in that answer and does not need to be: the client
+        holds it already and hands it to each leg beside the decision.
         """
-        plan = (await self.placement.select.call_one(request, self.me)).winner
-        if plan is None:
+        response = await self.placement.decide.call_one(request, self.me)
+        if response is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"
             )
@@ -267,17 +279,20 @@ class ServingHost:
                 )
             )
             return None
-        if plan.prefill != self.me:
+        if response.prefill != self.me:
             # Traced only when the answer moves the request; the prefill host's own
             # ROUTE line already records where it landed.
             self.trace.record(
-                self._now(), "REDIR", f"{request.id} {self.me} -> {plan.prefill}"
+                self._now(), "REDIR", f"{request.id} {self.me} -> {response.prefill}"
             )
-        return plan
+        return response
 
     # -- leg 2: the request's prefill, on the host control chose ----------- #
-    async def prefill(self, plan: Plan) -> Tuple[Optional[str], torch.Tensor]:
-        """Prefill ``plan``'s request here; answer with its first token and where next.
+    async def prefill(
+        self, request: Request, response: Response
+    ) -> Tuple[Optional[str], torch.Tensor]:
+        """Prefill ``request`` here as ``response`` priced it; answer with its first
+        token and where next.
 
         Returns ``(next host, first token)``: the instance id the client should take
         this plan to, or ``None`` when there is no next host, which is a run that
@@ -290,8 +305,9 @@ class ServingHost:
         # Nothing is reserved on the accelerator here: it books the pass when it is
         # submitted and decode books its steps on the same occupancy, so one object
         # owns the answer and no forecast is written over it.
-        self._trace_route(plan)
-        row = self._make_accepted(plan)
+        plan = response.plan
+        self._trace_route(request, response)
+        row = self._make_accepted(request, response)
         # Published before the work below: this host is the only one that will know
         # these fields, and the row is amended in place as the facts land.
         self.metrics.add(row)
@@ -300,7 +316,7 @@ class ServingHost:
         # so tell it: the volume evicts on what it has observed.
         if plan.local_blocks:
             await self.store.reuse(
-                self.me, list(plan.request.block_keys[:plan.local_blocks])
+                self.me, list(request.block_keys[:plan.local_blocks])
             )
         # ...then pull the remote prefix (a real get_batch -> real fabric cost). The
         # KV comes back because this host is about to hold it: it goes into the
@@ -315,7 +331,7 @@ class ServingHost:
                 # ran out of room). The plan is stale, so recompute the whole
                 # planned reuse rather than fail: a pull is all-or-nothing, and half
                 # a prefix is not a prefix.
-                uncached = self._recompute(plan, row)
+                uncached = self._recompute(request, plan, row)
                 pulled = []
         # (2) submit the forward pass for the uncached suffix. The engine is told
         # the work, not a duration: what it costs and *when* it runs are both the
@@ -327,10 +343,10 @@ class ServingHost:
         #
         # Sliced by *offset* off the request's own prompt, not as ``prompt[-n:]``,
         # which would hand a fully-cached request its entire prompt back.
-        prompt = plan.request.prompt[plan.request.prompt_tokens - uncached:]
+        prompt = request.prompt[request.prompt_tokens - uncached:]
         submitted_at = self._now()
         kv, first_token = await self.prefill_engine.run(
-            prompt, pulled, tag=plan.request.id
+            prompt, pulled, tag=request.id
         )
         # Whatever that took beyond the pass itself was queueing for the device: the
         # *measured* wait, next to control's prediction of it already on the row.
@@ -344,7 +360,7 @@ class ServingHost:
         # pulled, plus the suffix it computed -- everything past what was already
         # local. Under disaggregation this is not only a cache fill for some later
         # request; it is how *this* request's KV reaches its decode host.
-        fresh = list(plan.request.block_keys[plan.local_blocks:])
+        fresh = list(request.block_keys[plan.local_blocks:])
         # A cache fill may fail: the request is already served and the only loss is
         # that nobody reuses this prefix. Recorded rather than dropped -- "cached"
         # and "had no room" are the two outcomes a capacity sweep exists to tell
@@ -359,9 +375,9 @@ class ServingHost:
         # already folded this completion, and a report left in flight is a model
         # answering off a queue it knows to be wrong.
         await self.cluster.notify.call_one(PrefillFinished(self.me, self._now()))
-        return await self._prefill_done(plan, row), first_token
+        return await self._prefill_done(request, response, row), first_token
 
-    def _recompute(self, plan: Plan, row: RequestResult) -> int:
+    def _recompute(self, request: Request, plan: Plan, row: RequestResult) -> int:
         """Re-price this prefill with the reuse that vanished; answer what is left.
 
         The remote prefix is gone, so only what this host already held is still
@@ -371,9 +387,9 @@ class ServingHost:
         """
         cached = min(
             plan.local_blocks * self.prefill_engine.block_tokens,
-            plan.request.prompt_tokens,
+            request.prompt_tokens,
         )
-        uncached = plan.request.prompt_tokens - cached
+        uncached = request.prompt_tokens - cached
         row.cached_tokens = cached
         row.uncached_tokens = uncached
         row.transfer_bytes = 0
@@ -381,27 +397,31 @@ class ServingHost:
         self.trace.record(
             self._now(),
             "RESTALE",
-            f"{plan.request.id} lost {len(plan.pull_keys)}blk of reuse on "
+            f"{request.id} lost {len(plan.pull_keys)}blk of reuse on "
             f"{plan.reuse_source} (evicted); recomputing on {self.me}",
         )
         return uncached
 
     # -- outcome bookkeeping ---------------------------------------------- #
-    def _make_accepted(self, plan: Plan) -> RequestResult:
+    def _make_accepted(
+        self, request: Request, response: Response
+    ) -> RequestResult:
+        plan = response.plan
         return RequestResult(
-            id=plan.request.id,
+            id=request.id,
             accepted=True,
             ttft=plan.ttft,
-            prompt_tokens=plan.request.prompt_tokens,
+            prompt_tokens=request.prompt_tokens,
             cached_tokens=plan.cached_tokens,
             uncached_tokens=plan.uncached_tokens,
             transfer_bytes=plan.transfer_bytes,
-            prefill=plan.prefill,
+            prefill=response.prefill,
             reuse_source=plan.reuse_source,
             predicted_queue_wait=plan.queue_wait,
         )
 
-    def _trace_route(self, plan: Plan) -> None:
+    def _trace_route(self, request: Request, response: Response) -> None:
+        plan = response.plan
         if plan.reuse_source is not None:
             src = f" pull {plan.match_blocks}blk from {plan.reuse_source}"
         elif plan.match_blocks:
@@ -411,40 +431,44 @@ class ServingHost:
         self.trace.record(
             self._now(),
             "ROUTE",
-            f"{plan.request.id} -> {plan.prefill}"
+            f"{request.id} -> {response.prefill}"
             f" (match {plan.match_blocks}blk,{src}, "
             f"compute {plan.uncached_tokens}tok, ttft {plan.ttft:.3f})",
         )
 
-    async def _prefill_done(self, plan: Plan, row: RequestResult) -> Optional[str]:
+    async def _prefill_done(
+        self, request: Request, response: Response, row: RequestResult
+    ) -> Optional[str]:
         """Close out the prefill, and answer with the next address (or none)."""
         note = "" if row.published else " -- NOT cached, no room on the volume"
         # What was published: the blocks pulled plus the suffix computed, not the
         # request's whole chain.
-        stored = len(plan.request.block_keys) - plan.local_blocks
+        stored = len(request.block_keys) - response.plan.local_blocks
         if not self.models_decode:
             self.trace.record(
                 self._now(),
                 "DONE",
-                f"{plan.request.id} prefill done on {self.me}"
+                f"{request.id} prefill done on {self.me}"
                 f" (published {stored}blk){note}",
             )
             return None
-        # Decode-simulating path: nothing is asked here. The plan already names the
-        # decode host, and the SLO that could have refused this request was decided
-        # against before its prefill ran.
+        # Decode-simulating path: nothing is asked here. The decision already names
+        # the decode host, and the SLO that could have refused this request was
+        # decided against before its prefill ran.
         self.trace.record(
             self._now(),
             "DONE",
-            f"{plan.request.id} prefill done on {self.me}"
+            f"{request.id} prefill done on {self.me}"
             f" (published {stored}blk){note}"
-            f"; decoding on {plan.decode}",
+            f"; decoding on {response.decode}",
         )
         # The address, not the act: the client goes there next.
-        return plan.decode
+        return response.decode
 
     # -- leg 3: decode, on a host that has to go and get the KV ------------ #
-    async def decode(self, plan: Plan) -> List[torch.Tensor]:
+    async def decode(
+        self, request: Request, response: Response
+    ) -> List[torch.Tensor]:
         """The client brought a prefilled request here. Fetch its KV, decode, finish.
 
         Answers with **the tokens this host generated** -- the request's output
@@ -478,10 +502,10 @@ class ServingHost:
         prefill host happened to publish), charged fabric / storage / RAM by the
         same cost model as every other fetch.
 
-        **Unless this host prefilled the request**, which the plan says outright.
+        **Unless this host prefilled the request**, which the decision says outright.
         Then the chain is already here and the store's local-hit rule applies:
         nothing moves and nothing is charged
-        (:meth:`~kvcache_sim.data.store.KVStore.reuse`). Fetching it back would
+        (:meth:`~kvcache_sim.data._store.KVStore.reuse`). Fetching it back would
         charge a storage read for KV that never left and report it as a handoff.
         Not a rare corner -- with prefill and decode drawn from one pool it was 73%
         of this scenario's reported handoff bytes before the plan was consulted.
@@ -544,9 +568,8 @@ class ServingHost:
         (a real engine evicting and recomputing a running sequence's blocks) is
         deliberately not modelled -- that is a scheduler this model does not have.
         """
-        request = plan.request
         keys = list(request.block_keys)
-        if plan.decode == plan.prefill:
+        if response.decode == response.prefill:
             # Ours already. Tell the volume it was read, so its eviction ranking
             # sees a hit the store would otherwise never observe, and record a
             # handoff of nothing -- there was no transfer to make.
@@ -559,8 +582,8 @@ class ServingHost:
                 self.trace.record(
                     self._now(),
                     "NOKV",
-                    f"{request.id} handoff from {plan.prefill} to {self.me} found "
-                    f"no {len(keys)}blk chain in the store (evicted or never "
+                    f"{request.id} handoff from {response.prefill} to {self.me} "
+                    f"found no {len(keys)}blk chain in the store (evicted or never "
                     f"cached); decoding without charging a transfer",
                 )
                 self.metrics.handed_off(request.id, self.me, 0, missed=True)
@@ -572,7 +595,7 @@ class ServingHost:
                 self.trace.record(
                     self._now(),
                     "HANDOFF",
-                    f"{request.id} {plan.prefill} -> {self.me} "
+                    f"{request.id} {response.prefill} -> {self.me} "
                     f"({len(keys)}blk, {nbytes}B of KV)",
                 )
                 self.metrics.handed_off(request.id, self.me, nbytes)

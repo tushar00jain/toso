@@ -182,19 +182,20 @@ Five consequences, and they are the reason for the shape:
 The only calls a "serving engine" makes are:
 
 ```python
-plan = (await placement.select(request, me)).winner    # route; None => rejected
+answer = await placement.decide(request, me)           # route; None => rejected
 ...                                                    # pull remote prefix + prefill
-await store.publish(plan.instance, fresh, kv)          # cache fill + decode handoff
-await cluster.notify(PrefillFinished(plan.instance, now))
+await store.publish(me, fresh, kv)                     # cache fill + decode handoff
+await cluster.notify(PrefillFinished(me, now))
 ```
 
-One question, asked once: the plan names the prefill host *and* the decode host, so
+One question, asked once: the answer names the prefill host *and* the decode host, so
 everything a request needs is settled before any of it runs and no refusal can cost
-a prefill. Control answers with a `Selection` ranking every prefill host it priced,
-each one's plan under its id on the payload, so `winner` is the decision and an
-abstention (`Selection.of([])`) is the refusal.
+a prefill. Behind it are two selections -- the prefill hosts control priced and the
+decode hosts it ranked against the winner among them -- and what comes back is the
+winner of each plus the price of the one that won (a `Response`). `None` is the
+refusal.
 
-Two ports, one member each, split between asking and telling: `AnySelector.select`
+Two ports, one member each, split between asking and telling: the scheduler's `decide`
 for the question (a `Request`) and `ClusterModel.notify` for the facts
 (`PrefillFinished`, `ComputeBusy`, `DecodeState`), every one of them a value. They
 are deliberately all a serving host may touch: control holds every instance's
@@ -222,7 +223,7 @@ directory read is control -- it does neither.
 ```
 kvcache_sim/
   control/                # DECIDES -- moves nothing, holds no client
-    scheduler.py          #   ONE scheduler behind proposed.AnySelector, the
+    scheduler.py          #   ONE scheduler behind proposed.ControlPlane, the
                           #   port the data plane calls: prefill placement,
                           #   pull-vs-recompute, SLO gates, decode placement,
                           #   every one of them priced against the cluster model
@@ -280,7 +281,7 @@ kvcache_sim/
                           #   they left on this host, handed to whoever admitted
                           #   it (all three underscored: nothing outside data/
                           #   drives them)
-    store.py              #   publish / reuse / fetch over a Deployment's clients,
+    _store.py             #   publish / reuse / fetch over a Deployment's clients,
                           #   moving whatever KV it is handed. It holds no notion
                           #   of what a block is or how big one is -- that is the
                           #   accelerator's, which produces them
@@ -418,7 +419,8 @@ plus the prefix-run read that express KV caching on a mesh.
   submission instant, then request id — rather than in whichever order the event loop
   resumed its waiters.
 - **The coordinator hop is free by default.** Control is a service, reached through
-  `realsim/seams/placement_handle.py` — so there is somewhere to charge the round trip,
+  `realsim/seams/control_plane_handle.py` — so there is somewhere to charge the round
+  trip,
   but `--coordinator-rtt` defaults to `0` and every call is inline. Turn it up and it
   is paid out and back before prefill can start: at `0.5` on the shared-prefix
   workload, mean TTFT goes 2.56 → 4.90 and the hit rate 0.734 → 0.704, because routing

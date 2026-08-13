@@ -80,13 +80,15 @@ def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
     # where the blocks are; a store in general is unbounded, which is why this
     # belongs to the capability and not to the profile every sim shares.
     profile = knobs.pop("profile", _KV_INSTANCE_PROFILE)
+    routing, sched = scheduler(kind, topology, **knobs)
     return Run(
         label,
         KVWorkload(topology, conversations),
-        # Two control planes, one per service: the scheduler decides compute
-        # placement through the placement seam, and the chain beside it answers the
-        # store's routing question in the directory.
-        control=scheduler(kind, topology, **knobs),
+        # Two control planes, one per service: the chain answers the store's
+        # routing question in the directory, and the scheduler decides compute
+        # placement through the placement seam.
+        control=routing,
+        placement=sched,
         data=serving_plane(
             coupled=coupled,
             simulate_decode=knobs.get("simulate_decode", False),

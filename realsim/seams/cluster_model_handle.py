@@ -2,7 +2,7 @@
 
 The **client** side, and only that -- the fourth of the pair this package builds for
 each service (see :mod:`realsim.seams.controller_handle`,
-:mod:`realsim.seams.placement_handle`, :mod:`realsim.seams.volume_handle`). A
+:mod:`realsim.seams.control_plane_handle`, :mod:`realsim.seams.volume_handle`). A
 serving host does not hold the application's model of the cluster; it holds a
 reference to one, and Monarch's reference is not the same shape as the actor:
 ``@endpoint`` turns each method into an ``EndpointProperty``, so the attribute
@@ -27,7 +27,7 @@ be decided against it, and only the reply orders the two at the *receiver*.
 Cost
 ----
 The hop is handed in and defaults to free, as
-:class:`~realsim.seams.placement_handle.LocalPlacementHandle`'s does. A run
+:class:`~realsim.seams.control_plane_handle.LocalControlPlaneHandle`'s does. A run
 builds it from the same :attr:`sim_common.config.SimConfig.control_rtt`: the
 model is held by the control plane that reads it, so reaching it is that same
 boundary at that same distance. At ``0.0`` -- the default -- awaiting an endpoint

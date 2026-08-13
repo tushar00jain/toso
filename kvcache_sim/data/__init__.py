@@ -13,7 +13,7 @@
   this package drives it: the host constructs it, owns it, and is the only thing it
   reports to, so control learns the decode load as a value the host forwards rather
   than by holding this object;
-* :mod:`~kvcache_sim.data.store` -- publish / reuse / fetch, as real ``put_batch``
+* :mod:`~kvcache_sim.data._store` -- publish / reuse / fetch, as real ``put_batch``
   / ``touch`` / ``get_batch`` calls over whatever KV it is handed (what a block *is*
   belongs to the accelerator, which produces them). It is the *only* path between
   two serving hosts: a prefill host publishes a request's KV and its decode host

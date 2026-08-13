@@ -12,7 +12,7 @@ implementing these and nothing else.
   (:attr:`ControlPlane.cluster`), to put a service in front of. Where a plane is
   *reached* from is its type, not a field: a
   :class:`~proposed.selector.KeySelector` is installed in the directory and a
-  :class:`~proposed.selector.AnySelector` is given a service, so a capability
+  the plane an application's own hosts ask is given a service, so a capability
   deciding in both places is two planes rather than one naming the other;
 * :class:`DataPlane` -- the executing half's one member,
   :meth:`DataPlane.after`: what the capability does once a transfer has landed.
@@ -64,7 +64,22 @@ class DataPlane:
 
     A capability with no such step implements nothing and inherits the default,
     which is real behaviour rather than a stub.
+
+    What it does need is somewhere to *reach*, which is what :meth:`attach` hands
+    over -- the store to call and the control plane to ask, both on one object.
     """
+
+    def attach(self, deployment: Any) -> None:
+        """Receive the deployment this plane executes against. Default: nothing.
+
+        The sibling of :meth:`ControlPlane.attach`, and two-phase for the same
+        reason: a plane is constructed with its knobs, and the store, the control
+        plane it asks and the model it reports into do not exist until the
+        deployment does. One argument, because they all hang off it
+        (:class:`~proposed.deployment.Deployment`) -- a plane that had to be handed
+        each port separately would make every caller responsible for knowing which
+        ports it wanted.
+        """
 
     async def after(self, requester: str, result: Any) -> None:
         """``requester``'s transfer landed, with ``result``. Default: nothing.
