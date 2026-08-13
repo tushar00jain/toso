@@ -1,4 +1,4 @@
-"""Which peer serves a prefix gap: the KV-cache source :class:`~proposed.policy.Policy`.
+"""Which peer serves a prefix gap: the KV-cache source :class:`~proposed.policy.KeySelector`.
 
 The *only* part of KV-cache routing that is a store question, so the only part that
 goes through the shared policy interface. Everything else the scheduler decides --
@@ -23,14 +23,14 @@ from __future__ import annotations
 
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-from proposed import DecisionLog, Policy, Selection
+from proposed import DecisionLog, KeySelector, Selection
 
 from ._view import prefix_lengths_of
 
 __all__ = ["LongestPrefixPolicy", "SpreadReadsPolicy"]
 
 
-class LongestPrefixPolicy(Policy):
+class LongestPrefixPolicy(KeySelector):
     """Rank instances by how much of the requested block prefix they hold.
 
     Longest contiguous run first, instance id as the tie-break, so the choice is

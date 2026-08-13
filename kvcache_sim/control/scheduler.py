@@ -1,6 +1,6 @@
 """One scheduler, two presets: ``LoadBalanceScheduler`` / ``CacheAwareScheduler``.
 
-Both are a :class:`~proposed.policy.Placement`, whose one member -- ``select`` --
+Both are a :class:`~proposed.policy.AnySelector`, whose one member -- ``select`` --
 is the whole surface the data plane may *ask*. Beside either runs a second control
 plane, :class:`FetchRouting`, which is what the *directory* consults; a run
 installs the two together (:func:`kvcache_sim.workload._serving.scheduler`) and
@@ -61,9 +61,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
-from proposed import Endpoint, Placement, Policy, Selection
+from proposed import AnySelector, Endpoint, Key, KeySelector, Selection
 from proposed.policy import (
-    AbstainOnSelf, PolicyChain, Refine, Refinement, Selector, TakeHead,
+    AbstainOnSelf, KeySelectorChain, Refine, Refinement, Selector, TakeHead,
 )
 
 from domain import (
@@ -148,11 +148,11 @@ class Plan:
 # What differs is the two axes and which admission gates are installed.
 #
 # Neither axis is ever installed in the controller. The second is a
-# :class:`~proposed.policy.Placement`, because the subject is what tells the two
+# :class:`~proposed.policy.AnySelector`, because the subject is what tells the two
 # selector kinds apart (:mod:`proposed.policy`) and its subject is the application's:
 # the candidates this scheduler priced. This first axis answers only the store-shaped
 # half -- name a peer to pull from, or nobody -- so it is the source ranking
-# (:mod:`kvcache_sim.control._source`, a real Policy) under the one test that is not
+# (:mod:`kvcache_sim.control._source`, a real KeySelector) under the one test that is not
 # the store's: is pulling worth more than recomputing here. That composition is a
 # :class:`~proposed.policy.Refine`, a plain Selector, which is what keeps it out of
 # the controller without either half holding the other.
@@ -163,8 +163,12 @@ class Plan:
 # (:meth:`_Scheduler.select`), so it runs to completion without suspending.
 
 
-class _LocalOnly(Placement):
+class _LocalOnly(Selector):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
+
+    A plain :class:`~proposed.policy.Selector`: its subject is keys, but the
+    scheduler is the only thing that asks it, so it is neither installed in the
+    directory nor fronted by a service.
 
     ``Selection.of([])``, which is :class:`~proposed.policy.FirstMatch`'s
     *abstention*: no source, so the caller recomputes the gap. Deliberately not
@@ -172,8 +176,9 @@ class _LocalOnly(Placement):
     """
 
     name = "local-only"
+    subject_type = Sequence[Key]
 
-    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
         return Selection.of([])
 
 
@@ -218,8 +223,11 @@ def _ranked(candidates: Sequence[Tuple[str, Any]]) -> Selection:
     return Selection.of([i for i, _ in candidates], payload=dict(candidates))
 
 
-class _Ranking(Placement):
+class _Ranking(Selector):
     """Rank candidates the scheduler has already priced, best first.
+
+    A plain :class:`~proposed.policy.Selector` for :class:`_LocalOnly`'s reason:
+    the scheduler consults it and nothing else reaches it.
 
     Pricing them here instead would pull the reuse placement, the transfer cost and
     the profile in with it, which is most of a scheduler.
@@ -229,6 +237,8 @@ class _Ranking(Placement):
     (:meth:`_Scheduler.attach`), which is why a preset names the kind rather than
     building one.
     """
+
+    subject_type = Sequence[Plan]
 
     def __init__(self, cluster: KVClusterModel) -> None:
         self.cluster = cluster
@@ -262,7 +272,7 @@ class _MinTTFT(_Ranking):
         return _ranked([(p.prefill, p) for p in ordered])
 
 
-class _LeastBatch(Placement):
+class _LeastBatch(Selector):
     """The smallest predicted decode batch (instance id tie-break).
 
     The other host pick of a routing decision, and the same shape as the axis above:
@@ -272,6 +282,7 @@ class _LeastBatch(Placement):
     """
 
     name = "least-batch"
+    subject_type = Sequence[Plan]
 
     async def select(
         self, batches: Sequence[Tuple[str, int]], requester: str
@@ -300,7 +311,7 @@ def _predicted_tbt_gate(plan: Plan, sched: "_Scheduler") -> bool:
     return plan.pred_tbt <= sched.slo_tbt
 
 
-class RoutedPull(Policy):
+class RoutedPull(KeySelector):
     """The peer a fetch's pull was already priced against, or an abstention.
 
     Answering the store from what routing decided, rather than deciding twice:
@@ -331,7 +342,7 @@ class RoutedPull(Policy):
         return Selection.of([peer] if peer is not None else [])
 
 
-class FetchRouting(PolicyChain):
+class FetchRouting(KeySelectorChain):
     """This capability's **store-side control plane**: who serves a fetch.
 
     What a run installs in the directory, beside the scheduler it installs as a
@@ -341,7 +352,7 @@ class FetchRouting(PolicyChain):
 
     A chain rather than an ``if``, so the fall-through is
     :class:`~proposed.policy.FirstMatch`'s abstention rule and not a second copy of
-    it here, and a :class:`~proposed.policy.PolicyChain` because the directory is
+    it here, and a :class:`~proposed.policy.KeySelectorChain` because the directory is
     handed this and both links select over keys.
 
     Args:
@@ -354,14 +365,14 @@ class FetchRouting(PolicyChain):
 
     name = "fetch-routing"
 
-    def __init__(self, cluster: KVClusterModel, source: Policy) -> None:
+    def __init__(self, cluster: KVClusterModel, source: KeySelector) -> None:
         super().__init__([RoutedPull(cluster), source])
 
 
-class _Scheduler(Placement):
+class _Scheduler(AnySelector):
     """The pricing, ranking and admission both schedulers share.
 
-    A :class:`~proposed.policy.Placement`, and only that: a serving host asks it as
+    A :class:`~proposed.policy.AnySelector`, and only that: a serving host asks it as
     a service (:meth:`select`). What the *directory* is told is a second control
     plane the run installs beside this one
     (:class:`FetchRouting`), and the two meet at the model -- this one prices a
@@ -386,6 +397,8 @@ class _Scheduler(Placement):
             has to make it first. ``None`` -- the default -- builds it in
             :meth:`attach`, where the instances become known.
     """
+
+    subject_type = Request
 
     def __init__(
         self,
@@ -486,7 +499,7 @@ class _Scheduler(Placement):
         for selector in (self._reuse, self._rank, self._decode_rank):
             selector.attach(self.view, transfer_cost)
 
-    # -- proposed.Placement: one member, for the question ------------------ #
+    # -- proposed.AnySelector: one member, for the question ------------------ #
     async def select(self, request: Request, requester: str) -> Selection:
         """Where should ``request`` run? Price every prefill instance, rank them.
 
@@ -679,7 +692,7 @@ class CacheAwareScheduler(_Scheduler):
             never serves it.
     """
 
-    def __init__(self, *, source_policy: Policy, balance_threshold: float = 1.5,
+    def __init__(self, *, source_policy: KeySelector, balance_threshold: float = 1.5,
                  replicate: bool = True, **knobs: Any) -> None:
         super().__init__(
             reuse=(

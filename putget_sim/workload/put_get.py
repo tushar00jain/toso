@@ -15,7 +15,7 @@ payload.
 
 The scenario is ordinary user code, top to bottom: a ``client.put`` and a gather
 of ``client.get``. There is no policy, no coordinator and no execution loop in
-it. Handing it a :class:`~proposed.policy.Policy` (and, if the capability needs
+it. Handing it a :class:`~proposed.policy.KeySelector` (and, if the capability needs
 one, a :class:`~proposed.plane.DataPlane`) is the *only* change needed to make it
 a routed run -- which is exactly how ``dedup_sim`` turns the same ``m x`` burst
 into a 1x one.
@@ -98,7 +98,7 @@ class PutGetBurst(Workload):
     """m readers get one key an origin already holds.
 
     The capability-free fixture: ordinary user code (a put, then a gather of gets)
-    with no routing of its own. Installing a :class:`~proposed.policy.Policy` and a
+    with no routing of its own. Installing a :class:`~proposed.policy.KeySelector` and a
     :class:`~proposed.plane.DataPlane` turns it into a routed run without touching
     a line of it, which is how ``dedup_sim`` compares the two.
 

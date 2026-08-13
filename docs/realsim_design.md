@@ -142,7 +142,7 @@ realsim/
   mesh.py                     # Mesh — multi-client wiring: per-node volumes + real clients,
                               #   one directory + registry, one shared transport factory
                               #   MeshView is the base every consumer of a mesh shares
-  policy.py                   # Policy.select(keys, requester) -> ranked sources +
+  policy.py                   # KeySelector.select(keys, requester) -> ranked sources +
                               #   readiness. Naive is the default; consulted inside the
                               #   real locate_volumes body
   view.py                     # View — read-only observation: locate, topology and
@@ -174,7 +174,7 @@ realsim/
     test_perf.py              # no-real-allocation-at-scale + parity vs. a capability sim
     test_composability.py     # import the real-directory backend + swap proof
     test_mesh.py              # Mesh wiring, per-operation source locality, one-owner install
-    test_planes.py            # the shared Policy / View / DataPlane / Runner contracts
+    test_planes.py            # the shared KeySelector / View / DataPlane / Runner contracts
     test_demos.py             # every Demo declares its parts, and every scenario runs
 
 putget_sim/                   # the unrouted put/get burst (repo root) — no policy, no
@@ -204,7 +204,7 @@ logic; the entire `MonarchRPCTransportBuffer` + base `TransportBuffer` lifecycle
 the entire `InMemoryStore`; and the real `Request` / `TensorSlice` / `StorageInfo`
 / `Trie` types.
 
-**What is modeled or glue:** the components being designed — a routing `Policy`
+**What is modeled or glue:** the components being designed — a routing `KeySelector`
 and the capability `DataPlane` that executes its answer; the `.call` / `.call_one`
 awaitable wrappers standing in for Monarch RPC; the ~5-line verbatim mirrors of the
 `locate_volumes` / `keys` read endpoints (see §4); the transport's resource-cost
@@ -424,7 +424,7 @@ directory handle, trace, profile, registry, install).
 
 ### `policy.py` / `view.py` / `plane.py` / `runner.py` — the components under design
 
-- **`Policy.select(keys, requester) -> Selection`.** One interface,
+- **`KeySelector.select(keys, requester) -> Selection`.** One interface,
   answering one question: which volume serves these keys for this requester, and
   *when* is it usable. A `Selection` is a ranked list of sources plus an optional
   **readiness gate**. It is invoked in two named places: inside the real
@@ -571,7 +571,7 @@ Both capability sims consume `realsim` directly, speaking the real torchstore
 `Request` / `TensorSlice` / `StorageInfo` / `Trie` types natively — so there is no
 region↔`TensorSlice` translation layer anywhere:
 
-- [`dedup_sim/`](../dedup_sim/) implements dedup routing as a real `Policy`
+- [`dedup_sim/`](../dedup_sim/) implements dedup routing as a real `KeySelector`
   (`DedupPolicy`) consulted inside the real `locate_volumes`, driving the real
   `Controller` directory + `LocalClient` to a 1× peer read-through.
 - [`kvcache_sim/`](../kvcache_sim/) consults the real `Controller` directory for

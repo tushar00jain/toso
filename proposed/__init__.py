@@ -5,24 +5,25 @@ torchstore does not have today. It is kept apart from ``realsim`` so the upstrea
 ask is legible at a glance: ``realsim`` is scaffolding that disappears outside the
 simulator, ``proposed`` is the design being argued for.
 
-* :mod:`proposed.policy` -- :class:`~proposed.policy.Selection` and the two
-  selection contracts that answer with one. A :class:`~proposed.policy.Policy`
-  selects over *keys*, and is the only kind a controller installs inside
-  ``locate_volumes``, where it decides which volume serves a requester and may
-  withhold the answer until that volume is usable; a
-  :class:`~proposed.policy.Placement` selects over an application payload (which
-  host prefills, which peer a prefix comes from) and is never installed -- an
-  application's hosts ask one as a service of its own, so it is also the whole of
-  what a control plane offers them. The
-  default :class:`~proposed.policy.NaivePolicy` returns the directory's own
+* :mod:`proposed.policy` -- :class:`~proposed.policy.Selection` and the selection
+  contracts that answer with one, each naming the subject it takes
+  (``subject_type``). A :class:`~proposed.policy.KeySelector` takes *keys*, and is
+  the only kind a controller installs inside ``locate_volumes``, where it decides
+  which volume serves a requester and may withhold the answer until that volume is
+  usable; a :class:`~proposed.policy.AnySelector` takes an application's own
+  subject (which host prefills, which peer a prefix comes from) and is never
+  installed -- an application's hosts ask one as a service of its own, so it is
+  also the whole of what a control plane offers them. A selector that is neither
+  is consulted by another selector and reached from nowhere. The
+  default :class:`~proposed.policy.NaiveKeySelector` returns the directory's own
   answer, so an installed policy changes nothing until one is written. It, the
   combinators beside it -- :class:`~proposed.policy.FirstMatch` (try selectors in
-  order), :class:`~proposed.policy.PolicyChain` (the same over keys, so
+  order), :class:`~proposed.policy.KeySelectorChain` (the same over keys, so
   installable) and :class:`~proposed.policy.Refine` (one selector's ranking,
   narrowed by the tests behind it) -- and the
   :class:`~proposed.policy.Selector` base they are typed on are reached
   through the module rather than re-exported here: what a deployment has to
-  *implement* is one of the two subtypes above.
+  *implement* is one of the two named subjects above.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
   directory surface a caller reaches (torchstore names this type but never declares
   it: ``api.py`` annotates the spawned handle as the actor class and ``LocalClient``
@@ -51,18 +52,21 @@ missing" section.
 # Re-export the contract surface so callers import from the package directly.
 from .cost import TransferCost
 from .deployment import (
-    ClusterModel, Controller, Deployment, StorageFull, StorageVolume,
+    ClusterModel, Controller, Deployment, Key, StorageFull, StorageVolume,
+    VolumeId,
 )
 from .plane import ControlPlane, DataPlane
-from .policy import DecisionLog, Placement, Policy, Selection
+from .policy import DecisionLog, AnySelector, KeySelector, Selection
 from .topology import Endpoint, locality, Tier, TIER_LABEL
 from .view import View
 
 __all__ = [
     # the torchstore ask
-    "Policy",
-    "Placement",
+    "KeySelector",
+    "AnySelector",
     "Selection",
+    "Key",
+    "VolumeId",
     "DecisionLog",
     "View",
     "Controller",

@@ -256,7 +256,7 @@ def test_resident_tracking_is_deterministic():
 # --------------------------------------------------------------------------
 # Asking control what to drop, instead of only refusing. The volume is the one
 # object that knows it is full and the one that cannot know what is worth
-# keeping -- so it asks the directory, which is where a Policy is installed,
+# keeping -- so it asks the directory, which is where a KeySelector is installed,
 # over the same handle every other caller reaches it through.
 # --------------------------------------------------------------------------
 

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
 
-from proposed import ControlPlane, Endpoint, Placement, Policy, View
+from proposed import ControlPlane, Endpoint, AnySelector, KeySelector, View
 from sim_common import config
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
@@ -102,8 +102,8 @@ class Simulation:
             * the store's own selector runs *in the directory service*, installed
               in the real controller's ``locate_volumes``, so a caller that just
               does ``client.get(K)`` is routed. That is whichever control plane is
-              a :class:`~proposed.policy.Policy`;
-            * a :class:`~proposed.policy.Placement` is the application's own
+              a :class:`~proposed.policy.KeySelector`;
+            * a :class:`~proposed.policy.AnySelector` is the application's own
               question, so it is fronted by a
               :class:`~realsim.seams.placement_handle.LocalPlacementHandle` as
               :attr:`placement_handle` and reached as its own service;
@@ -189,8 +189,8 @@ class Simulation:
         # The store's own question, answered inside locate_volumes by the seam in
         # front of the directory (LocalControllerHandle). Selected by type and not
         # by position: the subject a directory hands down is keys, so being a
-        # Policy is the claim that makes a plane installable there.
-        store_side = _one(planes, Policy, "run inside locate_volumes")
+        # KeySelector is the claim that makes a plane installable there.
+        store_side = _one(planes, KeySelector, "run inside locate_volumes")
         if store_side is not None:
             self.mesh.controller_handle.install_policy(store_side)
         # What reaching a control plane costs. Resolved once, here, because this is
@@ -199,9 +199,9 @@ class Simulation:
         # all of them: a model is held by the control plane that reads it, so a
         # host reaching any of them crosses the same boundary.
         hop = ServiceHop(config.current().control_rtt)
-        # The application's own question, which only a Placement answers. A
+        # The application's own question, which only a AnySelector answers. A
         # capability that runs solely in the directory has no such service.
-        placement = _one(planes, Placement, "answer the application's question")
+        placement = _one(planes, AnySelector, "answer the application's question")
         if placement is not None:
             self.placement_handle = LocalPlacementHandle(
                 PlacementService(placement), hop=hop

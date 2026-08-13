@@ -40,7 +40,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Sequence
 
-from proposed import Endpoint, Policy
+from proposed import Endpoint, KeySelector
 from sim_common.cost_model import MachineProfile
 from sim_common.report import Ledger
 from sim_common.trace import Trace
@@ -111,7 +111,7 @@ class Run:
             two forms choose is *which* service, which is a fact about where the
             capability ships rather than a configuration:
 
-            * a :class:`~proposed.policy.Policy` runs **in the directory
+            * a :class:`~proposed.policy.KeySelector` runs **in the directory
               service**, installed in the real controller's ``locate_volumes``,
               and is reached through the seam already standing there
               (:class:`~realsim.seams.controller_handle.LocalControllerHandle`) --

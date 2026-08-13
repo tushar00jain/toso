@@ -19,7 +19,7 @@ disappear, not a different kind of thing.
 
 One endpoint per member of the surface -- and there is one
 ----------------------------------------------------------
-The member is :class:`proposed.policy.Placement`'s: ``select``. Naming it here is
+The member is :class:`proposed.policy.AnySelector`'s: ``select``. Naming it here is
 not the harness knowing what a capability decided -- it is the harness knowing the
 port, which lives in ``proposed`` exactly so both sides can be written without
 either knowing the other. Same as

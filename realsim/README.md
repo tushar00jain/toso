@@ -12,7 +12,7 @@ types. It is the foundation only — it owns no scenario and no demo; the unrout
 put/get burst is `putget_sim`. It deliberately depends on the real
 `torchstore` / `torch` / `monarch` install — the client, controller, transport,
 and store types that execute are the real ones; only the components being designed
-(a routing `Policy`, a capability's `DataPlane`) and the actor/RPC boundary are
+(a routing `KeySelector`, a capability's `DataPlane`) and the actor/RPC boundary are
 substituted with in-process seams.
 
 **See [`../docs/realsim_design.md`](../docs/realsim_design.md) for the full design**
@@ -26,7 +26,7 @@ the allocation-free data plane, the policy seam, and the concurrency contract.
 - **Real** `Controller` directory logic (`_notify_put` / `_notify_delete` over a
   real `Trie`; the two ~5-line read-endpoint bodies are mirrored verbatim).
 - **Real** `MonarchRPCTransportBuffer` + `InMemoryStore` put/get lifecycle.
-- **Model:** the four types a capability plugs into — `Policy` (which volume
+- **Model:** the four types a capability plugs into — `KeySelector` (which volume
   serves these keys for this requester, and when; consulted *inside* the real
   `locate_volumes`, naive by default), `View` (the read-only observation a policy
   is handed), `DataPlane` (what a capability does after a transfer lands) and
@@ -173,7 +173,7 @@ putget_sim/     the unrouted put/get burst (no policy, no data plane) -- the m x
   report/         summary.py: fabric/wallclock summary + source->dest tree
   __main__.py     the Demo declaration (`python -m putget_sim`)
 proposed/       every contract that outlives the simulator; imports nothing
-  policy.py       Policy.select(keys, requester) -> ranked sources +
+  policy.py       KeySelector.select(keys, requester) -> ranked sources +
                   readiness. Naive (all holders, directory order) is the
                   default; the controller consults it inside locate_volumes.
                   A selector that gates on a registration subscribes to the

@@ -37,7 +37,7 @@ client/controller/transport), so they depend on the from-source
 - [`realsim/`](realsim/) — the **real-code** cooperative DES foundation: it drives
   the **real** TorchStore client planning core, controller directory, and
   in-memory transport/store off-actor on a deterministic virtual clock. It models
-  only what a capability plugs in, through four shared types: `Policy` (which
+  only what a capability plugs in, through four shared types: `KeySelector` (which
   volume serves these keys for this requester, and when — consulted *inside* the
   real `locate_volumes`, naive by default), `View` (the read-only observation a
   policy is handed), `DataPlane` (what a capability does after a transfer lands)
@@ -57,7 +57,7 @@ client/controller/transport), so they depend on the from-source
   the whole real stack while deciding nothing, and the baseline `dedup_sim`
   measures against.
 - [`dedup_sim/`](dedup_sim/) — the dedup capability **on the real directory**: a
-  real `Policy` that routes each reader to a peer and withholds the controller's
+  real `KeySelector` that routes each reader to a peer and withholds the controller's
   answer until that peer's read-through put registers, plus the one-method data
   plane that does the put. The scenario is `putget_sim`'s ordinary put/get
   fixture, unchanged — installing the policy is the whole difference between *m×*
@@ -65,7 +65,7 @@ client/controller/transport), so they depend on the from-source
 - [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
   real directory**: the scheduler keeps its compute decisions (prefill placement,
   pull-vs-recompute, SLO gates, decode placement) and delegates only "which peer
-  serves this prefix gap" to the same `Policy.select`; the serving loop and the
+  serves this prefix gap" to the same `KeySelector.select`; the serving loop and the
   batched decode engine drive real fetches via `realsim`'s `Mesh`/client/engine/
   cost model.
 

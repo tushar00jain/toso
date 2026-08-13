@@ -2,23 +2,31 @@
 
     Selector.select(subject, requester) -> Selection
 
-The answer is always a ranked list of sources plus the moment they become usable
+The answer is always volume ids, best first, plus the moment they become usable
 (and, for a selector handed candidates it did not price, what each one priced at).
-What differs is the subject, and that difference is a type:
+What differs is the **subject**, and every selector names its own::
 
-* :class:`Policy` -- the subject is **keys**, so the question is the store's:
-  which volume serves these bytes. ``dedup_sim`` wants a reader routed to a *peer*
-  about to hold the key, ``kvcache_sim`` the peer holding the longest reusable
-  prefix. The only kind installable in the controller.
-* :class:`Placement` -- the subject is an application payload, so the question is
-  the application's: which peer to source a prefix from, which host prefills,
-  which host decodes. Never installed in the controller; an application's hosts
-  reach one as a service of its own.
+    subject_type = Sequence[Key]     # the store's question
+    subject_type = Request           # an application's
 
-Two subtypes rather than one generic interface because a controller consults a
-:class:`Policy` inside ``locate_volumes``: with a single type, a selector whose
-subject is not keys could be installed there, and :class:`Selection` would be a
-union serving neither caller. The subtype is the marker.
+Two of those subjects are *types* as well, because a run reaches a selector by
+which one it is:
+
+* :class:`KeySelector` -- ``Sequence[Key]``: which volume serves these bytes, the
+  store's own question. ``dedup_sim`` wants a reader routed to a *peer* about to
+  hold the key, ``kvcache_sim`` the peer holding the longest reusable prefix. The
+  only kind installable in the controller.
+* :class:`AnySelector` -- an application's own subject, whatever it is: which peer
+  to source a prefix from, which host prefills, which host decodes. Never
+  installed; an application's hosts reach one as a service of its own. Its
+  ``subject_type`` stays ``Any`` and a subclass narrows it, since this package
+  cannot name a type an application invented.
+
+Types rather than ``subject_type`` alone, because taking keys does not by itself
+mean *the store may ask you*: :class:`Refine` and ``kvcache_sim``'s reuse axis take
+the same keys and must not be installed. A selector that is neither type is reached
+from nowhere -- another selector consults it -- and being plain :class:`Selector`
+is what keeps it out of both call sites.
 
 Admission and SLO gates are neither: an answer that is not a ranked set of sources
 does not belong in a :class:`Selection` at all. A gate rides *with* one instead --
@@ -31,8 +39,8 @@ Selectors compose two ways, and neither one is a selector holding another:
   first answer. It wraps either kind and *is* a plain :class:`Selector` whatever
   it wraps, so a chain mixing the two kinds is possible and harmless -- and
   thereby barred from the controller, the one place the mixture would matter. A
-  chain whose links are all policies is a :class:`PolicyChain`, which is a
-  :class:`Policy` and may be installed.
+  chain whose links all take keys is a :class:`KeySelectorChain`, which is a
+  :class:`KeySelector` and may be installed.
 * :class:`Refine` funnels a single answer -- one selector's ranking, narrowed by
   each :class:`Refinement` behind it. That is how a test an application owns is
   applied to a ranking the store produced, with the composition in the object
@@ -47,12 +55,13 @@ from typing import (
     Any, Awaitable, Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple,
 )
 
+from proposed.deployment import Key, VolumeId
 from proposed.plane import ControlPlane
 from proposed.view import View
 
 __all__ = [
-    "Ready", "Selection", "DecisionLog", "Selector", "Policy", "Placement",
-    "NaivePolicy", "FirstMatch", "PolicyChain",
+    "Ready", "Selection", "DecisionLog", "Selector", "KeySelector", "AnySelector",
+    "NaiveKeySelector", "FirstMatch", "KeySelectorChain",
     "Refinement", "Refine", "AbstainOnSelf", "TakeHead",
 ]
 
@@ -81,17 +90,17 @@ class Selection:
             ranks.
     """
 
-    sources: Optional[Tuple[str, ...]] = None
+    sources: Optional[Tuple[VolumeId, ...]] = None
     ready: Optional[Ready] = None
-    payload: Mapping[str, Any] = field(default_factory=dict)
+    payload: Mapping[VolumeId, Any] = field(default_factory=dict)
 
     @classmethod
     def of(
         cls,
-        sources: Sequence[str],
+        sources: Sequence[VolumeId],
         *,
         ready: Optional[Ready] = None,
-        payload: Optional[Mapping[str, Any]] = None,
+        payload: Optional[Mapping[VolumeId, Any]] = None,
     ) -> "Selection":
         """A selection ranking ``sources`` best-first."""
         return cls(
@@ -117,7 +126,7 @@ class Selection:
         if self.ready is not None:
             await self.ready()
 
-    def only(self, sources: Sequence[str]) -> "Selection":
+    def only(self, sources: Sequence[VolumeId]) -> "Selection":
         """This selection cut down to ``sources``, in the order given.
 
         The readiness gate rides along and each kept source keeps its price, so
@@ -163,10 +172,10 @@ class DecisionLog(Protocol):
 class Selector(ControlPlane, ABC):
     """Rank the sources that should serve a subject, and say when they are usable.
 
-    Everything shared by the two kinds lives here -- ``select`` and the
-    :class:`~proposed.plane.ControlPlane` lifecycle -- so :class:`Policy` and
-    :class:`Placement` cannot drift apart. Implement one of those; only the
-    combinators below sit on the base itself.
+    Everything shared by every kind lives here -- ``select``, ``subject_type``,
+    the :class:`~proposed.plane.ControlPlane` lifecycle -- so :class:`KeySelector`
+    and :class:`AnySelector` cannot drift apart. Implement one of those, or this
+    base directly for a selector nothing reaches from outside.
 
     A selector that must wait for a source to appear subscribes to the directory
     in its own :meth:`attach` (:meth:`proposed.deployment.Controller.subscribe`),
@@ -175,6 +184,13 @@ class Selector(ControlPlane, ABC):
     """
 
     name = "selector"
+
+    #: What :meth:`select` takes, spelled the way the signature spells it
+    #: (``Sequence[Key]``, ``Request``, ``Sequence[Plan]``). Declared rather than
+    #: read off a generic parameter, because :pep:`484` erases those at runtime:
+    #: ``isinstance(x, Selector[Sequence[Key]])`` raises, and recovering the
+    #: argument from ``__orig_bases__`` stops working one subclass down.
+    subject_type: Any = Any
 
     #: What this selector senses through: ``None`` until :meth:`attach`, and never
     #: read by one that ranks only what it is handed.
@@ -193,28 +209,36 @@ class Selector(ControlPlane, ABC):
     async def select(self, subject: Any, requester: str) -> Selection:
         """Rank the sources that should serve ``subject`` for ``requester``.
 
-        ``Any``, because what a subject *is* is the subtype's claim: keys for a
-        :class:`Policy`, an application's own values for a :class:`Placement`.
+        ``Any`` in the signature and :attr:`subject_type` in the class: what a
+        subject *is* is each selector's own claim, and one annotation cannot be
+        both ``Sequence[Key]`` and an application's own type.
         """
 
 
-class Policy(Selector):
+class KeySelector(Selector):
     """A selector whose subject is **keys**: which volume serves these bytes.
 
     The store's own question, and the only kind a controller may install in
-    ``locate_volumes``. Adds no member to :class:`Selector`; being this type *is*
-    the claim that ``subject`` is a set of keys, which is what makes installing one
-    checkable (``isinstance(control, Policy)`` at the seam).
+    ``locate_volumes``: being this type *is* the claim, which is what makes
+    installing one checkable (``isinstance(control, KeySelector)`` at the seam).
+
+    A type as well as a :attr:`subject_type`, because taking keys does not by
+    itself mean the store may ask you -- a selector an application consults while
+    routing takes the same keys and must stay out of the directory.
     """
 
+    subject_type = Sequence[Key]
 
-class Placement(Selector):
+
+class AnySelector(Selector):
     """A selector whose subject is an **application payload**.
 
-    An application question that happens to be a selection -- which peer to source
-    a prefix from, which host prefills, which host decodes. Adds no member to
-    :class:`Selector`; being this type instead of :class:`Policy` is what keeps it
-    out of the controller, where a subject the store cannot read would make
+    An application question that happens to be a selection -- which host prefills,
+    which host decodes, which of these priced candidates wins. :attr:`subject_type`
+    stays ``Any`` here and a subclass narrows it: this package cannot name a type an
+    application invented, and the run does not need the name -- it reaches one of
+    these by *being* one. Being this type instead of :class:`KeySelector` is what
+    keeps it out of the controller, where a subject the store cannot read would make
     ``locate_volumes`` answer a question it was not asked.
 
     One that an application's own hosts ask is given a service of its own by the
@@ -224,7 +248,7 @@ class Placement(Selector):
     """
 
 
-class NaivePolicy(Policy):
+class NaiveKeySelector(KeySelector):
     """Every holder, in directory order, usable now.
 
     Precisely the real directory's own answer, so this returns the empty
@@ -244,7 +268,7 @@ class FirstMatch(Selector):
     A :class:`Selection` can be empty in two ways, and they mean opposite things:
 
     * ``Selection()`` -- ``sources is None`` -- is *every holder, in directory
-      order*, the decision :class:`NaivePolicy` makes. It **wins the chain**, and
+      order*, the decision :class:`NaiveKeySelector` makes. It **wins the chain**, and
       the selectors behind it are never consulted.
     * ``Selection.of([])`` names nobody. That is the **abstention**, and it falls
       through.
@@ -252,7 +276,7 @@ class FirstMatch(Selector):
     An exhausted chain abstains in turn, which keeps chaining associative:
     ``FirstMatch([FirstMatch([a, b]), c])`` still reaches ``c``, as it could not if
     the inner chain's exhaustion arrived looking like a decision. A chain that
-    should always answer ends with a :class:`NaivePolicy`. The winner is returned
+    should always answer ends with a :class:`NaiveKeySelector`. The winner is returned
     exactly as built, so a readiness gate rides along untouched.
 
     Args:
@@ -283,27 +307,27 @@ class FirstMatch(Selector):
         return Selection.of([])
 
 
-class PolicyChain(FirstMatch, Policy):
+class KeySelectorChain(FirstMatch, KeySelector):
     """A :class:`FirstMatch` every link of which selects over keys, so it does too.
 
     Installable in the controller, which a plain chain is not. The claim is checked
     at construction rather than trusted, so being this type says exactly what
-    :class:`Policy` says: a ``locate_volumes`` hands its subject down every link,
+    :class:`KeySelector` says: a ``locate_volumes`` hands its subject down every link,
     and one that read it as anything but keys would answer a question the directory
     did not ask.
 
     Args:
-        selectors: consulted left to right; each must be a :class:`Policy`.
+        selectors: consulted left to right; each must be a :class:`KeySelector`.
     """
 
     name = "policy-chain"
 
     def __init__(self, selectors: Sequence[Selector]) -> None:
         super().__init__(selectors)
-        wrong = [type(s).__name__ for s in self.selectors if not isinstance(s, Policy)]
+        wrong = [type(s).__name__ for s in self.selectors if not isinstance(s, KeySelector)]
         if wrong:
             raise TypeError(
-                f"a PolicyChain selects over keys, so every link must be a Policy; "
+                f"a KeySelectorChain selects over keys, so every link must be a KeySelector; "
                 f"{', '.join(wrong)} {'is' if len(wrong) == 1 else 'are'} not"
             )
 
@@ -361,6 +385,15 @@ class Refine(Selector):
     def __init__(self, source: Selector, *steps: Refinement) -> None:
         self.source = source
         self.steps: Tuple[Refinement, ...] = tuple(steps)
+
+    @property
+    def subject_type(self) -> Any:
+        """Its source's: a funnel narrows an answer, it does not reinterpret one.
+
+        Which is why a :class:`Refine` over a :class:`KeySelector` is still not one
+        -- it takes keys and is barred from the directory all the same.
+        """
+        return self.source.subject_type
 
     def attach(self, view: Any, transfer_cost: Any) -> None:
         """Hand the stack's ports to the source and every step."""

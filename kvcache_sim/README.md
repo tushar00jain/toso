@@ -194,7 +194,7 @@ a prefill. Control answers with a `Selection` ranking every prefill host it pric
 each one's plan under its id on the payload, so `winner` is the decision and an
 abstention (`Selection.of([])`) is the refusal.
 
-Two ports, one member each, split between asking and telling: `Placement.select`
+Two ports, one member each, split between asking and telling: `AnySelector.select`
 for the question (a `Request`) and `ClusterModel.notify` for the facts
 (`PrefillFinished`, `ComputeBusy`, `DecodeState`), every one of them a value. They
 are deliberately all a serving host may touch: control holds every instance's
@@ -222,7 +222,7 @@ directory read is control -- it does neither.
 ```
 kvcache_sim/
   control/                # DECIDES -- moves nothing, holds no client
-    scheduler.py          #   ONE scheduler behind proposed.Placement, the
+    scheduler.py          #   ONE scheduler behind proposed.AnySelector, the
                           #   port the data plane calls: prefill placement,
                           #   pull-vs-recompute, SLO gates, decode placement,
                           #   every one of them priced against the cluster model
@@ -243,7 +243,7 @@ kvcache_sim/
     _source.py            #   LongestPrefixPolicy (+ the opt-in
                           #   SpreadReadsPolicy, which spreads reads over
                           #   equally good replicas): the one store question
-                          #   ("which peer serves this gap"), a proposed.Policy
+                          #   ("which peer serves this gap"), a proposed.KeySelector
     _view.py              #   KVView: per-instance prefix-run lengths, plus the
                           #   pinned snapshot one routing decision reads through
                           #   (underscored: the coordinator builds its own, so
@@ -318,7 +318,7 @@ The async engine, the cost model, the topology/`Endpoint` skeleton, the `Trace`
 recorder and the `Ledger`/report helpers live in the repo-root `sim_common/`; the
 served model's flop terms, KV block bytes and token→time conversions live in
 `domain/llm.py` (both planes call them: control predicts, data charges); the real
-client/controller/transport seams + adapters, the `Mesh`, the `Policy` / `View` /
+client/controller/transport seams + adapters, the `Mesh`, the `KeySelector` / `View` /
 `DataPlane` / `Runner` / `ItemDispatch` types live in `realsim/`. This package holds only the
 KV-cache decisions and the three directory verbs (`publish` / `fetch` / `evict`)
 plus the prefix-run read that express KV caching on a mesh.

@@ -8,7 +8,7 @@ rather than a field on the base view.
 
 :meth:`KVView.pinned` is the second half of the same idea. A routing decision reads
 the prefix runs several times -- once for the candidate loop's local matches, once
-per candidate when it asks the source :class:`~proposed.policy.Policy` which peer
+per candidate when it asks the source :class:`~proposed.policy.KeySelector` which peer
 would serve the gap -- and all of them must see the *same* directory state or the
 decision is incoherent. Pinning also means the directory is walked once per
 request, not once per read.

@@ -349,9 +349,9 @@ def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
 def test_plane_port_rule_actually_resolves_the_real_ports():
     """Vacuous unless it finds both real ports and the plane that holds them.
 
-    A serving host reaches control twice -- it asks a ``Placement`` and reports to
+    A serving host reaches control twice -- it asks a ``AnySelector`` and reports to
     a ``ClusterModel`` -- and each is found on its own mark: the first derives
-    ``ControlPlane`` two levels up (``Placement`` -> ``Selector`` ->
+    ``ControlPlane`` two levels up (``AnySelector`` -> ``Selector`` ->
     ``ControlPlane``), which is why the closure is transitive; the second is one of
     the all-coroutine services ``proposed.deployment`` declares. Both are imported
     from ``proposed`` rather than from a sibling ``control/``, so this also pins the
@@ -374,7 +374,7 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
         )
     }
     ports = check_structure._control_ports(rel, tree, mods, trees)
-    assert ports == {"Placement", "ClusterModel"}, ports
+    assert ports == {"AnySelector", "ClusterModel"}, ports
     # ...and that the plane's fields are recognised as holding them.
     _local, attrs = check_structure._port_names(tree, ports)
     assert {"placement", "cluster"} <= attrs, attrs
@@ -463,7 +463,7 @@ def test_lint_flags_control_importing_the_mesh_or_a_client():
 
 def test_lint_allows_what_control_is_supposed_to_use():
     allowed = (
-        "from proposed import Policy, Selection\n"
+        "from proposed import KeySelector, Selection\n"
         "from proposed import View\n"
         "from proposed import TransferCost\n"
         "from domain import prefill_time, MachineProfile\n"

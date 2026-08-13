@@ -11,8 +11,8 @@ implementing these and nothing else.
   harvests off it once attached -- the model it decides against
   (:attr:`ControlPlane.cluster`), to put a service in front of. Where a plane is
   *reached* from is its type, not a field: a
-  :class:`~proposed.policy.Policy` is installed in the directory and a
-  :class:`~proposed.policy.Placement` is given a service, so a capability
+  :class:`~proposed.policy.KeySelector` is installed in the directory and a
+  :class:`~proposed.policy.AnySelector` is given a service, so a capability
   deciding in both places is two planes rather than one naming the other;
 * :class:`DataPlane` -- the executing half's one member,
   :meth:`DataPlane.after`: what the capability does once a transfer has landed.
@@ -92,7 +92,7 @@ class ControlPlane:
     ``set_storage_volumes``.
 
     The default is real behaviour, not a stub: a control plane that decides from
-    what it is asked -- a :class:`~proposed.policy.Placement` ranking the values in
+    what it is asked -- a :class:`~proposed.policy.AnySelector` ranking the values in
     its subject -- needs no ports of its own and inherits this no-op.
     """
 

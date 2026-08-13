@@ -19,7 +19,7 @@ reference to that service rather than the service itself -- a different shape,
 declared by Monarch, and left untyped here for the reason given on
 :attr:`Deployment.controller_handle`. Leaving that as ``Any``
 made the directory look like it had no interface at all, which in turn made
-:class:`~proposed.policy.Policy` look like the primary one instead of a hook
+:class:`~proposed.policy.KeySelector` look like the primary one instead of a hook
 consulted inside this surface.
 
 The endpoint indirection a caller goes through (``locate_volumes.call_one(...)``
@@ -33,13 +33,21 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
-    "ClusterModel", "Controller", "Deployment", "Registered", "StorageFull",
-    "StorageVolume",
+    "ClusterModel", "Controller", "Deployment", "Key", "Registered",
+    "StorageFull", "StorageVolume", "VolumeId",
 ]
+
+#: What the store is asked *for*: the directory's own noun, and the subject a
+#: :class:`~proposed.policy.KeySelector` declares (``subject_type``).
+Key = str
+
+#: What the store answers *with*: a storage volume's directory identity, and what
+#: every :class:`~proposed.policy.Selection` ranks, whatever its subject.
+VolumeId = str
 
 #: A directory subscriber: ``(volume_id, keys)``, called once per registration.
 #: Synchronous -- see :meth:`Controller.subscribe`.
-Registered = Callable[[str, Sequence[str]], None]
+Registered = Callable[[VolumeId, Sequence[Key]], None]
 
 
 class StorageFull(Exception):
@@ -78,7 +86,7 @@ class Controller(Protocol):
 
     The difference between this protocol and torchstore's class *is* the ask, and
     it is three things. One cannot be declared: ``locate_volumes`` gains a hook that
-    consults a :class:`~proposed.policy.Policy`, which changes no signature, so it
+    consults a :class:`~proposed.policy.KeySelector`, which changes no signature, so it
     is stated here instead. The others are :meth:`locate_raw`, the same directory
     read with that hook skipped, and :meth:`subscribe`, which is how anything hears
     that the directory changed. Every other member already exists upstream, spelled
@@ -172,7 +180,7 @@ class ClusterModel(Protocol):
     done. It is written as the hosts report what they did.
 
     One member, because being told is the only thing a *caller* does to a model.
-    What decides against it is a :class:`~proposed.policy.Placement`, and what it
+    What decides against it is a :class:`~proposed.policy.AnySelector`, and what it
     may show is read off the model itself: the reads are the application's, since a
     queue tail and a decode occupancy are one application's vocabulary, and
     :class:`~proposed.view.View` is the *store's* sensor, which cannot see load at
@@ -197,7 +205,7 @@ class StorageVolume(Protocol):
     """The store's *storage* service, as a caller reaches it.
 
     The third service in a deployment, beside :class:`Controller` (which knows who
-    holds what) and the application's own :class:`~proposed.policy.Placement`
+    holds what) and the application's own :class:`~proposed.policy.AnySelector`
     (which decides): the one that actually holds
     bytes. torchstore has this class -- ``torchstore.storage_volume.StorageVolume``,
     an actor whose endpoints each delegate to an ``InMemoryStore`` -- and, as with

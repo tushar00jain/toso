@@ -103,7 +103,7 @@ Control runs as a service, so this plane reaches it the way it reaches the store
 through a port, over calls that carry values. There are two, and the split is
 between asking and telling:
 
-* :class:`~proposed.policy.Placement` -- the **question**: where should this run.
+* :class:`~proposed.policy.AnySelector` -- the **question**: where should this run.
   A question is answered, so it is called and waited for. The answer is a
   :class:`~proposed.policy.Selection`, a value, and the one thing this plane takes
   off it is its winner;
@@ -139,7 +139,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from proposed import ClusterModel, Placement
+from proposed import ClusterModel, AnySelector
 
 from ..control.scheduler import ComputeBusy, DecodeState, Plan, PrefillFinished
 from ..report.metrics import Metrics, RequestResult
@@ -168,7 +168,7 @@ class ServingHost:
             way KV reaches this host from another one: the prefill host publishes
             and the decode host fetches, with the store in between.
         placement: where a question goes -- the control plane, through its
-            :class:`~proposed.policy.Placement` port and nothing else.
+            :class:`~proposed.policy.AnySelector` port and nothing else.
         cluster: where a fact goes -- control's model of the cluster, through its
             :class:`~proposed.deployment.ClusterModel` port and nothing else. A
             separate service because reporting is not asking, and the answers
@@ -192,7 +192,7 @@ class ServingHost:
         self,
         me: str,
         store: KVStore,
-        placement: Placement,
+        placement: AnySelector,
         cluster: ClusterModel,
         *,
         trace,
@@ -203,7 +203,7 @@ class ServingHost:
     ) -> None:
         self.me = me
         self.store = store
-        self.placement: Placement = placement
+        self.placement: AnySelector = placement
         self.cluster: ClusterModel = cluster
         self.trace = trace
         self.metrics = metrics

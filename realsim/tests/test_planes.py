@@ -1,6 +1,6 @@
 """The four shared types every capability plugs into.
 
-:class:`~proposed.view.View` (sense), :class:`~proposed.policy.Policy` (decide),
+:class:`~proposed.view.View` (sense), :class:`~proposed.policy.KeySelector` (decide),
 :class:`~proposed.plane.DataPlane` (what follows a transfer) and
 :class:`~realsim.runner.Runner` / :class:`~realsim.runner.ItemDispatch` (drive a run) are the generic half of both capabilities. These tests
 pin the contract each one owes its callers:
@@ -13,8 +13,8 @@ pin the contract each one owes its callers:
 3. a selection narrows a directory answer to its ranked sources, and withholds
    the answer until its readiness gate opens -- and the two combinators built on
    it tell an *abstention* from the *naive answer*, carry a wrapped selector's
-   gate through, and wake every selector they hold, whichever subtype (``Policy``
-   over keys, ``Placement`` over an application payload) that selector is.
+   gate through, and wake every selector they hold, whichever subtype (``KeySelector``
+   over keys, ``AnySelector`` over an application payload) that selector is.
    ``FirstMatch`` picks between alternatives; ``Refine`` funnels one ranking
    through the tests behind it, and is barred from the controller for the same
    reason;
@@ -32,6 +32,7 @@ Run from the repo root::
 from __future__ import annotations
 
 import asyncio
+from typing import Any, Sequence
 
 import pytest
 import torch
@@ -39,11 +40,12 @@ import torch
 from realsim.mesh import Mesh
 from realsim.simulation import Simulation
 from proposed import DataPlane
-from proposed import Placement, Policy, Selection
+from proposed import AnySelector, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.policy import (
-    AbstainOnSelf, FirstMatch, NaivePolicy, Refine, Refinement, Selector, TakeHead,
+    AbstainOnSelf, FirstMatch, KeySelectorChain, NaiveKeySelector, Refine,
+    Refinement, Selector, TakeHead,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.transport import Endpoint
@@ -109,7 +111,7 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
 
     seen: list[str] = []
 
-    class _Counting(Policy):
+    class _Counting(KeySelector):
         async def select(self, keys, requester):
             seen.append(requester)
             # Reading the directory from inside select must not recurse.
@@ -157,7 +159,7 @@ def _burst_trace(policy) -> str:
 
 
 def test_installing_the_naive_policy_changes_nothing():
-    assert _burst_trace(NaivePolicy()) == _burst_trace(None)
+    assert _burst_trace(NaiveKeySelector()) == _burst_trace(None)
 
 
 def test_naive_selection_leaves_a_directory_answer_untouched():
@@ -166,7 +168,7 @@ def test_naive_selection_leaves_a_directory_answer_untouched():
 
 
 # --------------------------------------------------------------------------
-# 2b. One base, two subjects: only a Policy reaches the controller.
+# 2b. One base, two subjects: only a KeySelector reaches the controller.
 # --------------------------------------------------------------------------
 
 
@@ -187,19 +189,48 @@ class _Answers:
         return self.selection
 
 
-class _Fixed(_Answers, Policy):
+class _Fixed(_Answers, KeySelector):
     """A policy that decides on command -- the store-question kind."""
 
 
-class _FixedPlacement(_Answers, Placement):
+class _FixedPlacement(_Answers, AnySelector):
     """The same body over an application payload -- the other kind."""
 
 
-def test_the_subtypes_add_nothing_of_their_own():
-    """The split is a marker, not a second interface, so it cannot drift apart."""
-    for kind in (Policy, Placement):
+def test_the_subtypes_add_a_subject_and_nothing_else():
+    """Each kind is a subject plus a place it is reached from -- no second interface.
+
+    ``KeySelector`` names the one subject the store can hand down; ``AnySelector``
+    leaves it open because this package cannot name a type an application invented.
+    Neither adds behaviour, so the two cannot drift apart.
+    """
+    for kind in (KeySelector, AnySelector):
         assert kind.__bases__ == (Selector,)
         assert not vars(kind).keys() & {"select", "attach", "name"}
+    assert KeySelector.subject_type == Sequence[Key]
+    assert AnySelector.subject_type is Any
+
+
+def test_taking_keys_is_not_the_same_claim_as_being_installable():
+    """Why the kinds are types and not just a ``subject_type`` comparison.
+
+    A funnel over a key selector takes keys and must still stay out of the
+    directory: its judgement is the application's, made while routing, and the
+    store-side answer is a different plane. A gate reading ``subject_type`` alone
+    would install it.
+    """
+    funnel = Refine(_Fixed(Selection.of(["v0"])), TakeHead())
+    assert funnel.subject_type == KeySelector.subject_type   # same subject ...
+    assert not isinstance(funnel, (KeySelector, AnySelector))  # ... neither kind
+
+
+def test_a_chain_of_key_selectors_is_one_and_a_mixed_chain_is_not():
+    """The subject a chain hands down is the subject its links must take."""
+    chain = KeySelectorChain([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"]))])
+    assert isinstance(chain, KeySelector)
+    assert chain.subject_type == Sequence[Key]
+    with pytest.raises(TypeError, match="every link must be a KeySelector"):
+        KeySelectorChain([_Fixed(), _FixedPlacement()])
 
 
 def test_a_selector_hears_registrations_by_subscribing_for_itself():
@@ -211,7 +242,7 @@ def test_a_selector_hears_registrations_by_subscribing_for_itself():
     """
     heard: list[tuple[str, tuple[str, ...]]] = []
 
-    class _Subscribes(Policy):
+    class _Subscribes(KeySelector):
         def attach(self, view, transfer_cost):
             super().attach(view, transfer_cost)
             view.directory.subscribe(
@@ -269,7 +300,7 @@ def test_only_a_policy_is_consulted_by_the_controller():
 def test_an_installed_policy_is_attached_to_the_run_s_view():
     """The sensor a policy is consulted with is the one it was brought up with.
 
-    A ``Policy`` is a ``ControlPlane``, so installing one in the directory and
+    A ``KeySelector`` is a ``ControlPlane``, so installing one in the directory and
     attaching it are the same act of assembly -- which is what lets ``select`` take
     a subject and a requester and no view. A policy installed but never attached
     would sense through ``None``.
@@ -404,7 +435,7 @@ def test_a_combinator_holds_either_kind_and_is_neither():
     assert _select(mixed).sources == ("v1",)
     for combinator in (mixed, FirstMatch([_Fixed(Selection())])):
         assert isinstance(combinator, Selector)
-        assert not isinstance(combinator, (Policy, Placement))
+        assert not isinstance(combinator, (KeySelector, AnySelector))
 
 
 # --------------------------------------------------------------------------
@@ -495,7 +526,7 @@ def test_refine_is_a_plain_selector_whatever_it_narrows():
     barred from the controller by being neither subtype."""
     funnel = Refine(_Fixed(Selection.of(["v0"])), TakeHead())
     assert isinstance(funnel, Selector)
-    assert not isinstance(funnel, (Policy, Placement))
+    assert not isinstance(funnel, (KeySelector, AnySelector))
 
 
 # --------------------------------------------------------------------------

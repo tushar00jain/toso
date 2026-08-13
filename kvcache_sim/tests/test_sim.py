@@ -29,8 +29,8 @@ from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data.store import KVStore
 from kvcache_sim.control.request import Request
-from proposed import Placement, Policy
-from proposed.policy import PolicyChain
+from proposed import AnySelector, KeySelector
+from proposed.policy import KeySelectorChain
 from kvcache_sim.control._source import LongestPrefixPolicy, SpreadReadsPolicy
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished, _LocalOnly,
@@ -1655,7 +1655,7 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     # The ranking is the last link of the store-side plane, which is where it is
     # reachable: the scheduler only sees it through the reuse placement that pulls.
     policies = [
-        next(p for p in run.control if isinstance(p, Policy)).selectors[-1]
+        next(p for p in run.control if isinstance(p, KeySelector)).selectors[-1]
         for run in aware
     ]
     assert all(isinstance(p, SpreadReadsPolicy) for p in policies)
@@ -1783,14 +1783,14 @@ def test_the_store_side_chain_is_a_policy_and_refuses_anything_else():
     """What the run installs in the directory selects over keys, and says so.
 
     A run declares two control planes and each is reached by its type, so being a
-    ``Policy`` is the claim that makes installing this one legal -- checked here
+    ``KeySelector`` is the claim that makes installing this one legal -- checked here
     rather than asserted in prose, and checked again at every link.
     """
     planes = scheduler("cache_aware", _make_topology(2))
-    assert [isinstance(p, Policy) for p in planes] == [True, False]
-    assert [isinstance(p, Placement) for p in planes] == [False, True]
-    with pytest.raises(TypeError, match="every link must be a Policy"):
-        PolicyChain([LongestPrefixPolicy(), _LocalOnly()])
+    assert [isinstance(p, KeySelector) for p in planes] == [True, False]
+    assert [isinstance(p, AnySelector) for p in planes] == [False, True]
+    with pytest.raises(TypeError, match="every link must be a KeySelector"):
+        KeySelectorChain([LongestPrefixPolicy(), _LocalOnly()])
 
 
 def test_a_scheduler_does_not_hold_what_the_directory_is_told():
@@ -1803,7 +1803,7 @@ def test_a_scheduler_does_not_hold_what_the_directory_is_told():
     """
     routing, sched = scheduler("cache_aware", _make_topology(2))
     assert not any(
-        isinstance(getattr(sched, name), Policy) and getattr(sched, name) is routing
+        isinstance(getattr(sched, name), KeySelector) and getattr(sched, name) is routing
         for name in vars(sched)
     ), "the scheduler holds the chain the run installs in the directory"
     assert sched.cluster is not None

@@ -3,7 +3,7 @@
 `dedup_sim` runs the **dedup algorithm on the real TorchStore directory and real
 types** (via [`realsim`](../realsim/)): a synchronized read burst is routed so
 that each unique byte crosses the fabric **exactly once (1x)**, versus **`m x`**
-for the unrouted baseline. The routing is a real `proposed.policy.Policy`
+for the unrouted baseline. The routing is a real `proposed.policy.KeySelector`
 (`dedup_sim.control.routing.DedupPolicy`) consulted *inside* the real
 `Controller`'s `locate_volumes`, over the real `LocalClient` planning core and the
 real in-memory transport, all on `realsim`'s deterministic virtual-clock async
@@ -24,7 +24,7 @@ With no policy installed, every reader `locate_volumes` the origin before anyone
 finishes, so each pulls from the origin volume -- `m x` fabric.
 
 `DedupPolicy` answers that same `locate_volumes` differently. It is a
-`proposed.policy.Policy`, consulted inside the real controller endpoint body:
+`proposed.policy.KeySelector`, consulted inside the real controller endpoint body:
 
 1. Readers reach the controller in order. The **first** is routed to a volume
    that already holds the key -- the single fabric hop.
@@ -112,7 +112,7 @@ against a `Deployment` (enforced by `realsim/tools/check_contract.py`).
 ```
 dedup_sim/
   control/                # DECIDES
-    routing.py            #   DedupPolicy: a proposed.Policy -- ranked source
+    routing.py            #   DedupPolicy: a proposed.KeySelector -- ranked source
                           #   + a readiness gate, from a read-only View
     _readiness.py         #   Readiness: a gate per fact not true yet, opened
                           #   against the directory (nothing remembered, because
@@ -140,17 +140,17 @@ visible from which folders exist and how thick they are:
 
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
-| `control/` — what is decided | `routing.py`: one `Policy.select` — a ranked source plus a readiness gate | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement) + `policy.py` (the source `Policy`) + `cache.py` (LRU) + `view.py` (prefix runs) |
+| `control/` — what is decided | `routing.py`: one `KeySelector.select` — a ranked source plus a readiness gate | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement) + `policy.py` (the source `KeySelector`) + `cache.py` (LRU) + `view.py` (prefix runs) |
 | `data/` — what executes | `read_through.py`: one `DataPlane.after` — a local put | `serving.py` (the per-request lifecycle) + `decode.py` (the batched decode engine) + `store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |
 | domain model + cost layer | **absent** — no served model to describe; charges realsim's cost model directly through the transport seam | `domain/llm.py` (shared — the LLM's flop terms, KV block byte size, and token→time) |
 
-The short version: dedup is a *source decision*, so it is one `Policy` and one
+The short version: dedup is a *source decision*, so it is one `KeySelector` and one
 `DataPlane` method. KV-cache serving is a *continuous arrival stream with
 per-instance compute state*, so it keeps its own scheduler, its own serving loop
 and its own outcome model — and delegates only the "which peer" part to the same
-`Policy.select`.
+`KeySelector.select`.
 
 ## Honesty note
 

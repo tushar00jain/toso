@@ -18,7 +18,7 @@ Laid out by role, like ``dedup_sim`` and ``kvcache_sim``:
 
 There is no ``control/`` and no ``data/``: this capability decides nothing and
 executes nothing of its own -- that is the point. Handing the same workload a
-:class:`~proposed.policy.Policy` and a :class:`~proposed.plane.DataPlane` is the
+:class:`~proposed.policy.KeySelector` and a :class:`~proposed.plane.DataPlane` is the
 only change needed to turn it into a routed run, which is exactly what
 ``dedup_sim`` does with it. Both sims therefore share this package's
 :class:`~putget_sim.workload.put_get.PutGetBurst`, so their comparison is

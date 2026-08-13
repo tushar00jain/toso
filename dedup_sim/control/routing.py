@@ -1,4 +1,4 @@
-"""1x-fabric dedup routing, as a :class:`proposed.policy.Policy`.
+"""1x-fabric dedup routing, as a :class:`proposed.policy.KeySelector`.
 
 The question a synchronized read burst asks the store is exactly the one the
 policy interface answers: *given this key and this requester, which volume serves
@@ -50,15 +50,15 @@ from __future__ import annotations
 from collections import deque
 from typing import Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
-from proposed import DecisionLog, Policy, Selection
+from proposed import DecisionLog, KeySelector, Selection
 
 from ._readiness import Readiness
 
 __all__ = ["DedupPolicy"]
 
 
-class DedupPolicy(Policy):
-    """Route each requester to a peer, not the origin (a real ``Policy``).
+class DedupPolicy(KeySelector):
+    """Route each requester to a peer, not the origin (a real ``KeySelector``).
 
     Args:
         fanout_cap: how many peers one source may be planned to feed (1 = a

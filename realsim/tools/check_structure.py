@@ -436,12 +436,12 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     """Surfaces ``proposed`` declares that a ``data/`` module reaches over a wire.
 
     A port that outlives the simulator lives in ``proposed`` rather than in a
-    capability's ``control/`` -- :class:`proposed.policy.Placement` is one. Those
+    capability's ``control/`` -- :class:`proposed.policy.AnySelector` is one. Those
     are found structurally, not by name, on either of two marks:
 
     * it derives :class:`proposed.plane.ControlPlane` -- the deciding half of a
       capability, and nothing else in the package does. Followed transitively,
-      because a surface may be declared one level down: a ``Placement`` is a
+      because a surface may be declared one level down: a ``AnySelector`` is a
       ``Selector`` is a ``ControlPlane``, and a rule that read only the direct base
       would go quiet on exactly the subtypes a caller holds;
     * it is declared in :mod:`proposed.deployment` and **every member it declares
@@ -497,7 +497,7 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     A ``Plan``, a ``Completion`` or a ``Request`` crossing the plane boundary is a
     *value* and its fields are meant to be read; those are dataclasses. A port is
     an object living in the other plane, and in this codebase that is a plain
-    class -- ``Policy`` and ``Placement`` both, following the same convention
+    class -- ``KeySelector`` and ``AnySelector`` both, following the same convention
     torchstore uses for ``TorchStoreStrategy``. So the discriminator is the
     dataclass decorator, not a base: it keeps holding when a port stops being a
     ``Protocol`` and becomes an ordinary base class.
@@ -505,7 +505,7 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     Two sources, because a port can outlive the simulator. A capability's own
     ``control/`` declares the capability-specific ones; ``proposed`` declares the
     ones that are part of the upstream ask, and a ``data/`` module reaches those by
-    package import (``from proposed import Placement``). Both are policed the
+    package import (``from proposed import AnySelector``). Both are policed the
     same, so moving a port from the first place to the second does not quietly stop
     rule 6 from applying -- which is what would happen if this only looked at
     ``control/``.

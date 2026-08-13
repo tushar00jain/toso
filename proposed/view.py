@@ -1,6 +1,6 @@
 """The read-only observation a policy is handed: :class:`View`.
 
-A :class:`~proposed.policy.Policy` never touches a client, a volume or the
+A :class:`~proposed.policy.KeySelector` never touches a client, a volume or the
 mesh -- it is given a ``View`` and returns a decision. The ``View`` is the sensor
 half of that contract: *reads* of state that already exists, and no mutation of any
 kind.

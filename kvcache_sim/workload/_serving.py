@@ -67,7 +67,7 @@ from typing import Callable, Dict, List, Optional
 from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
-from proposed import Endpoint, Policy
+from proposed import Endpoint, KeySelector
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.simulation import Simulation
@@ -156,7 +156,7 @@ def scheduler(
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
-    source_policy: Optional[Policy] = None,
+    source_policy: Optional[KeySelector] = None,
 ) -> List[object]:
     """This run's **two control planes**, as objects a scenario can just declare.
 
@@ -167,9 +167,9 @@ def scheduler(
 
     Two planes because kvcache decides in two places, and where a plane is reached
     from is its type. The :class:`~realsim.run.Run` fronts the
-    :class:`~proposed.policy.Placement` with a
+    :class:`~proposed.policy.AnySelector` with a
     :class:`~realsim.seams.placement_handle.LocalPlacementHandle` (it decides
-    compute placement) and installs the :class:`~proposed.policy.Policy` in the
+    compute placement) and installs the :class:`~proposed.policy.KeySelector` in the
     directory (it answers the store's routing question). They share the cluster
     model, which is why it is built here: the scheduler prices a pull and records
     it there, and the chain answers the fetch with it.
@@ -180,7 +180,7 @@ def scheduler(
     reads (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`).
 
     ``source_policy`` is the one knob that is an object rather than a value: which
-    peer serves a prefix gap is a :class:`~proposed.policy.Policy`, and it keeps
+    peer serves a prefix gap is a :class:`~proposed.policy.KeySelector`, and it keeps
     state across the decisions it makes
     (:class:`~kvcache_sim.control._source.SpreadReadsPolicy`). ``None`` -- the
     default -- is :class:`~kvcache_sim.control._source.LongestPrefixPolicy`. Give

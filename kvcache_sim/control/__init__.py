@@ -15,7 +15,7 @@
 * :mod:`~kvcache_sim.control._pending` -- what was decided and not yet carried out,
   each record expiring on its own terms as it is read;
 * :mod:`~kvcache_sim.control._source` -- the one part that *is* a store question,
-  "which peer serves this prefix gap", as a :class:`proposed.policy.Policy`. It is
+  "which peer serves this prefix gap", as a :class:`proposed.policy.KeySelector`. It is
   used twice: the scheduler calls it to *price* a pull against recomputing, and
   the run installs it in the directory so the fetch is *served* by the peer that
   was priced;

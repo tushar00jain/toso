@@ -27,7 +27,7 @@ piece of state touched is the real object's, and
 
 Where a control plane runs
 --------------------------
-Here. A :class:`~proposed.policy.Policy` installed in this service is a
+Here. A :class:`~proposed.policy.KeySelector` installed in this service is a
 capability's control plane running *inside the directory service* -- all of
 dedupe's, and the source half of kvcache's. :meth:`ControllerService._route` is
 that call site, kept as its own method so it is findable: the mirrored real body
@@ -64,7 +64,7 @@ class ControllerService:
             :class:`realsim.adapters.real_controller.RealControllerAdapter`).
 
     Built with no policy and none installed, the directory answers for itself --
-    which is what the naive policy says anyway.
+    which is what :class:`~proposed.policy.NaiveKeySelector` says anyway.
     """
 
     def __init__(self, controller) -> None:

@@ -26,7 +26,7 @@ The running example throughout is a single 1-D tensor **`W = [0 1 2 3 4 5 6 7]`*
 - **Shard** — one contiguous *piece* of a tensor held by one rank. If `W` is split
   across 4 ranks, rank 1's shard is `[2 3]`.
 
-- **Placement** — *how* a tensor is split across a mesh axis. The two that matter:
+- **AnySelector** — *how* a tensor is split across a mesh axis. The two that matter:
   - `Shard(d)` = cut along dimension `d` (e.g. `Shard(0)` on `W` gives each rank a
     different slice).
   - `Replicate()` = every rank holds a full copy (used for data parallelism).

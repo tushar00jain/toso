@@ -60,7 +60,7 @@ class Burst(Scenario):
         console.summary(BurstReport(result))
         console.info(
             "no routing policy => %dx fabric (every reader pulls the origin). Installing "
-            "a Policy (proposed/policy.py) in the controller's locate_volumes -- as "
+            "a KeySelector (proposed/policy.py) in the controller's locate_volumes -- as "
             "dedup_sim does -- routes later readers to read-through peers and cuts this "
             "toward 1x, with the scenario code above unchanged.",
             result.workload.num_readers,

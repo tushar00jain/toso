@@ -33,7 +33,7 @@ One burst charges every resource class through one `MachineProfile`:
 
 The scenario is ordinary user code top to bottom: a `client.put` and a gather of
 `client.get`. There is no policy, no coordinator and no execution loop in it.
-Handing it a `proposed.policy.Policy` (and, if the capability needs one, a
+Handing it a `proposed.policy.KeySelector` (and, if the capability needs one, a
 `proposed.plane.DataPlane`) is the *only* change needed to make it a routed run —
 which is exactly what `dedup_sim` does, importing this package's `PutGetBurst`
 unchanged so its comparison is byte-for-byte the same topology, payload and cost
@@ -110,7 +110,7 @@ engine, meta/metadata carriers — is imported from `realsim` / `sim_common`.
 
 | role | `putget_sim` | `dedup_sim` | `kvcache_sim` |
 |---|---|---|---|
-| `control/` — what is decided | **absent** — the naive default (all holders, directory order) | `routing.py`: one `Policy.select` — a ranked source plus a readiness gate | `scheduler.py` + `policy.py` + `cache.py` + `view.py` |
+| `control/` — what is decided | **absent** — the naive default (all holders, directory order) | `routing.py`: one `KeySelector.select` — a ranked source plus a readiness gate | `scheduler.py` + `policy.py` + `cache.py` + `view.py` |
 | `data/` — what executes | **absent** — a `get` and nothing after it | `read_through.py`: one `DataPlane.after` — a local put | `serving.py` + `decode.py` + `store.py` |
 | `workload/` — what is simulated | `put_get.py`: one synchronized burst, parameterized by reader count | the same `put_get.py`, with the policy installed | `request.py` + `generator.py` + `scenarios.py` |
 | `report/` — outcome metrics | `summary.py`: rendering only, over a shared `Ledger` | `summary.py`: rendering only, over the same `Ledger` | `metrics.py`: its **own** per-request outcome row |

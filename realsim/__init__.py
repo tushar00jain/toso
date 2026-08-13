@@ -31,7 +31,7 @@ is here:
   shared ``create_transport_buffer`` substitution. Build capabilities on this
   rather than re-deriving the wiring;
 * the four types every capability plugs into:
-  :class:`proposed.policy.Policy` (which volume serves these keys for this
+  :class:`proposed.policy.KeySelector` (which volume serves these keys for this
   requester, and when -- naive by default, and consulted inside the real
   controller's ``locate_volumes``), :class:`proposed.view.View` (the read-only
   observation a policy is handed), :class:`proposed.plane.DataPlane` (what a
