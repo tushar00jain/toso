@@ -161,7 +161,7 @@ class Plan:
 # SLO gates answer yes or no, and a ranked set of sources cannot say that.
 
 
-class _LocalOnly(Selector):
+class _LocalOnly(Selector[Sequence[Key]]):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
     A plain :class:`~proposed.selector.Selector`: its subject is keys, but the
@@ -174,7 +174,6 @@ class _LocalOnly(Selector):
     """
 
     name = "local-only"
-    subject_type = Sequence[Key]
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection:
         return Selection.of([])
@@ -340,7 +339,7 @@ class FetchRouting(KeySelectorChain):
         super().__init__([RoutedPull(cluster), source])
 
 
-class _Scheduler(AnySelector):
+class _Scheduler(AnySelector[Request]):
     """The pricing, ranking and admission both schedulers share.
 
     A :class:`~proposed.selector.AnySelector`, and only that: a serving host asks it as
@@ -368,8 +367,6 @@ class _Scheduler(AnySelector):
             has to make it first. ``None`` -- the default -- builds it in
             :meth:`attach`, where the instances become known.
     """
-
-    subject_type = Request
 
     def __init__(
         self,

@@ -211,6 +211,36 @@ def test_the_subtypes_add_a_subject_and_nothing_else():
     assert AnySelector.subject_type is Any
 
 
+def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
+    """``Selector[X]`` is the only place a subject is written; the value follows.
+
+    Two annotations for one fact would drift. The parameter is what a reader sees
+    and mypy checks; ``subject_type`` is the same type as something the install
+    gate can compare, since :pep:`484` erases the parameter at runtime.
+    """
+
+    class _Parameterised(Selector[Sequence[Key]]):
+        async def select(self, keys, requester):
+            return Selection()
+
+    class _Inherits(_Parameterised):        # narrows behaviour, not the subject
+        pass
+
+    class _DeclaresItsOwn(Selector):
+        @property
+        def subject_type(self):             # what Refine does
+            return "computed"
+
+        async def select(self, subject, requester):
+            return Selection()
+
+    assert _Parameterised.subject_type == Sequence[Key]
+    assert _Inherits.subject_type == Sequence[Key]
+    assert _DeclaresItsOwn().subject_type == "computed"
+    # An unbound parameter is not a subject: AnySelector is Selector[_S].
+    assert AnySelector.subject_type is Any
+
+
 def test_taking_keys_is_not_the_same_claim_as_being_installable():
     """Why the kinds are types and not just a ``subject_type`` comparison.
 

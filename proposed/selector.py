@@ -53,7 +53,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (
     Any, Awaitable, Callable, Dict, Generic, Mapping, Optional, Protocol,
-    Sequence, Tuple, TypeVar,
+    Sequence, Tuple, TypeVar, get_args,
 )
 
 from proposed.deployment import Key, VolumeId
@@ -75,6 +75,10 @@ Ready = Callable[[], Awaitable[None]]
 #: is generic in this and in nothing else: the *subject* belongs to the selector
 #: (``subject_type``), not to the answer it returns.
 _P = TypeVar("_P")
+
+#: What a selector's ``select`` takes. Written into the class by parameterizing it
+#: -- ``Selector[Sequence[Key]]`` -- and read back at runtime as ``subject_type``.
+_S = TypeVar("_S")
 
 
 @dataclass(frozen=True)
@@ -194,7 +198,7 @@ class DecisionLog(Protocol):
         ...
 
 
-class Selector(ControlPlane, ABC):
+class Selector(ControlPlane, ABC, Generic[_S]):
     """Rank the sources that should serve a subject, and say when they are usable.
 
     Everything shared by every kind lives here -- ``select``, ``subject_type``,
@@ -210,12 +214,33 @@ class Selector(ControlPlane, ABC):
 
     name = "selector"
 
-    #: What :meth:`select` takes, spelled the way the signature spells it
-    #: (``Sequence[Key]``, ``Request``, ``Sequence[Plan]``). Declared rather than
-    #: read off a generic parameter, because :pep:`484` erases those at runtime:
-    #: ``isinstance(x, Selector[Sequence[Key]])`` raises, and recovering the
-    #: argument from ``__orig_bases__`` stops working one subclass down.
+    #: What :meth:`select` takes, as a value: :pep:`484` erases the parameter, so
+    #: ``isinstance(x, Selector[Sequence[Key]])`` raises and the one place a subject
+    #: is *checked* needs something comparable. Set by :meth:`__init_subclass__`
+    #: from the parameter, so the annotation and the value cannot disagree.
     subject_type: Any = Any
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Read :attr:`subject_type` off ``Selector[...]``, if this class named one.
+
+        A subclass that parameterizes nothing inherits its parent's, which is what
+        makes a narrowing subclass (``SpreadReadsKeySelector``) and a combinator
+        typed on two bases (:class:`KeySelectorChain`) both resolve by ordinary
+        attribute lookup. One that declares ``subject_type`` itself is left alone --
+        :class:`Refine` computes it from its source and would lose the property.
+
+        Reads ``cls.__dict__`` rather than :func:`getattr`, which would find the
+        base's ``__orig_bases__`` and give every unparameterized subclass the bare
+        type variable.
+        """
+        super().__init_subclass__(**kwargs)
+        if "subject_type" in vars(cls):
+            return
+        for base in cls.__dict__.get("__orig_bases__", ()):
+            for arg in get_args(base):
+                if not isinstance(arg, TypeVar):
+                    cls.subject_type = arg
+                return
 
     #: What this selector senses through: ``None`` until :meth:`attach`, and never
     #: read by one that ranks only what it is handed.
@@ -231,16 +256,15 @@ class Selector(ControlPlane, ABC):
         self.view = view
 
     @abstractmethod
-    async def select(self, subject: Any, requester: str) -> Selection:
+    async def select(self, subject: _S, requester: str) -> Selection[Any]:
         """Rank the sources that should serve ``subject`` for ``requester``.
 
-        ``Any`` in the signature and :attr:`subject_type` in the class: what a
-        subject *is* is each selector's own claim, and one annotation cannot be
-        both ``Sequence[Key]`` and an application's own type.
+        ``_S`` is whatever this selector was parameterized with, and
+        :attr:`subject_type` is that same type as a value a check can compare.
         """
 
 
-class KeySelector(Selector):
+class KeySelector(Selector[Sequence[Key]]):
     """A selector whose subject is **keys**: which volume serves these bytes.
 
     The store's own question, and the only kind a controller may install in
@@ -252,10 +276,9 @@ class KeySelector(Selector):
     routing takes the same keys and must stay out of the directory.
     """
 
-    subject_type = Sequence[Key]
 
 
-class AnySelector(Selector):
+class AnySelector(Selector[_S]):
     """A selector whose subject is an **application payload**.
 
     An application question that happens to be a selection -- which host prefills,
