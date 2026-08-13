@@ -17,7 +17,7 @@ is here:
 * :mod:`realsim.run` -- the whole run lifecycle in one module, one role per type:
   :class:`~realsim.run.Workload` (the work, and nothing else),
   :class:`~realsim.run.Run` (a labelled configuration -- the workload plus the
-  policy and plane a capability installs around it, and which knows how to
+  selector and plane a capability installs around it, and which knows how to
   :meth:`~realsim.run.Run.execute` itself),
   :class:`~realsim.run.Result` (one type, for every sim) and
   :class:`~realsim.run.Report` (a finished run, as text). Every run in the repo
@@ -31,10 +31,10 @@ is here:
   shared ``create_transport_buffer`` substitution. Build capabilities on this
   rather than re-deriving the wiring;
 * the four types every capability plugs into:
-  :class:`proposed.policy.KeySelector` (which volume serves these keys for this
+  :class:`proposed.selector.KeySelector` (which volume serves these keys for this
   requester, and when -- naive by default, and consulted inside the real
   controller's ``locate_volumes``), :class:`proposed.view.View` (the read-only
-  observation a policy is handed), :class:`proposed.plane.DataPlane` (what a
+  observation a selector is handed), :class:`proposed.plane.DataPlane` (what a
   capability does after a transfer lands) and :class:`realsim.runner.Runner`
   (release work items on the virtual clock, install the mesh once, gather) with
   :class:`realsim.runner.ItemDispatch` (how one run is driven).

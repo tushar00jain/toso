@@ -17,7 +17,7 @@ convert, and the model's architecture *is* that conversion.
 Why it is neither in ``realsim`` nor in a capability
 ----------------------------------------------------
 These are **domain facts** -- what a transformer costs -- not simulator
-machinery and not a policy. ``realsim`` is about driving the real store; a
+machinery and not a selector. ``realsim`` is about driving the real store; a
 capability is about one decision. Both capabilities describe operations on a
 model's tensors:
 

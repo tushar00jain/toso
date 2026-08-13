@@ -11,7 +11,7 @@ A design for making **TorchStore double as a Mooncake-style KV cache** for LLM
 serving — a disaggregated, prefix-reusing KVCache pool with a cache-aware
 scheduler — *without* forking the store. The claim is
 that **almost everything such a cache needs already exists in TorchStore's data plane
-and transport; what's missing is a new control-plane policy** (a cache-aware
+and transport; what's missing is a new control-plane selector** (a cache-aware
 coordinator), a **key-naming convention** (prefix-hash block ids), and one
 data-plane capability the weight-sync path never needed (**eviction**).
 
@@ -40,7 +40,7 @@ and **prefill/decode disaggregation**. This doc maps each concept onto TorchStor
   unlike the versioned, burst-scoped weight-sync cache.
 - Be **additive**: the geometry-addressed `put`/`get`/`*_state_dict` weight-sync path
   keeps working unchanged. KV-cache mode is a *different
-  control-plane policy over the same volumes and transport*.
+  control-plane selector over the same volumes and transport*.
 
 **Non-goals**
 - **Not** an inference engine. TorchStore stores, locates, and moves KV blocks; it does
@@ -55,7 +55,7 @@ and **prefill/decode disaggregation**. This doc maps each concept onto TorchStor
   TorchComms RDMA / shm / Gloo) already *is* Messenger; we reuse it.
 - **Not** a full SLO admission controller in v1. The store exposes the *signals*
   (per-instance prefix-match length, load, predicted TTFT); prediction-based early
-  rejection is an optional policy on top (§5.7), not a store primitive.
+  rejection is an optional selector on top (§5.7), not a store primitive.
 
 ---
 
@@ -71,15 +71,15 @@ TorchStore already has three of Mooncake's four parts. The table is the crux of 
 | **Metadata master** — global directory, no data flow | `Controller` directory `key → {volume_id → StorageInfo}` + prefix `Trie` (`controller.py`) | **none** — reuse; blocks are just keys |
 | **Client + transfer submitter** | `LocalClient` (`client.py`) driving `put`/`get` over the transport | **none** — reuse |
 | **KV-cache event feed** — stored/removed event stream | *(nothing)* — Controller has no stored/removed event stream | **NEW seam** (optional): Controller emits stored/removed events the coordinator subscribes to (§4) |
-| **Conductor** — cache-aware prefill/decode scheduler | *(nothing)* | **NEW control plane**: a `CacheCoordinator` layered in front of the `Controller` (a policy actor over the dumb directory) |
+| **Conductor** — cache-aware prefill/decode scheduler | *(nothing)* | **NEW control plane**: a `CacheCoordinator` layered in front of the `Controller` (a selector actor over the dumb directory) |
 | **Prefix-hash block id** — computed in the serving-engine connector, not the store | opaque string keys (any scheme allowed) | **naming convention** only, no code change |
 | **Prefix matching** | `Controller.locate_volumes([keys])` / `keys(prefix)` on the trie | adapt: walk the block-key chain |
-| **Eviction / replication policy** | `delete` / `notify_delete` exist; no *policy*, no replica config | **NEW data-plane policy** |
+| **Eviction / replication selector** | `delete` / `notify_delete` exist; no *selector*, no replica config | **NEW data-plane selector** |
 | **Hot-block replication / swap** | read-through population + peer-source fan-out (K4/K3 below) | **reuse the pattern**, drive it by access frequency instead of a burst |
 
 So: **data plane ✓, transport ✓, directory ✓.** The genuinely new work is (a) a
 cache-aware **coordinator** (control plane — the Conductor analog), (b) a prefix-hash
-**key convention** (a connector concern, §5.1), and (c) **eviction** (a data-plane policy
+**key convention** (a connector concern, §5.1), and (c) **eviction** (a data-plane selector
 the weight-sync path never needed).
 
 Three control-plane mechanisms from the reference architecture worth adopting:
@@ -110,7 +110,7 @@ Two facts from the existing store make this fit cleanly:
 ## 3. Shared substrate (what KV-cache mode depends on)
 
 Reusable pieces (the substrate this design builds on). Most exist today; K5
-(eviction) is the main new data-plane policy.
+(eviction) is the main new data-plane selector.
 
 | # | Piece | What / where |
 |---|-------|--------------|
@@ -119,20 +119,20 @@ Reusable pieces (the substrate this design builds on). Most exist today; K5
 | K2b | **Prefix locate** | `locate_volumes(block_keys)` (existing) returns per-block presence; the **longest present run from the front, per volume** = that instance's reusable prefix length. This is the coordinator's core query, computed from the existing directory. |
 | K3 | **Peer-source transfer** | A block resolves to *any* volume holding it, incl. a peer instance's volume; the transport moves it once. This is already indexable in the Controller directory. |
 | K4 | **Read-through population** | After an instance fetches/computes a block, it `put`s the block into its own volume and the controller registers it — so peers can reuse it. Persistent: the block stays cached (no version window). |
-| K5 | **Eviction policy** | Per-volume LRU (default; the paper found LRU best on their traces) / LFU / length-aware, driven by access recency the coordinator observes on the request stream. Evicting a block = `delete(block_key)` on that volume + `notify_delete`. **New** relative to weight-sync (which pins within a version window). |
+| K5 | **Eviction selector** | Per-volume LRU (default; the paper found LRU best on their traces) / LFU / length-aware, driven by access recency the coordinator observes on the request stream. Evicting a block = `delete(block_key)` on that volume + `notify_delete`. **New** relative to weight-sync (which pins within a version window). |
 | K6 | **Locality cost model** | Rank sources/instances by locality: shm > NVLink peer > cross-node RDMA. These tiers drive which instance's prefix is "cheap" to reuse and whether to transfer vs recompute. |
 | K7 | **Client-side local hot cache** (optional) | A per-client hot cache admitted by frequency: only keys whose access count clears a threshold are cached locally, so repeat fetches of very hot blocks short-circuit before reaching the coordinator. An optional client-side tier in front of the coordinator. |
 
-K1+K2b+K3+K4 are the reusable core (mostly existing); K5 is the new data-plane policy;
+K1+K2b+K3+K4 are the reusable core (mostly existing); K5 is the new data-plane selector;
 the coordinator (§5) adds cache-aware routing on top.
 
 ---
 
 ## 4. Layered controllers (the key structural change)
 
-The key structural move: **split policy from storage.** Keep the
+The key structural move: **split selector from storage.** Keep the
 existing `Controller` as a dumb directory; add a **`CacheCoordinator`** actor in front
-that owns prefix matching, cache-aware routing, replication, and eviction policy. It
+that owns prefix matching, cache-aware routing, replication, and eviction selector. It
 **delegates** block-location lookups to the `Controller` and only *instructs* clients —
 KV bytes still move client↔volume over the existing transport.
 
@@ -143,7 +143,7 @@ KV bytes still move client↔volume over the existing transport.
  │  prompt -> block_keys │────▶│  (Conductor analog):      │──▶│  (block directory:│
  │                       │◀────│   prefix-match + TTFT      │   │   key→{vol→info}, │
  │  prefill uncached     │(p,d)│   routing + replication    │   │   trie)           │
- │  suffix, put blocks   │     │   + eviction policy        │   └───────────────────┘
+ │  suffix, put blocks   │     │   + eviction selector        │   └───────────────────┘
  │  (K4), decode         │     │  — one actor, serialized   │            │
  └──────────┬────────────┘     └──────────────────────────┘            ▼
             └────────── KV block transfer (existing transport) ──▶┌───────────────────┐
@@ -152,15 +152,15 @@ KV bytes still move client↔volume over the existing transport.
                                                                   └───────────────────┘
 ```
 
-- **Controller (unchanged):** block-location index, prefix trie, presence. No policy.
+- **Controller (unchanged):** block-location index, prefix trie, presence. No selector.
 - **CacheCoordinator (new):** answers "for this prompt, which instance has the longest
   reusable prefix, what's the predicted TTFT on each, where should this request run, and
-  should I replicate a hot block?" Owns the routing/replication/eviction policy. This is
+  should I replicate a hot block?" Owns the routing/replication/eviction selector. This is
   precisely the role of Mooncake's **Conductor** — a global scheduler that maintains a
   prefix table and routes requests. The `CacheCoordinator` is TorchStore's in-tree
   equivalent.
 - **Fallback:** with no coordinator, the store is the plain geometry-addressed KV store;
-  the weight-sync path is unaffected (KV-cache mode is a *different* policy over the
+  the weight-sync path is unaffected (KV-cache mode is a *different* selector over the
   same volumes).
 
 **Integration seam — how the coordinator learns block locations.** Two options:
@@ -323,9 +323,9 @@ pick). Replication is best-effort with slice-level placement guarantees (each re
 slices in different segments). The coordinator should also mark a genuinely hot prefix
 **soft-pinned** (§5.5) so replicas survive eviction pressure.
 
-### 5.7 Overload / prediction-based early rejection (optional policy)
+### 5.7 Overload / prediction-based early rejection (optional selector)
 
-The store exposes the load signals; the rejection *policy* is a thin layer:
+The store exposes the load signals; the rejection *selector* is a thin layer:
 
 - **SLO as load measure:** compare predicted max TTFT (prefill) and TBT (decode) against
   `l_ttft` / `l_tbt`; reject (429) when unachievable — the `schedule` return above.
@@ -358,7 +358,7 @@ TBT:
   decode step — the central Mooncake result, and the reason disaggregation protects
   served-request TBT even at identical admitted load.
 
-The **early-rejection** policy above (§5.7) is exactly the admission decision that
+The **early-rejection** selector above (§5.7) is exactly the admission decision that
 keeps TBT in SLO without burning prefill: reject *before* prefill on the decode load
 **predicted at prefill completion** (including in-flight prefills that will have landed
 by then), rather than late-checking *after* prefill (a wasted prefill) or gating on a
@@ -428,7 +428,7 @@ tractable; treat the sim as a router/capacity-sizing tool, not a storage-fidelit
 existing substrate, reusing volumes + transport + directory. It's a natural fit: the
 store is already a distributed, RDMA-connected, metadata-indexed byte pool — precisely
 the KVCache pool + Transfer Engine + global metadata the reference architecture calls
-for. Only the *policy* is new.
+for. Only the *selector* is new.
 
 **Phasing (each independently shippable):**
 1. **K1 + K2/K2b (prefix-hash blocks + prefix locate)** — a client-side key convention
@@ -459,7 +459,7 @@ for. Only the *policy* is new.
 - **Interaction with weight sync on the same store:** a serving instance is often *also*
   a generator being weight-synced (RL). Do KV-cache keys and weight keys share a store
   (separate namespaces) or separate stores? Namespacing is cheapest.
-- **Consistency across model versions:** a weight update (new policy in RL) invalidates
+- **Consistency across model versions:** a weight update (new selector in RL) invalidates
   the KV cache. Tie KV `block_key`s to the weight `version` (MAPPING marker) so a sync
   bump auto-invalidates stale KV.
 - **A read cannot target a volume.** §5.6 assumes a prefix is pulled from the *chosen*

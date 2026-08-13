@@ -112,9 +112,9 @@ class Mesh:
         # endpoint through :attr:`controller_handle`, which is the name the
         # ``Deployment`` port uses, rather than a second alias here.
         self.directory = make_controller_adapter(real_directory)
-        # No policy yet: a mesh answers for itself -- every holder, directory
+        # No selector yet: a mesh answers for itself -- every holder, directory
         # order -- until whoever assembled it installs one through
-        # ``controller_handle.install_policy``, which is where a control plane
+        # ``controller_handle.install_selector``, which is where a control plane
         # runs (inside the endpoint's locate_volumes, see
         # LocalControllerHandle._route). An unrouted mesh pays nothing for the
         # hook.
@@ -164,7 +164,7 @@ class Mesh:
         what a :class:`Mesh` is.
 
         Senses through the directory *service*, not the handle in front of it:
-        ``locate_raw`` is the unrouted read, so a policy consulted inside
+        ``locate_raw`` is the unrouted read, so a selector consulted inside
         ``locate_volumes`` cannot re-enter the hook it is being called from. Note
         what that also means -- a control plane's directory reads do not cross the
         handle, so they are neither routed nor charged the hop a real one would pay.
@@ -195,7 +195,7 @@ class Mesh:
         """:class:`proposed.deployment.Deployment` -- the directory endpoints.
 
         The one way to reach the directory service: a client is built with it, a
-        ``View`` reads through it, and an installed policy is consulted inside it.
+        ``View`` reads through it, and an installed selector is consulted inside it.
         """
         return self.directory.handle
 
@@ -216,7 +216,7 @@ class Mesh:
         to tell which of the mesh's clients it is building a transport for.
 
         Binds two identities for the same client: the locality endpoint the cost
-        model prices against, and the directory volume id a routing policy is
+        model prices against, and the directory volume id a routing selector is
         asked about (see :func:`realsim.seams.factory.bind_requester`).
         """
         factory.bind_source(self.topology[node_id])

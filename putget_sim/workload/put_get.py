@@ -14,8 +14,8 @@ origin before anyone finishes and each pulls from it -- fabric is ``m x`` the
 payload.
 
 The scenario is ordinary user code, top to bottom: a ``client.put`` and a gather
-of ``client.get``. There is no policy, no coordinator and no execution loop in
-it. Handing it a :class:`~proposed.policy.KeySelector` (and, if the capability needs
+of ``client.get``. There is no selector, no coordinator and no execution loop in
+it. Handing it a :class:`~proposed.selector.KeySelector` (and, if the capability needs
 one, a :class:`~proposed.plane.DataPlane`) is the *only* change needed to make it
 a routed run -- which is exactly how ``dedup_sim`` turns the same ``m x`` burst
 into a 1x one.
@@ -98,7 +98,7 @@ class PutGetBurst(Workload):
     """m readers get one key an origin already holds.
 
     The capability-free fixture: ordinary user code (a put, then a gather of gets)
-    with no routing of its own. Installing a :class:`~proposed.policy.KeySelector` and a
+    with no routing of its own. Installing a :class:`~proposed.selector.KeySelector` and a
     :class:`~proposed.plane.DataPlane` turns it into a routed run without touching
     a line of it, which is how ``dedup_sim`` compares the two.
 
@@ -115,7 +115,7 @@ class PutGetBurst(Workload):
             other cost from the same one.
         compute_device: roofline device for that generate step.
 
-    A capability that routes this burst installs its policy and data plane on the
+    A capability that routes this burst installs its selector and data plane on the
     :class:`~realsim.run.Run`, not here -- the workload is identical either way,
     which is what makes the routed/unrouted comparison mean something.
     """
@@ -170,7 +170,7 @@ class PutGetBurst(Workload):
     def items(self, sim: Simulation) -> List[WorkItem]:
         """One work item per reader: bind who I am, then get the key."""
         mesh, trace = sim.mesh, sim.trace
-        # Bytes served by the origin are the fabric cost a routing policy exists
+        # Bytes served by the origin are the fabric cost a routing selector exists
         # to cut; everything else is a peer-to-peer hop.
         sim.origins(self.origin_id)
 

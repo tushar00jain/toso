@@ -167,7 +167,7 @@ class Ledger:
     * :attr:`origin_bytes` -- the subset served by a volume in :attr:`origins`,
       i.e. the bytes that had to cross from a pre-existing source. With no
       routing the two are equal (``m x`` for ``m`` readers of one key); a
-      dedup/cache-aware policy drives ``origin_bytes`` toward the 1x union while
+      dedup/cache-aware selector drives ``origin_bytes`` toward the 1x union while
       ``transfer_bytes`` stays ``m x``. (The name is deliberately literal: a
       capability whose "fabric bytes" mean something else -- ``kvcache_sim``
       sums a per-request planned transfer -- names its own reading of the rows.)

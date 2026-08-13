@@ -2,7 +2,7 @@
 
 Every layer under the scenario is **real** TorchStore code driven off-actor on
 the deterministic virtual-clock engine. The scenario itself
-(``putget_sim/workload/put_get.py``) is ordinary user code and installs no policy.
+(``putget_sim/workload/put_get.py``) is ordinary user code and installs no selector.
 
 What is run and how it is narrated is
 :class:`putget_sim.workload.scenarios.Burst`; this file only declares the demo.
@@ -23,12 +23,12 @@ from .workload.scenarios import Burst, NUM_READERS
 
 
 class PutGetDemo(Demo):
-    """The baseline demo: one burst, no policy, no data plane."""
+    """The baseline demo: one burst, no selector, no data plane."""
 
     name = "putget_sim"
     description = (
         "Deterministic read-burst simulation over the REAL TorchStore "
-        "client/controller/transport, with no policy installed. Prints the "
+        "client/controller/transport, with no selector installed. Prints the "
         "summary + source->dest tree (INFO) and, with -v, the full per-event "
         "trace (DEBUG)."
     )

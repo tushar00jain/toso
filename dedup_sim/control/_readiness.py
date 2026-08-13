@@ -1,6 +1,6 @@
 """Waiting for a fact that has not happened yet: :class:`Readiness`.
 
-A policy that routes a requester to a source which does not hold the key *yet* has
+A selector that routes a requester to a source which does not hold the key *yet* has
 to withhold its answer until it does. That is a gate per fact still outstanding,
 and getting it right is concurrency work, not routing work: the gate must never be
 created for something that has already happened, or the waiter is never woken.

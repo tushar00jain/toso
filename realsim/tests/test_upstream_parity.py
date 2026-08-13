@@ -59,8 +59,8 @@ COPIED_FROM_UPSTREAM = [
 ]
 
 #: Members that are the *ask* -- declared here because torchstore would have to gain
-#: them. ``locate_raw`` is ``locate_volumes`` with the policy hook skipped, which is
-#: what a controller hands its own policy through a ``View``, and it is asked for as
+#: them. ``locate_raw`` is ``locate_volumes`` with the selector hook skipped, which is
+#: what a controller hands its own selector through a ``View``, and it is asked for as
 #: a plain **synchronous local method**: a directory read that cannot suspend is
 #: what makes a routing decision atomic without a lock.
 THE_ASK = ["locate_raw", "subscribe"]
@@ -176,7 +176,7 @@ def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
     every real caller, which is why the two are separate objects.
 
     The handle carries every member a *caller* reaches, and ``locate_raw`` is not
-    one: the only reader of the unrouted read is the policy running inside the
+    one: the only reader of the unrouted read is the selector running inside the
     service, sensing through a ``View`` built over the service itself, so nothing
     crosses the boundary the handle stands for. Which is why it is asked for as a
     plain synchronous method -- see :func:`test_the_ask_is_a_local_synchronous_read`.

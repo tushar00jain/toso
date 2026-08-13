@@ -5,11 +5,11 @@ Run from the repo root so the package resolves::
     PYTHONPATH=. .venv/bin/python -m dedup_sim [-v]
 
 The demo drives a synchronized read burst over the **real** ``Controller``
-directory + **real** client/transport (via ``realsim``) under two policies:
+directory + **real** client/transport (via ``realsim``) under two selectors:
 
-  * the unrouted baseline (no policy installed): every reader pulls from the
+  * the unrouted baseline (no selector installed): every reader pulls from the
     origin -- ``m x`` fabric; and
-  * the dedup policy (:class:`dedup_sim.control.routing.DedupPolicy`): the
+  * the dedup selector (:class:`dedup_sim.control.routing.DedupKeySelector`): the
     controller routes each reader to a peer and withholds the answer until that
     peer's read-through put registers, so the burst becomes a chain
     (``fanout_cap=1``) or tree (``fanout_cap=2``) and each unique byte crosses
@@ -32,12 +32,12 @@ from .workload.scenarios import Dedup
 
 
 class DedupDemo(Demo):
-    """The dedup demo: one burst, three policies, one comparison."""
+    """The dedup demo: one burst, three selectors, one comparison."""
 
     name = "dedup_sim"
     description = (
         "Dedup read-routing demo on the real TorchStore directory. Runs a "
-        "synchronized read burst under the naive baseline and the dedup policy "
+        "synchronized read burst under the naive baseline and the dedup selector "
         "(chain + tree), printing the fabric summary + ASCII diagram (INFO) and, "
         "with -v, the full per-event virtual-time trace (DEBUG)."
     )

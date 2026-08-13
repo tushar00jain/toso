@@ -4,7 +4,7 @@ The measurements are a shared :class:`sim_common.report.Ledger` filled by the
 mesh's transfer accounting; this capability defines none of its own. All these
 reports do is turn the runs' :class:`~realsim.run.Result` objects into the
 side-by-side story: how many times the payload crossed the fabric under each
-policy, and who served whom.
+selector, and who served whom.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class BaselineReport(Report):
     """The unrouted baseline's own fabric summary.
 
     The counterpart to :class:`DedupReport`: what the same burst costs with no
-    policy installed, which is the number dedup is measured against.
+    selector installed, which is the number dedup is measured against.
     """
 
     def __init__(self, naive: Result) -> None:

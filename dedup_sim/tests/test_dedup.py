@@ -210,7 +210,7 @@ def test_metadata_mode_carries_only_a_descriptor():
 #
 #    The 1x chain used to be produced by swapping each reader's private
 #    ``client._controller`` for a handle that narrowed the real directory answer,
-#    and by a burst loop inside the policy. Both are gone: the readers run an
+#    and by a burst loop inside the selector. Both are gone: the readers run an
 #    untouched real client over the mesh's own controller handle, and the chain
 #    is a consequence of the controller withholding each answer until the planned
 #    peer registers. These two tests pin that, because it is the whole point of
@@ -225,7 +225,7 @@ def test_readers_run_an_untouched_real_client():
 
 
 def test_the_scenario_holds_no_burst_loop():
-    """Dedup and the baseline run the *same* scenario code, policy aside."""
+    """Dedup and the baseline run the *same* scenario code, selector aside."""
     import ast
     import inspect
 
@@ -234,7 +234,7 @@ def test_the_scenario_holds_no_burst_loop():
     from dedup_sim.workload import scenarios
 
     tree = ast.parse(inspect.getsource(scenarios))
-    # The capability contributes a policy and a data plane; the burst itself is
+    # The capability contributes a selector and a data plane; the burst itself is
     # putget_sim's fixture. So the scenario stages nothing of its own: no
     # coroutine, hence no gather, no await, no execution order to get wrong.
     assert not [
@@ -242,7 +242,7 @@ def test_the_scenario_holds_no_burst_loop():
         for n in ast.walk(tree)
         if isinstance(n, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor))
     ]
-    # ...and every run is literally the same workload object, one policy apart:
+    # ...and every run is literally the same workload object, one selector apart:
     # the baseline and each routed cap cannot differ in what they simulate.
     runs = scenarios.Dedup().runs()
     assert [r.label for r in runs] == ["baseline", "cap=1", "cap=2"]
@@ -253,12 +253,12 @@ def test_the_scenario_holds_no_burst_loop():
 
 
 # --------------------------------------------------------------------------
-# Readiness: the waiting the policy delegates. Its safety properties are the ones
+# Readiness: the waiting the selector delegates. Its safety properties are the ones
 # a hand-rolled latch gets wrong, so they are asserted directly rather than only
 # through a burst that happens to exercise them.
 #
 # It remembers nothing: a gate is opened against the truth read from wherever the
-# caller says it lives -- the real directory, in the policy -- because a volume
+# caller says it lives -- the real directory, in the selector -- because a volume
 # that evicts makes a past registration false. ``_holds`` stands in for that read.
 # --------------------------------------------------------------------------
 

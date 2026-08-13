@@ -19,7 +19,7 @@ What crosses here and what does not
 -----------------------------------
 This endpoint carries what a *host* reports. The control plane holding the model
 reads it, and writes its own decisions into it, by plain local call -- the same
-co-location an installed :class:`~proposed.policy.KeySelector` has with the directory it
+co-location an installed :class:`~proposed.selector.KeySelector` has with the directory it
 senses through ``locate_raw``, and for the same reason: a decision formed against a
 read that could suspend is a decision formed against a picture that changed halfway
 through.

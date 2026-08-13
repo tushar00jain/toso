@@ -9,7 +9,7 @@ made an ``AsyncEngine`` directly and one went through ``run_sim``; one hooked
 transfer accounting and one did not; one built its transfer-cost estimate from the
 same profile and topology as its mesh with nothing holding the two together.
 
-    sim = Simulation(topology, control=DedupPolicy())
+    sim = Simulation(topology, control=DedupKeySelector())
     results = sim.run(my_workload, plane=my_plane)
 
 What it builds, top to bottom (compare the stack in the design doc):
@@ -102,8 +102,8 @@ class Simulation:
             * the store's own selector runs *in the directory service*, installed
               in the real controller's ``locate_volumes``, so a caller that just
               does ``client.get(K)`` is routed. That is whichever control plane is
-              a :class:`~proposed.policy.KeySelector`;
-            * a :class:`~proposed.policy.AnySelector` is the application's own
+              a :class:`~proposed.selector.KeySelector`;
+            * a :class:`~proposed.selector.AnySelector` is the application's own
               question, so it is fronted by a
               :class:`~realsim.seams.placement_handle.LocalPlacementHandle` as
               :attr:`placement_handle` and reached as its own service;
@@ -158,7 +158,7 @@ class Simulation:
         self._random_seed = random_seed
 
         # The store: real controller + real volumes + real clients, and one shared
-        # transport factory. What runs in the policy hook inside locate_volumes is
+        # transport factory. What runs in the selector hook inside locate_volumes is
         # installed below, once the control plane has been attached: a selector
         # over this run's directory cannot exist before this run's directory does.
         self.mesh = Mesh(
@@ -192,7 +192,7 @@ class Simulation:
         # KeySelector is the claim that makes a plane installable there.
         store_side = _one(planes, KeySelector, "run inside locate_volumes")
         if store_side is not None:
-            self.mesh.controller_handle.install_policy(store_side)
+            self.mesh.controller_handle.install_selector(store_side)
         # What reaching a control plane costs. Resolved once, here, because this is
         # the one place a run's control services are built -- the same reason
         # ``make_controller_adapter`` resolves the directory's. One distance for
@@ -246,7 +246,7 @@ class Simulation:
         """Mark volumes as holding data before the run (fabric accounting).
 
         A transfer served by one of these is a fabric byte -- the cost a routing
-        policy exists to cut. Returns self so it can be chained onto construction.
+        selector exists to cut. Returns self so it can be chained onto construction.
         """
         self.ledger.origins.update(volume_ids)
         return self

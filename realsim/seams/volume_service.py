@@ -115,7 +115,7 @@ class VolumeService:
             ``storage_capacity_bytes`` is this volume's byte capacity (defaults
             to :data:`~sim_common.cost_model.DEFAULT_PROFILE`, i.e. unbounded).
         controller: a handle to the directory service, which is where a
-            :class:`~proposed.policy.KeySelector` is installed and therefore who this
+            :class:`~proposed.selector.KeySelector` is installed and therefore who this
             volume asks when a put does not fit. ``None`` -- the default -- means
             there is nobody to ask, which is the historical behaviour: refuse it.
     """
@@ -139,7 +139,7 @@ class VolumeService:
         self.resident_bytes: int = 0
         self.peak_resident_bytes: int = 0
         # How this volume picks its own victims. Swappable, because which key
-        # should go is a policy and holding the bytes is not.
+        # should go is a selector and holding the bytes is not.
         self._retention = retention if retention is not None else LeastRecentlyUsed()
 
     @property

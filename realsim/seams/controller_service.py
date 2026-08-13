@@ -2,7 +2,7 @@
 
 This is the **server** side of the directory. In a deployment it is a Monarch
 actor: a process holding the real ``Controller``, receiving messages, and
-consulting whatever policy was installed in it. Here it is a plain object holding
+consulting whatever selector was installed in it. Here it is a plain object holding
 the same real ``Controller`` in this process, with the same methods, receiving
 ordinary calls instead of messages.
 
@@ -27,21 +27,21 @@ piece of state touched is the real object's, and
 
 Where a control plane runs
 --------------------------
-Here. A :class:`~proposed.policy.KeySelector` installed in this service is a
+Here. A :class:`~proposed.selector.KeySelector` installed in this service is a
 capability's control plane running *inside the directory service* -- all of
 dedupe's, and the source half of kvcache's. :meth:`ControllerService._route` is
 that call site, kept as its own method so it is findable: the mirrored real body
-runs first (:meth:`locate_raw`), then the policy is asked which of the directory's
+runs first (:meth:`locate_raw`), then the selector is asked which of the directory's
 volumes should serve this requester, and the answer is *withheld* until the chosen
-source is usable. With no policy installed -- the default -- ``locate_volumes`` is
+source is usable. With no selector installed -- the default -- ``locate_volumes`` is
 exactly the mirrored real body.
 
-The policy is asked for a decision and handed no sensor: it runs on this side, so
+The selector is asked for a decision and handed no sensor: it runs on this side, so
 it senses through the :class:`~proposed.view.View` the run attached it to
-(:meth:`proposed.policy.Selector.attach`), which reads :meth:`locate_raw` and
+(:meth:`proposed.selector.Selector.attach`), which reads :meth:`locate_raw` and
 therefore cannot re-enter the hook it is being called from.
 
-That is the only thing here that knows what a policy is. Hearing that the
+That is the only thing here that knows what a selector is. Hearing that the
 directory changed goes the other way: anything at all may :meth:`subscribe`, and
 this service calls plain callables back without knowing whose they are.
 """
@@ -56,30 +56,30 @@ __all__ = ["ControllerService"]
 
 
 class ControllerService:
-    """A real ``Controller``, its policy, and its endpoints' bodies.
+    """A real ``Controller``, its selector, and its endpoints' bodies.
 
     Args:
         controller: a real ``Controller`` instance (constructed off-actor and
             marked initialized by
             :class:`realsim.adapters.real_controller.RealControllerAdapter`).
 
-    Built with no policy and none installed, the directory answers for itself --
-    which is what :class:`~proposed.policy.NaiveKeySelector` says anyway.
+    Built with no selector and none installed, the directory answers for itself --
+    which is what :class:`~proposed.selector.NaiveKeySelector` says anyway.
     """
 
     def __init__(self, controller) -> None:
         self.controller = controller
-        self._policy: Optional[Any] = None
+        self._selector: Optional[Any] = None
         self._subscribers: List[Registered] = []
 
-    def install_policy(self, policy: Any) -> None:
+    def install_selector(self, selector: Any) -> None:
         """Install a control plane in this service after construction.
 
-        Two-phase because a policy senses through a
+        Two-phase because a selector senses through a
         :class:`~proposed.view.View` built over this service, so it cannot exist
         before the service does.
         """
-        self._policy = policy
+        self._selector = selector
 
     # -- proposed.deployment.Controller ------------------------------------- #
     def subscribe(self, on_register: Registered) -> None:
@@ -98,7 +98,7 @@ class ControllerService:
             return self.locate_raw(keys, missing_ok, require_fully_committed)
         # Withhold the answer until the chosen source is usable. The directory is
         # re-read afterwards because waiting is exactly what lets it change: the
-        # source the policy picked registers while we are blocked here.
+        # source the selector picked registers while we are blocked here.
         await selection.wait()
         located = self.locate_raw(keys, missing_ok, require_fully_committed)
         return selection.narrow(located)
@@ -151,11 +151,11 @@ class ControllerService:
     async def _route(self, keys: Sequence[str]) -> Optional[Any]:
         """Ask the installed control plane who should serve ``keys``.
 
-        ``None`` means there is nobody to ask -- no policy installed, or no
+        ``None`` means there is nobody to ask -- no selector installed, or no
         requester bound (a caller the seam cannot identify, GAP 2) -- and the
         directory answers for itself.
         """
-        if self._policy is None:
+        if self._selector is None:
             return None
         # Import locally: the seam is otherwise dependency-free, and only a
         # routed run needs to know who is calling.
@@ -164,7 +164,7 @@ class ControllerService:
         requester = factory.current_requester()
         if requester is None:
             return None
-        return await self._policy.select(list(keys), requester)
+        return await self._selector.select(list(keys), requester)
 
     def locate_raw(
         self,
@@ -176,7 +176,7 @@ class ControllerService:
 
         :meth:`proposed.deployment.Controller.locate_raw` -- the one member of that
         surface torchstore does not have yet, and what a ``View`` reads: not the
-        routed read, so a policy sensing the directory cannot re-enter the hook it is
+        routed read, so a selector sensing the directory cannot re-enter the hook it is
         being called from, and not a coroutine, so forming an answer against it
         cannot be interleaved with forming another.
         """

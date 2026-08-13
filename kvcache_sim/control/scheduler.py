@@ -1,6 +1,6 @@
 """One scheduler, two presets: ``LoadBalanceScheduler`` / ``CacheAwareScheduler``.
 
-Both are a :class:`~proposed.policy.AnySelector`, whose one member -- ``select`` --
+Both are a :class:`~proposed.selector.AnySelector`, whose one member -- ``select`` --
 is the whole surface the data plane may *ask*. Beside either runs a second control
 plane, :class:`FetchRouting`, which is what the *directory* consults; a run
 installs the two together (:func:`kvcache_sim.workload._serving.scheduler`) and
@@ -13,7 +13,7 @@ This application's one question::
 
 The ranking is real -- every prefill instance is priced -- and the winner's
 :class:`Plan` rides in the payload, so a caller wanting the decision reads
-:attr:`~proposed.policy.Selection.winner` and never indexes the ranking. A refusal
+:attr:`~proposed.selector.Selection.winner` and never indexes the ranking. A refusal
 (an SLO miss) is the abstention every selector here uses, ``Selection.of([])``.
 
 A plan names both of the request's hosts, so it is asked once and before anything
@@ -36,7 +36,7 @@ consulted per candidate for "name a peer to pull a prefix from, or nobody", and
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
 * ``CacheAwareScheduler`` = pull under a balance threshold, lowest predicted TTFT,
-  over the **global** prefix-match directory. Which peer serves the gap is a policy
+  over the **global** prefix-match directory. Which peer serves the gap is a selector
   again (:mod:`kvcache_sim.control._source`).
 
 Admission is a setting rather than an axis: ``early_rejection`` names what the TBT
@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 from proposed import AnySelector, Endpoint, Key, KeySelector, Selection
-from proposed.policy import (
+from proposed.selector import (
     AbstainOnSelf, KeySelectorChain, Refine, Refinement, Selector, TakeHead,
 )
 
@@ -148,13 +148,13 @@ class Plan:
 # What differs is the two axes and which admission gates are installed.
 #
 # Neither axis is ever installed in the controller. The second is a
-# :class:`~proposed.policy.AnySelector`, because the subject is what tells the two
-# selector kinds apart (:mod:`proposed.policy`) and its subject is the application's:
+# :class:`~proposed.selector.AnySelector`, because the subject is what tells the two
+# selector kinds apart (:mod:`proposed.selector`) and its subject is the application's:
 # the candidates this scheduler priced. This first axis answers only the store-shaped
 # half -- name a peer to pull from, or nobody -- so it is the source ranking
 # (:mod:`kvcache_sim.control._source`, a real KeySelector) under the one test that is not
 # the store's: is pulling worth more than recomputing here. That composition is a
-# :class:`~proposed.policy.Refine`, a plain Selector, which is what keeps it out of
+# :class:`~proposed.selector.Refine`, a plain Selector, which is what keeps it out of
 # the controller without either half holding the other.
 #
 # What is not a selection at all is the rest of what a scheduler decides --
@@ -166,11 +166,11 @@ class Plan:
 class _LocalOnly(Selector):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
-    A plain :class:`~proposed.policy.Selector`: its subject is keys, but the
+    A plain :class:`~proposed.selector.Selector`: its subject is keys, but the
     scheduler is the only thing that asks it, so it is neither installed in the
     directory nor fronted by a service.
 
-    ``Selection.of([])``, which is :class:`~proposed.policy.FirstMatch`'s
+    ``Selection.of([])``, which is :class:`~proposed.selector.FirstMatch`'s
     *abstention*: no source, so the caller recomputes the gap. Deliberately not
     ``Selection()``, which is a decision meaning every holder in directory order.
     """
@@ -192,7 +192,7 @@ class _LongerThanLocal(Refinement):
 
     Judges the head and abstains for the whole ranking rather than filtering peer
     by peer. A ranking is not obliged to be in raw-run order
-    (:class:`~kvcache_sim.control._source.SpreadReadsPolicy` discounts a busy
+    (:class:`~kvcache_sim.control._source.SpreadReadsKeySelector` discounts a busy
     source), so the sources behind the head are the ones it preferred *less*, and
     promoting one on a longer raw run would overrule the ranking from outside it.
 
@@ -226,10 +226,10 @@ def _ranked(candidates: Sequence[Tuple[str, Any]]) -> Selection:
 class _Ranking(Selector):
     """Rank candidates the scheduler has already priced, best first.
 
-    A plain :class:`~proposed.policy.Selector` for :class:`_LocalOnly`'s reason:
+    A plain :class:`~proposed.selector.Selector` for :class:`_LocalOnly`'s reason:
     the scheduler consults it and nothing else reaches it.
 
-    Pricing them here instead would pull the reuse placement, the transfer cost and
+    Pricing them here instead would pull the reuse axis, the transfer cost and
     the profile in with it, which is most of a scheduler.
 
     Handed the run's cluster model, since a ranking may want a signal the price has
@@ -322,7 +322,7 @@ class RoutedPull(KeySelector):
 
     Reading it **consumes** it (:meth:`~kvcache_sim.control._cluster.KVClusterModel.claim`
     expires the record on a match), so this belongs at the head of a
-    :class:`~proposed.policy.FirstMatch` chain and under no combinator that can drop
+    :class:`~proposed.selector.FirstMatch` chain and under no combinator that can drop
     an answer. In that one position spending and using coincide: a link that answers
     wins the chain, an abstention matched nothing and spends nothing. Under one that
     could reject the peer, the record would be gone and the fetch would fall through
@@ -351,15 +351,15 @@ class FetchRouting(KeySelectorChain):
     prefix.
 
     A chain rather than an ``if``, so the fall-through is
-    :class:`~proposed.policy.FirstMatch`'s abstention rule and not a second copy of
-    it here, and a :class:`~proposed.policy.KeySelectorChain` because the directory is
+    :class:`~proposed.selector.FirstMatch`'s abstention rule and not a second copy of
+    it here, and a :class:`~proposed.selector.KeySelectorChain` because the directory is
     handed this and both links select over keys.
 
     Args:
         cluster: the run's model, which the scheduler records a priced pull into.
             The whole of what the two planes share.
         source: ranks the holders of a prefix. The same object a pulling
-            scheduler's reuse placement names a peer with, so the peer chosen
+            scheduler's reuse axis names a peer with, so the peer chosen
             while pricing is the peer this answers with.
     """
 
@@ -372,7 +372,7 @@ class FetchRouting(KeySelectorChain):
 class _Scheduler(AnySelector):
     """The pricing, ranking and admission both schedulers share.
 
-    A :class:`~proposed.policy.AnySelector`, and only that: a serving host asks it as
+    A :class:`~proposed.selector.AnySelector`, and only that: a serving host asks it as
     a service (:meth:`select`). What the *directory* is told is a second control
     plane the run installs beside this one
     (:class:`FetchRouting`), and the two meet at the model -- this one prices a
@@ -490,7 +490,7 @@ class _Scheduler(AnySelector):
         # (:meth:`~kvcache_sim.control._view.KVView.pinned`).
         #
         # A reuse axis that ranks peers brings up the source ranking it funnels
-        # (:meth:`~proposed.policy.Refine.attach`), and that ranking is also a link
+        # (:meth:`~proposed.selector.Refine.attach`), and that ranking is also a link
         # of the store-side chain, which the run attaches to the plain view it hands
         # every control plane. This attach is the one that leaves it sensing through
         # the pinned view, so a run listing the two planes puts this one **last**:
@@ -504,9 +504,9 @@ class _Scheduler(AnySelector):
         """Where should ``request`` run? Price every prefill instance, rank them.
 
         The prefill hosts best first, with each one's :class:`Plan` under its id in
-        :attr:`~proposed.policy.Selection.payload`; the head's plan is the one that
+        :attr:`~proposed.selector.Selection.payload`; the head's plan is the one that
         was admitted and committed, so a caller reads
-        :attr:`~proposed.policy.Selection.winner`. An SLO miss abstains
+        :attr:`~proposed.selector.Selection.winner`. An SLO miss abstains
         (``Selection.of([])``) -- there is no host this request may run on, and a
         refusal costs nothing because nothing has run.
 
@@ -541,8 +541,8 @@ class _Scheduler(AnySelector):
     ) -> Tuple[int, Optional[str], Sequence[str]]:
         """What a reuse selection buys ``inst``: ``(match, source, pull_keys)``.
 
-        Derived here and not in the policy, because naming a peer is where a
-        policy's job ends: how much of this prompt that peer's prefix covers is
+        Derived here and not in the selector, because naming a peer is where a
+        selector's job ends: how much of this prompt that peer's prefix covers is
         arithmetic over the snapshot this scheduler already read. An abstention --
         and a selection naming ``inst`` itself, which is not a pull -- leaves the
         local match to recompute from.
@@ -675,14 +675,14 @@ class CacheAwareScheduler(_Scheduler):
     """Cache-aware: global prefix-match routing under a balance threshold.
 
     ``replicate=False`` (which isolates replication's contribution in the demo) is
-    never pulling at all, so it is the baseline's reuse placement rather than a flag
+    never pulling at all, so it is the baseline's reuse axis rather than a flag
     the candidate loop tests.
 
     Args:
-        source_policy: ranks peers for a prefix pull, and the same object the
+        source_selector: ranks peers for a prefix pull, and the same object the
             store-side plane answers a fetch with, so the peer named while pricing
             is the peer the directory serves. Read only through the reuse
-            placement, which is why ``replicate=False`` never asks it anything.
+            axis, which is why ``replicate=False`` never asks it anything.
 
             Required, and deliberately without a default: the ranking has to be the
             *same object* the run gives :class:`FetchRouting`, so whoever builds the
@@ -692,12 +692,12 @@ class CacheAwareScheduler(_Scheduler):
             never serves it.
     """
 
-    def __init__(self, *, source_policy: KeySelector, balance_threshold: float = 1.5,
+    def __init__(self, *, source_selector: KeySelector, balance_threshold: float = 1.5,
                  replicate: bool = True, **knobs: Any) -> None:
         super().__init__(
             reuse=(
                 Refine(
-                    source_policy,
+                    source_selector,
                     AbstainOnSelf(),
                     _LongerThanLocal(balance_threshold),
                     TakeHead(),

@@ -1,22 +1,22 @@
-"""Which peer serves a prefix gap: the KV-cache source :class:`~proposed.policy.KeySelector`.
+"""Which peer serves a prefix gap: the KV-cache source :class:`~proposed.selector.KeySelector`.
 
 The *only* part of KV-cache routing that is a store question, so the only part that
-goes through the shared policy interface. Everything else the scheduler decides --
+goes through the shared selector interface. Everything else the scheduler decides --
 which instance prefills, whether to pull at all or recompute locally, the TTFT/TBT
 gates, where decode lands -- is compute placement, which the store knows nothing
 about, and stays in :mod:`kvcache_sim.control.scheduler`.
 
-Not installed in the controller, unlike ``dedup_sim``'s policy: the scheduler
+Not installed in the controller, unlike ``dedup_sim``'s selector: the scheduler
 wants to *price* a source against recomputing the prefix rather than be handed
 one, so it calls :meth:`select` itself and then decides.
 
-:class:`LongestPrefixPolicy` ranks on reuse value alone and is the default.
-:class:`SpreadReadsPolicy` is that same ranking with a bounded discount for how
-much this policy has *lately routed* at each source, so a host holding a hot
+:class:`LongestPrefixKeySelector` ranks on reuse value alone and is the default.
+:class:`SpreadReadsKeySelector` is that same ranking with a bounded discount for how
+much this selector has *lately routed* at each source, so a host holding a hot
 prefix does not serve every read of it. It is opt-in and off by default:
 ``python -m kvcache_sim hotspot --spread-reads`` hands a fresh one to each of that
 scenario's cache-aware runs as
-:func:`~kvcache_sim.workload._serving.scheduler`'s ``source_policy``.
+:func:`~kvcache_sim.workload._serving.scheduler`'s ``source_selector``.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ from proposed import DecisionLog, KeySelector, Selection
 
 from ._view import prefix_lengths_of
 
-__all__ = ["LongestPrefixPolicy", "SpreadReadsPolicy"]
+__all__ = ["LongestPrefixKeySelector", "SpreadReadsKeySelector"]
 
 
-class LongestPrefixPolicy(KeySelector):
+class LongestPrefixKeySelector(KeySelector):
     """Rank instances by how much of the requested block prefix they hold.
 
     Longest contiguous run first, instance id as the tie-break, so the choice is
@@ -51,11 +51,11 @@ class LongestPrefixPolicy(KeySelector):
         return Selection.of(ranked)
 
     def _prefix_runs(self, keys: Sequence[str]) -> Dict[str, int]:
-        """Per-instance prefix runs, off whichever view this policy was attached to.
+        """Per-instance prefix runs, off whichever view this selector was attached to.
 
         The scheduler attaches its :class:`~kvcache_sim.control._view.KVView`, whose
         snapshot a routing decision pins, so the whole decision reads one directory.
-        A run that installs this policy on its own can only attach the plain
+        A run that installs this selector on its own can only attach the plain
         :class:`~proposed.view.View`, since a prefix run is a KV-cache notion the
         store has no reason to know. Use the derived read when offered, derive it
         otherwise, off one shared definition.
@@ -74,12 +74,12 @@ class _Grant(NamedTuple):
 
 
 class _Grants:
-    """Sources this policy has named lately, tallied per source.
+    """Sources this selector has named lately, tallied per source.
 
     A window rather than a running total: a total that only grows is not a load
     signal -- after enough traffic the differences between sources wash out and the
     ranking decays back to prefix-and-id, the exact behaviour
-    :class:`SpreadReadsPolicy` exists to change.
+    :class:`SpreadReadsKeySelector` exists to change.
 
     Expiry runs on the **read**, the idiom :mod:`kvcache_sim.control._pending` uses
     and for the same reason: a selection reads the tally before it adds to it, so
@@ -99,7 +99,7 @@ class _Grants:
         """``source -> grants still inside their window``, dropping the rest.
 
         A non-positive window expires every grant the instant it is issued, which
-        makes :class:`SpreadReadsPolicy` rank exactly as :class:`LongestPrefixPolicy`
+        makes :class:`SpreadReadsKeySelector` rank exactly as :class:`LongestPrefixKeySelector`
         does.
         """
         self._issued = [g for g in self._issued if g.expires_at > now]
@@ -109,19 +109,19 @@ class _Grants:
         return counts
 
 
-class SpreadReadsPolicy(LongestPrefixPolicy):
+class SpreadReadsKeySelector(LongestPrefixKeySelector):
     """Longest prefix, minus a bounded discount for reads lately routed there.
 
     Every replica holding a hot prefix ranks *identically* under
-    :class:`LongestPrefixPolicy`, and the instance-id tie-break then sends every read
-    of it to whichever replica sorts first: deterministic, but a hotspot. This policy
+    :class:`LongestPrefixKeySelector`, and the instance-id tie-break then sends every read
+    of it to whichever replica sorts first: deterministic, but a hotspot. This selector
     breaks that tie on something that moves.
 
-    The load signal is this policy's own bookkeeping, because :mod:`proposed.view`
+    The load signal is this selector's own bookkeeping, because :mod:`proposed.view`
     has no ``load()`` to read and :meth:`select` is chokepoint enough -- every read
-    this policy influences passes through it. A named source counts for ``window``
+    this selector influences passes through it. A named source counts for ``window``
     seconds of the loop's clock and then stops counting (:class:`_Grants`);
-    ``window`` is the one number this policy cannot derive -- too short and it
+    ``window`` is the one number this selector cannot derive -- too short and it
     forgets a peer it has just piled four transfers onto, too long and it goes on
     penalising a peer that finished them.
 
@@ -144,14 +144,14 @@ class SpreadReadsPolicy(LongestPrefixPolicy):
     and a run reproduces. ``window`` is measured on
     :meth:`~proposed.view.View.now`, the loop's virtual clock.
 
-    **The count is a model, not a measurement.** A grant records that this policy
+    **The count is a model, not a measurement.** A grant records that this selector
     *named* a source, not that any byte moved -- the scheduler asks once per prefill
     candidate while pricing and then keeps one plan, so most grants belong to
     candidates that were dropped, and since nothing counts a source that served a
-    read this policy never granted, the tally drifts one-way *above* reality: read
+    read this selector never granted, the tally drifts one-way *above* reality: read
     it as "recently pointed at", not "currently serving". The scheduler's
     ``busy_until`` is a prediction too, but ``PrefillFinished`` corrects it against
-    what happened, and **this policy has no such correction path** -- a window only
+    what happened, and **this selector has no such correction path** -- a window only
     bounds how long a wrong count can persist, it never learns that it was wrong.
     The fix is a measurement: real per-volume serving load, counted in the data
     plane and surfaced on :class:`~proposed.view.View`, the observation
@@ -160,11 +160,11 @@ class SpreadReadsPolicy(LongestPrefixPolicy):
 
     Args:
         window: seconds a grant counts for. Non-positive means no memory, which
-            reproduces :class:`LongestPrefixPolicy`'s ranking exactly.
+            reproduces :class:`LongestPrefixKeySelector`'s ranking exactly.
         max_discount: the most blocks of prefix run load may cancel out. ``0`` makes
             the load term a pure tie-break between sources whose runs are already
             equal, which is enough for the replicated-hot-prefix case.
-        trace: optional :class:`~proposed.policy.DecisionLog`. Records only.
+        trace: optional :class:`~proposed.selector.DecisionLog`. Records only.
     """
 
     name = "spread-reads"
@@ -181,7 +181,7 @@ class SpreadReadsPolicy(LongestPrefixPolicy):
         self._grants = _Grants(window)
 
     async def select(self, keys: Sequence[str], requester: str) -> Selection:
-        """Rank as :class:`LongestPrefixPolicy` does, spread over equal-value peers.
+        """Rank as :class:`LongestPrefixKeySelector` does, spread over equal-value peers.
 
         The whole ranking is returned, not just the head, so a caller that rejects
         the first source still has the rest in a useful order. Only the head counts

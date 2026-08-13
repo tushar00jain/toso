@@ -141,7 +141,7 @@ with no mechanism behind it.
 gate) still counts as a turn, and the conversation continues to the next one as
 though it had been served. Two alternatives were considered. Ending the
 conversation at the first refusal is what a discouraged user does, but it makes
-*which requests exist* depend on the policy under test, so a rejection count would
+*which requests exist* depend on the selector under test, so a rejection count would
 no longer be comparable between the two columns it is the whole point of. Re-deriving
 the chain at run time to drop the refused turn's content would make the stream
 depend on the wiring in the same way. What the simplification costs is one block

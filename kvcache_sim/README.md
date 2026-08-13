@@ -79,7 +79,7 @@ python -m kvcache_sim --help            # usage + valid scenario names
   trace prints (capped to the first 60 events per scenario); the default INFO level
   prints only the `(b)` summaries.
 - `--spread-reads` gives the **hotspot** scenario's cache-aware runs
-  `SpreadReadsPolicy` as their source ranking instead of longest-prefix-then-id, so
+  `SpreadReadsKeySelector` as their source ranking instead of longest-prefix-then-id, so
   one replica of a hot prefix does not serve every read of it. Off by default: it
   changes which replica answers, so it is not byte-identical.
 
@@ -116,7 +116,7 @@ python -m kvcache_sim --help            # usage + valid scenario names
   generated, so the disaggregated pool accumulates ~2.7x the blocks the coupled one
   does for identical load.
 - **early_rejection** — heavy decode load under a tight TBT SLO, comparing admission
-  policies `early` and `predict`. Both gate at routing, before the prefill runs, so a
+  modes `early` and `predict`. Both gate at routing, before the prefill runs, so a
   refusal costs no compute — late-checking after the prefill is the behaviour the
   design argues against and is not implemented. A mode is not a branch the coordinator
   tests either: it names whether the decode occupancy the **gate** is fed is predicted
@@ -240,8 +240,8 @@ kvcache_sim/
     _pending.py           #   Reservations / RoutedPulls: what was decided and
                           #   not yet done. Each expires on its own terms, when
                           #   read -- so no decision method carries a sweep
-    _source.py            #   LongestPrefixPolicy (+ the opt-in
-                          #   SpreadReadsPolicy, which spreads reads over
+    _source.py            #   LongestPrefixKeySelector (+ the opt-in
+                          #   SpreadReadsKeySelector, which spreads reads over
                           #   equally good replicas): the one store question
                           #   ("which peer serves this gap"), a proposed.KeySelector
     _view.py              #   KVView: per-instance prefix-run lengths, plus the
@@ -352,7 +352,7 @@ plus the prefix-run read that express KV caching on a mesh.
 - **A refused turn does not end its conversation.** The user is told no and the next
   turn is offered anyway, as though the refused one had been served. Ending the
   dialogue instead is what a discouraged user does, but it makes *which requests
-  exist* depend on the policy under test, and a rejection count is only worth
+  exist* depend on the selector under test, and a rejection count is only worth
   anything when both columns are shedding from the same offered load. What the
   simplification costs is one block of query and one of output in the next turn's
   prompt that a real transcript would not carry — an over-charge, never an invented
@@ -376,7 +376,7 @@ plus the prefix-run read that express KV caching on a mesh.
   faithful real-directory behavior. The peer it pulls *from* is the one the
   coordinator priced: the run installs the *scheduler* in the directory, and its
   `select` answers a fetch with the pull it already routed (falling back to
-  `LongestPrefixPolicy` when it routed none), so `locate_volumes` narrows to that
+  `LongestPrefixKeySelector` when it routed none), so `locate_volumes` narrows to that
   peer. Without it the
   client takes whichever holder the directory lists first, which for a block several
   instances hold (a shared system prompt, anything replicated) can be a different

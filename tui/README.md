@@ -31,9 +31,9 @@ all.
 
 `../live_example.py` runs an async-RL workload with **one role per rank** (see its
 module docstring): under `--nproc-per-node=5` ranks 0–1 are **trainers**
-(`trainer.<i>.*`, rewriting policy tensors each step and rotating an optimizer key
+(`trainer.<i>.*`, rewriting selector tensors each step and rotating an optimizer key
 in/out), ranks 2–3 are **generators** (`generator.<j>.*`, pulling each trainer's
-latest policy version and writing fresh rollouts), and rank 4 is the
+latest selector version and writing fresh rollouts), and rank 4 is the
 **aggregator** — the §5 socket server the TUI connects to. Each rank hosts its own
 storage volume, so the TUI shows the keys sharded across five volumes.
 
@@ -79,7 +79,7 @@ The header is always shown: `toso-tui · <store> · <strategy> · <N> vols · <N
 `l`/`Enter` drills into the selected row; `h`/`Esc` goes back. The examples below
 use the store from `live_example.py`, whose top-level prefixes are `trainer.0`,
 `trainer.1`, `generator.0`, and `generator.1` (each holding `step`, `metadata`,
-and policy/rollout tensors).
+and selector/rollout tensors).
 
 ### Health board (landing)
 
@@ -112,12 +112,12 @@ keys beneath it. Drilling descends one level at a time (lazy, paged); drilling a
 **leaf** (a row that is itself a stored key) opens its Detail.
 
 ```
-keys · trainer.0.policy
+keys · trainer.0.selector
 NAME       KEYS  DTENSORS  PARTIAL  BYTES     STATUS
 ▸ layer0    1     0         —       16.0 KB   ok     ← intermediate node → drills deeper
 ▸ layer1    1     0         —       4.0 KB    ok
 ```
-Drilling `layer0` → `keys · trainer.0.policy.layer0` → row `weight` (a leaf) → Detail.
+Drilling `layer0` → `keys · trainer.0.selector.layer0` → row `weight` (a leaf) → Detail.
 
 ### Detail (a single key)
 
@@ -127,7 +127,7 @@ each shard, with coordinates/offsets/local shape). `p` peeks tensor stats.
 
 ```
 detail
-trainer.0.policy.layer0.weight
+trainer.0.selector.layer0.weight
 type TENSOR   dtype float32   committed ✓ fully committed
 global_shape —   mesh_shape —
 shards (1)

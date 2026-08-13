@@ -7,7 +7,7 @@
 * :mod:`~kvcache_sim.control.scheduler` -- the serving scheduler: which instance
   prefills, pull-vs-recompute, the TTFT/TBT admission gates, where decode lands.
   These are *compute* decisions the store knows nothing about, which is why they
-  are app code and not part of the shared policy interface;
+  are app code and not part of the shared selector interface;
 * :mod:`~kvcache_sim.control._cluster` -- what those decisions are made against: one
   model of the cluster's load per run, behind :class:`proposed.ClusterModel`'s single
   write verb. The facts a host reports are here with the fold that applies them, and
@@ -15,7 +15,7 @@
 * :mod:`~kvcache_sim.control._pending` -- what was decided and not yet carried out,
   each record expiring on its own terms as it is read;
 * :mod:`~kvcache_sim.control._source` -- the one part that *is* a store question,
-  "which peer serves this prefix gap", as a :class:`proposed.policy.KeySelector`. It is
+  "which peer serves this prefix gap", as a :class:`proposed.selector.KeySelector`. It is
   used twice: the scheduler calls it to *price* a pull against recomputing, and
   the run installs it in the directory so the fetch is *served* by the peer that
   was priced;

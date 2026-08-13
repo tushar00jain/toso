@@ -436,7 +436,7 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     """Surfaces ``proposed`` declares that a ``data/`` module reaches over a wire.
 
     A port that outlives the simulator lives in ``proposed`` rather than in a
-    capability's ``control/`` -- :class:`proposed.policy.AnySelector` is one. Those
+    capability's ``control/`` -- :class:`proposed.selector.AnySelector` is one. Those
     are found structurally, not by name, on either of two marks:
 
     * it derives :class:`proposed.plane.ControlPlane` -- the deciding half of a

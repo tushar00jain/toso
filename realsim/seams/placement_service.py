@@ -7,7 +7,7 @@ receiving messages, and answering them. Here it is a plain object holding that s
 deciding object in this process, with the same method, receiving ordinary calls
 instead of messages.
 
-It implements :class:`proposed.policy.AnySelector`'s one member by storing the
+It implements :class:`proposed.selector.AnySelector`'s one member by storing the
 capability's control plane and calling it. Which is all a service is: the surface
 is generic (it is in ``proposed``), the decisions are the capability's, and neither
 has to know about the other's process.
@@ -34,13 +34,13 @@ class PlacementService:
 
     Args:
         control: the capability's control plane -- a
-            :class:`proposed.policy.AnySelector`. This service holds it and forwards;
+            :class:`proposed.selector.AnySelector`. This service holds it and forwards;
             it decides nothing.
     """
 
     def __init__(self, control: Any) -> None:
         self.control = control
 
-    # -- proposed.policy.AnySelector ------------------------------------------ #
+    # -- proposed.selector.AnySelector ------------------------------------------ #
     async def select(self, subject: Any, requester: str) -> Any:
         return await self.control.select(subject, requester)

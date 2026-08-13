@@ -5,7 +5,7 @@
 real ``client.put`` into that reader's co-located volume: a zero-fabric local
 write plus the real ``notify_put_batch``. The reader is now a genuine source in
 the real directory, which is what
-:class:`~dedup_sim.control.routing.DedupPolicy` was waiting on.
+:class:`~dedup_sim.control.routing.DedupKeySelector` was waiting on.
 
 Nothing here decides anything -- the source assignment already happened in
 ``control/``; this is the actuation, and it is one ordinary store call.

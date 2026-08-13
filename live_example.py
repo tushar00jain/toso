@@ -5,7 +5,7 @@ each to its own ``torchrun`` rank so the topology looks like it would in practic
 — separate processes, each hosting its own storage volume (``LocalRankStrategy``
 places one volume per rank), talking only through the shared store:
 
-  * ``Trainer`` — each step overwrites its policy tensors under ``trainer.<i>.*``,
+  * ``Trainer`` — each step overwrites its selector tensors under ``trainer.<i>.*``,
     bumps step/metadata, and periodically rotates an optimizer key in/out. A pure
     producer: it only ``ts.put``/``ts.delete`` and never knows the aggregator or
     TUI exists. Its writes land on its own rank's volume.
@@ -118,7 +118,7 @@ class Store:
 
 
 class Trainer:
-    """One trainer: every step overwrites its policy tensors, bumps metadata, and
+    """One trainer: every step overwrites its selector tensors, bumps metadata, and
     periodically rotates an optimizer key in/out so the keyspace grows/shrinks.
 
     A pure producer — it only ``ts.put``/``ts.delete`` and never knows the
@@ -138,8 +138,8 @@ class Trainer:
     async def seed(self) -> None:
         """Write the step-0 baseline so the aggregator sees data before step 1."""
         await ts.put(f"{self.prefix}.step", torch.tensor([0], dtype=torch.int64))
-        await ts.put(f"{self.prefix}.policy.layer0.weight", torch.randn(64, 64))
-        await ts.put(f"{self.prefix}.policy.layer1.weight", torch.randn(32, 32))
+        await ts.put(f"{self.prefix}.selector.layer0.weight", torch.randn(64, 64))
+        await ts.put(f"{self.prefix}.selector.layer1.weight", torch.randn(32, 32))
         await ts.put(f"{self.prefix}.metadata", {"step": 0, "lr": 0.01})
 
     async def _rotate_key(self, key: str, present: bool) -> bool:
@@ -156,8 +156,8 @@ class Trainer:
         while True:
             step += 1
             await ts.put(f"{self.prefix}.step", torch.tensor([step], dtype=torch.int64))
-            await ts.put(f"{self.prefix}.policy.layer0.weight", torch.randn(64, 64))
-            await ts.put(f"{self.prefix}.policy.layer1.weight", torch.randn(32, 32))
+            await ts.put(f"{self.prefix}.selector.layer0.weight", torch.randn(64, 64))
+            await ts.put(f"{self.prefix}.selector.layer1.weight", torch.randn(32, 32))
             await ts.put(
                 f"{self.prefix}.metadata", {"step": step, "lr": 0.01, "loss": 1.0 / step}
             )
@@ -229,7 +229,7 @@ class Generator:
             )
 
             logger.info(
-                "generator %d step %d (policy v%d from trainer %d)",
+                "generator %d step %d (selector v%d from trainer %d)",
                 self.gid,
                 step,
                 policy_version,

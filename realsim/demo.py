@@ -107,7 +107,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--controller-rtt", type=float, default=None, metavar="SECONDS",
         help="one-way latency of the hop to the directory service (default: 0 -- "
         "the in-process call). Every capability pays it on every directory read, "
-        "and so does every consultation of a policy installed there; it is a "
+        "and so does every consultation of a selector installed there; it is a "
         "fidelity model, not byte-identical to 0.",
     )
     parser.add_argument(

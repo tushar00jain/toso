@@ -64,7 +64,7 @@ class KVCacheDemo(Demo):
     def flags(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--spread-reads", action="store_true",
-            help="give the hotspot scenario's cache-aware runs SpreadReadsPolicy "
+            help="give the hotspot scenario's cache-aware runs SpreadReadsKeySelector "
             "as their source ranking instead of longest-prefix-then-id, so one "
             "replica of a hot prefix does not serve every read of it. Off by "
             "default: it changes which replica answers, so it is not "
@@ -83,7 +83,7 @@ class KVCacheDemo(Demo):
         console.info("GENERATES is looked up and hit by the next turn rather than written and")
         console.info("forgotten. LRU eviction bounds the cache (hit rate vs capacity is the")
         console.info("sizing knob); hot-block replication trades recompute for KV transfer;")
-        console.info("SLO admission sheds overload. All of it is control-plane policy over the")
+        console.info("SLO admission sheds overload. All of it is control-plane selector over the")
         console.info("same data plane.")
         console.info("On the decode side the same coordinator bounds time-between-tokens:")
         console.info("disaggregating decode onto its own pool keeps a prefill from colliding")

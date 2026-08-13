@@ -19,7 +19,7 @@ reference to that service rather than the service itself -- a different shape,
 declared by Monarch, and left untyped here for the reason given on
 :attr:`Deployment.controller_handle`. Leaving that as ``Any``
 made the directory look like it had no interface at all, which in turn made
-:class:`~proposed.policy.KeySelector` look like the primary one instead of a hook
+:class:`~proposed.selector.KeySelector` look like the primary one instead of a hook
 consulted inside this surface.
 
 The endpoint indirection a caller goes through (``locate_volumes.call_one(...)``
@@ -38,11 +38,11 @@ __all__ = [
 ]
 
 #: What the store is asked *for*: the directory's own noun, and the subject a
-#: :class:`~proposed.policy.KeySelector` declares (``subject_type``).
+#: :class:`~proposed.selector.KeySelector` declares (``subject_type``).
 Key = str
 
 #: What the store answers *with*: a storage volume's directory identity, and what
-#: every :class:`~proposed.policy.Selection` ranks, whatever its subject.
+#: every :class:`~proposed.selector.Selection` ranks, whatever its subject.
 VolumeId = str
 
 #: A directory subscriber: ``(volume_id, keys)``, called once per registration.
@@ -86,7 +86,7 @@ class Controller(Protocol):
 
     The difference between this protocol and torchstore's class *is* the ask, and
     it is three things. One cannot be declared: ``locate_volumes`` gains a hook that
-    consults a :class:`~proposed.policy.KeySelector`, which changes no signature, so it
+    consults a :class:`~proposed.selector.KeySelector`, which changes no signature, so it
     is stated here instead. The others are :meth:`locate_raw`, the same directory
     read with that hook skipped, and :meth:`subscribe`, which is how anything hears
     that the directory changed. Every other member already exists upstream, spelled
@@ -104,12 +104,12 @@ class Controller(Protocol):
         missing_ok: bool = False,
         require_fully_committed: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
-        """``{key -> {volume_id -> StorageInfo}}``, *unrouted*: no policy consulted.
+        """``{key -> {volume_id -> StorageInfo}}``, *unrouted*: no selector consulted.
 
         A controller implementing this proposal needs both reads. This is the one it
-        hands its own policy, through a :class:`~proposed.view.View`: a policy
+        hands its own selector, through a :class:`~proposed.view.View`: a selector
         sensing the directory must see it as it *is*, and reading it back through
-        ``locate_volumes`` would re-enter the hook the policy is being called from.
+        ``locate_volumes`` would re-enter the hook the selector is being called from.
 
         **Not a coroutine, and that is load-bearing.** A directory read cannot
         suspend, so everything a control plane does between reading the directory
@@ -118,7 +118,7 @@ class Controller(Protocol):
         read-modify-write with no lock (``dedup_sim.control.routing``) and lets a
         set of priced candidates be comparable
         (``kvcache_sim.control.scheduler``). It is a plain local method for the same
-        reason it can be one: the only caller is the controller's own policy,
+        reason it can be one: the only caller is the controller's own selector,
         sensing through a view built over the directory in this process, so nothing
         crosses a boundary and there is nothing to wait for.
         """
@@ -137,7 +137,7 @@ class Controller(Protocol):
         How anything hears that the directory changed, and the whole of it: the
         subscriber is a plain callable, so a directory carries no notion of what a
         control plane is. A capability that needs one registers in its own
-        :meth:`~proposed.policy.Selector.attach`, through the
+        :meth:`~proposed.selector.Selector.attach`, through the
         :class:`~proposed.view.View` it is already handed.
 
         **Not a coroutine, for :meth:`locate_raw`'s reason.** A subscriber runs
@@ -180,7 +180,7 @@ class ClusterModel(Protocol):
     done. It is written as the hosts report what they did.
 
     One member, because being told is the only thing a *caller* does to a model.
-    What decides against it is a :class:`~proposed.policy.AnySelector`, and what it
+    What decides against it is a :class:`~proposed.selector.AnySelector`, and what it
     may show is read off the model itself: the reads are the application's, since a
     queue tail and a decode occupancy are one application's vocabulary, and
     :class:`~proposed.view.View` is the *store's* sensor, which cannot see load at
@@ -205,7 +205,7 @@ class StorageVolume(Protocol):
     """The store's *storage* service, as a caller reaches it.
 
     The third service in a deployment, beside :class:`Controller` (which knows who
-    holds what) and the application's own :class:`~proposed.policy.AnySelector`
+    holds what) and the application's own :class:`~proposed.selector.AnySelector`
     (which decides): the one that actually holds
     bytes. torchstore has this class -- ``torchstore.storage_volume.StorageVolume``,
     an actor whose endpoints each delegate to an ``InMemoryStore`` -- and, as with

@@ -100,7 +100,7 @@ def test_invariants_hold_across_seeds(mode):
         # All readers completed.
         assert res.ledger.items_done == res.ledger.items_total == 4
 
-        # Naive policy: each of m readers pulls the full payload from the origin,
+        # Naive selector: each of m readers pulls the full payload from the origin,
         # so fabric == total delivered == m * payload (the m x baseline).
         assert res.ledger.transfer_bytes == 4 * payload_nbytes
         assert res.ledger.origin_bytes == 4 * payload_nbytes

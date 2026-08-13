@@ -30,8 +30,8 @@ from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data.store import KVStore
 from kvcache_sim.control.request import Request
 from proposed import AnySelector, KeySelector
-from proposed.policy import KeySelectorChain
-from kvcache_sim.control._source import LongestPrefixPolicy, SpreadReadsPolicy
+from proposed.selector import KeySelectorChain
+from kvcache_sim.control._source import LongestPrefixKeySelector, SpreadReadsKeySelector
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished, _LocalOnly,
 )
@@ -500,10 +500,10 @@ def test_hotspot_replication_trades_recompute_for_transfer():
     peers -- is gone, and the assertion for it is not weakened here but replaced,
     because the phenomenon it measured is gone rather than smaller. The old
     workload's "one dominant conversation" was one fixed prefix that every one of
-    that conversation's requests shared, so the cache-aware policy really did pile
+    that conversation's requests shared, so the cache-aware selector really did pile
     all of them on the single instance holding it and replication really did spread
     them. A multi-turn dominant *tenant* is many dialogues, each with its own
-    growing history, and the cache-aware policy already scatters them across
+    growing history, and the cache-aware selector already scatters them across
     instances by following those histories -- there is no pile left to spread. What
     is shared between them is only the opening, which is a shrinking fraction of a
     conversation that grows, and pulling it now means pulling a long chain rather
@@ -1449,7 +1449,7 @@ def test_a_distant_client_delays_the_request_and_costs_reuse():
 #     that: `locate_volumes` returns every holder and the client takes the first,
 #     so for a block several instances hold -- a shared system prompt, or
 #     anything replicated -- the bytes could come from a different tier than the
-#     one predicted. The run installs LongestPrefixPolicy in the directory and
+#     one predicted. The run installs LongestPrefixKeySelector in the directory and
 #     the fetch names its source, so the answer is narrowed to the priced peer.
 def _unplanned_edges(result) -> int:
     """Transfer edges whose (source, destination) no accepted plan asked for."""
@@ -1474,29 +1474,29 @@ def test_a_pull_is_served_by_the_peer_that_was_priced():
     assert _unplanned_edges(replicated) == 0
 
 
-# 18. The source policy serves either view it can be attached to.
+# 18. The source selector serves either view it can be attached to.
 #     The scheduler attaches a KVView, whose snapshot one routing decision pins; a
-#     run installing this policy on its own can only attach the plain View the mesh
+#     run installing this selector on its own can only attach the plain View the mesh
 #     built, because a prefix run is a KV-cache notion the store has no reason to
 #     know. The ranking branch is the only place the two differ, and a
 #     controller-side call carries an already-chosen source and short-circuits
 #     before reaching it -- so nothing but this test holds the plain view up.
-def test_the_source_policy_accepts_a_plain_view():
-    from kvcache_sim.control._source import LongestPrefixPolicy
+def test_the_source_selector_accepts_a_plain_view():
+    from kvcache_sim.control._source import LongestPrefixKeySelector
     from realsim.simulation import Simulation
 
     topo = _make_topology(2)
     sim = Simulation(topo)
     keys = _block_keys_for("m0", [0, 1])
-    policy = LongestPrefixPolicy()
-    policy.attach(sim.view, sim.transfer_cost)
+    selector = LongestPrefixKeySelector()
+    selector.attach(sim.view, sim.transfer_cost)
 
     async def scenario():
         with sim.mesh.installed():
-            empty = await policy.select(keys, "s0")
+            empty = await selector.select(keys, "s0")
             store = KVStore(sim.mesh)
             await store.publish("s1", list(keys), _kv(len(keys)))
-            ranked = await policy.select(keys, "s0")
+            ranked = await selector.select(keys, "s0")
         return empty, ranked
 
     try:
@@ -1507,10 +1507,10 @@ def test_the_source_policy_accepts_a_plain_view():
     assert ranked.sources == ("s1",)            # ...and now the holder is ranked
 
 
-# 19. Spreading reads: the opt-in source policy breaks the prefix tie on load.
+# 19. Spreading reads: the opt-in source selector breaks the prefix tie on load.
 #     Reuse value is a property of the prefix, so replicas of a hot prefix rank
 #     identically and the id tie-break sends every read to the same host.
-#     SpreadReadsPolicy counts the grants it issued -- its own bookkeeping, since
+#     SpreadReadsKeySelector counts the grants it issued -- its own bookkeeping, since
 #     nothing in the repo observes per-volume load -- and lets that settle the tie,
 #     under a bound that keeps a genuinely longer prefix winning.
 def _replicated(holders, blocks, *, num=4):
@@ -1518,7 +1518,7 @@ def _replicated(holders, blocks, *, num=4):
 
     Returns ``(sim, keys)``; the caller drives its own scenario on ``sim.loop`` and
     closes it. Publishing is the same real ``put_batch`` every other test here
-    uses, so the prefix runs the policy reads come out of the real directory.
+    uses, so the prefix runs the selector reads come out of the real directory.
     """
     sim = Simulation(_make_topology(num))
     keys = _block_keys_for("m0", list(range(max(blocks.values()))))
@@ -1534,15 +1534,15 @@ def _replicated(holders, blocks, *, num=4):
     return sim, keys
 
 
-def _select_heads(sim, policy, keys, *, count, gap=0.0):
+def _select_heads(sim, selector, keys, *, count, gap=0.0):
     """The head of ``count`` successive rankings, ``gap`` virtual seconds apart."""
-    policy.attach(sim.view, sim.transfer_cost)
+    selector.attach(sim.view, sim.transfer_cost)
 
     async def scenario():
         heads = []
         with sim.mesh.installed():
             for _ in range(count):
-                heads.append((await policy.select(keys, "s0")).sources[0])
+                heads.append((await selector.select(keys, "s0")).sources[0])
                 if gap:
                     await asyncio.sleep(gap)
         return heads
@@ -1554,9 +1554,9 @@ def test_spread_reads_rotates_between_equal_prefix_replicas():
     """Three replicas of one prefix, so the ranking has nothing else to go on."""
     sim, keys = _replicated(["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 4})
     try:
-        heads = _select_heads(sim, SpreadReadsPolicy(), keys, count=6)
-        # ...and the same replicas under the default policy, which cannot spread.
-        stuck = _select_heads(sim, LongestPrefixPolicy(), keys, count=6)
+        heads = _select_heads(sim, SpreadReadsKeySelector(), keys, count=6)
+        # ...and the same replicas under the default selector, which cannot spread.
+        stuck = _select_heads(sim, LongestPrefixKeySelector(), keys, count=6)
     finally:
         sim.loop.close()
     assert heads == ["s1", "s2", "s3", "s1", "s2", "s3"]   # id order, then rotate
@@ -1571,11 +1571,11 @@ def test_spread_reads_still_prefers_a_materially_longer_prefix():
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 2, "s2": 4})
     try:
-        heads = _select_heads(sim, SpreadReadsPolicy(max_discount=1), keys, count=5)
+        heads = _select_heads(sim, SpreadReadsKeySelector(max_discount=1), keys, count=5)
         # A discount wide enough to cover the gap does trade reuse away, and only
         # once it has been fully spent -- stated here because it is the knob's
         # meaning, not a defect.
-        wide = _select_heads(sim, SpreadReadsPolicy(max_discount=4), keys, count=3)
+        wide = _select_heads(sim, SpreadReadsKeySelector(max_discount=4), keys, count=3)
     finally:
         sim.loop.close()
     assert heads == ["s2"] * 5
@@ -1585,18 +1585,18 @@ def test_spread_reads_still_prefers_a_materially_longer_prefix():
 def test_spread_reads_forgets_a_grant_once_its_window_passes():
     """A grant is a window, not a running total, so load cannot accumulate.
 
-    Back-to-back the policy rotates; spaced further apart than the window, every
+    Back-to-back the selector rotates; spaced further apart than the window, every
     read finds an empty tally and the id tie-break answers again -- which is the
     difference between "recently routed there" and "has ever been routed there".
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 4, "s2": 4})
     try:
-        prompt = _select_heads(sim, SpreadReadsPolicy(window=1.0), keys, count=4)
+        prompt = _select_heads(sim, SpreadReadsKeySelector(window=1.0), keys, count=4)
         aged = _select_heads(
-            sim, SpreadReadsPolicy(window=1.0), keys, count=4, gap=2.0
+            sim, SpreadReadsKeySelector(window=1.0), keys, count=4, gap=2.0
         )
-        # window <= 0 is no memory at all: the default policy's ranking, exactly.
-        forgetful = _select_heads(sim, SpreadReadsPolicy(window=0.0), keys, count=4)
+        # window <= 0 is no memory at all: the default selector's ranking, exactly.
+        forgetful = _select_heads(sim, SpreadReadsKeySelector(window=0.0), keys, count=4)
     finally:
         sim.loop.close()
     assert prompt == ["s1", "s2", "s1", "s2"]
@@ -1613,12 +1613,12 @@ def test_spread_reads_ranks_deterministically():
     reads the rest of it.
     """
     async def rankings(sim, keys):
-        policy = SpreadReadsPolicy()
-        policy.attach(sim.view, sim.transfer_cost)
+        selector = SpreadReadsKeySelector()
+        selector.attach(sim.view, sim.transfer_cost)
         out = []
         with sim.mesh.installed():
             for _ in range(5):
-                out.append((await policy.select(keys, "s0")).sources)
+                out.append((await selector.select(keys, "s0")).sources)
         return out
 
     holders, blocks = ["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 3}
@@ -1642,7 +1642,7 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
 
     ``python -m kvcache_sim hotspot --spread-reads``: the demo declares the flag,
     the scenario reads it off the parsed command line and gives each cache-aware
-    run its *own* policy, and which peer serves a pull changes. What does not
+    run its *own* selector, and which peer serves a pull changes. What does not
     change is that a *planned* pull is fetched from the peer it was priced against
     -- the ranking sits behind the routed-pull memo in the store-side chain, so a
     different ranking cannot redirect a pull already decided.
@@ -1654,12 +1654,12 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     aware = scenarios.Hotspot(0).runs(args)[1:]
     # The ranking is the last link of the store-side plane, which is where it is
     # reachable: the scheduler only sees it through the reuse placement that pulls.
-    policies = [
+    selectors = [
         next(p for p in run.control if isinstance(p, KeySelector)).selectors[-1]
         for run in aware
     ]
-    assert all(isinstance(p, SpreadReadsPolicy) for p in policies)
-    assert policies[0] is not policies[1], "a shared tally would count both runs"
+    assert all(isinstance(p, SpreadReadsKeySelector) for p in selectors)
+    assert selectors[0] is not selectors[1], "a shared tally would count both runs"
 
     def pull_sources(result):
         return sorted(
@@ -1779,7 +1779,7 @@ def test_an_unknown_fact_is_refused_not_guessed():
         sim.loop.close()
 
 
-def test_the_store_side_chain_is_a_policy_and_refuses_anything_else():
+def test_the_store_side_chain_is_a_key_selector_and_refuses_anything_else():
     """What the run installs in the directory selects over keys, and says so.
 
     A run declares two control planes and each is reached by its type, so being a
@@ -1790,7 +1790,7 @@ def test_the_store_side_chain_is_a_policy_and_refuses_anything_else():
     assert [isinstance(p, KeySelector) for p in planes] == [True, False]
     assert [isinstance(p, AnySelector) for p in planes] == [False, True]
     with pytest.raises(TypeError, match="every link must be a KeySelector"):
-        KeySelectorChain([LongestPrefixPolicy(), _LocalOnly()])
+        KeySelectorChain([LongestPrefixKeySelector(), _LocalOnly()])
 
 
 def test_a_scheduler_does_not_hold_what_the_directory_is_told():

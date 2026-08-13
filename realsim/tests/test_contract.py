@@ -42,7 +42,7 @@ def _parse(source: str):
 
 CONTROL = "kvcache_sim/control/scheduler.py"
 DATA = "kvcache_sim/data/serving.py"
-PROPOSED = "proposed/policy.py"
+PROPOSED = "proposed/selector.py"
 
 
 def test_sim_paths_obey_the_concurrency_contract():
@@ -369,7 +369,7 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
         dotted: ast.parse((root / mods[dotted]).read_text())
         for dotted in (
             "kvcache_sim.control.scheduler",
-            "proposed.policy",
+            "proposed.selector",
             "proposed.deployment",
         )
     }
@@ -536,7 +536,7 @@ def test_lint_flags_the_proposal_leaning_on_the_simulator():
         "from realsim.mesh import Mesh\n",
         "from realsim.seams.controller_handle import LocalControllerHandle\n",
         "import torchstore\n",
-        "from kvcache_sim.control._source import LongestPrefixPolicy\n",
+        "from kvcache_sim.control._source import LongestPrefixKeySelector\n",
     ):
         assert "proposed-imports-simulator" in _codes(line, path=PROPOSED), line
 

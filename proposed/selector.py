@@ -79,7 +79,7 @@ class Selection:
             holder, in directory order*, which is what the real directory returns
             on its own, so a ``None`` selection leaves the controller's answer
             untouched.
-        ready: optional gate awaited before the answer is released, for a policy
+        ready: optional gate awaited before the answer is released, for a selector
             that routes a requester to a peer which has not registered yet.
         payload: ``source id -> what this selector holds about that source``,
             application-defined because this package cannot read an application's
@@ -159,10 +159,10 @@ class Selection:
 
 
 class DecisionLog(Protocol):
-    """Somewhere a policy can explain itself.
+    """Somewhere a selector can explain itself.
 
-    Optional and never load-bearing: a policy must behave identically with none
-    attached. Declared here so a policy need not name the simulator's trace.
+    Optional and never load-bearing: a selector must behave identically with none
+    attached. Declared here so a selector need not name the simulator's trace.
     """
 
     def record(self, at: float, kind: str, message: str) -> None:
@@ -253,7 +253,7 @@ class NaiveKeySelector(KeySelector):
 
     Precisely the real directory's own answer, so this returns the empty
     :class:`Selection` rather than re-deriving it: installing it is byte-identical
-    to installing no policy at all.
+    to installing no selector at all.
     """
 
     name = "naive"
@@ -320,7 +320,7 @@ class KeySelectorChain(FirstMatch, KeySelector):
         selectors: consulted left to right; each must be a :class:`KeySelector`.
     """
 
-    name = "policy-chain"
+    name = "selector-chain"
 
     def __init__(self, selectors: Sequence[Selector]) -> None:
         super().__init__(selectors)
@@ -365,7 +365,7 @@ class Refine(Selector):
     """One selector's ranking, put through each :class:`Refinement` in turn.
 
     A plain :class:`Selector` whatever it wraps, for :class:`FirstMatch`'s reason:
-    narrowing a policy's ranking with an application's test asks something the
+    narrowing a selector's ranking with an application's test asks something the
     store cannot read, and being neither subtype is what bars the result from the
     controller.
 

@@ -8,7 +8,7 @@ rather than a field on the base view.
 
 :meth:`KVView.pinned` is the second half of the same idea. A routing decision reads
 the prefix runs several times -- once for the candidate loop's local matches, once
-per candidate when it asks the source :class:`~proposed.policy.KeySelector` which peer
+per candidate when it asks the source :class:`~proposed.selector.KeySelector` which peer
 would serve the gap -- and all of them must see the *same* directory state or the
 decision is incoherent. Pinning also means the directory is walked once per
 request, not once per read.
@@ -48,7 +48,7 @@ def prefix_lengths_of(
 
     Split from the read that feeds it: :meth:`KVView.prefix_lengths` reads the
     directory (or serves a pinned snapshot), while
-    :class:`~kvcache_sim.control._source.LongestPrefixPolicy` may be attached to a
+    :class:`~kvcache_sim.control._source.LongestPrefixKeySelector` may be attached to a
     plain :class:`~proposed.view.View` and reads it itself. One definition either
     way.
     """
@@ -93,7 +93,7 @@ class KVView(View):
 
         Scoped state on the view rather than a snapshot object passed around,
         because every selector a decision consults senses through this same view
-        (:meth:`~proposed.policy.Selector.attach`) and would otherwise read past the
+        (:meth:`~proposed.selector.Selector.attach`) and would otherwise read past the
         snapshot into the live directory.
 
         Sound because one decision cannot be interleaved with another: the directory

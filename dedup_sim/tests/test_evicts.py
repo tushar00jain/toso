@@ -4,7 +4,7 @@ The burst in ``test_dedup.py`` reads one key once, on volumes with room for
 everything, so every registration it makes is still true at the end of the run.
 That is the easy half. A store whose volumes are bounded *unregisters* too -- a
 new model version lands in a reader's cache and displaces the old one -- and a
-routing policy that remembers "volume V holds key K" from the moment V registered
+routing selector that remembers "volume V holds key K" from the moment V registered
 it will keep routing readers to V long after V dropped it.
 
 So this run reads the same key twice with an eviction in between:
@@ -16,7 +16,7 @@ So this run reads the same key twice with an eviction in between:
    (:meth:`realsim.seams.volume_service.VolumeService._ask_for_room`);
 3. every reader gets ``W`` again.
 
-Round 3 is the whole test. The policy's routes are unchanged from round 1 -- each
+Round 3 is the whole test. The selector's routes are unchanged from round 1 -- each
 reader is still pointed at the peer ahead of it -- but none of those peers holds
 ``W`` any more, so each answer has to be withheld again until the peer's
 read-through brings it back. Reading the directory is what makes that happen; a
@@ -45,7 +45,7 @@ from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
 
-from dedup_sim.control.routing import DedupPolicy
+from dedup_sim.control.routing import DedupKeySelector
 from dedup_sim.data.read_through import ReadThroughPlane
 
 #: The version that displaces ``W`` in a one-deep reader volume.
@@ -115,24 +115,24 @@ class PerItemReadThrough(ReadThroughPlane):
         return result
 
 
-def _run(num_readers: int = 3, *, fanout_cap: int = 1) -> tuple[Result, DedupPolicy]:
+def _run(num_readers: int = 3, *, fanout_cap: int = 1) -> tuple[Result, DedupKeySelector]:
     """One three-round run on volumes with room for exactly one payload."""
     # One payload per volume: the origin holds W and nothing else, and a reader
     # can cache exactly one version at a time -- which is what makes round 2 an
     # eviction rather than an accumulation.
     profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES)
     workload = VersionedRounds(num_readers, profile=profile)
-    policy = DedupPolicy(fanout_cap=fanout_cap)
+    selector = DedupKeySelector(fanout_cap=fanout_cap)
     result = Run(
         f"cap={fanout_cap}",
         workload,
-        control=policy,
+        control=selector,
         data=lambda sim: ItemDispatch(
             PerItemReadThrough(sim.mesh, KEY, workload.put_value).run_then_publish
         ),
         profile=profile,
     ).execute()
-    return result, policy
+    return result, selector
 
 
 def _directory(result: Result) -> dict:
@@ -147,7 +147,7 @@ def _directory(result: Result) -> dict:
 
 def test_the_rounds_do_not_overlap():
     """Each round finishes inside its own window, so round 3 sees round 2 whole."""
-    result, _policy = _run()
+    result, _selector = _run()
     assert result.ledger.items_done == result.ledger.items_total == 9
     for row in result.ledger.rows:
         assert row.done < row.released + ROUND, row.id
@@ -155,7 +155,7 @@ def test_the_rounds_do_not_overlap():
 
 def test_the_next_version_evicts_the_one_the_reader_cached():
     """A one-deep volume that takes on a new version drops the old one."""
-    result, _policy = _run()
+    result, _selector = _run()
     for reader in result.workload.reader_ids:
         volume = result.sim.mesh.volumes[reader].service
         # Round 3 re-read W, which evicted the version round 2 put there: a
@@ -176,11 +176,11 @@ def test_the_chain_re_forms_after_the_peers_evict():
     """Two reads of W, two crossings of the fabric -- not one per reader.
 
     Round 3's peers have all dropped W, so every answer but the first has to be
-    withheld until the peer's read-through re-registers it. A policy answering
+    withheld until the peer's read-through re-registers it. A selector answering
     from a remembered registration would release them at once and send them all
     to the origin (or to a volume holding nothing at all).
     """
-    result, _policy = _run()
+    result, _selector = _run()
     origin = result.workload.origin_id
 
     assert result.ledger.origin_bytes == 2 * PAYLOAD_BYTES  # 1x per read of W
@@ -192,7 +192,7 @@ def test_the_chain_re_forms_after_the_peers_evict():
 
 def test_every_reader_still_receives_the_payload_in_both_rounds():
     """Routing to a peer that has to re-fetch first is still a correct answer."""
-    result, _policy = _run()
+    result, _selector = _run()
     expected = result.workload.expected
     for item_id, payload in result.results.items():
         if item_id.endswith("-read"):
@@ -203,23 +203,23 @@ def test_every_reader_still_receives_the_payload_in_both_rounds():
 def test_the_fabric_is_1x_per_read_for_any_fanout_cap():
     """The cap trades depth against wallclock; it does not spend fabric."""
     for cap in (1, 2, 3):
-        result, _policy = _run(4, fanout_cap=cap)
+        result, _selector = _run(4, fanout_cap=cap)
         assert result.ledger.origin_bytes == 2 * PAYLOAD_BYTES, cap
 
 
 # --------------------------------------------------------------------------
-# And the policy is no bigger at the end of the run than at the start.
+# And the selector is no bigger at the end of the run than at the start.
 # --------------------------------------------------------------------------
 
 
 class Directory:
-    """The reads a policy makes, over a ``key -> volumes`` map a test controls.
+    """The reads a selector makes, over a ``key -> volumes`` map a test controls.
 
     Waiting is the part of routing that fails by *not* happening, and the two
     ways it can go wrong -- one registration owed to several requesters, and a
     source with no registration owed at all -- both need the directory to change
     between two ``select`` calls at an exact moment. Staging that state directly
-    says what the policy is being asked; arranging for a burst to produce it says
+    says what the selector is being asked; arranging for a burst to produce it says
     considerably less.
     """
 
@@ -227,7 +227,7 @@ class Directory:
         self.by_key = {key: set(vols.split()) for key, vols in holders.items()}
         self._subscribers = []
 
-    # -- the View surface DedupPolicy uses ---------------------------------- #
+    # -- the View surface DedupKeySelector uses ---------------------------------- #
     @property
     def directory(self):
         """A view exposes the directory it reads; here they are one object."""
@@ -265,14 +265,14 @@ class Directory:
         self.by_key[key].discard(volume)
 
 
-def _sensing(directory: Directory, *, fanout_cap: int) -> DedupPolicy:
-    """A policy sensing through ``directory``, as a run's ``attach`` leaves it.
+def _sensing(directory: Directory, *, fanout_cap: int) -> DedupKeySelector:
+    """A selector sensing through ``directory``, as a run's ``attach`` leaves it.
 
     Nothing here is priced, so the transfer-cost half of the port is ``None``.
     """
-    policy = DedupPolicy(fanout_cap=fanout_cap)
-    policy.attach(directory, None)
-    return policy
+    selector = DedupKeySelector(fanout_cap=fanout_cap)
+    selector.attach(directory, None)
+    return selector
 
 
 def test_one_registration_releases_every_requester_waiting_on_it():
@@ -286,9 +286,9 @@ def test_one_registration_releases_every_requester_waiting_on_it():
 
     async def _burst():
         directory = Directory(W="p")
-        policy = _sensing(directory, fanout_cap=2)
-        await policy.select([KEY], "r0")  # r0 <- p, the origin
-        waiters = [await policy.select([KEY], r) for r in ("r1", "r2")]
+        selector = _sensing(directory, fanout_cap=2)
+        await selector.select([KEY], "r0")  # r0 <- p, the origin
+        waiters = [await selector.select([KEY], r) for r in ("r1", "r2")]
         assert all(w.sources == ("r0",) for w in waiters)
         assert all(w.ready is not None for w in waiters), "neither is waiting"
 
@@ -323,12 +323,12 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
 
     async def _after_the_eviction():
         directory = Directory(W="p")
-        policy = _sensing(directory, fanout_cap=3)
-        await policy.select([KEY], "r0")  # r0 <- p
+        selector = _sensing(directory, fanout_cap=3)
+        await selector.select([KEY], "r0")  # r0 <- p
         directory.publish("r0", KEY)  # r0's read-through lands
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
-        stale = await policy.select([KEY], "r1")
+        stale = await selector.select([KEY], "r1")
         # Nothing to wait for, and nobody to be sent to: the naive answer.
         assert stale.ready is None, "parked on a registration nobody owes"
         assert stale.sources is None
@@ -336,7 +336,7 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
 
         # r1 is a live source though -- it is fetching now -- so r2 attaches to it
         # rather than to the peer that was retired.
-        return await policy.select([KEY], "r2")
+        return await selector.select([KEY], "r2")
 
     selection, _trace = run_sim(_after_the_eviction())
     assert selection.sources == ("r1",)
@@ -359,21 +359,21 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
 
     async def _fanout_across_a_retire() -> int:
         directory = Directory(W="p")
-        policy = _sensing(directory, fanout_cap=cap)
+        selector = _sensing(directory, fanout_cap=cap)
         # r0 pulls from the origin and publishes: a source for cap peers now.
-        await policy.select([KEY], "r0")
+        await selector.select([KEY], "r0")
         directory.publish("r0", KEY)
         served = 0
         for i in range(cap):  # ...and every one of those slots is taken
-            if (await policy.select([KEY], f"r{i + 1}")).sources == ("r0",):
+            if (await selector.select([KEY], f"r{i + 1}")).sources == ("r0",):
                 served += 1
         # The origin drops the key, so r0's source holds nothing and owes nothing:
         # it is retired, and r0 is assigned afresh on the ask after that.
         directory.evict("p", KEY)
-        await policy.select([KEY], "r0")
-        await policy.select([KEY], "r0")
+        await selector.select([KEY], "r0")
+        await selector.select([KEY], "r0")
         for i in range(2 * cap):
-            if (await policy.select([KEY], f"x{i}")).sources == ("r0",):
+            if (await selector.select([KEY], f"x{i}")).sources == ("r0",):
                 served += 1
         return served
 
@@ -381,13 +381,13 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
     assert served == cap
 
 
-def test_the_policy_remembers_no_registrations():
+def test_the_selector_remembers_no_registrations():
     """What it keeps is per requester, not per (volume, key) ever registered.
 
     The readiness object is the one that would have grown with every version the
     run touched; it holds gates for facts still being waited on and nothing else,
     so a finished run leaves it empty.
     """
-    result, policy = _run()
-    assert policy._ready._gates == {}
-    assert set(policy._route) == set(result.workload.reader_ids)
+    result, selector = _run()
+    assert selector._ready._gates == {}
+    assert set(selector._route) == set(result.workload.reader_ids)

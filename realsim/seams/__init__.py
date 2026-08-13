@@ -7,7 +7,7 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
   ``MonarchRPCTransportBuffer``; the real put/get lifecycle runs, backed by a
   real ``InMemoryStore``, plus a virtual-clock transfer cost.
 - ``controller_service.ControllerService`` -- the directory server: the real
-  ``Controller``, the policy installed in it, and the endpoint bodies
+  ``Controller``, the selector installed in it, and the endpoint bodies
 - ``volume_service.VolumeService`` -- the storage server: a real ``InMemoryStore``
   behind the real ``StorageVolume`` endpoint bodies, plus this volume's residency
   and the capacity rule that asks control what to drop

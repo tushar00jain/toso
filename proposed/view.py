@@ -1,6 +1,6 @@
-"""The read-only observation a policy is handed: :class:`View`.
+"""The read-only observation a selector is handed: :class:`View`.
 
-A :class:`~proposed.policy.KeySelector` never touches a client, a volume or the
+A :class:`~proposed.selector.KeySelector` never touches a client, a volume or the
 mesh -- it is given a ``View`` and returns a decision. The ``View`` is the sensor
 half of that contract: *reads* of state that already exists, and no mutation of any
 kind.
@@ -9,8 +9,8 @@ What the base view offers, and why that is all it offers
 --------------------------------------------------------
 * :meth:`locate` -- the real directory answer for a set of keys, read straight
   from the real ``Controller`` body. It deliberately bypasses the controller's
-  routing hook (see :mod:`proposed.policy`): a sensor must report the directory
-  as it *is*, and a policy reading its own answer back would recurse.
+  routing hook (see :mod:`proposed.selector`): a sensor must report the directory
+  as it *is*, and a selector reading its own answer back would recurse.
 * :meth:`holders` / :meth:`topology` / :meth:`endpoint` / :meth:`locality` --
   who holds a key and how far away they are, the two inputs every source
   decision has needed so far.
@@ -22,11 +22,11 @@ What the base view offers, and why that is all it offers
 Anything more specific stays out. ``kvcache_sim`` wants leading-prefix-run
 lengths, which are a KV-cache notion (a block key chain), so that derived read is
 a subclass in ``kvcache_sim/control/``; ``dedup_sim`` wants a fan-out tally,
-which is the policy's own bookkeeping, not observed state. Folding either into
+which is the selector's own bookkeeping, not observed state. Folding either into
 the base type would make it a union serving neither caller -- and per-node
 *load* is the same trap twice over: the KV-cache scheduler's load signal is its
 own predicted prefill queue (a control-plane model, not an observation) and the
-dedup policy's is its planned tree, so a base ``load()`` would be a stub with two
+dedup selector's is its planned tree, so a base ``load()`` would be a stub with two
 incompatible meanings. It is left out until a caller can observe one: an
 application ranking by load reads that beside this view, off its own
 :class:`~proposed.deployment.ClusterModel`.
@@ -79,7 +79,7 @@ class View:
 
         Missing keys are simply absent (``missing_ok=True``): a sensor reports
         what is there, it does not raise at the observer. Reads the raw
-        controller body, so the routing hook a policy may be installed behind is
+        controller body, so the routing hook a selector may be installed behind is
         not re-entered -- and cannot suspend, which is what a decision formed
         against it relies on (:meth:`~proposed.deployment.Controller.locate_raw`).
         """

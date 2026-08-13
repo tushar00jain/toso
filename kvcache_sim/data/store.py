@@ -132,7 +132,7 @@ class KVStore:
         Drives the real client planning core + transport seam, so the storage / RAM
         / network cost is charged by the real cost model against the peer that
         actually serves the blocks. That peer is the one the control plane priced:
-        the installed policy *is* that control plane, so nothing has to be threaded
+        the installed selector *is* that control plane, so nothing has to be threaded
         through this call.
 
         Answers with the KV, one block per key in the order asked for

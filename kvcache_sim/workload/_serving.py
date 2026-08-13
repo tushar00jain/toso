@@ -75,7 +75,7 @@ from realsim.run import Workload
 from sim_common import config
 
 from ..control._cluster import KVClusterModel
-from ..control._source import LongestPrefixPolicy
+from ..control._source import LongestPrefixKeySelector
 from ..control.request import Request
 from ..control.scheduler import (
     CacheAwareScheduler, FetchRouting, LoadBalanceScheduler, predicts_decode,
@@ -156,7 +156,7 @@ def scheduler(
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
-    source_policy: Optional[KeySelector] = None,
+    source_selector: Optional[KeySelector] = None,
 ) -> List[object]:
     """This run's **two control planes**, as objects a scenario can just declare.
 
@@ -167,29 +167,29 @@ def scheduler(
 
     Two planes because kvcache decides in two places, and where a plane is reached
     from is its type. The :class:`~realsim.run.Run` fronts the
-    :class:`~proposed.policy.AnySelector` with a
+    :class:`~proposed.selector.AnySelector` with a
     :class:`~realsim.seams.placement_handle.LocalPlacementHandle` (it decides
-    compute placement) and installs the :class:`~proposed.policy.KeySelector` in the
+    compute placement) and installs the :class:`~proposed.selector.KeySelector` in the
     directory (it answers the store's routing question). They share the cluster
     model, which is why it is built here: the scheduler prices a pull and records
     it there, and the chain answers the fetch with it.
 
     **Ordered.** The scheduler is last because both planes bring up the one
-    ``source_policy``, and the scheduler's attach is the one that leaves it sensing
+    ``source_selector``, and the scheduler's attach is the one that leaves it sensing
     through the pinned :class:`~kvcache_sim.control._view.KVView` a routing decision
     reads (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`).
 
-    ``source_policy`` is the one knob that is an object rather than a value: which
-    peer serves a prefix gap is a :class:`~proposed.policy.KeySelector`, and it keeps
+    ``source_selector`` is the one knob that is an object rather than a value: which
+    peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and it keeps
     state across the decisions it makes
-    (:class:`~kvcache_sim.control._source.SpreadReadsPolicy`). ``None`` -- the
-    default -- is :class:`~kvcache_sim.control._source.LongestPrefixPolicy`. Give
+    (:class:`~kvcache_sim.control._source.SpreadReadsKeySelector`). ``None`` -- the
+    default -- is :class:`~kvcache_sim.control._source.LongestPrefixKeySelector`. Give
     each run its own: two runs sharing one would tally each other's grants and
     neither would reproduce alone.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
-    source = source_policy if source_policy is not None else LongestPrefixPolicy()
+    source = source_selector if source_selector is not None else LongestPrefixKeySelector()
     # Over ALL instances: the prefill and decode pools may each be a subset.
     cluster = KVClusterModel(
         sorted(topology), lookahead=predicts_decode(simulate_decode, early_rejection)
@@ -210,7 +210,7 @@ def scheduler(
         # what names a peer; the baseline never pulls and never asks one.
         placement = CacheAwareScheduler(
             balance_threshold=balance_threshold, replicate=replicate,
-            source_policy=source, **knobs
+            source_selector=source, **knobs
         )
     else:
         placement = LoadBalanceScheduler(**knobs)
@@ -247,7 +247,7 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
 
     The load balancer a deployment has and a simulation has to stand in for. Client
     affinity rather than round robin because it is what a real front end does with
-    a session id, and because it is the arrival policy redirected least: a
+    a session id, and because it is the arrival selector redirected least: a
     conversation's requests share a prefix, so the host that served the last one is
     usually the host that should serve the next.
 
@@ -259,7 +259,7 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
     every instance and buy nothing back.
 
     Note what it deliberately does *not* do: it never looks at the block keys. An
-    arrival policy that routed by cache contents would be doing control's job
+    arrival selector that routed by cache contents would be doing control's job
     with none of control's information, and the comparison this whole
     package exists to make would be measuring itself.
 
@@ -279,7 +279,7 @@ class _Client:
 
     Stands in for what a deployment already has in front of its hosts -- a client
     SDK doing client-side balancing, an ingress proxy, DNS -- and therefore for
-    something that is deleted rather than moved when this ships. It holds no policy
+    something that is deleted rather than moved when this ships. It holds no selector
     of its own beyond ``landed``, and it never asks where a request should *run*:
     it asks a host, and does what it is told.
 

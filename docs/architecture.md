@@ -56,7 +56,7 @@ The running example throughout is a single 1-D tensor **`W = [0 1 2 3 4 5 6 7]`*
 - **Store** — one named TorchStore instance, identified by `store_name` (default
   `"torchstore"`). You can run several independent stores in one job.
 
-- **Key** — the string you store a value under, e.g. `"policy/layer0.weight"`.
+- **Key** — the string you store a value under, e.g. `"selector/layer0.weight"`.
   Like a dictionary key. State-dicts expand into many keys of the form
   `"<key>/<param_name>"`.
 
@@ -99,7 +99,7 @@ The running example throughout is a single 1-D tensor **`W = [0 1 2 3 4 5 6 7]`*
   `key -> {volume_id -> StorageInfo}` and answers "which volumes hold this key?"
   (`locate_volumes`). Metadata only; no tensor bytes ever pass through it.
 
-- **Strategy** — the policy deciding *which volume a given client talks to*.
+- **Strategy** — the selector deciding *which volume a given client talks to*.
   `LocalRankStrategy` = one volume per rank; `HostStrategy` = one per host;
   `ControllerStorageVolumes` = a single shared volume (deprecated).
 
@@ -218,7 +218,7 @@ Its state is one structure:
 
 ```
 keys_to_storage_volumes : Trie
-    "policy/layer0.weight" -> {
+    "selector/layer0.weight" -> {
         "0": StorageInfo(object_type=TENSOR_SLICE, tensor_slices={TensorSlice(...)}),
         "1": StorageInfo(object_type=TENSOR_SLICE, tensor_slices={TensorSlice(...)}),
         ...
@@ -758,7 +758,7 @@ After this line, **`placements` are gone.** `Shard(0)` vs `Shard(1)` vs
 | `placements` (`Shard(dim)`, `Replicate`) | ❌ discarded after lowering | no |
 | Which mesh axis is TP vs DP vs PP | ❌ never conveyed | no |
 | Model architecture / layer types / FQNs | ❌ (keys are opaque strings) | no |
-| dtype / device of the shard | ✅ carried with the bytes | no policy attached |
+| dtype / device of the shard | ✅ carried with the bytes | no selector attached |
 
 ### The two places it *does* peek at mesh structure
 

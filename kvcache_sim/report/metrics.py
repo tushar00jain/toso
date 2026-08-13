@@ -477,15 +477,15 @@ def render_early_rejection(early: Metrics, predict: Metrics, slo: float) -> str:
 
     End-to-end is here as well as in the disaggregation table because this
     comparison is the one where the per-token metric and the wait can disagree:
-    an admission policy that spreads decode holds the inter-token gap by keeping
+    an admission selector that spreads decode holds the inter-token gap by keeping
     batches small, which is a longer queue somewhere for somebody. The row says
     whether that trade shows up in what a caller experienced. Note what it does
     *not* average over: a rejected request has no end-to-end latency at all, so a
     column describes the requests its run kept.
 
-    The decode-KV rows say what each policy's *routing* costs in cache. A request
+    The decode-KV rows say what each selector's *routing* costs in cache. A request
     decoded somewhere other than where it was prefilled drags its whole chain onto
-    the decode host's volume and leaves it there, so a policy that spreads decode
+    the decode host's volume and leaves it there, so a selector that spreads decode
     widely buys its TBT with somebody's capacity -- and the two columns differ more
     on it than on any other row here.
     """

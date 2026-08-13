@@ -40,7 +40,7 @@ client/controller/transport), so they depend on the from-source
   only what a capability plugs in, through four shared types: `KeySelector` (which
   volume serves these keys for this requester, and when — consulted *inside* the
   real `locate_volumes`, naive by default), `View` (the read-only observation a
-  policy is handed), `DataPlane` (what a capability does after a transfer lands)
+  selector is handed), `DataPlane` (what a capability does after a transfer lands)
   and `Runner` + `ItemDispatch` (release work on the clock, install the mesh once,
   gather). `Mesh` is the
   multi-client wiring the capability sims build on — per-node volumes + real
@@ -52,7 +52,7 @@ client/controller/transport), so they depend on the from-source
   *target-machine* `MachineProfile`, never measured on the box running the sim.
   It is the foundation only: it has no scenario and no demo of its own.
 - [`putget_sim/`](putget_sim/) — the unrouted put/get burst: seed one key, then
-  `m` clients get it, with **no policy and no data plane**, so every reader pulls
+  `m` clients get it, with **no selector and no data plane**, so every reader pulls
   the origin and fabric is *m×* the payload. The smallest thing that exercises
   the whole real stack while deciding nothing, and the baseline `dedup_sim`
   measures against.
@@ -60,7 +60,7 @@ client/controller/transport), so they depend on the from-source
   real `KeySelector` that routes each reader to a peer and withholds the controller's
   answer until that peer's read-through put registers, plus the one-method data
   plane that does the put. The scenario is `putget_sim`'s ordinary put/get
-  fixture, unchanged — installing the policy is the whole difference between *m×*
+  fixture, unchanged — installing the selector is the whole difference between *m×*
   and 1× fabric.
 - [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
   real directory**: the scheduler keeps its compute decisions (prefill placement,

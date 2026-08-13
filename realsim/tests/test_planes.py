@@ -1,14 +1,14 @@
 """The four shared types every capability plugs into.
 
-:class:`~proposed.view.View` (sense), :class:`~proposed.policy.KeySelector` (decide),
+:class:`~proposed.view.View` (sense), :class:`~proposed.selector.KeySelector` (decide),
 :class:`~proposed.plane.DataPlane` (what follows a transfer) and
 :class:`~realsim.runner.Runner` / :class:`~realsim.runner.ItemDispatch` (drive a run) are the generic half of both capabilities. These tests
 pin the contract each one owes its callers:
 
 1. the view reads the *real* directory and the run's virtual clock, and reading
    it never re-enters the controller's routing hook;
-2. the naive policy is the directory's own answer -- installing it changes
-   nothing, byte for byte, which is what lets a capability policy be swapped in
+2. the naive selector is the directory's own answer -- installing it changes
+   nothing, byte for byte, which is what lets a capability selector be swapped in
    as the only difference between two runs;
 3. a selection narrows a directory answer to its ranked sources, and withholds
    the answer until its readiness gate opens -- and the two combinators built on
@@ -43,7 +43,7 @@ from proposed import DataPlane
 from proposed import AnySelector, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
-from proposed.policy import (
+from proposed.selector import (
     AbstainOnSelf, FirstMatch, KeySelectorChain, NaiveKeySelector, Refine,
     Refinement, Selector, TakeHead,
 )
@@ -107,7 +107,7 @@ def test_view_reads_the_real_directory_topology_and_clock():
 
 
 def test_view_locate_does_not_re_enter_the_routing_hook():
-    """A policy senses through the view, so the view must read the raw body."""
+    """A selector senses through the view, so the view must read the raw body."""
 
     seen: list[str] = []
 
@@ -135,14 +135,14 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
 
 
 # --------------------------------------------------------------------------
-# 2. The naive policy is the directory's own answer.
+# 2. The naive selector is the directory's own answer.
 # --------------------------------------------------------------------------
 
 
-def _burst_trace(policy) -> str:
-    """Run the same two-reader burst with/without a policy; return its trace."""
+def _burst_trace(selector) -> str:
+    """Run the same two-reader burst with/without a selector; return its trace."""
     trace = Trace()
-    sim = Simulation(_topology(), trace=trace, control=policy)
+    sim = Simulation(_topology(), trace=trace, control=selector)
 
     async def scenario():
         with sim.mesh.installed():
@@ -158,7 +158,7 @@ def _burst_trace(policy) -> str:
     return trace.render()
 
 
-def test_installing_the_naive_policy_changes_nothing():
+def test_installing_the_naive_selector_changes_nothing():
     assert _burst_trace(NaiveKeySelector()) == _burst_trace(None)
 
 
@@ -190,7 +190,7 @@ class _Answers:
 
 
 class _Fixed(_Answers, KeySelector):
-    """A policy that decides on command -- the store-question kind."""
+    """A selector that decides on command -- the store-question kind."""
 
 
 class _FixedPlacement(_Answers, AnySelector):
@@ -234,7 +234,7 @@ def test_a_chain_of_key_selectors_is_one_and_a_mixed_chain_is_not():
 
 
 def test_a_selector_hears_registrations_by_subscribing_for_itself():
-    """The directory calls back plain callables and knows nothing of policies.
+    """The directory calls back plain callables and knows nothing of selectors.
 
     Subscribing in ``attach`` is what makes that possible: the view a selector is
     handed exposes the directory behind it, so the wakeup needs no member on
@@ -277,7 +277,7 @@ def test_a_registration_reaches_a_subscriber_before_the_put_returns():
     assert seen == []
 
 
-def test_only_a_policy_is_consulted_by_the_controller():
+def test_only_a_key_selector_is_consulted_by_the_controller():
     """A selector over a subject the store cannot read must not answer for it."""
 
     def _asked(control) -> list[str]:
@@ -297,18 +297,18 @@ def test_only_a_policy_is_consulted_by_the_controller():
     assert _asked(_FixedPlacement()) == []
 
 
-def test_an_installed_policy_is_attached_to_the_run_s_view():
-    """The sensor a policy is consulted with is the one it was brought up with.
+def test_an_installed_selector_is_attached_to_the_run_s_view():
+    """The sensor a selector is consulted with is the one it was brought up with.
 
     A ``KeySelector`` is a ``ControlPlane``, so installing one in the directory and
     attaching it are the same act of assembly -- which is what lets ``select`` take
-    a subject and a requester and no view. A policy installed but never attached
+    a subject and a requester and no view. A selector installed but never attached
     would sense through ``None``.
     """
-    policy = _Fixed()
-    sim = Simulation(_topology(), control=policy)
-    assert policy.view is sim.view
-    assert isinstance(policy.view, View)
+    selector = _Fixed()
+    sim = Simulation(_topology(), control=selector)
+    assert selector.view is sim.view
+    assert isinstance(selector.view, View)
 
 
 # --------------------------------------------------------------------------
@@ -428,7 +428,8 @@ def test_a_combinator_holds_either_kind_and_is_neither():
     """Mixing kinds is allowed because the mixture cannot reach the controller.
 
     A combinator is a plain ``Selector`` whatever it wraps, so a chain of two
-    policies is no more installable than a chain of one and a placement -- which
+    key selectors is no more installable than a chain mixing in an application's
+    -- which
     is what makes the mixture harmless rather than something to reject.
     """
     mixed = FirstMatch([_Fixed(Selection.of([])), _FixedPlacement(Selection.of(["v1"]))])
@@ -521,7 +522,7 @@ def test_refine_brings_up_the_source_and_every_step():
 
 
 def test_refine_is_a_plain_selector_whatever_it_narrows():
-    """Same bar as ``FirstMatch``: narrowing a policy's ranking with an
+    """Same bar as ``FirstMatch``: narrowing a selector's ranking with an
     application's test asks something the store cannot read, so the result is
     barred from the controller by being neither subtype."""
     funnel = Refine(_Fixed(Selection.of(["v0"])), TakeHead())
@@ -656,7 +657,7 @@ def test_the_controller_hop_is_charged_to_every_capability():
     This boundary used to be the one seam charging nothing: the transport charged
     bytes and the coordinator handle charged its round trip, while every
     ``locate_volumes`` / ``notify_put_batch`` in the repo was free. A burst that
-    routes nothing and installs no policy still crosses it.
+    routes nothing and installs no selector still crosses it.
     """
     from sim_common import config
 

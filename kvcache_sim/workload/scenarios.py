@@ -23,7 +23,7 @@ from realsim.demo import Console, Scenario
 from realsim.run import Result, Run
 from sim_common.trace import Trace
 
-from ..control._source import SpreadReadsPolicy
+from ..control._source import SpreadReadsKeySelector
 from ..report.metrics import Metrics
 from ..report.summary import (
     CacheVsBaselineReport,
@@ -280,7 +280,7 @@ class Hotspot(Scenario):
     """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware.
 
     ``--spread-reads`` swaps the source ranking the two cache-aware runs use, from
-    longest-prefix-then-id to :class:`~kvcache_sim.control._source.SpreadReadsPolicy`.
+    longest-prefix-then-id to :class:`~kvcache_sim.control._source.SpreadReadsKeySelector`.
     This scenario is where it can matter: extreme skew replicates one prefix, and
     every replica of it ranks identically on prefix alone. Off by default, and only
     here -- it changes which replica serves a read, so it is not byte-identical.
@@ -297,16 +297,16 @@ class Hotspot(Scenario):
         spread = getattr(args, "spread_reads", False)
 
         def source():
-            """A *fresh* policy per run: the tally is per-run state, and two runs
+            """A *fresh* selector per run: the tally is per-run state, and two runs
             sharing one would count each other's grants."""
-            return SpreadReadsPolicy() if spread else None
+            return SpreadReadsKeySelector() if spread else None
 
         return [
             _configure("baseline", topo, convs, "load_balance"),
             _configure("no_replication", topo, convs, "cache_aware", replicate=False,
-                 source_policy=source()),
+                 source_selector=source()),
             _configure("replication", topo, convs, "cache_aware",
-                 balance_threshold=1.2, replicate=True, source_policy=source()),
+                 balance_threshold=1.2, replicate=True, source_selector=source()),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
@@ -483,7 +483,7 @@ class EarlyRejection(Scenario):
         console.info("before turn N answers -- so at most one request per open dialogue is ever")
         console.info("in flight, and this scenario's 160 turns arrive as ~22 concurrent")
         console.info("conversations instead of as a burst at rate 20. Occupancy is then never")
-        console.info("far from what a stale snapshot reports, the two policies route almost")
+        console.info("far from what a stale snapshot reports, the two selectors route almost")
         console.info("identically, and across four seeds the attainment gap is noise whose sign")
         console.info("changes. Restoring the mechanism means offering the concurrency these")
         console.info("constants intended -- many more, shorter conversations -- and no such")

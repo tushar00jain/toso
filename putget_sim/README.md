@@ -5,7 +5,7 @@ the **real** `LocalClient` planning core, the **real** `Controller` directory an
 the **real** in-memory transport/store (via [`realsim`](../realsim/)), on
 `realsim`'s deterministic virtual-clock async engine.
 
-It installs **no policy and no data plane**. Every reader locates the origin
+It installs **no selector and no data plane**. Every reader locates the origin
 before anyone finishes, so each pulls from it and fabric is **`m x`** the
 payload. That is deliberately the uninteresting outcome: this is the baseline
 [`dedup_sim`](../dedup_sim/) measures its **1x** against, and the smallest thing
@@ -32,8 +32,8 @@ One burst charges every resource class through one `MachineProfile`:
 - **RAM** — host staging on serve.
 
 The scenario is ordinary user code top to bottom: a `client.put` and a gather of
-`client.get`. There is no policy, no coordinator and no execution loop in it.
-Handing it a `proposed.policy.KeySelector` (and, if the capability needs one, a
+`client.get`. There is no selector, no coordinator and no execution loop in it.
+Handing it a `proposed.selector.KeySelector` (and, if the capability needs one, a
 `proposed.plane.DataPlane`) is the *only* change needed to make it a routed run —
 which is exactly what `dedup_sim` does, importing this package's `PutGetBurst`
 unchanged so its comparison is byte-for-byte the same topology, payload and cost
@@ -71,8 +71,8 @@ PYTHONPATH=. .venv/bin/python -m putget_sim --help
 - `-v` — also print the full per-event virtual-time trace (DEBUG).
 
 Output: the fabric/wallclock summary + an ASCII source→dest tree at INFO. With no
-policy every reader pulls the origin (`m×` fabric) — the baseline a read-through
-policy cuts toward the 1× union.
+selector every reader pulls the origin (`m×` fabric) — the baseline a read-through
+selector cuts toward the 1× union.
 
 ## Testing
 
@@ -92,7 +92,7 @@ which folders exist — and the two that decide and execute are simply absent.
 
 ```
 putget_sim/
-  control/                # DECIDES -- absent: no policy, that is the point
+  control/                # DECIDES -- absent: no selector, that is the point
   data/                   # EXECUTES -- absent: no data plane either
   workload/               # WHAT IS SIMULATED
     put_get.py            #   PutGetBurst, a realsim.Workload: seed W on the
@@ -110,8 +110,8 @@ engine, meta/metadata carriers — is imported from `realsim` / `sim_common`.
 
 | role | `putget_sim` | `dedup_sim` | `kvcache_sim` |
 |---|---|---|---|
-| `control/` — what is decided | **absent** — the naive default (all holders, directory order) | `routing.py`: one `KeySelector.select` — a ranked source plus a readiness gate | `scheduler.py` + `policy.py` + `cache.py` + `view.py` |
+| `control/` — what is decided | **absent** — the naive default (all holders, directory order) | `routing.py`: one `KeySelector.select` — a ranked source plus a readiness gate | `scheduler.py` + `selector.py` + `cache.py` + `view.py` |
 | `data/` — what executes | **absent** — a `get` and nothing after it | `read_through.py`: one `DataPlane.after` — a local put | `serving.py` + `decode.py` + `store.py` |
-| `workload/` — what is simulated | `put_get.py`: one synchronized burst, parameterized by reader count | the same `put_get.py`, with the policy installed | `request.py` + `generator.py` + `scenarios.py` |
+| `workload/` — what is simulated | `put_get.py`: one synchronized burst, parameterized by reader count | the same `put_get.py`, with the selector installed | `request.py` + `generator.py` + `scenarios.py` |
 | `report/` — outcome metrics | `summary.py`: rendering only, over a shared `Ledger` | `summary.py`: rendering only, over the same `Ledger` | `metrics.py`: its **own** per-request outcome row |
 | outcome | `m x` fabric | **1x** fabric, same workload | TTFT/TBT under an arrival stream |

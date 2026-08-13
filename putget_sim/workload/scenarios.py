@@ -1,6 +1,6 @@
 """What this sim runs: one unrouted burst, as a :class:`realsim.demo.Scenario`.
 
-The degenerate comparison -- a single :class:`~realsim.run.Run` with no policy
+The degenerate comparison -- a single :class:`~realsim.run.Run` with no selector
 and no data plane. That absence is the content: it is the ``m x`` baseline
 ``dedup_sim`` measures its 1x against, and ``dedup_sim`` builds its own runs over
 this same :class:`~putget_sim.workload.put_get.PutGetBurst`.
@@ -59,8 +59,8 @@ class Burst(Scenario):
         console.trace(result.trace)
         console.summary(BurstReport(result))
         console.info(
-            "no routing policy => %dx fabric (every reader pulls the origin). Installing "
-            "a KeySelector (proposed/policy.py) in the controller's locate_volumes -- as "
+            "no routing selector => %dx fabric (every reader pulls the origin). Installing "
+            "a KeySelector (proposed/selector.py) in the controller's locate_volumes -- as "
             "dedup_sim does -- routes later readers to read-through peers and cuts this "
             "toward 1x, with the scenario code above unchanged.",
             result.workload.num_readers,

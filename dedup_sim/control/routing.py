@@ -1,7 +1,7 @@
-"""1x-fabric dedup routing, as a :class:`proposed.policy.KeySelector`.
+"""1x-fabric dedup routing, as a :class:`proposed.selector.KeySelector`.
 
 The question a synchronized read burst asks the store is exactly the one the
-policy interface answers: *given this key and this requester, which volume serves
+selector interface answers: *given this key and this requester, which volume serves
 it, and when is that volume usable?* Answering it is the whole capability.
 
 How 1x falls out
@@ -10,27 +10,27 @@ With no routing, ``m`` readers of one key all ``locate_volumes`` before anyone
 finishes, so all ``m`` are told "the origin" and each pulls from it -- ``m x``
 fabric.
 
-``DedupPolicy`` answers differently. Readers arrive at the controller in order;
+``DedupKeySelector`` answers differently. Readers arrive at the controller in order;
 the first is routed to the volume that already holds the key (the single fabric
 hop), and every later one is routed to a **peer** -- a reader that is *about to*
 hold it. Because that peer has not registered yet, the selection carries a
 readiness gate, and the controller withholds its answer until the peer's
-read-through put lands -- which this policy hears because it subscribed to the
-directory (:meth:`DedupPolicy.attach`). Peers are handed out FIFO under a fan-out
+read-through put lands -- which this selector hears because it subscribed to the
+directory (:meth:`DedupKeySelector.attach`). Peers are handed out FIFO under a fan-out
 cap, so cap 1 builds a chain and cap >= 2 a shallow tree.
 
 Whether a peer holds the key is asked of the directory every time an answer is
-formed (:meth:`DedupPolicy._registered`), never remembered: volumes evict, so a
+formed (:meth:`DedupKeySelector._registered`), never remembered: volumes evict, so a
 peer that registered the key and later dropped it for a newer version is a peer
 the next requester has to wait for again.
 
 Which raises the question of when waiting is safe at all, because a gate that
 nothing will ever open hangs the requester behind it. The answer is the debt the
-policy is already tracking: a requester it routes is going to read the key
+selector is already tracking: a requester it routes is going to read the key
 through, so from the moment it asks it *owes* that registration, and waiting for
 it is bounded. A source that owes nothing has to hold the key already, and one
 that holds nothing and owes nothing is no longer a source at all -- it is retired
-and the directory answers for that requester (:meth:`DedupPolicy._retire`).
+and the directory answers for that requester (:meth:`DedupKeySelector._retire`).
 
 Exactly one reader is ever routed to a pre-existing holder, so exactly one
 transfer's source is an origin: ``origin_bytes`` is the 1x union whatever the cap.
@@ -42,7 +42,7 @@ there will be. The tree is assigned one requester at a time as they ask, and the
 chain executes because each reader's read-through put releases the next reader's
 withheld answer -- an emergent property of the data plane's registration, not a
 schedule this module runs. That is what makes the scenario ordinary user code:
-a gather of ``client.get(K)``, with no idea a policy exists.
+a gather of ``client.get(K)``, with no idea a selector exists.
 """
 
 from __future__ import annotations
@@ -54,18 +54,18 @@ from proposed import DecisionLog, KeySelector, Selection
 
 from ._readiness import Readiness
 
-__all__ = ["DedupPolicy"]
+__all__ = ["DedupKeySelector"]
 
 
-class DedupPolicy(KeySelector):
+class DedupKeySelector(KeySelector):
     """Route each requester to a peer, not the origin (a real ``KeySelector``).
 
     Args:
         fanout_cap: how many peers one source may be planned to feed (1 = a
             chain, >= 2 = a shallow tree). The fabric stays 1x for any cap; the
             cap only trades wallclock against tree depth.
-        trace: optional :class:`~proposed.policy.DecisionLog` to record each
-            routing decision into. Changes no metric; the policy behaves
+        trace: optional :class:`~proposed.selector.DecisionLog` to record each
+            routing decision into. Changes no metric; the selector behaves
             identically with none attached.
     """
 
@@ -103,7 +103,7 @@ class DedupPolicy(KeySelector):
         """Sense through the view, and ask the directory to say when it changes.
 
         The subscription is made here rather than by whoever assembles the run: a
-        gate is this policy's own business, and the directory it subscribes to is
+        gate is this selector's own business, and the directory it subscribes to is
         the one behind the view it was just handed, so the two cannot disagree.
         """
         super().attach(view, transfer_cost)

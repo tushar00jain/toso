@@ -262,7 +262,7 @@ def test_resident_tracking_is_deterministic():
 
 
 async def _put_over_capacity(
-    policy=None, *, wired=True, keys=("A", "B", "C"), setup=None
+    selector=None, *, wired=True, keys=("A", "B", "C"), setup=None
 ):
     """Fill a two-payload volume, then put one more and let it make room.
 

@@ -4,7 +4,7 @@
 that drives the **real** TorchStore client planning core, the **real** controller
 directory, and the **real** in-memory transport/store off-actor, under a virtual
 clock. It models only the *new* read coordinator — the one component that does not
-exist in production yet — behind a pluggable policy seam.
+exist in production yet — behind a pluggable selector seam.
 
 `realsim` is the real-code foundation the two capability simulations build on:
 both [`dedup_sim/`](../dedup_sim/) and [`kvcache_sim/`](../kvcache_sim/) `import
@@ -19,7 +19,7 @@ substituted with in-process seams.
 This document is the single design reference for `realsim`: the concurrency model
 that makes it sound, the architecture, exactly how each real object is driven
 off-actor, the cost model and allocation-free data plane, the coordinator and its
-policy seam, the CI-enforced concurrency contract, and how the capability sims
+selector seam, the CI-enforced concurrency contract, and how the capability sims
 consume it. For a narrative walk-through of the whole DES foundation and how the
 two capability sims differ, see [`des_explained.md`](des_explained.md).
 
@@ -142,7 +142,7 @@ realsim/
   mesh.py                     # Mesh — multi-client wiring: per-node volumes + real clients,
                               #   one directory + registry, one shared transport factory
                               #   MeshView is the base every consumer of a mesh shares
-  policy.py                   # KeySelector.select(keys, requester) -> ranked sources +
+  selector.py                   # KeySelector.select(keys, requester) -> ranked sources +
                               #   readiness. Naive is the default; consulted inside the
                               #   real locate_volumes body
   view.py                     # View — read-only observation: locate, topology and
@@ -177,7 +177,7 @@ realsim/
     test_planes.py            # the shared KeySelector / View / DataPlane / Runner contracts
     test_demos.py             # every Demo declares its parts, and every scenario runs
 
-putget_sim/                   # the unrouted put/get burst (repo root) — no policy, no
+putget_sim/                   # the unrouted put/get burst (repo root) — no selector, no
                               #   data plane: the m x baseline, and the fixture the
                               #   realsim tests above drive
   workload/put_get.py         # PutGetBurst, a Workload: seed a key, then m clients get
@@ -422,7 +422,7 @@ construction. With `Mesh` extracted, each capability package holds only capabili
 code, and `MeshView` is the base every consumer of a mesh shares (topology, ids,
 directory handle, trace, profile, registry, install).
 
-### `policy.py` / `view.py` / `plane.py` / `runner.py` — the components under design
+### `selector.py` / `view.py` / `plane.py` / `runner.py` — the components under design
 
 - **`KeySelector.select(keys, requester) -> Selection`.** One interface,
   answering one question: which volume serves these keys for this requester, and
@@ -430,7 +430,7 @@ directory handle, trace, profile, registry, install).
   **readiness gate**. It is invoked in two named places: inside the real
   controller's `locate_volumes` body, after it reads the directory and before it
   returns (so a scenario that just calls `client.get(K)` is routed without knowing
-  a policy exists, and the controller can *withhold* its answer until the gate
+  a selector exists, and the controller can *withhold* its answer until the gate
   opens); and directly from an app, when the app wants to price the alternatives
   rather than be handed one. Either way the selector senses through the `View`
   it was attached with, so the caller passes a subject and a requester. The default implementation is
@@ -440,12 +440,12 @@ directory handle, trace, profile, registry, install).
   What deliberately does *not* go through it: compute placement, admission and SLO
   gates. The moment `select` answers those it becomes a union type serving neither
   caller.
-- **`View`.** The read-only observation a policy is handed: `locate` (the raw
-  directory body, so a policy reading it back does not re-enter the hook),
+- **`View`.** The read-only observation a selector is handed: `locate` (the raw
+  directory body, so a selector reading it back does not re-enter the hook),
   topology/locality, and the virtual clock. Awaited reads, no mutation. It stops
   there on purpose — `kvcache_sim`'s prefix-run lengths are a KV notion and live
   in its own `control/`, and neither capability's *load* signal is an observation
-  (the scheduler's is its own predicted queue, the dedup policy's is its planned
+  (the scheduler's is its own predicted queue, the dedup selector's is its planned
   tree), so there is no `load()` on the base type.
 - **`DataPlane`.** One member — `after(requester, result)`, what a capability does
   once a transfer has landed — defaulting to real behaviour (nothing). Moving the
@@ -480,11 +480,11 @@ node `R` each get it. `PutGetBurst` is a `realsim.run.Workload`: it seeds
 `W` in `prepare()` and yields one work item per reader from `items(sim)`. It
 takes `mode=` (`"meta"` default / `"metadata"`, §7), `profile=` (the target
 `MachineProfile`, §6) and `compute_device=` (the producer's roofline device,
-default `"cuda"`). A policy and a data plane are *not* its arguments — a
+default `"cuda"`). A selector and a data plane are *not* its arguments — a
 capability puts those on the `realsim.run.Run`, so the workload is identical
 between a routed run and the baseline.
 The scenario body is ordinary user code — a `client.put` and a gather of
-`client.get` — and installing a policy is the *only* change that turns the same
+`client.get` — and installing a selector is the *only* change that turns the same
 `m×` run into a 1× one, which is exactly what `dedup_sim` does with it.
 `render_burst_summary` prints the fabric/wallclock digest + the ASCII source→dest
 tree.
@@ -572,7 +572,7 @@ Both capability sims consume `realsim` directly, speaking the real torchstore
 region↔`TensorSlice` translation layer anywhere:
 
 - [`dedup_sim/`](../dedup_sim/) implements dedup routing as a real `KeySelector`
-  (`DedupPolicy`) consulted inside the real `locate_volumes`, driving the real
+  (`DedupKeySelector`) consulted inside the real `locate_volumes`, driving the real
   `Controller` directory + `LocalClient` to a 1× peer read-through.
 - [`kvcache_sim/`](../kvcache_sim/) consults the real `Controller` directory for
   KV-block presence (`KVView.prefix_lengths` over `locate_volumes`) and drives
@@ -639,8 +639,8 @@ PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m putget_sim \
 - `-v` — also print the full per-event virtual-time trace (DEBUG).
 
 It prints the fabric/wallclock summary + the ASCII source→dest tree at INFO. Under
-the naive policy every reader pulls the origin (`m×` fabric) — the baseline a
-read-through policy would cut toward the 1× union. Costs come from the target
+the naive selector every reader pulls the origin (`m×` fabric) — the baseline a
+read-through selector would cut toward the 1× union. Costs come from the target
 `MachineProfile` (the illustrative `DEFAULT_PROFILE` in the demo), never measured
 on the box running the sim.
 

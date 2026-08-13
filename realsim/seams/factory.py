@@ -60,7 +60,7 @@ _current_src: "contextvars.ContextVar[Endpoint]" = contextvars.ContextVar(
 )
 
 # The *directory* identity (volume id) of that same client, for the controller's
-# routing hook: a policy is asked "which source for this requester". Defaults to
+# routing hook: a selector is asked "which source for this requester". Defaults to
 # ``None`` so an unrouted drive simply gets the directory's own answer.
 _current_requester: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "realsim_current_requester", default=None
@@ -80,7 +80,7 @@ def bind_requester(volume_id: Optional[str]) -> None:
 
     The endpoint bound by :func:`bind_source` is the locality the cost model
     prices against; this is the same client's volume id in the real directory,
-    which is what a routing policy needs to know who is asking. They are
+    which is what a routing selector needs to know who is asking. They are
     separate ids (a topology may name a node ``"r0"`` and its endpoint
     ``"volr0"``), so both are bound together by
     :meth:`realsim.mesh.Mesh.bind_source`.
@@ -92,7 +92,7 @@ def current_requester() -> Optional[str]:
     """The directory identity of the calling client, or ``None`` if unbound.
 
     Unlike :func:`current_source` this returns ``None`` rather than raising: a
-    routing policy that cannot tell who is asking must fall back to the
+    routing selector that cannot tell who is asking must fall back to the
     directory's own answer, which is always correct, whereas an unbound *source*
     would silently misprice a transfer.
     """

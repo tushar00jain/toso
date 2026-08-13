@@ -9,7 +9,7 @@ nothing; :meth:`realsim.demo.Demo.main` does that with
 Every run shares one :class:`~putget_sim.workload.put_get.PutGetBurst` -- ordinary
 user code: seed ``W``, then a gather of ``client.get(W)``. The baseline installs
 nothing and gets ``m x``; the routed runs add
-:class:`~dedup_sim.control.routing.DedupPolicy` and the read-through
+:class:`~dedup_sim.control.routing.DedupKeySelector` and the read-through
 :class:`~dedup_sim.data.read_through.ReadThroughPlane` and get 1x. Same topology,
 payload, cost model and client calls -- the *only* difference is what the ``Run``
 carries, which is what makes the comparison mean something.
@@ -25,7 +25,7 @@ from realsim.runner import ItemDispatch
 from realsim.run import Result, Run
 from sim_common.trace import Trace
 
-from ..control.routing import DedupPolicy
+from ..control.routing import DedupKeySelector
 from ..data.read_through import ReadThroughPlane
 from ..report.summary import BaselineReport, DedupReport
 
@@ -65,7 +65,7 @@ class Dedup(Scenario):
         burst = self.burst or PutGetBurst(self.num_readers)
         runs = [Run("baseline", burst, profile=burst.profile)]
         for cap in self.caps:
-            # The policy records into the same trace the run reports, and it is
+            # The selector records into the same trace the run reports, and it is
             # installed in the controller when the mesh is built -- so the trace has
             # to exist before the stack, which is why the Run carries it.
             trace = Trace()
@@ -73,7 +73,7 @@ class Dedup(Scenario):
                 Run(
                     f"cap={cap}",
                     burst,
-                    control=DedupPolicy(fanout_cap=cap, trace=trace),
+                    control=DedupKeySelector(fanout_cap=cap, trace=trace),
                     # The capability is the plane's one member; what the runner
                     # drives is the dispatch that calls it. Wiring, so it is here
                     # and not in ``data/``.
@@ -104,7 +104,7 @@ class Dedup(Scenario):
         for result in routed:
             cap = int(result.label.split("=")[1])
             topo = "chain" if cap == 1 else "tree"
-            console.section(f"dedup policy  --  fanout_cap={cap} ({topo})")
+            console.section(f"dedup selector  --  fanout_cap={cap} ({topo})")
             console.trace(result.trace, label=f"dedup(cap={cap}) run")
             console.summary(DedupReport(result, naive, cap))
             # 1x proven live on the real directory.

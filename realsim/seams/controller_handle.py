@@ -19,7 +19,7 @@ is the `[S]` that disappears. Which is also why it does not implement
 :class:`proposed.deployment.Controller`: the *service* implements that, and a
 reference to a service is a different shape. Fusing the two into one object is what
 used to make "is this the client side or the server side?" unanswerable about this
-file -- the mirrored endpoint bodies and the policy hook now live in the service,
+file -- the mirrored endpoint bodies and the selector hook now live in the service,
 where they always belonged.
 """
 
@@ -59,11 +59,11 @@ class LocalControllerHandle:
         """The real ``Controller`` behind the service, for tests asserting on it."""
         return self.service.controller
 
-    def install_policy(self, policy: Any) -> None:
+    def install_selector(self, selector: Any) -> None:
         """Install a control plane in the service this refers to.
 
-        The policy runs in the *service* and is stored there; this exists for the
+        The selector runs in the *service* and is stored there; this exists for the
         one caller that holds a handle and not a service
         (:class:`realsim.mesh.Mesh`, assembling a run).
         """
-        self.service.install_policy(policy)
+        self.service.install_selector(selector)

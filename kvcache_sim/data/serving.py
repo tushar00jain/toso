@@ -103,9 +103,9 @@ Control runs as a service, so this plane reaches it the way it reaches the store
 through a port, over calls that carry values. There are two, and the split is
 between asking and telling:
 
-* :class:`~proposed.policy.AnySelector` -- the **question**: where should this run.
+* :class:`~proposed.selector.AnySelector` -- the **question**: where should this run.
   A question is answered, so it is called and waited for. The answer is a
-  :class:`~proposed.policy.Selection`, a value, and the one thing this plane takes
+  :class:`~proposed.selector.Selection`, a value, and the one thing this plane takes
   off it is its winner;
 * :class:`~proposed.deployment.ClusterModel` -- the **facts**: this host's decode
   batch, its busy compute, the clock its prefill really reached. Nothing comes
@@ -125,7 +125,7 @@ what to send on.
 Coupling lives here
 -------------------
 Whether prefill and decode contend for this host's compute is a fact about the
-deployment, not the policy, so the host owns it: by handing both engines one
+deployment, not the selector, so the host owns it: by handing both engines one
 accelerator or two, and by reporting each decode step's end onward as a
 :class:`~kvcache_sim.control.scheduler.ComputeBusy` fact so control's *predicted*
 prefill queue tracks the device decode is actually using. A disaggregated host
@@ -168,7 +168,7 @@ class ServingHost:
             way KV reaches this host from another one: the prefill host publishes
             and the decode host fetches, with the store in between.
         placement: where a question goes -- the control plane, through its
-            :class:`~proposed.policy.AnySelector` port and nothing else.
+            :class:`~proposed.selector.AnySelector` port and nothing else.
         cluster: where a fact goes -- control's model of the cluster, through its
             :class:`~proposed.deployment.ClusterModel` port and nothing else. A
             separate service because reporting is not asking, and the answers
@@ -252,7 +252,7 @@ class ServingHost:
         hear about this request.
 
         Control answers with a ranking of the hosts it priced, so what this host
-        wants off it is :attr:`~proposed.policy.Selection.winner` -- the plan the
+        wants off it is :attr:`~proposed.selector.Selection.winner` -- the plan the
         head was chosen with. A refusal is that selector's abstention, which names
         nobody and so has no winner.
         """

@@ -82,7 +82,7 @@ source→destination assignment on top.
 
 ## 4. Layered controllers (the key structural change)
 
-Split policy from storage. Keep the existing `Controller` as a dumb directory; add a
+Split selector from storage. Keep the existing `Controller` as a dumb directory; add a
 **`TransferCoordinator`** actor in front that owns demand-aware routing, dedup,
 dependencies, and cache lifecycle. It **delegates** storage lookups to the `Controller`
 and only *instructs* clients — bytes still move client↔volume as today.
@@ -101,13 +101,13 @@ and only *instructs* clients — bytes still move client↔volume as today.
                                                               └───────────────────┘
 ```
 
-- **Controller (unchanged):** index, commit tracking, key listing. No policy.
+- **Controller (unchanged):** index, commit tracking, key listing. No selector.
 - **TransferCoordinator (new):** answers "for this reader's needed regions, which source
   should each come from, and what must I wait for?" Owns the plan, the promise/dependency
   table, and cache-volume registration.
 - **Fallback:** if no coordinator is configured, `get` behaves exactly as today.
 
-The coordinator is the only new policy surface; the client/transport/publish plumbing is
+The coordinator is the only new selector surface; the client/transport/publish plumbing is
 shared with ordinary `get`/`put`.
 
 ---
@@ -125,7 +125,7 @@ the rendezvous. **No barrier, no cohort, no `world_size`.**
 
 ### 5.2 API
 
-Ordinary `get` / `get_state_dict`, with an opt-in flag (or store-level policy):
+Ordinary `get` / `get_state_dict`, with an opt-in flag (or store-level selector):
 
 ```python
 sd = await ts.get_state_dict(key, user_state_dict=sd, dedup=True)
@@ -216,7 +216,7 @@ without any global plan, and no source ever exceeds `FANOUT_CAP` concurrent serv
   volume; "create a volume on `g`" is just publishing into it under the weight key.
 - **No eviction within a version window:** once `R` is promised/present at version `v`, it
   stays until `v` is superseded — the coordinator knows the burst is in progress, so the
-  cache won't evict mid-sync (it's routing policy + a pin, not an LRU).
+  cache won't evict mid-sync (it's routing selector + a pin, not an LRU).
 - **Invalidation:** a new `put_state_dict` (new MAPPING) bumps `version`; the coordinator
   drops stale `sources`/`promises`. Optionally `delete`s stale cached slices.
 
@@ -264,7 +264,7 @@ synchronized burst just as well.
 
 ## 7. Open questions
 - Coordinator placement/sharding for very wide fan-in (one actor vs. key-hash sharded).
-- Fan-out cap policy (fixed vs. bandwidth-aware) and topology awareness (does the
+- Fan-out cap selector (fixed vs. bandwidth-aware) and topology awareness (does the
   coordinator know NVLink vs. cross-node? `strategy` has `volume_hostname` — enough for
   same-host detection; NVLink domain needs more).
 - Whether read-through population should be automatic for every `get` or opt-in per key

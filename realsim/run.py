@@ -23,7 +23,7 @@ its own signature (``run_burst(num_readers, ...)`` vs ``run(topology, requests,
 kind, ...)``).
 
     runs = [Run("baseline", burst),
-            Run("cap=1", burst, control=DedupPolicy(1, trace=t), data=make_plane)]
+            Run("cap=1", burst, control=DedupKeySelector(1, trace=t), data=make_plane)]
     results = [r.execute() for r in runs]
 
 :class:`Simulation` deliberately does *not* take a ``Run``. It is constructible
@@ -111,12 +111,12 @@ class Run:
             two forms choose is *which* service, which is a fact about where the
             capability ships rather than a configuration:
 
-            * a :class:`~proposed.policy.KeySelector` runs **in the directory
+            * a :class:`~proposed.selector.KeySelector` runs **in the directory
               service**, installed in the real controller's ``locate_volumes``,
               and is reached through the seam already standing there
               (:class:`~realsim.seams.controller_handle.LocalControllerHandle`) --
               a caller just calls ``client.get`` and is routed. This is dedupe:
-              its whole control plane is the policy, and it must exist before the
+              its whole control plane is the selector, and it must exist before the
               mesh is built, which is why an object rather than a factory;
             * a :data:`MakeControl` factory runs **in its own service**, built
               over the assembled stack and fronted by a
@@ -128,7 +128,7 @@ class Run:
             A capability whose control plane runs in *both* places passes a
             sequence of the two, which is what kvcache does: the placement
             decides where to prefill, and a
-            :class:`~kvcache_sim.control._source.LongestPrefixPolicy` in the
+            :class:`~kvcache_sim.control._source.LongestPrefixKeySelector` in the
             directory narrows the pull to the peer the coordinator already priced
             -- without it the client reads from whichever holder the directory
             lists first, and a pull predicted over NVLink can be charged over
