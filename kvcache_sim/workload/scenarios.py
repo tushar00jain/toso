@@ -83,10 +83,10 @@ def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
     return Run(
         label,
         KVWorkload(topology, conversations),
-        # One control plane, reached from both services: it decides compute
-        # placement through the placement seam, and answers the store's routing
-        # question through the chain it names in the directory.
-        control=scheduler(kind, **knobs),
+        # Two control planes, one per service: the scheduler decides compute
+        # placement through the placement seam, and the chain beside it answers the
+        # store's routing question in the directory.
+        control=scheduler(kind, topology, **knobs),
         data=serving_plane(
             coupled=coupled,
             simulate_decode=knobs.get("simulate_decode", False),

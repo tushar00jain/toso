@@ -33,7 +33,7 @@ the workload supplies the work; :meth:`realsim.run.Run.execute` pairs the two.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from proposed import ControlPlane, Endpoint, Placement, Policy, View
 from sim_common import config
@@ -60,6 +60,34 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = ["Simulation"]
 
 
+def _as_planes(control: Optional[Any]) -> Sequence[Any]:
+    """``control`` as the sequence of planes it is, one or several.
+
+    A control plane may itself be a sequence (a chain is one), so the test is for
+    a list or tuple and not for iterability.
+    """
+    if control is None:
+        return ()
+    if isinstance(control, (list, tuple)):
+        return tuple(control)
+    return (control,)
+
+
+def _one(planes: Sequence[Any], role: type, doing: str) -> Optional[Any]:
+    """The one plane filling ``role``, or ``None``.
+
+    Two is refused rather than resolved by position: which of them the run reached
+    would be a fact about the order a capability happened to list them in.
+    """
+    filling = [p for p in planes if isinstance(p, role)]
+    if len(filling) > 1:
+        raise TypeError(
+            f"{len(filling)} control planes are a {role.__name__} "
+            f"({', '.join(type(p).__name__ for p in filling)}): one may {doing}"
+        )
+    return filling[0] if filling else None
+
+
 class Simulation:
     """One assembled stack: clock, mesh, view, ledger, cost estimate.
 
@@ -67,13 +95,14 @@ class Simulation:
         topology: ``node_id -> Endpoint``. The node id is also its storage-volume
             id in the real directory.
         control: the capability's control plane, or ``None`` for the plain path.
-            One object, reached from wherever it answers:
+            One object, or a sequence of them when a capability decides in more
+            than one place. Each is attached, and then each is wired to the side
+            that reaches it:
 
             * the store's own selector runs *in the directory service*, installed
               in the real controller's ``locate_volumes``, so a caller that just
-              does ``client.get(K)`` is routed. That is the control plane itself
-              when it is a :class:`~proposed.policy.Policy`, and otherwise the one
-              it names (:attr:`~proposed.plane.ControlPlane.policy`);
+              does ``client.get(K)`` is routed. That is whichever control plane is
+              a :class:`~proposed.policy.Policy`;
             * a :class:`~proposed.policy.Placement` is the application's own
               question, so it is fronted by a
               :class:`~realsim.seams.placement_handle.LocalPlacementHandle` as
@@ -82,11 +111,19 @@ class Simulation:
               (:attr:`~proposed.plane.ControlPlane.cluster`) is fronted too, as
               :attr:`cluster_handle`, so the hosts report into it directly.
 
-            All three, for one object, is the interesting case: kvcache's scheduler
-            ranks prefill hosts over the handle *and* names the chain that answers
-            "which peer serves this prefix" in the directory, which is how the peer
-            it priced is the peer that serves the pull without anything being
-            threaded through the data plane to say so.
+            dedup is one object filling the first role; kvcache is two, and the
+            pair is the interesting case: a scheduler ranking prefill hosts over
+            the handle, and beside it a chain answering "which peer serves this
+            prefix" in the directory. They share the model the first writes and
+            the second reads, so the peer control priced is the peer that serves
+            the pull, with nothing threaded through the data plane to say so.
+
+            Attached in the order given, which matters when the two share a
+            selector: the last attach is the view it senses through.
+
+            At most one of each role. Two planes claiming the same one is a
+            capability that has not decided who answers, and it is refused here
+            rather than resolved by position.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`;
             supplies every cost constant and each volume's byte capacity.
         trace: shared :class:`~sim_common.trace.Trace` (created if omitted).
@@ -138,49 +175,52 @@ class Simulation:
         self.view: View = self.mesh.view
         self.transfer_cost = ProfileTransferCost(self.mesh.topology, self.profile)
 
-        # The one ``control`` object, wired to each side that reaches it. Every
-        # control plane is a proposed.ControlPlane, so it is attached by type
-        # rather than by sniffing for the method, and attach runs first because it
-        # hands over the view and the transfer-cost estimate that everything below
-        # is derived from.
+        # The ``control`` planes, each wired to the side that reaches it. Every
+        # control plane is a proposed.ControlPlane, so each is attached by type
+        # rather than by sniffing for the method, and every attach runs before any
+        # wiring below: attach hands over the view and the transfer-cost estimate
+        # that everything below is derived from, and a plane may not be brought up
+        # against a stack another plane has not finished joining.
         self.placement_handle: Optional[Any] = None
         self.cluster_handle: Optional[Any] = None
-        if isinstance(control, ControlPlane):
-            control.attach(self.view, self.transfer_cost)
-            # The store's own question, answered inside locate_volumes by the seam
-            # in front of the directory (LocalControllerHandle). Checked and not
-            # assumed: the subject a directory hands down is keys, so a selector
-            # over anything else would be answering a question it was not asked.
-            store_side = control if isinstance(control, Policy) else control.policy
-            if store_side is not None:
-                if not isinstance(store_side, Policy):
-                    raise TypeError(
-                        f"{type(control).__name__}.policy is a "
-                        f"{type(store_side).__name__}, not a Policy: only a "
-                        f"selector over keys may run inside locate_volumes"
-                    )
-                self.mesh.controller_handle.install_policy(store_side)
-            # What reaching this control plane costs. Resolved once, here, because
-            # this is the one place a run's control services are built -- the same
-            # reason ``make_controller_adapter`` resolves the directory's. One
-            # distance for both of them: a model is held by the control plane that
-            # reads it, so a host reaching either crosses the same boundary.
-            hop = ServiceHop(config.current().control_rtt)
-            # The application's own question, which only a Placement answers. A
-            # control plane that runs solely in the directory has no such service.
-            if isinstance(control, Placement):
-                self.placement_handle = LocalPlacementHandle(
-                    PlacementService(control), hop=hop
-                )
-            # The other half of what a host says to control: a question goes to the
-            # placement, a fact goes to the model it corrects. Only a control plane
-            # that keeps one has it (``ControlPlane.cluster``), and it is read
-            # after ``attach`` because that is when a model learns which cluster it
-            # is of.
-            if control.cluster is not None:
-                self.cluster_handle = LocalClusterModelHandle(
-                    ClusterModelService(control.cluster), hop=hop
-                )
+        planes = [p for p in _as_planes(control) if isinstance(p, ControlPlane)]
+        for plane in planes:
+            plane.attach(self.view, self.transfer_cost)
+        # The store's own question, answered inside locate_volumes by the seam in
+        # front of the directory (LocalControllerHandle). Selected by type and not
+        # by position: the subject a directory hands down is keys, so being a
+        # Policy is the claim that makes a plane installable there.
+        store_side = _one(planes, Policy, "run inside locate_volumes")
+        if store_side is not None:
+            self.mesh.controller_handle.install_policy(store_side)
+        # What reaching a control plane costs. Resolved once, here, because this is
+        # the one place a run's control services are built -- the same reason
+        # ``make_controller_adapter`` resolves the directory's. One distance for
+        # all of them: a model is held by the control plane that reads it, so a
+        # host reaching any of them crosses the same boundary.
+        hop = ServiceHop(config.current().control_rtt)
+        # The application's own question, which only a Placement answers. A
+        # capability that runs solely in the directory has no such service.
+        placement = _one(planes, Placement, "answer the application's question")
+        if placement is not None:
+            self.placement_handle = LocalPlacementHandle(
+                PlacementService(placement), hop=hop
+            )
+        # The other half of what a host says to control: a question goes to the
+        # placement, a fact goes to the model it corrects. Only a plane that keeps
+        # one has it (``ControlPlane.cluster``), and it is read after ``attach``
+        # because that is when a model learns which cluster it is of.
+        modelled = [p for p in planes if p.cluster is not None]
+        if len(modelled) > 1:
+            raise TypeError(
+                f"{len(modelled)} control planes keep a cluster model "
+                f"({', '.join(type(p).__name__ for p in modelled)}): the hosts "
+                f"report into one, so a run has one to front"
+            )
+        if modelled:
+            self.cluster_handle = LocalClusterModelHandle(
+                ClusterModelService(modelled[0].cluster), hop=hop
+            )
 
     @property
     def loop(self) -> AsyncEngine:

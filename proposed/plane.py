@@ -7,10 +7,13 @@ declaring both is the whole proposal in miniature: a capability is written
 implementing these and nothing else.
 
 * :class:`ControlPlane` -- the deciding half's lifecycle: knobs at construction,
-  the stack's ports at :meth:`ControlPlane.attach`, and the two things a run
+  the stack's ports at :meth:`ControlPlane.attach`, and the one thing a run
   harvests off it once attached -- the model it decides against
-  (:attr:`ControlPlane.cluster`), to put a service in front of, and the store's
-  own selector (:attr:`ControlPlane.policy`), to install in the directory;
+  (:attr:`ControlPlane.cluster`), to put a service in front of. Where a plane is
+  *reached* from is its type, not a field: a
+  :class:`~proposed.policy.Policy` is installed in the directory and a
+  :class:`~proposed.policy.Placement` is given a service, so a capability
+  deciding in both places is two planes rather than one naming the other;
 * :class:`DataPlane` -- the executing half's one member,
   :meth:`DataPlane.after`: what the capability does once a transfer has landed.
   The transfer itself is an ordinary client call and needs no interface.
@@ -99,14 +102,6 @@ class ControlPlane:
     #: ``None`` -- the default -- is a control plane that models nothing between
     #: calls, so there is nothing for a host to correct and no service to stand up.
     cluster: Optional[ClusterModel] = None
-
-    #: The :class:`~proposed.policy.Policy` this control plane wants consulted
-    #: inside ``locate_volumes``, if it *names* one rather than *being* one. Read
-    #: after :meth:`attach`, since a selector over the run's directory cannot be
-    #: built before the run has one. ``None`` -- the default -- leaves the
-    #: directory answering for itself, which is also what a control plane that is
-    #: itself a policy leaves here: the run installs that one directly.
-    policy: Optional[Any] = None
 
     def attach(self, view: Any, transfer_cost: Any) -> None:
         """Receive the ports this control plane senses and prices through."""

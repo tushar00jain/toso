@@ -1,7 +1,13 @@
 """One scheduler, two presets: ``LoadBalanceScheduler`` / ``CacheAwareScheduler``.
 
 Both are a :class:`~proposed.policy.Placement`, whose one member -- ``select`` --
-is the whole surface the data plane may *ask*. This application's one question::
+is the whole surface the data plane may *ask*. Beside either runs a second control
+plane -- a chain headed by :class:`RoutedPull` -- which is what the *directory*
+consults; a run installs the two together
+(:func:`kvcache_sim.workload._serving.scheduler`) and they meet only at the
+cluster model.
+
+This application's one question::
 
     await select(request, me) -> Selection    # prefill hosts, best first,
                                               # payload {host: Plan}
@@ -57,7 +63,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 from proposed import Endpoint, Placement, Policy, Selection
-from proposed.policy import PolicyChain
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -77,9 +82,25 @@ __all__ = [
     "ComputeBusy",
     "DecodeState",
     "Plan",
+    "RoutedPull",
+    "predicts_decode",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
 ]
+
+
+def predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
+    """Does this run roll decode occupancy forward to prefill completion?
+
+    ``"predict"`` counts the prefills promised that will have landed by then, which
+    moves where decode lands even with no SLO to miss -- a fidelity setting of the
+    model rather than an admission rule, which is why the model is built with it and
+    the scheduler installs the same gates either way.
+
+    Here rather than inside the scheduler because whoever builds the model early
+    (:func:`kvcache_sim.workload._serving.scheduler`) answers the same question.
+    """
+    return simulate_decode and early_rejection == "predict"
 
 
 # -- what this application's control plane answers with ---------------------- #
@@ -162,8 +183,8 @@ class _PullLongestPrefix(Placement):
     The peer ranking itself is delegated (:mod:`kvcache_sim.control._source`) and
     only the pull-versus-recompute judgement is here. This ``select`` is consulted
     per candidate while the scheduler prices, and never installed anywhere, unlike
-    :attr:`_Scheduler.policy`, which answers the *store* with the peer this one
-    named.
+    the store-side chain headed by :class:`RoutedPull`, which answers the *store*
+    with the peer this one named.
 
     Abstains when the ranking's head is the requester itself: a source is a peer,
     and a host does not pull what it already holds -- that prefix is its local
@@ -287,7 +308,7 @@ def _predicted_tbt_gate(plan: Plan, sched: "_Scheduler") -> bool:
     return plan.pred_tbt <= sched.slo_tbt
 
 
-class _RoutedPull(Policy):
+class RoutedPull(Policy):
     """The peer a fetch's pull was already priced against, or an abstention.
 
     Answering the store from what routing decided, rather than deciding twice:
@@ -304,6 +325,8 @@ class _RoutedPull(Policy):
     could reject the peer, the record would be gone and the fetch would fall through
     to a ranking that never saw it.
 
+    The model is the whole of what this shares with the scheduler that priced the
+    pull: one writes it, the other consumes it, and neither holds the other.
     """
 
     name = "routed-pull"
@@ -319,13 +342,13 @@ class _RoutedPull(Policy):
 class _Scheduler(Placement):
     """The pricing, ranking and admission both schedulers share.
 
-    Both control-plane jobs in one object. As a
-    :class:`~proposed.policy.Placement` a serving host asks it as a service
-    (:meth:`select`); through :attr:`policy` it also hands the run the store-shaped
-    chain the controller consults inside ``locate_volumes``. One object on purpose:
-    the peer it prices a pull against is the peer that chain later tells the
-    directory to serve, with nothing threaded through the data plane to carry that
-    between them.
+    A :class:`~proposed.policy.Placement`, and only that: a serving host asks it as
+    a service (:meth:`select`). What the *directory* is told is a second control
+    plane the run installs beside this one
+    (a chain headed by :class:`RoutedPull`), and the two meet at the model -- this
+    one prices a pull and records it, that one answers the fetch with it -- so
+    nothing is threaded through the data plane to carry it and neither object holds
+    the other.
 
     Args:
         reuse / rank: the two axes a preset picks (see above), both
@@ -342,6 +365,10 @@ class _Scheduler(Placement):
             prefill completion.
         source_policy: ranks peers for a prefix pull
             (default :class:`~kvcache_sim.control._source.LongestPrefixPolicy`).
+        cluster: the run's one :class:`~kvcache_sim.control._cluster.KVClusterModel`,
+            when a caller is building the store-side plane against it too and so
+            has to make it first. ``None`` -- the default -- builds it in
+            :meth:`attach`, where the instances become known.
     """
 
     def __init__(
@@ -359,6 +386,7 @@ class _Scheduler(Placement):
         simulate_decode: bool = False,
         early_rejection: str = "early",
         source_policy: Optional[Any] = None,
+        cluster: Optional[KVClusterModel] = None,
     ) -> None:
         self.B = block_tokens
         self.profile = profile
@@ -387,24 +415,17 @@ class _Scheduler(Placement):
         self._gates: List[_Gate] = [_ttft_gate]
         if simulate_decode:
             self._gates.append(_predicted_tbt_gate)
-        # The admission mode is spent here and never read again. Both modes install
-        # the same gates and differ only in the decode occupancy fed to them:
-        # "predict" rolls it forward to prefill completion, counting the prefills
-        # promised that will have landed by then. That moves where decode lands even
-        # with no SLO to miss, so it is a fidelity setting of the model rather than
-        # an admission rule.
-        self._lookahead = simulate_decode and early_rejection == "predict"
+        # The admission mode is spent here and never read again: both modes install
+        # the same gates (above) and differ only in what the model feeds them.
+        self._lookahead = predicts_decode(simulate_decode, early_rejection)
         # Filled by attach(): the run knows its servers only once its stack exists.
         self.transfer_cost: Optional[TransferCost] = None
         self.topo: Dict[str, Endpoint] = {}
         self.ids: List[str] = []
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
-        self.cluster: Optional[KVClusterModel] = None
+        self.cluster: Optional[KVClusterModel] = cluster
         self._rank: Optional[_Ranking] = None
-        #: :attr:`proposed.plane.ControlPlane.policy` -- who serves a fetch, for
-        #: the run to install in the directory. Built by :meth:`attach`.
-        self.policy: Optional[PolicyChain] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view, transfer_cost: TransferCost) -> None:
@@ -417,11 +438,11 @@ class _Scheduler(Placement):
         prefix runs are this capability's notion, not the store's.
 
         The run's one :class:`~kvcache_sim.control._cluster.KVClusterModel` is built
-        here as well: this is where the instances become known, and this runs once
-        per run, so nothing else is placed to build a second (empty) one -- and an
-        empty one would report every host idle, which is a run that looks healthy
-        and is wrong. Everything that ranks, prices or gates is handed that one
-        model.
+        here unless a caller made it first (``cluster``): this is where the
+        instances become known, and this runs once per run, so nothing else is
+        placed to build a second (empty) one -- and an empty one would report every
+        host idle, which is a run that looks healthy and is wrong. Everything that
+        ranks, prices or gates is handed that one model.
         """
         self.view = KVView(view.directory, view.topology)
         # A protocol rather than a simulator function: a deployment supplies its own
@@ -429,8 +450,9 @@ class _Scheduler(Placement):
         self.transfer_cost = transfer_cost
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
-        # Over ALL instances: the prefill and decode pools may each be a subset.
-        self.cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
+        if self.cluster is None:
+            # Over ALL instances: the prefill and decode pools may each be a subset.
+            self.cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
         self._rank = self._rank_kind(self.cluster)
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
@@ -438,19 +460,18 @@ class _Scheduler(Placement):
         self.decode_ids = (
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
-        # Who serves a fetch: the pull already priced for this caller, else the
-        # ranking. A chain rather than an ``if``, so the fall-through is
-        # :class:`~proposed.policy.FirstMatch`'s abstention rule and not a second
-        # copy of it here, and a :class:`~proposed.policy.PolicyChain` because the
-        # directory is going to be handed it and both links select over keys.
-        self.policy = PolicyChain([_RoutedPull(self.cluster), self.source_policy])
         # Every selector this one consults senses through the same view, which is
         # what lets one routing decision pin one directory snapshot for all of them
-        # (:meth:`~kvcache_sim.control._view.KVView.pinned`). The chain is attached
-        # here too, not by whoever installs it: it is this object's, and the view it
-        # senses through has to be the view the decision pinned.
-        for selector in (self._reuse, self._rank, self._decode_rank, self.policy):
+        # (:meth:`~kvcache_sim.control._view.KVView.pinned`).
+        #
+        # ``source_policy`` is also a link of the store-side chain, which the run
+        # attaches to the plain view it hands every control plane. This attach is
+        # what leaves it sensing through the pinned one, so a run listing the two
+        # planes puts this one **last** -- a source ranking a decision consults
+        # inside its pin must not read past the snapshot into the live directory.
+        for selector in (self._reuse, self._rank, self._decode_rank):
             selector.attach(self.view, transfer_cost)
+        self.source_policy.attach(self.view, transfer_cost)
 
     # -- proposed.Placement: one member, for the question ------------------ #
     async def select(self, request: Request, requester: str) -> Selection:

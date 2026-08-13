@@ -29,12 +29,13 @@ from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data.store import KVStore
 from kvcache_sim.control.request import Request
-from proposed import Policy
+from proposed import Placement, Policy
 from proposed.policy import PolicyChain
 from kvcache_sim.control._source import LongestPrefixPolicy, SpreadReadsPolicy
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished, _LocalOnly,
 )
+from kvcache_sim.workload._serving import scheduler
 from kvcache_sim.workload._generator import _block_keys_for, make_workload
 from kvcache_sim.tests._run import (
     run,
@@ -1643,7 +1644,7 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     the scenario reads it off the parsed command line and gives each cache-aware
     run its *own* policy, and which peer serves a pull changes. What does not
     change is that a *planned* pull is fetched from the peer it was priced against
-    -- the ranking sits behind the routed-pull memo in the scheduler's chain, so a
+    -- the ranking sits behind the routed-pull memo in the store-side chain, so a
     different ranking cannot redirect a pull already decided.
     """
     parser = argparse.ArgumentParser()
@@ -1651,7 +1652,11 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     args = parser.parse_args(["--spread-reads"])
 
     aware = scenarios.Hotspot(0).runs(args)[1:]
-    policies = [run.control.source_policy for run in aware]
+    # The scheduler is the run's Placement; both planes hold the one source policy.
+    policies = [
+        next(p for p in run.control if isinstance(p, Placement)).source_policy
+        for run in aware
+    ]
     assert all(isinstance(p, SpreadReadsPolicy) for p in policies)
     assert policies[0] is not policies[1], "a shared tally would count both runs"
 
@@ -1776,13 +1781,31 @@ def test_an_unknown_fact_is_refused_not_guessed():
 def test_the_store_side_chain_is_a_policy_and_refuses_anything_else():
     """What the run installs in the directory selects over keys, and says so.
 
-    The chain is the scheduler's -- it holds the pull this scheduler priced -- but
-    it is the controller that consults it, so being a ``Policy`` is the claim that
-    makes installing it legal, and it is checked rather than asserted in prose.
+    A run declares two control planes and each is reached by its type, so being a
+    ``Policy`` is the claim that makes installing this one legal -- checked here
+    rather than asserted in prose, and checked again at every link.
     """
-    _sim, sched = _scheduler()
-    assert isinstance(sched.policy, Policy)
+    planes = scheduler("cache_aware", _make_topology(2))
+    assert [isinstance(p, Policy) for p in planes] == [True, False]
+    assert [isinstance(p, Placement) for p in planes] == [False, True]
     with pytest.raises(TypeError, match="every link must be a Policy"):
         PolicyChain([LongestPrefixPolicy(), _LocalOnly()])
+
+
+def test_a_scheduler_does_not_hold_what_the_directory_is_told():
+    """The two planes meet at the model and nowhere else.
+
+    The scheduler answers the application and knows nothing of the chain the
+    directory consults; the chain answers the store and knows nothing of the
+    scheduler. What passes between them is the pull one records and the other
+    consumes, which is the model's.
+    """
+    routing, sched = scheduler("cache_aware", _make_topology(2))
+    assert not any(
+        isinstance(getattr(sched, name), Policy) and getattr(sched, name) is routing
+        for name in vars(sched)
+    ), "the scheduler holds the chain the run installs in the directory"
+    assert sched.cluster is not None
+    assert routing.selectors[0]._cluster is sched.cluster
 
 

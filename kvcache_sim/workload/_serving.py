@@ -68,14 +68,19 @@ from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
 from proposed import Endpoint, Policy
+from proposed.policy import PolicyChain
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.simulation import Simulation
 from realsim.run import Workload
 from sim_common import config
 
+from ..control._cluster import KVClusterModel
+from ..control._source import LongestPrefixPolicy
 from ..control.request import Request
-from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
+from ..control.scheduler import (
+    CacheAwareScheduler, LoadBalanceScheduler, RoutedPull, predicts_decode,
+)
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from ..data._decode import DecodeEngine
 from ..data._prefill import PrefillEngine
@@ -142,6 +147,7 @@ class KVWorkload(Workload):
 
 def scheduler(
     kind: str,
+    topology: Dict[str, Endpoint],
     *,
     balance_threshold: float = 1.5,
     replicate: bool = True,
@@ -152,18 +158,27 @@ def scheduler(
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
     source_policy: Optional[Policy] = None,
-) -> object:
-    """This run's **control plane**, as an object a scenario can just declare.
+) -> List[object]:
+    """This run's **two control planes**, as objects a scenario can just declare.
 
-    ``kind`` is ``"cache_aware"`` (the scheduler under test) or
-    ``"load_balance"`` (the baseline). Knobs only: the stack's ports arrive later
-    through :meth:`~kvcache_sim.control.scheduler._Scheduler.attach`, which is what
-    lets this be a value rather than a factory the harness must call at the right
-    moment. The :class:`~realsim.run.Run` fronts it with a
+    ``kind`` is ``"cache_aware"`` (the scheduler under test) or ``"load_balance"``
+    (the baseline). Knobs only: the stack's ports arrive later through
+    :meth:`~proposed.plane.ControlPlane.attach`, which is what lets these be values
+    rather than factories the harness must call at the right moment.
+
+    Two planes because kvcache decides in two places, and where a plane is reached
+    from is its type. The :class:`~realsim.run.Run` fronts the
+    :class:`~proposed.policy.Placement` with a
     :class:`~realsim.seams.placement_handle.LocalPlacementHandle` (it decides
-    compute placement) *and* installs the chain it names in the directory (that
-    answers the store's routing question) -- one object, reached through the seam
-    of whichever service is asking.
+    compute placement) and installs the :class:`~proposed.policy.Policy` in the
+    directory (it answers the store's routing question). They share the cluster
+    model, which is why it is built here: the scheduler prices a pull and records
+    it there, and the chain answers the fetch with it.
+
+    **Ordered.** The scheduler is last because both planes bring up the one
+    ``source_policy``, and the scheduler's attach is the one that leaves it sensing
+    through the pinned :class:`~kvcache_sim.control._view.KVView` a routing decision
+    reads (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`).
 
     ``source_policy`` is the one knob that is an object rather than a value: which
     peer serves a prefix gap is a :class:`~proposed.policy.Policy`, and it keeps
@@ -175,6 +190,11 @@ def scheduler(
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
+    source = source_policy if source_policy is not None else LongestPrefixPolicy()
+    # Over ALL instances: the prefill and decode pools may each be a subset.
+    cluster = KVClusterModel(
+        sorted(topology), lookahead=predicts_decode(simulate_decode, early_rejection)
+    )
     knobs = dict(
         block_tokens=BLOCK_TOKENS,
         profile=DEFAULT_PROFILE,
@@ -184,13 +204,23 @@ def scheduler(
         prefill_pool=prefill_pool,
         decode_pool=decode_pool,
         early_rejection=early_rejection,
-        source_policy=source_policy,
+        source_policy=source,
+        cluster=cluster,
     )
     if kind == "cache_aware":
-        return CacheAwareScheduler(
+        placement = CacheAwareScheduler(
             balance_threshold=balance_threshold, replicate=replicate, **knobs
         )
-    return LoadBalanceScheduler(**knobs)
+    else:
+        placement = LoadBalanceScheduler(**knobs)
+    # The store-side plane: who serves a fetch. The pull the scheduler already
+    # priced for this caller (read out of the model it recorded it in), else
+    # ``source``'s ranking of whoever holds the longest prefix. A chain rather than
+    # an ``if``, so the fall-through is :class:`~proposed.policy.FirstMatch`'s
+    # abstention rule and not a second copy of it here, and a
+    # :class:`~proposed.policy.PolicyChain` because the directory is going to be
+    # handed it and both links select over keys.
+    return [PolicyChain([RoutedPull(cluster), source]), placement]
 
 
 class _ServingEndpoints:
