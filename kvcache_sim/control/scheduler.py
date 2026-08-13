@@ -8,8 +8,7 @@ they meet only at the cluster model.
 
 This application's one question::
 
-    await select(request, me) -> Selection    # prefill hosts, best first,
-                                              # payload {host: Plan}
+    await select(request, me) -> Selection[Plan]   # prefill hosts, best first
 
 The ranking is real -- every prefill instance is priced -- and the winner's
 :class:`Plan` rides in the payload, so a caller wanting the decision reads
@@ -28,10 +27,10 @@ host already knows which blocks it computed, and a volume that runs out of room
 drops its own coldest keys and tells the directory afterwards
 (:mod:`realsim.seams._retention`). Every argument and return is a value.
 
-Both names are *presets* of one scheduler, parameterized on two axes, each a
-selector this one consults and neither installable in the directory: **reuse**,
-consulted per candidate for "name a peer to pull a prefix from, or nobody", and
-**the ranking**, asked which of the priced candidates wins.
+Both names are *presets* of one scheduler, parameterized on two axes, neither of
+them reachable from outside it: **reuse**, a selector consulted per candidate for
+"name a peer to pull a prefix from, or nobody", and **the rank key**, which sorts
+the candidates this scheduler priced.
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
@@ -59,9 +58,9 @@ each move the executed cost off it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from proposed import AnySelector, Endpoint, Key, KeySelector, Selection
+from proposed import AnySelector, Endpoint, Key, KeySelector, Selection, VolumeId
 from proposed.selector import (
     AbstainOnSelf, KeySelectorChain, Refine, Refinement, Selector, TakeHead,
 )
@@ -147,20 +146,19 @@ class Plan:
 # Everything a routing decision does is the same whichever scheduler is running.
 # What differs is the two axes and which admission gates are installed.
 #
-# Neither axis is ever installed in the controller. The second is a
-# :class:`~proposed.selector.AnySelector`, because the subject is what tells the two
-# selector kinds apart (:mod:`proposed.selector`) and its subject is the application's:
-# the candidates this scheduler priced. This first axis answers only the store-shaped
-# half -- name a peer to pull from, or nobody -- so it is the source ranking
-# (:mod:`kvcache_sim.control._source`, a real KeySelector) under the one test that is not
-# the store's: is pulling worth more than recomputing here. That composition is a
+# Only this first axis is a selector at all, and it answers the store-shaped half
+# -- name a peer to pull from, or nobody. So it is the source ranking
+# (:mod:`kvcache_sim.control._source`, a real KeySelector) under the one test that is
+# not the store's: is pulling worth more than recomputing here. That composition is a
 # :class:`~proposed.selector.Refine`, a plain Selector, which is what keeps it out of
-# the controller without either half holding the other.
+# the controller without either half holding the other. Its ``select`` is awaited
+# inside the decision's pinned snapshot (:meth:`_Scheduler.select`), so it runs to
+# completion without suspending.
 #
-# What is not a selection at all is the rest of what a scheduler decides --
-# admission and the SLO gates answer yes or no, and a ranked set of sources cannot
-# say that. An axis's ``select`` is awaited inside the decision's pinned snapshot
-# (:meth:`_Scheduler.select`), so it runs to completion without suspending.
+# The second axis is below, and is a sort key rather than a selector: it ranks what
+# this scheduler already priced, reads no directory and answers nobody. What is not
+# a selection at all is the rest of what a scheduler decides -- admission and the
+# SLO gates answer yes or no, and a ranked set of sources cannot say that.
 
 
 class _LocalOnly(Selector):
@@ -218,76 +216,49 @@ class _LongerThanLocal(Refinement):
 # -- the second axis: which priced candidate wins ---------------------------- #
 
 
-def _ranked(candidates: Sequence[Tuple[str, Any]]) -> Selection:
-    """``(instance, its price)`` in rank order, as a selection carrying the prices."""
-    return Selection.of([i for i, _ in candidates], payload=dict(candidates))
+#: One decode candidate: the instance, and the batch it is predicted to meet
+#: there. The subject :func:`_by_batch` sorts, and the only ranking here whose
+#: subject is not plans.
+_Batched = Tuple[VolumeId, int]
 
 
-class _Ranking(Selector):
-    """Rank candidates the scheduler has already priced, best first.
-
-    A plain :class:`~proposed.selector.Selector` for :class:`_LocalOnly`'s reason:
-    the scheduler consults it and nothing else reaches it.
-
-    Pricing them here instead would pull the reuse axis, the transfer cost and
-    the profile in with it, which is most of a scheduler.
-
-    Handed the run's cluster model, since a ranking may want a signal the price has
-    already folded the clock into (:class:`_LeastLoaded`). Built where that model is
-    (:meth:`_Scheduler.attach`), which is why a preset names the kind rather than
-    building one.
-    """
-
-    subject_type = Sequence[Plan]
-
-    def __init__(self, cluster: KVClusterModel) -> None:
-        self.cluster = cluster
+#: How a priced candidate sorts: the key ``sorted`` is handed, smallest first. The
+#: same shape as :data:`_Gate` and for the same reason -- both decide one candidate
+#: at a time against the run's model, and neither is reachable from outside this
+#: scheduler, so neither is a selector. Every key ends in the instance id, which is
+#: what makes a rank total and a run reproducible.
+_RankKey = Callable[[Plan, "_Scheduler"], Tuple]
 
 
-class _LeastLoaded(_Ranking):
+def _by_load(plan: Plan, sched: "_Scheduler") -> Tuple:
     """The shortest predicted prefill queue, whatever reuse bought (the baseline).
 
-    Ranks on ``busy_until`` rather than the candidate's ``queue_wait``, which is
+    Sorts on ``busy_until`` rather than the candidate's ``queue_wait``, which is
     that tail clamped at the clock: two instances idle since different moments both
     wait zero, so the choice would fall to the id tie-break and a different one
     would win. This scheduler's claim is that it picks by load and nothing else.
     """
-
-    name = "least-loaded"
-
-    async def select(self, plans: Sequence[Plan], requester: str) -> Selection:
-        tails = self.cluster.busy_until
-        ordered = sorted(plans, key=lambda p: (tails[p.prefill], p.prefill))
-        return _ranked([(p.prefill, p) for p in ordered])
+    return (sched.cluster.busy_until[plan.prefill], plan.prefill)
 
 
-class _MinTTFT(_Ranking):
-    """The lowest predicted queue + transfer + prefill -- why reuse is *priced*
-    rather than preferred: a longer match on a busier instance can still lose."""
+def _by_ttft(plan: Plan, sched: "_Scheduler") -> Tuple:
+    """The lowest predicted queue + transfer + prefill.
 
-    name = "min-ttft"
-
-    async def select(self, plans: Sequence[Plan], requester: str) -> Selection:
-        ordered = sorted(plans, key=lambda p: (p.ttft, p.prefill))
-        return _ranked([(p.prefill, p) for p in ordered])
-
-
-class _LeastBatch(Selector):
-    """The smallest predicted decode batch (instance id tie-break).
-
-    The other host pick of a routing decision, and the same shape as the axis above:
-    the scheduler predicts each candidate's batch
-    (:meth:`_Scheduler._predicted_batch`) and this ranks what came back. Not an axis
-    -- both presets pick a decode instance this way.
+    Why reuse is *priced* rather than preferred: a longer match on a busier
+    instance can still lose.
     """
+    return (plan.ttft, plan.prefill)
 
-    name = "least-batch"
-    subject_type = Sequence[Tuple[str, int]]
 
-    async def select(
-        self, batches: Sequence[Tuple[str, int]], requester: str
-    ) -> Selection:
-        return _ranked(sorted(batches, key=lambda c: (c[1], c[0])))
+def _by_batch(candidate: _Batched) -> Tuple:
+    """The smallest predicted decode batch, instance id breaking the tie.
+
+    The other host pick of a routing decision, over ``(instance, predicted batch)``
+    rather than plans. Not an axis -- both presets pick a decode instance this way,
+    so the scheduler applies it directly instead of being handed it.
+    """
+    instance, batch = candidate
+    return (batch, instance)
 
 
 #: An admission gate: does this plan clear one SLO? Installed as a list --
@@ -380,10 +351,10 @@ class _Scheduler(AnySelector):
     threaded through the data plane to carry it and neither object holds the other.
 
     Args:
-        reuse / rank: the two axes a preset picks (see above), both consulted while
-            forming the one answer :meth:`select` gives, and neither installable in
-            the controller. ``rank`` is the *kind*, since the load it reads exists
-            only once :meth:`attach` has run.
+        reuse / rank: the two axes a preset picks (see above), both used while
+            forming the one answer :meth:`select` gives. ``reuse`` is a selector
+            and ``rank`` a sort key (:data:`_RankKey`), which is why only the first
+            is attached.
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -404,7 +375,7 @@ class _Scheduler(AnySelector):
         self,
         *,
         reuse: Selector,
-        rank: Type[_Ranking],
+        rank: _RankKey,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
@@ -420,8 +391,7 @@ class _Scheduler(AnySelector):
         self.profile = profile
         self.model = model
         self._reuse = reuse
-        self._rank_kind = rank
-        self._decode_rank = _LeastBatch()
+        self._rank = rank
         self._prefill_pool = prefill_pool
         self._decode_pool = decode_pool
         self.slo_ttft = slo_ttft
@@ -450,7 +420,6 @@ class _Scheduler(AnySelector):
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
         self.cluster: Optional[KVClusterModel] = cluster
-        self._rank: Optional[_Ranking] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view, transfer_cost: TransferCost) -> None:
@@ -478,16 +447,16 @@ class _Scheduler(AnySelector):
         if self.cluster is None:
             # Over ALL instances: the prefill and decode pools may each be a subset.
             self.cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
-        self._rank = self._rank_kind(self.cluster)
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
         )
         self.decode_ids = (
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
-        # Every selector this one consults senses through the same view, which is
-        # what lets one routing decision pin one directory snapshot for all of them
-        # (:meth:`~kvcache_sim.control._view.KVView.pinned`).
+        # The reuse axis senses through the same view this one does, which is what
+        # lets one routing decision pin one directory snapshot for both
+        # (:meth:`~kvcache_sim.control._view.KVView.pinned`). The rank keys need no
+        # view: they sort what this scheduler already priced.
         #
         # A reuse axis that ranks peers brings up the source ranking it funnels
         # (:meth:`~proposed.selector.Refine.attach`), and that ranking is also a link
@@ -496,11 +465,10 @@ class _Scheduler(AnySelector):
         # the pinned view, so a run listing the two planes puts this one **last**:
         # a ranking a decision consults inside its pin must not read past the
         # snapshot into the live directory.
-        for selector in (self._reuse, self._rank, self._decode_rank):
-            selector.attach(self.view, transfer_cost)
+        self._reuse.attach(self.view, transfer_cost)
 
     # -- proposed.AnySelector: one member, for the question ------------------ #
-    async def select(self, request: Request, requester: str) -> Selection:
+    async def select(self, request: Request, requester: str) -> Selection[Plan]:
         """Where should ``request`` run? Price every prefill instance, rank them.
 
         The prefill hosts best first, with each one's :class:`Plan` under its id in
@@ -531,7 +499,8 @@ class _Scheduler(AnySelector):
                 plans.append(self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
                 ))
-            ranked = await self._rank.select(plans, request.id)
+            plans.sort(key=lambda plan: self._rank(plan, self))
+            ranked = Selection.priced([(p.prefill, p) for p in plans])
         admitted = await self._admit(ranked.winner)
         return ranked if admitted is not None else Selection.of([])
 
@@ -575,7 +544,7 @@ class _Scheduler(AnySelector):
 
         Reserves nothing and mutates nothing, so a losing candidate leaves no trace
         (:class:`~kvcache_sim.control._cluster.Committed` records a decision actually
-        taken). Which candidate wins is the ranking's business (:class:`_Ranking`).
+        taken). Which candidate wins is the rank key's business (:data:`_RankKey`).
         """
         cached = min(match * self.B, request.prompt_tokens)
         uncached = request.prompt_tokens - cached
@@ -623,14 +592,13 @@ class _Scheduler(AnySelector):
     async def _select_decode(self, plan: Plan) -> Tuple[str, int]:
         """Where ``plan`` decodes, and the batch it was predicted to meet there.
 
-        Priced here and ranked by :class:`_LeastBatch`. With decode unmodelled every
-        candidate prices at zero, so the ranking's id tie-break is the whole of the
-        choice.
+        Priced here and sorted by :func:`_by_batch`. With decode unmodelled every
+        candidate prices at zero, so the id tie-break is the whole of the choice.
         """
         batches = [
             (d, self._predicted_batch(d, plan.done_time)) for d in self.decode_ids
         ]
-        chosen = await self._decode_rank.select(batches, plan.request.id)
+        chosen = Selection.priced(sorted(batches, key=_by_batch))
         d = chosen.sources[0]
         return (d, chosen.payload[d])
 
@@ -668,7 +636,7 @@ class LoadBalanceScheduler(_Scheduler):
     """Baseline (~vLLM): least-loaded instance, local-only cache reuse."""
 
     def __init__(self, **knobs: Any) -> None:
-        super().__init__(reuse=_LocalOnly(), rank=_LeastLoaded, **knobs)
+        super().__init__(reuse=_LocalOnly(), rank=_by_load, **knobs)
 
 
 class CacheAwareScheduler(_Scheduler):
@@ -705,6 +673,6 @@ class CacheAwareScheduler(_Scheduler):
                 if replicate
                 else _LocalOnly()
             ),
-            rank=_MinTTFT,
+            rank=_by_ttft,
             **knobs,
         )

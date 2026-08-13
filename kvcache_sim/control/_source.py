@@ -42,8 +42,14 @@ class LongestPrefixKeySelector(KeySelector):
 
     name = "longest-prefix"
 
-    async def select(self, keys: Sequence[str], requester: str) -> Selection:
-        """Instances holding a leading run of ``keys``, longest run first."""
+    async def select(
+        self, keys: Sequence[str], requester: str
+    ) -> Selection[None]:
+        """Instances holding a leading run of ``keys``, longest run first.
+
+        ``Selection[None]``: a ranking with nothing priced into it -- what a source
+        is worth is the scheduler's to weigh.
+        """
         counts = self._prefix_runs(list(keys))
         if not counts:
             return Selection.of([])

@@ -52,7 +52,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (
-    Any, Awaitable, Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple,
+    Any, Awaitable, Callable, Dict, Generic, Mapping, Optional, Protocol,
+    Sequence, Tuple, TypeVar,
 )
 
 from proposed.deployment import Key, VolumeId
@@ -69,9 +70,15 @@ __all__ = [
 # usable. ``None`` means "usable now".
 Ready = Callable[[], Awaitable[None]]
 
+#: What a selector holds about each source it ranks -- a price, a plan, a batch
+#: size. The one thing about an answer that varies, which is why :class:`Selection`
+#: is generic in this and in nothing else: the *subject* belongs to the selector
+#: (``subject_type``), not to the answer it returns.
+_P = TypeVar("_P")
+
 
 @dataclass(frozen=True)
-class Selection:
+class Selection(Generic[_P]):
     """Ranked sources for one subject, plus when they become usable.
 
     Args:
@@ -92,7 +99,7 @@ class Selection:
 
     sources: Optional[Tuple[VolumeId, ...]] = None
     ready: Optional[Ready] = None
-    payload: Mapping[VolumeId, Any] = field(default_factory=dict)
+    payload: Mapping[VolumeId, _P] = field(default_factory=dict)
 
     @classmethod
     def of(
@@ -100,15 +107,33 @@ class Selection:
         sources: Sequence[VolumeId],
         *,
         ready: Optional[Ready] = None,
-        payload: Optional[Mapping[VolumeId, Any]] = None,
-    ) -> "Selection":
+        payload: Optional[Mapping[VolumeId, _P]] = None,
+    ) -> "Selection[_P]":
         """A selection ranking ``sources`` best-first."""
         return cls(
             sources=tuple(sources), ready=ready, payload=dict(payload or {})
         )
 
+    @classmethod
+    def priced(
+        cls,
+        candidates: Sequence[Tuple[VolumeId, _P]],
+        *,
+        ready: Optional[Ready] = None,
+    ) -> "Selection[_P]":
+        """Ranked ids and what each was priced at, from one ordered sequence.
+
+        The safe form of :meth:`of` for a selector that prices: one argument, so
+        the ranking and the prices cannot be built out of step with each other.
+        """
+        return cls(
+            sources=tuple(i for i, _ in candidates),
+            ready=ready,
+            payload={i: price for i, price in candidates},
+        )
+
     @property
-    def winner(self) -> Optional[Any]:
+    def winner(self) -> Optional[_P]:
         """What the best-ranked source was chosen *with*, or ``None`` if none was.
 
         The payload under the head of :attr:`sources`, so a caller wanting the one
@@ -126,7 +151,7 @@ class Selection:
         if self.ready is not None:
             await self.ready()
 
-    def only(self, sources: Sequence[VolumeId]) -> "Selection":
+    def only(self, sources: Sequence[VolumeId]) -> "Selection[_P]":
         """This selection cut down to ``sources``, in the order given.
 
         The readiness gate rides along and each kept source keeps its price, so
