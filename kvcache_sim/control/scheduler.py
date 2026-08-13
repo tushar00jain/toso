@@ -161,7 +161,7 @@ class Plan:
 # SLO gates answer yes or no, and a ranked set of sources cannot say that.
 
 
-class _LocalOnly(Selector[Sequence[Key]]):
+class _LocalOnly(Selector[Sequence[Key], None]):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
     A plain :class:`~proposed.selector.Selector`: its subject is keys, but the
@@ -175,11 +175,11 @@ class _LocalOnly(Selector[Sequence[Key]]):
 
     name = "local-only"
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
         return Selection.of([])
 
 
-class _LongerThanLocal(Refinement):
+class _LongerThanLocal(Refinement[Sequence[Key], None]):
     """Abstain unless the head's prefix beats recomputing the gap locally.
 
     Its run must be more than ``threshold`` times the requester's own -- the
@@ -203,8 +203,8 @@ class _LongerThanLocal(Refinement):
         self.threshold = threshold
 
     async def refine(
-        self, selection: Selection, keys: Any, requester: str
-    ) -> Selection:
+        self, selection: Selection[None], keys: Sequence[Key], requester: str
+    ) -> Selection[None]:
         counts = self.view.prefix_lengths(list(keys))
         head = selection.sources[0]
         if counts.get(head, 0) <= counts.get(requester, 0) * self.threshold:
@@ -281,7 +281,7 @@ def _predicted_tbt_gate(plan: Plan, sched: "_Scheduler") -> bool:
     return plan.pred_tbt <= sched.slo_tbt
 
 
-class RoutedPull(KeySelector):
+class RoutedPull(KeySelector[None]):
     """The peer a fetch's pull was already priced against, or an abstention.
 
     Answering the store from what routing decided, rather than deciding twice:
@@ -307,12 +307,12 @@ class RoutedPull(KeySelector):
     def __init__(self, cluster: KVClusterModel) -> None:
         self._cluster = cluster
 
-    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
         peer = self._cluster.claim(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
 
-class FetchRouting(KeySelectorChain):
+class FetchRouting(KeySelectorChain[None]):
     """This capability's **store-side control plane**: who serves a fetch.
 
     What a run installs in the directory, beside the scheduler it installs as a
@@ -335,11 +335,11 @@ class FetchRouting(KeySelectorChain):
 
     name = "fetch-routing"
 
-    def __init__(self, cluster: KVClusterModel, source: KeySelector) -> None:
+    def __init__(self, cluster: KVClusterModel, source: KeySelector[None]) -> None:
         super().__init__([RoutedPull(cluster), source])
 
 
-class _Scheduler(AnySelector[Request]):
+class _Scheduler(AnySelector[Request, Plan]):
     """The pricing, ranking and admission both schedulers share.
 
     A :class:`~proposed.selector.AnySelector`, and only that: a serving host asks it as
@@ -353,7 +353,9 @@ class _Scheduler(AnySelector[Request]):
         reuse / rank: the two axes a preset picks (see above), both used while
             forming the one answer :meth:`select` gives. ``reuse`` is a selector
             and ``rank`` a sort key (:data:`_RankKey`), which is why only the first
-            is attached.
+            is attached. It names a peer for a candidate's block keys and prices
+            nothing (``Selector[Sequence[Key], None]``): what a peer is worth is
+            this scheduler's to work out (:meth:`_priced_reuse`).
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -371,7 +373,7 @@ class _Scheduler(AnySelector[Request]):
     def __init__(
         self,
         *,
-        reuse: Selector,
+        reuse: Selector[Sequence[Key], None],
         rank: _RankKey,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
@@ -503,7 +505,8 @@ class _Scheduler(AnySelector[Request]):
 
     @staticmethod
     def _priced_reuse(
-        counts: Dict[str, int], keys: Sequence[str], inst: str, chosen: Selection
+        counts: Dict[str, int], keys: Sequence[Key], inst: str,
+        chosen: Selection[None],
     ) -> Tuple[int, Optional[str], Sequence[str]]:
         """What a reuse selection buys ``inst``: ``(match, source, pull_keys)``.
 
@@ -657,7 +660,8 @@ class CacheAwareScheduler(_Scheduler):
             never serves it.
     """
 
-    def __init__(self, *, source_selector: KeySelector, balance_threshold: float = 1.5,
+    def __init__(self, *, source_selector: KeySelector[None],
+                 balance_threshold: float = 1.5,
                  replicate: bool = True, **knobs: Any) -> None:
         super().__init__(
             reuse=(

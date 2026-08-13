@@ -156,7 +156,7 @@ def scheduler(
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
-    source_selector: Optional[KeySelector] = None,
+    source_selector: Optional[KeySelector[None]] = None,
 ) -> List[object]:
     """This run's **two control planes**, as objects a scenario can just declare.
 

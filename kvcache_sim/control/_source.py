@@ -23,14 +23,14 @@ from __future__ import annotations
 
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-from proposed import DecisionLog, KeySelector, Selection
+from proposed import DecisionLog, Key, KeySelector, Selection
 
 from ._view import prefix_lengths_of
 
 __all__ = ["LongestPrefixKeySelector", "SpreadReadsKeySelector"]
 
 
-class LongestPrefixKeySelector(KeySelector):
+class LongestPrefixKeySelector(KeySelector[None]):
     """Rank instances by how much of the requested block prefix they hold.
 
     Longest contiguous run first, instance id as the tie-break, so the choice is
@@ -43,11 +43,11 @@ class LongestPrefixKeySelector(KeySelector):
     name = "longest-prefix"
 
     async def select(
-        self, keys: Sequence[str], requester: str
+        self, keys: Sequence[Key], requester: str
     ) -> Selection[None]:
         """Instances holding a leading run of ``keys``, longest run first.
 
-        ``Selection[None]``: a ranking with nothing priced into it -- what a source
+        ``KeySelector[None]``: a ranking with nothing priced into it -- what a source
         is worth is the scheduler's to weigh.
         """
         counts = self._prefix_runs(list(keys))
@@ -56,7 +56,7 @@ class LongestPrefixKeySelector(KeySelector):
         ranked = sorted(counts, key=lambda inst: (-counts[inst], inst))
         return Selection.of(ranked)
 
-    def _prefix_runs(self, keys: Sequence[str]) -> Dict[str, int]:
+    def _prefix_runs(self, keys: Sequence[Key]) -> Dict[str, int]:
         """Per-instance prefix runs, off whichever view this selector was attached to.
 
         The scheduler attaches its :class:`~kvcache_sim.control._view.KVView`, whose
@@ -186,7 +186,7 @@ class SpreadReadsKeySelector(LongestPrefixKeySelector):
         self.trace = trace
         self._grants = _Grants(window)
 
-    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
         """Rank as :class:`LongestPrefixKeySelector` does, spread over equal-value peers.
 
         The whole ranking is returned, not just the head, so a caller that rejects

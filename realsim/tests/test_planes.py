@@ -212,19 +212,23 @@ def test_the_subtypes_add_a_subject_and_nothing_else():
 
 
 def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
-    """``Selector[X]`` is the only place a subject is written; the value follows.
+    """``Selector[X, ...]`` is the only place a subject is written; the value follows.
 
     Two annotations for one fact would drift. The parameter is what a reader sees
     and mypy checks; ``subject_type`` is the same type as something the install
     gate can compare, since :pep:`484` erases the parameter at runtime.
     """
 
-    class _Parameterised(Selector[Sequence[Key]]):
+    class _Parameterised(Selector[Sequence[Key], None]):
         async def select(self, keys, requester):
             return Selection()
 
     class _Inherits(_Parameterised):        # narrows behaviour, not the subject
         pass
+
+    class _PricesOnly(KeySelector[int]):    # binds the price, not the subject
+        async def select(self, keys, requester):
+            return Selection()
 
     class _DeclaresItsOwn(Selector):
         @property
@@ -236,8 +240,9 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
 
     assert _Parameterised.subject_type == Sequence[Key]
     assert _Inherits.subject_type == Sequence[Key]
+    assert _PricesOnly.subject_type == Sequence[Key]
     assert _DeclaresItsOwn().subject_type == "computed"
-    # An unbound parameter is not a subject: AnySelector is Selector[_S].
+    # An unbound parameter is not a subject: AnySelector is Selector[_S, _P].
     assert AnySelector.subject_type is Any
 
 

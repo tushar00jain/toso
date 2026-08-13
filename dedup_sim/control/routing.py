@@ -50,14 +50,14 @@ from __future__ import annotations
 from collections import deque
 from typing import Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
-from proposed import DecisionLog, KeySelector, Selection
+from proposed import DecisionLog, Key, KeySelector, Selection
 
 from ._readiness import Readiness
 
 __all__ = ["DedupKeySelector"]
 
 
-class DedupKeySelector(KeySelector):
+class DedupKeySelector(KeySelector[None]):
     """Route each requester to a peer, not the origin (a real ``KeySelector``).
 
     Args:
@@ -110,7 +110,7 @@ class DedupKeySelector(KeySelector):
         view.directory.subscribe(self._registered_now)
 
     # -- decide -------------------------------------------------------------- #
-    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
         """Route ``requester`` to a peer (or, if it is first, to a holder)."""
         # Asking is the promise: this requester is about to fetch these keys and the
         # read-through plane publishes what it fetched, so it now owes the directory
@@ -154,7 +154,7 @@ class DedupKeySelector(KeySelector):
         # nothing to serve, so it stops being a source.
         return self._retire(requester, source)
 
-    def _retire(self, requester: str, source: str) -> Selection:
+    def _retire(self, requester: str, source: str) -> Selection[None]:
         """Drop a source nothing is coming from, and answer naively this once.
 
         The requester keeps no route to it, so its next ask is assigned afresh --
@@ -166,7 +166,7 @@ class DedupKeySelector(KeySelector):
             self.trace.record(self.view.now(), "retire", f"{source} holds nothing")
         return Selection()
 
-    def _assign(self, keys: Sequence[str], requester: str) -> Optional[str]:
+    def _assign(self, keys: Sequence[Key], requester: str) -> Optional[str]:
         """Pick this requester's source and fold it into the read-through tree.
 
         Safe without a lock because it cannot suspend
@@ -223,7 +223,7 @@ class DedupKeySelector(KeySelector):
             if volume in self.view.holders(located, key)
         ]
 
-    def _registered_now(self, volume_id: str, keys: Sequence[str]) -> None:
+    def _registered_now(self, volume_id: str, keys: Sequence[Key]) -> None:
         """The real directory just registered ``keys`` on ``volume_id``.
 
         Releases any requester whose answer was withheld pending that volume, and

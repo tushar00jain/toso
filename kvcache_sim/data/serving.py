@@ -192,7 +192,7 @@ class ServingHost:
         self,
         me: str,
         store: KVStore,
-        placement: AnySelector,
+        placement: AnySelector[Request, Plan],
         cluster: ClusterModel,
         *,
         trace,
@@ -203,7 +203,7 @@ class ServingHost:
     ) -> None:
         self.me = me
         self.store = store
-        self.placement: AnySelector = placement
+        self.placement: AnySelector[Request, Plan] = placement
         self.cluster: ClusterModel = cluster
         self.trace = trace
         self.metrics = metrics

@@ -459,8 +459,8 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     reaching the store is what a ``Deployment`` is for.
 
     Bases are pooled per *name*, so the closure holds whichever module in the
-    package declares a link in the chain, and a base that names its type parameter
-    (``Selector[Sequence[Key]]``) counts as that base.
+    package declares a link in the chain, and a base that names its type parameters
+    (``Selector[Sequence[Key], None]``) counts as that base.
     """
     bases: Dict[str, Set[str]] = defaultdict(set)
     remote: Set[str] = set()
@@ -471,8 +471,8 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
             if not isinstance(node, ast.ClassDef):
                 continue
             bases[node.name] |= {
-                # ``Selector[Sequence[Key]]`` is a Subscript, not a Name: a base
-                # that names its type parameter is still that base.
+                # ``Selector[Sequence[Key], None]`` is a Subscript, not a Name: a
+                # base that names its type parameters is still that base.
                 (b.value if isinstance(b, ast.Subscript) else b).id
                 for b in node.bases
                 if isinstance(b.value if isinstance(b, ast.Subscript) else b, ast.Name)
@@ -547,9 +547,21 @@ def _port_names(tree: ast.Module, ports: Set[str]) -> tuple:
     attrs: Set[str] = set()
 
     def named(ann) -> bool:
+        """Is this annotation a port, however it names its type parameters?
+
+        ``AnySelector[Request, Plan]`` is the port ``AnySelector``: reading only the
+        bare ``Name`` would leave this rule blind to exactly the attributes a
+        ``data/`` module holds a control plane in.
+        """
+        if isinstance(ann, ast.Subscript):
+            ann = ann.value
         if isinstance(ann, ast.Name):
             return ann.id in ports
-        return isinstance(ann, ast.Constant) and ann.value in ports
+        return (
+            isinstance(ann, ast.Constant)
+            and isinstance(ann.value, str)
+            and ann.value.partition("[")[0] in ports
+        )
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

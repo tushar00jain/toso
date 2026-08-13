@@ -1,13 +1,13 @@
 """One question, two subjects: which sources serve this, and when::
 
-    Selector.select(subject, requester) -> Selection
+    Selector[Subject, Price].select(subject, requester) -> Selection[Price]
 
 The answer is always volume ids, best first, plus the moment they become usable
 (and, for a selector handed candidates it did not price, what each one priced at).
-What differs is the **subject**, and every selector names its own::
+What differs is the **subject**, and every selector names its own in its header::
 
-    subject_type = Sequence[Key]     # the store's question
-    subject_type = Request           # an application's
+    class RoutedPull(KeySelector[None]):           # keys, ranked without pricing
+    class _Scheduler(AnySelector[Request, Plan]):  # an application's, priced
 
 Two of those subjects are *types* as well, because a run reaches a selector by
 which one it is:
@@ -53,7 +53,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (
     Any, Awaitable, Callable, Dict, Generic, Mapping, Optional, Protocol,
-    Sequence, Tuple, TypeVar, get_args,
+    Sequence, Tuple, TypeVar, get_args, get_origin,
 )
 
 from proposed.deployment import Key, VolumeId
@@ -71,13 +71,15 @@ __all__ = [
 Ready = Callable[[], Awaitable[None]]
 
 #: What a selector holds about each source it ranks -- a price, a plan, a batch
-#: size. The one thing about an answer that varies, which is why :class:`Selection`
-#: is generic in this and in nothing else: the *subject* belongs to the selector
-#: (``subject_type``), not to the answer it returns.
+#: size. The one thing about an answer that varies, so it is the only thing
+#: :class:`Selection` is generic in, and a selector's second parameter: the
+#: *subject* belongs to the selector alone, the price to both. ``None`` for one that
+#: ranks without pricing.
 _P = TypeVar("_P")
 
-#: What a selector's ``select`` takes. Written into the class by parameterizing it
-#: -- ``Selector[Sequence[Key]]`` -- and read back at runtime as ``subject_type``.
+#: What a selector's ``select`` takes: the **subject** parameter, which
+#: :meth:`Selector.__init_subclass__` reads back into ``subject_type`` by finding
+#: whichever argument lines up with this variable.
 _S = TypeVar("_S")
 
 
@@ -198,8 +200,13 @@ class DecisionLog(Protocol):
         ...
 
 
-class Selector(ControlPlane, ABC, Generic[_S]):
+class Selector(ControlPlane, ABC, Generic[_S, _P]):
     """Rank the sources that should serve a subject, and say when they are usable.
+
+    Written with the subject it takes and the price it hands each source back with
+    (``AnySelector[Request, Plan]``), so both halves of ``select``'s signature are
+    in the header a reader already looks at. ``None`` is the price of a selector
+    that only ranks.
 
     Everything shared by every kind lives here -- ``select``, ``subject_type``,
     the :class:`~proposed.plane.ControlPlane` lifecycle -- so :class:`KeySelector`
@@ -215,18 +222,21 @@ class Selector(ControlPlane, ABC, Generic[_S]):
     name = "selector"
 
     #: What :meth:`select` takes, as a value: :pep:`484` erases the parameter, so
-    #: ``isinstance(x, Selector[Sequence[Key]])`` raises and the one place a subject
-    #: is *checked* needs something comparable. Set by :meth:`__init_subclass__`
-    #: from the parameter, so the annotation and the value cannot disagree.
+    #: ``isinstance(x, Selector[Sequence[Key], None])`` raises and the one place a
+    #: subject is *checked* needs something comparable. Set by
+    #: :meth:`__init_subclass__` from the parameter, so the annotation and the value
+    #: cannot disagree.
     subject_type: Any = Any
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Read :attr:`subject_type` off ``Selector[...]``, if this class named one.
+        """Read :attr:`subject_type` off whichever base bound :data:`_S`.
 
-        A subclass that parameterizes nothing inherits its parent's, which is what
-        makes a narrowing subclass (``SpreadReadsKeySelector``) and a combinator
-        typed on two bases (:class:`KeySelectorChain`) both resolve by ordinary
-        attribute lookup. One that declares ``subject_type`` itself is left alone --
+        Positional, not "the first argument": a base may bind the price and leave
+        the subject alone (``KeySelector[None]``), so the argument to read is the
+        one lining up with :data:`_S` in that base's own ``__parameters__``. A class
+        no base of which binds :data:`_S` inherits its parent's subject, which is how
+        both a narrowing subclass (``SpreadReadsKeySelector``) and a priced-only
+        header resolve. One that declares ``subject_type`` itself is left alone --
         :class:`Refine` computes it from its source and would lose the property.
 
         Reads ``cls.__dict__`` rather than :func:`getattr`, which would find the
@@ -237,10 +247,13 @@ class Selector(ControlPlane, ABC, Generic[_S]):
         if "subject_type" in vars(cls):
             return
         for base in cls.__dict__.get("__orig_bases__", ()):
-            for arg in get_args(base):
-                if not isinstance(arg, TypeVar):
-                    cls.subject_type = arg
-                return
+            params = getattr(get_origin(base) or base, "__parameters__", ())
+            if _S not in params:
+                continue
+            subject = get_args(base)[params.index(_S)]
+            if not isinstance(subject, TypeVar):
+                cls.subject_type = subject
+            return
 
     #: What this selector senses through: ``None`` until :meth:`attach`, and never
     #: read by one that ranks only what it is handed.
@@ -256,15 +269,15 @@ class Selector(ControlPlane, ABC, Generic[_S]):
         self.view = view
 
     @abstractmethod
-    async def select(self, subject: _S, requester: str) -> Selection[Any]:
+    async def select(self, subject: _S, requester: str) -> Selection[_P]:
         """Rank the sources that should serve ``subject`` for ``requester``.
 
-        ``_S`` is whatever this selector was parameterized with, and
-        :attr:`subject_type` is that same type as a value a check can compare.
+        Both types are whatever this selector was parameterized with, and
+        :attr:`subject_type` is ``_S`` as a value a check can compare.
         """
 
 
-class KeySelector(Selector[Sequence[Key]]):
+class KeySelector(Selector[Sequence[Key], _P]):
     """A selector whose subject is **keys**: which volume serves these bytes.
 
     The store's own question, and the only kind a controller may install in
@@ -278,7 +291,7 @@ class KeySelector(Selector[Sequence[Key]]):
 
 
 
-class AnySelector(Selector[_S]):
+class AnySelector(Selector[_S, _P]):
     """A selector whose subject is an **application payload**.
 
     An application question that happens to be a selection -- which host prefills,
@@ -296,7 +309,7 @@ class AnySelector(Selector[_S]):
     """
 
 
-class NaiveKeySelector(KeySelector):
+class NaiveKeySelector(KeySelector[None]):
     """Every holder, in directory order, usable now.
 
     Precisely the real directory's own answer, so this returns the empty
@@ -306,11 +319,11 @@ class NaiveKeySelector(KeySelector):
 
     name = "naive"
 
-    async def select(self, keys: Sequence[str], requester: str) -> Selection:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
         return Selection()
 
 
-class FirstMatch(Selector):
+class FirstMatch(Selector[_S, _P]):
     """Ask each selector in order; the first one that answers is the answer.
 
     A :class:`Selection` can be empty in two ways, and they mean opposite things:
@@ -328,13 +341,15 @@ class FirstMatch(Selector):
     exactly as built, so a readiness gate rides along untouched.
 
     Args:
-        selectors: consulted left to right. An empty chain is legal and abstains.
+        selectors: consulted left to right, each taking the chain's subject and
+            pricing in its terms -- a chain answers as its links do, which is what
+            the two parameters say. An empty chain is legal and abstains.
     """
 
     name = "first-match"
 
-    def __init__(self, selectors: Sequence[Selector]) -> None:
-        self.selectors: Tuple[Selector, ...] = tuple(selectors)
+    def __init__(self, selectors: Sequence[Selector[_S, _P]]) -> None:
+        self.selectors: Tuple[Selector[_S, _P], ...] = tuple(selectors)
 
     def attach(self, view: Any, transfer_cost: Any) -> None:
         """Hand the stack's ports to every wrapped selector, answering or not.
@@ -346,7 +361,7 @@ class FirstMatch(Selector):
         for selector in self.selectors:
             selector.attach(view, transfer_cost)
 
-    async def select(self, subject: Any, requester: str) -> Selection:
+    async def select(self, subject: _S, requester: str) -> Selection[_P]:
         """The first non-abstaining answer, or an abstention if there is none."""
         for selector in self.selectors:
             selection = await selector.select(subject, requester)
@@ -355,7 +370,7 @@ class FirstMatch(Selector):
         return Selection.of([])
 
 
-class KeySelectorChain(FirstMatch, KeySelector):
+class KeySelectorChain(FirstMatch[Sequence[Key], _P], KeySelector[_P]):
     """A :class:`FirstMatch` every link of which selects over keys, so it does too.
 
     Installable in the controller, which a plain chain is not. The claim is checked
@@ -366,11 +381,13 @@ class KeySelectorChain(FirstMatch, KeySelector):
 
     Args:
         selectors: consulted left to right; each must be a :class:`KeySelector`.
+            Typed as the base's, since the claim is what is *checked* below -- an
+            annotation would only restate what a caller can ignore.
     """
 
     name = "selector-chain"
 
-    def __init__(self, selectors: Sequence[Selector]) -> None:
+    def __init__(self, selectors: Sequence[Selector[Sequence[Key], _P]]) -> None:
         super().__init__(selectors)
         wrong = [type(s).__name__ for s in self.selectors if not isinstance(s, KeySelector)]
         if wrong:
@@ -380,12 +397,13 @@ class KeySelectorChain(FirstMatch, KeySelector):
             )
 
 
-class Refinement(ControlPlane, ABC):
+class Refinement(ControlPlane, ABC, Generic[_S, _P]):
     """Narrow a ranking some selector already produced.
 
     Not a :class:`Selector`: it has no subject of its own, and ``select`` has
     nowhere to put an incoming ranking. :class:`Refine` is what holds the selector,
-    which is what keeps one selector from holding another.
+    which is what keeps one selector from holding another. Its parameters are that
+    selector's, borrowed -- the subject it is handed and the price it must not lose.
 
     Senses through the run's view like anything else in a chain (:meth:`attach`).
     """
@@ -400,8 +418,8 @@ class Refinement(ControlPlane, ABC):
 
     @abstractmethod
     async def refine(
-        self, selection: Selection, subject: Any, requester: str
-    ) -> Selection:
+        self, selection: Selection[_P], subject: _S, requester: str
+    ) -> Selection[_P]:
         """``selection``, narrowed. Handed the subject too, since a test may read it.
 
         Called only with a selection that names at least one source, so an
@@ -409,7 +427,7 @@ class Refinement(ControlPlane, ABC):
         """
 
 
-class Refine(Selector):
+class Refine(Selector[_S, _P]):
     """One selector's ranking, put through each :class:`Refinement` in turn.
 
     A plain :class:`Selector` whatever it wraps, for :class:`FirstMatch`'s reason:
@@ -424,15 +442,19 @@ class Refine(Selector):
     back an unfiltered ranking.
 
     Args:
-        source: produces the ranking. Either kind of selector.
-        steps: applied left to right.
+        source: produces the ranking. Either kind of selector, and what both
+            parameters are read off: a funnel answers its source's question with
+            its source's prices.
+        steps: applied left to right, each narrowing that same ranking.
     """
 
     name = "refine"
 
-    def __init__(self, source: Selector, *steps: Refinement) -> None:
+    def __init__(
+        self, source: Selector[_S, _P], *steps: Refinement[_S, _P]
+    ) -> None:
         self.source = source
-        self.steps: Tuple[Refinement, ...] = tuple(steps)
+        self.steps: Tuple[Refinement[_S, _P], ...] = tuple(steps)
 
     @property
     def subject_type(self) -> Any:
@@ -450,7 +472,7 @@ class Refine(Selector):
         for step in self.steps:
             step.attach(view, transfer_cost)
 
-    async def select(self, subject: Any, requester: str) -> Selection:
+    async def select(self, subject: _S, requester: str) -> Selection[_P]:
         """The source's ranking narrowed by every step, or the first abstention."""
         selection = await self.source.select(subject, requester)
         for step in self.steps:
@@ -465,30 +487,33 @@ class Refine(Selector):
         return selection
 
 
-class AbstainOnSelf(Refinement):
+class AbstainOnSelf(Refinement[Any, _P]):
     """Abstain when the ranking's head is the requester itself.
 
     A source is a peer, and a requester does not fetch what it already holds. The
     whole selection goes rather than just the head: the ranking preferred the
     requester, so nothing behind it is preferred to what the requester has.
+
+    ``Refinement[Any, _P]``, as :class:`TakeHead` is: a step that reads the ranking
+    and the requester and not the subject fits behind a source of any kind.
     """
 
     name = "abstain-on-self"
 
     async def refine(
-        self, selection: Selection, subject: Any, requester: str
-    ) -> Selection:
+        self, selection: Selection[_P], subject: Any, requester: str
+    ) -> Selection[_P]:
         if selection.sources[0] == requester:
             return Selection.of([])
         return selection
 
 
-class TakeHead(Refinement):
+class TakeHead(Refinement[Any, _P]):
     """Keep the best-ranked source and drop the rest, price and gate intact."""
 
     name = "take-head"
 
     async def refine(
-        self, selection: Selection, subject: Any, requester: str
-    ) -> Selection:
+        self, selection: Selection[_P], subject: Any, requester: str
+    ) -> Selection[_P]:
         return selection.only(selection.sources[:1])
