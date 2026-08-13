@@ -215,21 +215,24 @@ class _LongerThanLocal(Refinement[Sequence[Key], None]):
 # -- the second axis: which priced candidate wins ---------------------------- #
 
 
-#: One decode candidate: the instance, and the batch it is predicted to meet
-#: there. The subject :func:`_by_batch` sorts, and the only ranking here whose
-#: subject is not plans.
+#: What either ranking here sorts: one candidate as the pair a
+#: :class:`~proposed.selector.Selection` is built out of -- the instance, and what
+#: this scheduler priced it at. A :class:`Plan` when the choice is which host
+#: prefills, a predicted batch size when it is which host decodes.
+_Priced = Tuple[VolumeId, Plan]
 _Batched = Tuple[VolumeId, int]
 
 
-#: How a priced candidate sorts: the key ``sorted`` is handed, smallest first. The
-#: same shape as :data:`_Gate` and for the same reason -- both decide one candidate
-#: at a time against the run's model, and neither is reachable from outside this
-#: scheduler, so neither is a selector. Every key ends in the instance id, which is
+#: How a priced candidate sorts: the key ``sorted`` is handed, smallest first.
+#: Takes the run's model as its second argument like :data:`_Gate` does, since both
+#: judge one candidate against the cluster, and neither is reachable from outside
+#: this scheduler, so neither is a selector. The instance is read off the candidate
+#: rather than out of what it was priced at, so every key can end in it -- which is
 #: what makes a rank total and a run reproducible.
-_RankKey = Callable[[Plan, "_Scheduler"], Tuple]
+_RankKey = Callable[[_Priced, "_Scheduler"], Tuple]
 
 
-def _by_load(plan: Plan, sched: "_Scheduler") -> Tuple:
+def _by_load(candidate: _Priced, sched: "_Scheduler") -> Tuple:
     """The shortest predicted prefill queue, whatever reuse bought (the baseline).
 
     Sorts on ``busy_until`` rather than the candidate's ``queue_wait``, which is
@@ -237,24 +240,27 @@ def _by_load(plan: Plan, sched: "_Scheduler") -> Tuple:
     wait zero, so the choice would fall to the id tie-break and a different one
     would win. This scheduler's claim is that it picks by load and nothing else.
     """
-    return (sched.cluster.busy_until[plan.prefill], plan.prefill)
+    instance, _ = candidate
+    return (sched.cluster.busy_until[instance], instance)
 
 
-def _by_ttft(plan: Plan, sched: "_Scheduler") -> Tuple:
+def _by_ttft(candidate: _Priced, sched: "_Scheduler") -> Tuple:
     """The lowest predicted queue + transfer + prefill.
 
     Why reuse is *priced* rather than preferred: a longer match on a busier
     instance can still lose.
     """
-    return (plan.ttft, plan.prefill)
+    instance, plan = candidate
+    return (plan.ttft, instance)
 
 
 def _by_batch(candidate: _Batched) -> Tuple:
     """The smallest predicted decode batch, instance id breaking the tie.
 
-    The other host pick of a routing decision, over ``(instance, predicted batch)``
-    rather than plans. Not an axis -- both presets pick a decode instance this way,
-    so the scheduler applies it directly instead of being handed it.
+    The other host pick of a routing decision, over a predicted batch rather than a
+    plan. Not an axis -- both presets pick a decode instance this way, so the
+    scheduler applies it directly instead of being handed it, which is why this one
+    needs no model.
     """
     instance, batch = candidate
     return (batch, instance)
@@ -498,8 +504,10 @@ class _Scheduler(AnySelector[Request, Plan]):
                 plans.append(self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
                 ))
-            plans.sort(key=lambda plan: self._rank(plan, self))
-            ranked = Selection.priced([(p.prefill, p) for p in plans])
+            candidates: List[_Priced] = [(plan.prefill, plan) for plan in plans]
+            ranked = Selection.priced(sorted(
+                candidates, key=lambda candidate: self._rank(candidate, self)
+            ))
         admitted = await self._admit(ranked.winner)
         return ranked if admitted is not None else Selection.of([])
 
@@ -660,8 +668,7 @@ class CacheAwareScheduler(_Scheduler):
             never serves it.
     """
 
-    def __init__(self, *, source_selector: KeySelector[None],
-                 balance_threshold: float = 1.5,
+    def __init__(self, *, source_selector: KeySelector, balance_threshold: float = 1.5,
                  replicate: bool = True, **knobs: Any) -> None:
         super().__init__(
             reuse=(
