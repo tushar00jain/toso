@@ -163,13 +163,15 @@ class DecisionLog(Protocol):
 class Selector(ControlPlane, ABC):
     """Rank the sources that should serve a subject, and say when they are usable.
 
-    Everything shared by the two kinds lives here -- ``select``, ``notice``, the
+    Everything shared by the two kinds lives here -- ``select`` and the
     :class:`~proposed.plane.ControlPlane` lifecycle -- so :class:`Policy` and
     :class:`Placement` cannot drift apart. Implement one of those; only the
     combinators below sit on the base itself.
 
-    Override :meth:`notice` too if the selection has to wait for a source to
-    appear.
+    A selector that must wait for a source to appear subscribes to the directory
+    in its own :meth:`attach` (:meth:`proposed.deployment.Controller.subscribe`),
+    reached through the view it is handed there. Nothing about that is declared
+    here: a wakeup is the directory's to deliver, not a member every selector owes.
     """
 
     name = "selector"
@@ -193,20 +195,6 @@ class Selector(ControlPlane, ABC):
 
         ``Any``, because what a subject *is* is the subtype's claim: keys for a
         :class:`Policy`, an application's own values for a :class:`Placement`.
-        """
-
-    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
-        """The real directory just gained ``keys`` on ``volume_id``.
-
-        Called by the controller on every real registration
-        (``notify_put_batch``). Default: nothing. A selector whose answer is
-        withheld until a planned peer registers opens its readiness gate here.
-
-        There is deliberately no counterpart for a *de*-registration
-        (``notify_delete_batch``). This hook delivers a **wakeup**, and nothing
-        waits for a key to disappear; a selector that needs to know who holds a key
-        right now reads the directory as it forms its answer, the only reading
-        that survives an eviction.
         """
 
 
@@ -267,13 +255,6 @@ class FirstMatch(Selector):
     should always answer ends with a :class:`NaivePolicy`. The winner is returned
     exactly as built, so a readiness gate rides along untouched.
 
-    :meth:`notice` goes to **every** wrapped selector, including ones this chain
-    has never reached, because it delivers a *wakeup*, not a consultation: one
-    sitting behind an earlier answer has requesters parked on gates that nothing
-    but its own ``notice`` opens. The fan-out is synchronous and in chain order,
-    with no ``await`` in it, so no registration can interleave with another's
-    delivery.
-
     Args:
         selectors: consulted left to right. An empty chain is legal and abstains.
     """
@@ -286,8 +267,9 @@ class FirstMatch(Selector):
     def attach(self, view: Any, transfer_cost: Any) -> None:
         """Hand the stack's ports to every wrapped selector, answering or not.
 
-        Same reason as :meth:`notice`: one that senses through a view of its own
-        must be brought up even if it never answers.
+        One that senses through a view of its own must be brought up even if it
+        never answers -- and one that subscribes to the directory does it here, so
+        a link behind an earlier answer still has its wakeups.
         """
         for selector in self.selectors:
             selector.attach(view, transfer_cost)
@@ -299,11 +281,6 @@ class FirstMatch(Selector):
             if selection.sources is None or selection.sources:
                 return selection
         return Selection.of([])
-
-    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
-        """Fan the registration out to every wrapped selector."""
-        for selector in self.selectors:
-            selector.notice(volume_id, keys)
 
 
 class PolicyChain(FirstMatch, Policy):
@@ -339,8 +316,6 @@ class Refinement(ControlPlane, ABC):
     which is what keeps one selector from holding another.
 
     Senses through the run's view like anything else in a chain (:meth:`attach`).
-    There is no ``notice`` counterpart: a refinement opens no readiness gate, it
-    carries through the one the ranking arrived with.
     """
 
     name = "refinement"
@@ -407,10 +382,6 @@ class Refine(Selector):
                 return selection
             selection = await step.refine(selection, subject, requester)
         return selection
-
-    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
-        """To the source alone: a step has no gate of its own to open."""
-        self.source.notice(volume_id, keys)
 
 
 class AbstainOnSelf(Refinement):

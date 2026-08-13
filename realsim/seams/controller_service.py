@@ -29,7 +29,7 @@ Where a control plane runs
 --------------------------
 Here. A :class:`~proposed.policy.Policy` installed in this service is a
 capability's control plane running *inside the directory service* -- all of
-dedupe's, and the source half of kvcache's. :meth:`ControllerService.route` is
+dedupe's, and the source half of kvcache's. :meth:`ControllerService._route` is
 that call site, kept as its own method so it is findable: the mirrored real body
 runs first (:meth:`locate_raw`), then the policy is asked which of the directory's
 volumes should serve this requester, and the answer is *withheld* until the chosen
@@ -40,11 +40,17 @@ The policy is asked for a decision and handed no sensor: it runs on this side, s
 it senses through the :class:`~proposed.view.View` the run attached it to
 (:meth:`proposed.policy.Selector.attach`), which reads :meth:`locate_raw` and
 therefore cannot re-enter the hook it is being called from.
+
+That is the only thing here that knows what a policy is. Hearing that the
+directory changed goes the other way: anything at all may :meth:`subscribe`, and
+this service calls plain callables back without knowing whose they are.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, List, Optional, Sequence
+
+from proposed.deployment import Registered
 
 __all__ = ["ControllerService"]
 
@@ -56,20 +62,30 @@ class ControllerService:
         controller: a real ``Controller`` instance (constructed off-actor and
             marked initialized by
             :class:`realsim.adapters.real_controller.RealControllerAdapter`).
-        policy: the :class:`~proposed.policy.Policy` this service consults inside
-            :meth:`locate_volumes`. ``None`` -- the default -- leaves the directory
-            answering for itself, which is what the naive policy says anyway.
+
+    Built with no policy and none installed, the directory answers for itself --
+    which is what the naive policy says anyway.
     """
 
-    def __init__(self, controller, *, policy: Optional[Any] = None) -> None:
+    def __init__(self, controller) -> None:
         self.controller = controller
-        self._policy = policy
+        self._policy: Optional[Any] = None
+        self._subscribers: List[Registered] = []
 
     def install_policy(self, policy: Any) -> None:
-        """Install a control plane in this service after construction."""
+        """Install a control plane in this service after construction.
+
+        Two-phase because a policy senses through a
+        :class:`~proposed.view.View` built over this service, so it cannot exist
+        before the service does.
+        """
         self._policy = policy
 
     # -- proposed.deployment.Controller ------------------------------------- #
+    def subscribe(self, on_register: Registered) -> None:
+        """Call ``on_register(volume_id, keys)`` after every registration."""
+        self._subscribers.append(on_register)
+
     async def locate_volumes(
         self,
         keys: Sequence[str],
@@ -77,7 +93,7 @@ class ControllerService:
         require_fully_committed: bool = True,
     ) -> dict[str, dict[str, Any]]:
         """The real ``locate_volumes`` body, then the routing hook."""
-        selection = await self.route(keys)
+        selection = await self._route(keys)
         if selection is None:
             return self.locate_raw(keys, missing_ok, require_fully_committed)
         # Withhold the answer until the chosen source is usable. The directory is
@@ -98,10 +114,13 @@ class ControllerService:
         c.assert_initialized()
         for request in requests:
             c._notify_put(request, storage_volume_id)
-        # The directory just changed. A policy that withheld an answer pending a
-        # source's registration is released here (default: nothing).
-        if self._policy is not None:
-            self._policy.notice(storage_volume_id, [r.key for r in requests])
+        # The directory just changed; whoever asked to hear about it is told, in
+        # subscription order. Synchronous and inside this body on purpose: a
+        # subscriber that could suspend would let a second registration interleave
+        # with this one (:meth:`proposed.deployment.Controller.subscribe`).
+        keys = [r.key for r in requests]
+        for on_register in self._subscribers:
+            on_register(storage_volume_id, keys)
 
     async def notify_delete(self, key: str, storage_volume_id: str) -> None:
         # Mirrors Controller.notify_delete @endpoint body verbatim.
@@ -127,9 +146,9 @@ class ControllerService:
         return c.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
 
     # -- the control-plane call site, and the surface's other read ---------- #
-    # ``route`` is this service's own; ``locate_raw`` is the surface's other
+    # ``_route`` is this service's own; ``locate_raw`` is the surface's other
     # read, kept next to the hook it exists to avoid.
-    async def route(self, keys: Sequence[str]) -> Optional[Any]:
+    async def _route(self, keys: Sequence[str]) -> Optional[Any]:
         """Ask the installed control plane who should serve ``keys``.
 
         ``None`` means there is nobody to ask -- no policy installed, or no

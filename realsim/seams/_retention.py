@@ -10,9 +10,9 @@ This is the store's own, and deliberately not a control-plane decision: recency 
 volume's data is the one thing that volume cannot be wrong about, and asking a
 cluster-wide service for it would be a round trip to be told what is already local.
 A control plane has no say here today: :class:`~proposed.policy.Policy` declares
-``select`` and ``notice`` and nothing else, so the decisions a volume cannot make --
-that a key has three other copies, that one is about to be read, that a version is
-dead -- have nowhere to be expressed. That gap is real and left visible.
+``select`` and nothing else, so the decisions a volume cannot make -- that a key
+has three other copies, that one is about to be read, that a version is dead --
+have nowhere to be expressed. That gap is real and left visible.
 
 Deterministic by construction: recency is a monotonic counter, never a clock, and
 ties break on the key.

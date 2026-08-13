@@ -174,9 +174,10 @@ putget_sim/     the unrouted put/get burst (no policy, no data plane) -- the m x
   __main__.py     the Demo declaration (`python -m putget_sim`)
 proposed/       every contract that outlives the simulator; imports nothing
   policy.py       Policy.select(keys, requester) -> ranked sources +
-                  readiness, plus notice() to open a readiness gate. Naive (all
-                  holders, directory order) is the default; the controller
-                  consults it inside locate_volumes
+                  readiness. Naive (all holders, directory order) is the
+                  default; the controller consults it inside locate_volumes.
+                  A selector that gates on a registration subscribes to the
+                  directory itself (Controller.subscribe)
   view.py         View -- read-only observation: locate, topology and locality,
                   the clock. Built over a Controller, and reads it through
                   locate_raw alone

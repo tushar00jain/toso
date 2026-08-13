@@ -225,8 +225,17 @@ class Directory:
 
     def __init__(self, **holders: str) -> None:
         self.by_key = {key: set(vols.split()) for key, vols in holders.items()}
+        self._subscribers = []
 
     # -- the View surface DedupPolicy uses ---------------------------------- #
+    @property
+    def directory(self):
+        """A view exposes the directory it reads; here they are one object."""
+        return self
+
+    def subscribe(self, on_register) -> None:
+        self._subscribers.append(on_register)
+
     def locate(self, keys):
         return {k: {v: None for v in sorted(self.by_key.get(k, ()))} for k in keys}
 
@@ -241,10 +250,15 @@ class Directory:
         return 0.0
 
     # -- what the volumes do to it ------------------------------------------ #
-    def publish(self, volume: str, key: str, policy: DedupPolicy) -> None:
-        """``volume``'s read-through lands: the directory gains it, and says so."""
+    def publish(self, volume: str, key: str) -> None:
+        """``volume``'s read-through lands: the directory gains it, and says so.
+
+        Registration first, then the subscribers -- the order
+        ``notify_put_batch`` uses, and the one a released waiter depends on.
+        """
         self.by_key.setdefault(key, set()).add(volume)
-        policy.notice(volume, [key])
+        for on_register in self._subscribers:
+            on_register(volume, [key])
 
     def evict(self, volume: str, key: str) -> None:
         """``volume`` drops ``key`` (a newer version took the room)."""
@@ -265,8 +279,8 @@ def test_one_registration_releases_every_requester_waiting_on_it():
     """A fan-out cap over 1 means several requesters wait on the same peer.
 
     There is exactly one registration coming for all of them -- the peer publishes
-    once -- so they share one gate, and the peer's single ``notice`` has to wake
-    all of them. (Dropping the released gate does not strand the second: each
+    once -- so they share one gate, and that single registration has to wake all
+    of them. (Dropping the released gate does not strand the second: each
     waiter holds the event itself, not a lookup of it.)
     """
 
@@ -288,7 +302,7 @@ def test_one_registration_releases_every_requester_waiting_on_it():
         tasks = [loop.create_task(wait(n, w)) for n, w in zip(("r1", "r2"), waiters)]
         await asyncio.sleep(0)
         assert released == [], "released before the peer published"
-        directory.publish("r0", KEY, policy)  # the one registration
+        directory.publish("r0", KEY)  # the one registration
         await asyncio.gather(*tasks)
         return released
 
@@ -311,7 +325,7 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
         directory = Directory(W="p")
         policy = _sensing(directory, fanout_cap=3)
         await policy.select([KEY], "r0")  # r0 <- p
-        directory.publish("r0", KEY, policy)  # r0's read-through lands
+        directory.publish("r0", KEY)  # r0's read-through lands
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
         stale = await policy.select([KEY], "r1")
@@ -348,7 +362,7 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
         policy = _sensing(directory, fanout_cap=cap)
         # r0 pulls from the origin and publishes: a source for cap peers now.
         await policy.select([KEY], "r0")
-        directory.publish("r0", KEY, policy)
+        directory.publish("r0", KEY)
         served = 0
         for i in range(cap):  # ...and every one of those slots is taken
             if (await policy.select([KEY], f"r{i + 1}")).sources == ("r0",):

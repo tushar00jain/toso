@@ -15,8 +15,9 @@ the first is routed to the volume that already holds the key (the single fabric
 hop), and every later one is routed to a **peer** -- a reader that is *about to*
 hold it. Because that peer has not registered yet, the selection carries a
 readiness gate, and the controller withholds its answer until the peer's
-read-through put lands (:meth:`DedupPolicy.notice`). Peers are handed out FIFO
-under a fan-out cap, so cap 1 builds a chain and cap >= 2 a shallow tree.
+read-through put lands -- which this policy hears because it subscribed to the
+directory (:meth:`DedupPolicy.attach`). Peers are handed out FIFO under a fan-out
+cap, so cap 1 builds a chain and cap >= 2 a shallow tree.
 
 Whether a peer holds the key is asked of the directory every time an answer is
 formed (:meth:`DedupPolicy._registered`), never remembered: volumes evict, so a
@@ -97,6 +98,16 @@ class DedupPolicy(Policy):
         # not a memory of past registrations -- says which are true, since a volume
         # that evicts makes one false again.
         self._ready = Readiness()
+
+    def attach(self, view, transfer_cost) -> None:
+        """Sense through the view, and ask the directory to say when it changes.
+
+        The subscription is made here rather than by whoever assembles the run: a
+        gate is this policy's own business, and the directory it subscribes to is
+        the one behind the view it was just handed, so the two cannot disagree.
+        """
+        super().attach(view, transfer_cost)
+        view.directory.subscribe(self._registered_now)
 
     # -- decide -------------------------------------------------------------- #
     async def select(self, keys: Sequence[str], requester: str) -> Selection:
@@ -212,12 +223,16 @@ class DedupPolicy(Policy):
             if volume in self.view.holders(located, key)
         ]
 
-    def notice(self, volume_id: str, keys: Sequence[str]) -> None:
+    def _registered_now(self, volume_id: str, keys: Sequence[str]) -> None:
         """The real directory just registered ``keys`` on ``volume_id``.
 
         Releases any requester whose answer was withheld pending that volume, and
         settles the debt: the publication happened, so from here on the directory
         is what says whether that volume still holds the key.
+
+        Subscribed in :meth:`attach`, and synchronous because the directory calls
+        it inside ``notify_put_batch``
+        (:meth:`proposed.deployment.Controller.subscribe`).
         """
         for key in keys:
             self._promised.discard((volume_id, key))

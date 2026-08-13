@@ -181,14 +181,10 @@ class _Answers:
     def __init__(self, selection: Selection | None = None) -> None:
         self.selection = selection if selection is not None else Selection()
         self.asked: list[str] = []
-        self.noticed: list[tuple[str, tuple[str, ...]]] = []
 
     async def select(self, subject, requester):
         self.asked.append(requester)
         return self.selection
-
-    def notice(self, volume_id, keys):
-        self.noticed.append((volume_id, tuple(keys)))
 
 
 class _Fixed(_Answers, Policy):
@@ -203,7 +199,51 @@ def test_the_subtypes_add_nothing_of_their_own():
     """The split is a marker, not a second interface, so it cannot drift apart."""
     for kind in (Policy, Placement):
         assert kind.__bases__ == (Selector,)
-        assert not vars(kind).keys() & {"select", "notice", "attach", "name"}
+        assert not vars(kind).keys() & {"select", "attach", "name"}
+
+
+def test_a_selector_hears_registrations_by_subscribing_for_itself():
+    """The directory calls back plain callables and knows nothing of policies.
+
+    Subscribing in ``attach`` is what makes that possible: the view a selector is
+    handed exposes the directory behind it, so the wakeup needs no member on
+    ``Selector`` and no help from whoever assembles the run.
+    """
+    heard: list[tuple[str, tuple[str, ...]]] = []
+
+    class _Subscribes(Policy):
+        def attach(self, view, transfer_cost):
+            super().attach(view, transfer_cost)
+            view.directory.subscribe(
+                lambda volume_id, keys: heard.append((volume_id, tuple(keys)))
+            )
+
+        async def select(self, keys, requester):
+            return Selection()
+
+    sim = Simulation(_topology(), control=_Subscribes())
+
+    async def scenario():
+        with sim.mesh.installed():
+            sim.mesh.bind_source("a")
+            await sim.mesh.client("a").put("W", _payload())
+
+    _drive(sim, scenario())
+    assert heard == [("a", ("W",))]
+
+
+def test_a_registration_reaches_a_subscriber_before_the_put_returns():
+    """Synchronous and inside ``notify_put_batch``: no window, no interleaving.
+
+    A subscriber that could suspend would let a second registration land while
+    the first was still being delivered, and a waiter released by the first would
+    resume against a directory the second had already changed.
+    """
+    service = Simulation(_topology()).mesh.directory.service
+    seen: list[str] = []
+    service.subscribe(lambda volume_id, keys: seen.append(volume_id))
+    assert not asyncio.iscoroutinefunction(type(service).subscribe)
+    assert seen == []
 
 
 def test_only_a_policy_is_consulted_by_the_controller():
@@ -339,13 +379,18 @@ def test_first_match_keeps_the_winner_s_readiness_gate():
     assert _select(chained).ready is gate
 
 
-def test_first_match_notices_to_every_selector_even_unconsulted_ones():
-    """A wakeup is not a consultation: a gate behind the chain still has to open."""
+def test_first_match_attaches_every_selector_even_unconsulted_ones():
+    """A link behind an earlier answer still has to be brought up.
+
+    That is what lets it subscribe: a selector parks requesters on gates nothing
+    but its own registration opens, and it never gets the chance if the chain
+    only attaches what it consults.
+    """
     front, behind = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
     chained = FirstMatch([front, behind])
+    chained.attach("a-view", "a-cost")
     _select(chained)                      # behind is never asked ...
-    chained.notice("v9", ["K"])
-    assert front.noticed == behind.noticed == [("v9", ("K",))]  # ... but is told
+    assert front.view is behind.view == "a-view"   # ... but is brought up
 
 
 def test_a_combinator_holds_either_kind_and_is_neither():
@@ -442,13 +487,6 @@ def test_refine_brings_up_the_source_and_every_step():
     funnel.attach("a-view", "a-cost")
 
     assert funnel.view is source.view is step.view == "a-view"
-
-
-def test_refine_notices_only_to_the_source():
-    """A step opens no gate of its own, so a wakeup has nowhere else to go."""
-    source = _Fixed(Selection.of(["v0"]))
-    Refine(source, _Step()).notice("v9", ["K"])
-    assert source.noticed == [("v9", ("K",))]
 
 
 def test_refine_is_a_plain_selector_whatever_it_narrows():

@@ -30,11 +30,16 @@ surface declares the methods, which is where the signatures are.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
-    "ClusterModel", "Controller", "Deployment", "StorageFull", "StorageVolume",
+    "ClusterModel", "Controller", "Deployment", "Registered", "StorageFull",
+    "StorageVolume",
 ]
+
+#: A directory subscriber: ``(volume_id, keys)``, called once per registration.
+#: Synchronous -- see :meth:`Controller.subscribe`.
+Registered = Callable[[str, Sequence[str]], None]
 
 
 class StorageFull(Exception):
@@ -72,11 +77,12 @@ class Controller(Protocol):
     the same convention torchstore already uses.
 
     The difference between this protocol and torchstore's class *is* the ask, and
-    it is two things. One cannot be declared: ``locate_volumes`` gains a hook that
+    it is three things. One cannot be declared: ``locate_volumes`` gains a hook that
     consults a :class:`~proposed.policy.Policy`, which changes no signature, so it
-    is stated here instead. The other is :meth:`locate_raw`, the same directory read
-    with that hook skipped. Every other member already exists upstream, spelled the
-    same way.
+    is stated here instead. The others are :meth:`locate_raw`, the same directory
+    read with that hook skipped, and :meth:`subscribe`, which is how anything hears
+    that the directory changed. Every other member already exists upstream, spelled
+    the same way.
 
     A caller does not hold one of these -- it holds a :class:`ControllerHandle`.
     torchstore's ``Controller`` implements this; under simulation the two bodies
@@ -116,6 +122,28 @@ class Controller(Protocol):
         require_fully_committed: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
         """``{key -> {volume_id -> StorageInfo}}``, routed."""
+
+    def subscribe(self, on_register: Registered) -> None:
+        """Call ``on_register(volume_id, keys)`` after every registration.
+
+        How anything hears that the directory changed, and the whole of it: the
+        subscriber is a plain callable, so a directory carries no notion of what a
+        control plane is. A capability that needs one registers in its own
+        :meth:`~proposed.policy.Selector.attach`, through the
+        :class:`~proposed.view.View` it is already handed.
+
+        **Not a coroutine, for :meth:`locate_raw`'s reason.** A subscriber runs
+        inside ``notify_put_batch``'s body, so one that could suspend would let a
+        second registration interleave with the first, and a waiter released by the
+        first would resume against a directory the second had already changed. In
+        process, synchronous, and cheap enough to run on every put.
+
+        **Registrations only.** Deregistration emits nothing, because this delivers
+        a *wakeup* and nothing waits for a key to disappear. A subscriber that needs
+        to know who holds a key right now reads the directory as it forms its
+        answer, the only reading that survives an eviction. A caller that genuinely
+        needs to watch deletions has nowhere to say so yet.
+        """
 
     async def notify_put_batch(
         self, requests: Sequence[Any], storage_volume_id: str

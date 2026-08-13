@@ -63,7 +63,7 @@ COPIED_FROM_UPSTREAM = [
 #: what a controller hands its own policy through a ``View``, and it is asked for as
 #: a plain **synchronous local method**: a directory read that cannot suspend is
 #: what makes a routing decision atomic without a lock.
-THE_ASK = ["locate_raw"]
+THE_ASK = ["locate_raw", "subscribe"]
 
 
 def _real(name: str):
@@ -126,15 +126,16 @@ def test_the_ask_is_still_an_ask():
         )
 
 
-def test_the_ask_is_a_local_synchronous_read():
-    """What torchstore is asked for is a method, not an endpoint or a coroutine.
+def test_the_ask_is_local_and_synchronous():
+    """What torchstore is asked for is methods, not endpoints or coroutines.
 
-    A directory read that cannot suspend is what a control plane's atomicity rests
-    on (``dedup_sim.control.routing._assign``,
-    ``kvcache_sim.control.scheduler._Scheduler._decide_route``), so ``async`` here
-    would not be a detail: it would put the interleaving back. Nothing reaches it
-    across a boundary either -- it is absent from the handle, which is what a caller
-    holds.
+    Both for the same reason. A directory read that cannot suspend is what a
+    control plane's atomicity rests on (``dedup_sim.control.routing._assign``,
+    ``kvcache_sim.control.scheduler._Scheduler._decide_route``); a subscriber runs
+    inside ``notify_put_batch``, so one that could suspend would let a second
+    registration interleave with the first. ``async`` on either would not be a
+    detail: it would put the interleaving back. Neither is reached across a
+    boundary -- both are absent from the handle, which is what a caller holds.
     """
     service = ControllerService(RealController())
     handle = LocalControllerHandle(service)
