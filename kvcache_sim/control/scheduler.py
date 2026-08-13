@@ -282,7 +282,7 @@ class _LeastBatch(Selector):
     """
 
     name = "least-batch"
-    subject_type = Sequence[Plan]
+    subject_type = Sequence[Tuple[str, int]]
 
     async def select(
         self, batches: Sequence[Tuple[str, int]], requester: str
