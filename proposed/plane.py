@@ -14,11 +14,14 @@ implementing these and nothing else.
   :class:`~proposed.selector.KeySelector` is installed in the directory and a
   the plane an application's own hosts ask is given a service, so a capability
   deciding in both places is two planes rather than one naming the other;
-* :class:`DataPlane` -- the executing half's one member,
-  :meth:`DataPlane.after`: what the capability does once a transfer has landed.
-  The transfer itself is an ordinary client call and needs no interface.
+* :class:`DataPlane` -- the executing half's lifecycle, and only that: knobs at
+  construction, the deployment at :meth:`DataPlane.attach`. What it *does* with
+  those ports is its own members' business, because moving bytes is an ordinary
+  client call and there is no shape here for a contract to declare.
 
-Both defaults are real behaviour, not stubs: a plain fetch takes them unchanged.
+Both are lifecycle-only, and for one reason: what a capability is asked and what it
+does are the capability's, so a run reaches them by holding the object it was given
+rather than by a member this package named in advance.
 
 What is deliberately *not* here
 -------------------------------
@@ -34,9 +37,15 @@ They were never the capability's contract, they were the runner's, so they live
 with the runner now (``realsim.runner.ItemDispatch``) -- all but ``drain()``,
 which turned out not to be anybody's: the one run with work outliving its items
 had a request whose decode leg answered too early, and fixing that left nothing to
-drain. What is left here is the
-one thing a capability genuinely declares, and it names a requester rather than an
-item, so a deployment can implement it.
+drain.
+
+``after(requester, result)`` went the same way, later and for a subtler reason. It
+was the *only* verb declared here, and only one capability could implement it: a
+post-transfer hook exists because something else owns the transfer, so a plane that
+owns its own execution (``kvcache_sim``'s serving host) never implemented it while
+the run wired a framework callback for the plane that did. A plane that is handed
+the fetch owns the whole sequence instead -- read, then keep what was read -- which
+is the same shape both capabilities now have, with no hook between the two halves.
 
 Also absent, and for a different reason: any per-operation hook to *shape* a
 transfer -- chunking, striping across sources, batching keys, failover. Those are
@@ -54,16 +63,14 @@ __all__ = ["ControlPlane", "DataPlane"]
 
 
 class DataPlane:
-    """What a capability does once a transfer has landed.
+    """A capability's executing half, as a harness brings it up.
 
-    The executing half, and one member wide on purpose. Moving the bytes is an
-    ordinary client call -- ``get``, ``put``, ``get_batch`` -- so a capability
-    needs no interface to do it and this declares none. What it may need is the
-    step *after*: ``dedup_sim``'s reader publishes what it just fetched into its
-    own volume, which is what makes it a source for the next reader.
-
-    A capability with no such step implements nothing and inherits the default,
-    which is real behaviour rather than a stub.
+    No verbs. Moving bytes is an ordinary client call -- ``get``, ``put``,
+    ``get_batch`` -- so a capability needs no interface to do it and this declares
+    none; what it *does* around those calls it declares itself, and whoever wires
+    the run names the member (``realsim.runner.ItemDispatch``). ``dedup_sim``'s
+    plane reads through and keeps what it read; ``kvcache_sim``'s host walks three
+    legs. Neither is a shape this package could have guessed.
 
     What it does need is somewhere to *reach*, which is what :meth:`attach` hands
     over -- the store to call and the control plane to ask, both on one object.
@@ -79,15 +86,6 @@ class DataPlane:
         (:class:`~proposed.deployment.Deployment`) -- a plane that had to be handed
         each port separately would make every caller responsible for knowing which
         ports it wanted.
-        """
-
-    async def after(self, requester: str, result: Any) -> None:
-        """``requester``'s transfer landed, with ``result``. Default: nothing.
-
-        ``requester`` is the node that did the transfer -- the identity it reaches
-        the store under, which is what a capability needs to act on its behalf
-        (``deployment.client_for(requester)``). Not a work item: a deployment has
-        requesters and no items, and this interface has to be implementable by one.
         """
 
 

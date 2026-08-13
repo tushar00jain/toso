@@ -97,22 +97,22 @@ class VersionedRounds(PutGetBurst):
         return items
 
 
-class PerItemReadThrough(ReadThroughPlane):
-    """Read-through for the key the item names, or nothing if it names none.
+def _per_item(sim, workload) -> Any:
+    """Drive each item: a read goes through the plane, anything else is its own call.
 
-    ``DataPlane.after`` is handed a requester and what it fetched, which is all a
-    capability serving one key needs and one thing short of what this needs: the
-    key varies per item here. So this composes the whole step as the run's
-    ``on_item`` instead -- run the item, then publish -- which is what the split
-    between the runner's contract and the capability's is for.
+    The plane reads the key the item names -- rounds 1 and 3 -- while round 2 is the
+    reader storing its *own* new version, which is the workload seeding a state and
+    not a read to publish. No subclass: the plane already takes the key.
     """
+    plane = ReadThroughPlane(KEY, workload.put_value)
+    plane.attach(sim)
 
-    async def run_then_publish(self, item: Any) -> Any:
-        result = await item.run()
-        if item.payload is not None:
-            reader, key = item.payload
-            await self.deployment.client_for(reader).put(key, self.value)
-        return result
+    async def drive(item: Any) -> Any:
+        if item.payload is None:
+            return await item.run()
+        return await plane.read_through(*item.payload)
+
+    return drive
 
 
 def _run(num_readers: int = 3, *, fanout_cap: int = 1) -> tuple[Result, DedupKeySelector]:
@@ -127,9 +127,7 @@ def _run(num_readers: int = 3, *, fanout_cap: int = 1) -> tuple[Result, DedupKey
         f"cap={fanout_cap}",
         workload,
         control=selector,
-        data=lambda sim: ItemDispatch(
-            PerItemReadThrough(sim.mesh, KEY, workload.put_value).run_then_publish
-        ),
+        data=lambda sim: ItemDispatch(_per_item(sim, workload)),
         profile=profile,
     ).execute()
     return result, selector

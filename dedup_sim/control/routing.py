@@ -41,8 +41,7 @@ There is no burst loop, no reader list, and no knowledge of how many readers
 there will be. The tree is assigned one requester at a time as they ask, and the
 chain executes because each reader's read-through put releases the next reader's
 withheld answer -- an emergent property of the data plane's registration, not a
-schedule this module runs. That is what makes the scenario ordinary user code:
-a gather of ``client.get(K)``, with no idea a selector exists.
+schedule this module runs.
 """
 
 from __future__ import annotations

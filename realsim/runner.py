@@ -89,35 +89,32 @@ class WorkItem:
 
 
 class ItemDispatch:
-    """What :class:`Runner` drives: how to run an item, and what follows it.
+    """What :class:`Runner` drives: how to run one item.
 
-    Two functions, both optional, each with the plain answer as its default:
+    One function, optional, with the plain answer as its default: the item's own
+    ordinary store call, which is what a capability that adds nothing around the
+    transfer wants. A capability that adds something passes a member of its
+    :class:`~proposed.plane.DataPlane` -- whichever one it named -- and that member
+    owns the whole sequence, including awaiting ``item.run`` if the transfer is the
+    item's own.
 
-    * ``on_item`` -- run one item. Default: the item's own ordinary store call,
-      which is what a capability that adds nothing around the transfer wants;
-    * ``on_after`` -- a capability's :meth:`proposed.plane.DataPlane.after`, called
-      with the *requester* rather than the item, because that is the part of an
-      item that means anything outside a harness.
-
-    There was a third, ``on_drain``; the module docstring says why there is not.
+    There were two more, ``on_drain`` and ``on_after``; the module docstring and
+    :mod:`proposed.plane` say why there are not.
 
     Args:
         on_item: called with each :class:`WorkItem`; its result is the item's.
-        on_after: called ``(requester, result)`` once an item has landed.
-        writes_own_outcomes: set it when what is behind these functions publishes
-            its own outcome rows -- one at several different lifecycle points,
-            say -- so the runner does not also write one per item.
+        writes_own_outcomes: set it when what is behind that function publishes its
+            own outcome rows -- one at several different lifecycle points, say --
+            so the runner does not also write one per item.
     """
 
     def __init__(
         self,
         on_item: Optional[Callable[[WorkItem], Awaitable[Any]]] = None,
         *,
-        on_after: Optional[Callable[[str, Any], Awaitable[None]]] = None,
         writes_own_outcomes: bool = False,
     ) -> None:
         self._on_item = on_item
-        self._on_after = on_after
         self.writes_own_outcomes = writes_own_outcomes
 
     async def execute(self, item: WorkItem) -> Any:
@@ -125,11 +122,6 @@ class ItemDispatch:
         if self._on_item is None:
             return await item.run()
         return await self._on_item(item)
-
-    async def after(self, item: WorkItem, result: Any) -> None:
-        """Hand the capability what landed, named by who fetched it."""
-        if self._on_after is not None:
-            await self._on_after(item.id, result)
 
 
 class Runner:
@@ -181,7 +173,6 @@ class Runner:
         if delay > 0:
             await asyncio.sleep(delay)
         result = await self.dispatch.execute(item)
-        await self.dispatch.after(item, result)
         if self.ledger is not None:
             self.ledger.add(
                 Outcome(

@@ -37,6 +37,16 @@ NUM_READERS = 3
 FANOUT_CAPS = (1, 2)
 
 
+def _read_through(sim, burst) -> ItemDispatch:
+    """This run's data plane, brought up against the assembled stack.
+
+    The plane makes both of a reader's store calls itself, so what the runner drives
+    is one member and the item carries only who is reading.
+    """
+    plane = ReadThroughPlane(KEY, burst.put_value, trace=sim.trace)
+    plane.attach(sim)
+    return ItemDispatch(lambda item: plane.read_through(item.id))
+
 
 class Dedup(Scenario):
     """The unrouted baseline, then one routed run per fan-out cap.
@@ -76,10 +86,9 @@ class Dedup(Scenario):
                     control=DedupKeySelector(fanout_cap=cap, trace=trace),
                     # The capability is the plane's one member; what the runner
                     # drives is the dispatch that calls it. Wiring, so it is here
-                    # and not in ``data/``.
-                    data=lambda sim, b=burst: ItemDispatch(
-                        on_after=ReadThroughPlane(sim.mesh, KEY, b.put_value).after
-                    ),
+                    # and not in ``data/``. The plane is built with its knobs and
+                    # handed the deployment, exactly as a control plane is.
+                    data=lambda sim, b=burst: _read_through(sim, b),
                     profile=burst.profile,
                     trace=trace,
                 )

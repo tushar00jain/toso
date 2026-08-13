@@ -104,7 +104,7 @@ transport, on real types throughout.
 | Component | File | Role |
 |---|---|---|
 | `DedupKeySelector` | `control/routing.py` | A real `KeySelector`. Assigns each requester, as it asks, a source under a fan-out cap, and returns it with a **readiness gate** when that source has not registered yet. Holds no client, no volume, no mesh — and no burst loop. |
-| `ReadThroughPlane` | `data/read_through.py` | One `DataPlane.after`: the finished reader `put`s the key into its own co-located volume, which through the real `client.put` path also calls the real `notify_put_batch`. That registration is what opens the next reader's gate. |
+| `ReadThroughPlane` | `data/read_through.py` | Dedup's whole executing half, one member: it awaits the reader's own `get`, then `put`s the key into that reader's co-located volume, which through the real `client.put` path also calls the real `notify_put_batch`. That registration is what opens the next reader's gate. |
 | dedup scenario | `workload/scenarios.py` | Runs `putget_sim`'s ordinary put/get fixture twice — unrouted (the *m×* baseline) and with the selector + plane installed (1×) — so the comparison is byte-for-byte the same topology, payload and cost model. |
 | demo entrypoint | `__main__.py` | `python -m dedup_sim` — fabric summary + ASCII diagram (INFO), full per-event trace (DEBUG, `-v`). |
 

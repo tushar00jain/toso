@@ -652,17 +652,16 @@ def test_refine_is_a_plain_selector_whatever_it_narrows():
 
 
 # --------------------------------------------------------------------------
-# 4. DataPlane defaults.
+# 4. The plain path, and what a DataPlane declares (a lifecycle, no verbs).
 # --------------------------------------------------------------------------
 
 
-def test_data_plane_defaults_run_the_call_and_do_nothing_after():
-    """The two defaults are real behaviour: run the item, do nothing after.
+def test_the_plain_path_is_the_item_s_own_call():
+    """No capability installed: the runner awaits the item and nothing surrounds it.
 
-    They now live on either side of the boundary -- running an item is the
-    runner's ``ItemDispatch``, what follows it is the capability's ``DataPlane``
-    -- so the plain path is the two of them composed, which is what a run with no
-    capability installed gets.
+    Which is why ``ItemDispatch``'s one hook defaults to ``item.run`` -- a
+    capability that adds something passes a member of its own plane instead, and
+    that member owns the whole sequence.
     """
     calls: list[str] = []
 
@@ -671,15 +670,25 @@ def test_data_plane_defaults_run_the_call_and_do_nothing_after():
         return 42
 
     item = WorkItem(id="i0", run=call)
-
-    async def scenario():
-        result = await ItemDispatch().execute(item)
-        assert await ItemDispatch().after(item, result) is None
-        assert await DataPlane().after(item.id, result) is None
-        return result
-
-    assert asyncio.run(scenario()) == 42
+    assert asyncio.run(ItemDispatch().execute(item)) == 42
     assert calls == ["ran"]
+
+
+def test_a_data_plane_declares_a_lifecycle_and_no_verbs():
+    """What a capability *does* is not this package's to name.
+
+    ``attach`` is the whole surface, so the only thing a run can do with a plane is
+    hand it the deployment; which member then carries the work is named by whoever
+    wires the run. A declared verb would have to be one every capability implements,
+    and the two here do not execute alike -- dedup reads through, kvcache walks
+    three legs.
+    """
+    verbs = {
+        name for name in vars(DataPlane)
+        if not name.startswith("_")
+    }
+    assert verbs == {"attach"}
+    assert DataPlane().attach(object()) is None   # a default that does nothing
 
 
 # --------------------------------------------------------------------------

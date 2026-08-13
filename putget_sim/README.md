@@ -111,7 +111,7 @@ engine, meta/metadata carriers — is imported from `realsim` / `sim_common`.
 | role | `putget_sim` | `dedup_sim` | `kvcache_sim` |
 |---|---|---|---|
 | `control/` — what is decided | **absent** — the naive default (all holders, directory order) | `routing.py`: one `KeySelector.select` — a ranked source plus a readiness gate | `scheduler.py` + `selector.py` + `cache.py` + `view.py` |
-| `data/` — what executes | **absent** — a `get` and nothing after it | `read_through.py`: one `DataPlane.after` — a local put | `serving.py` + `decode.py` + `_store.py` |
+| `data/` — what executes | **absent** — a `get` and nothing after it | `read_through.py`: one member — the get, then a local put | `serving.py` + `decode.py` + `_store.py` |
 | `workload/` — what is simulated | `put_get.py`: one synchronized burst, parameterized by reader count | the same `put_get.py`, with the selector installed | `request.py` + `generator.py` + `scenarios.py` |
 | `report/` — outcome metrics | `summary.py`: rendering only, over a shared `Ledger` | `summary.py`: rendering only, over the same `Ledger` | `metrics.py`: its **own** per-request outcome row |
 | outcome | `m x` fabric | **1x** fabric, same workload | TTFT/TBT under an arrival stream |
