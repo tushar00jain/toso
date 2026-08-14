@@ -672,6 +672,39 @@ def test_discount_refuses_a_ranking_that_prices_nothing():
         _select(discounted)
 
 
+def test_discount_takes_the_kind_of_the_ranking_it_wraps():
+    """One combinator over both subjects, and a chain still refuses the wrong one.
+
+    A discount asks whatever its ranking asks -- it hands the subject down untouched --
+    so its own kind cannot be declared once. It has to *be* a type, because that is how
+    a chain checks its links, so it is derived: a discounted key ranking is a chain
+    link, and a discounted application ranking gets the answer that ranking would get
+    by itself.
+    """
+    over_keys = Discount(_Fixed(Selection.priced([("v0", 5)])))
+    over_payload = Discount(_FixedPlacement(Selection.priced([("v0", 5)])))
+
+    assert isinstance(over_keys, KeySelector)
+    assert not isinstance(over_payload, KeySelector)
+    assert isinstance(over_payload, Discount)        # still the combinator
+    assert over_payload.subject_type is Any          # read off the ranking under it
+
+    FirstMatch([over_keys])                          # a link like the ranking it wraps
+    with pytest.raises(TypeError, match="every link must be a KeySelector"):
+        FirstMatch([over_payload])
+
+
+def test_discount_spreads_an_application_ranking_too():
+    """The tie a discount breaks is not the store's question in particular.
+
+    Two hosts an application priced the same sort on its last tie-break, exactly as two
+    volumes do, so the combinator is the same one -- which is the whole point of it
+    taking any subject.
+    """
+    discounted = Discount(_FixedPlacement(Selection.priced([("h0", 5), ("h1", 5)])))
+    assert _heads(discounted, count=4) == ["h0", "h1", "h0", "h1"]
+
+
 def test_discount_attaches_the_ranking_under_it_and_keeps_what_it_answered():
     """The wrapped selector is sensing, and the answer is re-ordered and nothing else.
 
