@@ -19,6 +19,11 @@ What the base view offers, and how a capability adds to it
   where it is *made*: a selector is handed a subject and no timestamp, since
   over a non-zero hop the sender's stamp is already stale and comparing it against
   every instance's queue would read the cluster in the past.
+* :meth:`pinned` -- one decision, one directory. It is the *port* read that is
+  pinned, so anything derived from it (``kvcache_sim``'s prefix runs) is coherent
+  for the whole decision without knowing the pin exists. What is deliberately not
+  pinned: a sensor, whose reads are live by design, and :meth:`locate_live`, for a
+  caller whose correctness is freshness (a gate on a fact yet to land).
 
 Anything more specific stays out, and is *composed* on instead: a capability adds
 one subclass of this base per read it senses -- a sensor it holds is one line,
@@ -48,13 +53,29 @@ builds one via ``Mesh.view``; a real controller would build one over itself.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Optional, Sequence
+from contextlib import contextmanager
+from typing import Any, Dict, FrozenSet, Iterator, Optional, Sequence
 
 from proposed.cost import TransferCost
 from proposed.deployment import Controller
 from proposed.topology import Endpoint
 
 __all__ = ["Sensed", "SensorView", "View"]
+
+
+class _Pin:
+    """The directory answer one decision pinned: which keys, and what they said.
+
+    ``keys is None`` outside a decision that pinned, which is when :meth:`View.locate`
+    is live. One cell per root view, shared *by reference* with everything derived from
+    it (:meth:`View.derived`), so a read on any of those views is inside the root's pin
+    rather than beside it -- a per-view cell would let a second derived view walk the
+    directory again and answer for a different moment.
+    """
+
+    def __init__(self) -> None:
+        self.keys: Optional[FrozenSet[str]] = None
+        self.located: Dict[str, Dict[str, Any]] = {}
 
 
 class View:
@@ -68,9 +89,9 @@ class View:
 
     What it reads are the members: :attr:`directory`, :attr:`topology`. Of the
     five the directory answers, one is safe for a decision to read, and that one is
-    what :meth:`locate` calls -- the read spelled out here rather than left to each
-    caller, since a decision made against an answer somebody has already reordered
-    would be ranking its own output back.
+    what :meth:`locate_live` calls -- the read spelled out here rather than left to
+    each caller, since a decision made against an answer somebody has already
+    reordered would be ranking its own output back.
 
     Args:
         directory: the directory to read -- anything satisfying
@@ -91,6 +112,7 @@ class View:
         self._directory = directory
         self._topology = dict(topology)
         self._cost = cost
+        self._pin = _Pin()
 
     def derived(self, cls: type, **sensors: Any) -> "View":
         """A view of type ``cls`` over these same ports, carrying ``sensors``.
@@ -108,8 +130,14 @@ class View:
         attribute of that name, so this base names none of them -- and one no attribute
         claimed reaches this base's own ``__init__``, which takes none, and fails there
         rather than being silently absent.
+
+        The pin (:meth:`pinned`) travels here rather than through the ports or the
+        keywords: a keyword would be one this base has to name, which is exactly what
+        makes a misspelled sensor raise, and the pin is not a port a run supplies.
         """
-        return cls(self._directory, self._topology, self._cost, **sensors)
+        view = cls(self._directory, self._topology, self._cost, **sensors)
+        view._pin = self._pin
+        return view
 
     @property
     def directory(self) -> Controller:
@@ -117,17 +145,69 @@ class View:
         return self._directory
 
     def locate(self, keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
-        """``key -> {volume_id -> StorageInfo}`` from the REAL directory.
+        """``key -> {volume_id -> StorageInfo}``: off the pin if one is held, else live.
+
+        Asserts on a key the pin does not cover: answering it live would be the
+        incoherence the pin exists to rule out, and answering it absent would say
+        nobody holds it -- so a read past the pin is a bug in the decision, not a miss
+        to serve.
+        """
+        pin = self._pin
+        if pin.keys is None:
+            return self.locate_live(keys)
+        assert all(key in pin.keys for key in keys), (
+            "a pinned view answers for the keys it was pinned to; one decision reads "
+            "one directory"
+        )
+        return {key: pin.located[key] for key in keys if key in pin.located}
+
+    def locate_live(self, keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """``key -> {volume_id -> StorageInfo}`` from the REAL directory, now.
 
         Missing keys are simply absent (``missing_ok=True``): a read reports
         what is there, it does not raise at the observer. Reads the raw controller
         body, so no caller's preference is folded into what a decision is made
-        against -- and it cannot suspend, which is what that decision relies on
+        against -- and it cannot suspend, which is what a pin relies on
         (:meth:`~proposed.deployment.Controller.locate_raw`).
+
+        For a caller whose correctness is freshness rather than coherence: a gate on a
+        fact that has not happened yet would park its waiter forever behind a read
+        taken before the fact landed. Everything deciding *against* the directory reads
+        :meth:`locate` instead.
         """
         if not keys:
             return {}
         return self._directory.locate_raw(list(keys), missing_ok=True)
+
+    @contextmanager
+    def pinned(self, keys: Sequence[str]) -> Iterator[None]:
+        """Walk the directory once for ``keys``, and serve that walk for the block.
+
+        Scoped state on the view rather than an answer passed around, because every
+        selector a decision consults senses through a view derived from this one
+        (:meth:`~proposed.selector.Selector.attach`) and would otherwise read past it
+        into the live directory.
+
+        Sound because one decision cannot be interleaved with another: the read
+        underneath it is a plain synchronous method
+        (:meth:`~proposed.deployment.Controller.locate_raw`), so there is no
+        suspension point between the pin and its release. Should one ever appear, the
+        assertions fire -- here on a second decision entering, in :meth:`locate` on a
+        read of other keys arriving inside one.
+        """
+        pin = self._pin
+        assert pin.keys is None, "a decision already holds this view's directory read"
+        # Copied per key: the directory answers with its own volume map for each key
+        # (:meth:`~proposed.deployment.Controller.locate_raw`), so a delete landing
+        # inside the decision would otherwise rewrite what it pinned.
+        located = {
+            key: dict(volumes) for key, volumes in self.locate_live(keys).items()
+        }
+        pin.keys, pin.located = frozenset(keys), located
+        try:
+            yield
+        finally:
+            pin.keys, pin.located = None, {}
 
     # -- topology ----------------------------------------------------------- #
     @property

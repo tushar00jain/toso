@@ -263,9 +263,10 @@ kvcache_sim/
                           #     on its own terms, when read -- so no decision
                           #     method carries a sweep
     _view.py              #   KVView: what a decision senses, one class per read
-                          #   and each a proposed.View -- prefix runs (with the
-                          #   pinned snapshot one routing decision reads them
-                          #   through) and each sensor above: the cluster, the
+                          #   and each a proposed.View -- prefix runs (a pure
+                          #   function of the directory read one routing decision
+                          #   pins, View.pinned, so nothing here holds a snapshot
+                          #   of its own) and each sensor above: the cluster, the
                           #   prefills promised (composed in only by a run that
                           #   predicts decode occupancy forward) and the routed
                           #   pulls, so what ranks or gates reads the view it

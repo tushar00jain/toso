@@ -297,7 +297,7 @@ class _Scheduler(ControlPlane):
         # the KVView above -- the fetch because its head link reads the routed-pull
         # sensor (:class:`~kvcache_sim.control._selector.RoutedPull`), the reuse axis
         # because one routing decision pins that view's snapshot for the whole of
-        # itself (:meth:`~kvcache_sim.control._view.KVView.pinned`) and a ranking
+        # itself (:meth:`~proposed.view.View.pinned`) and a ranking
         # consulted inside the pin must not read past it into the live directory. The
         # source ranking is a link of both and gets attached twice, to the same view
         # either way, so no order here is load-bearing.
@@ -367,7 +367,7 @@ class _Scheduler(ControlPlane):
         compared as well as what won.
 
         Atomic: every read is off one pinned directory snapshot
-        (:meth:`~kvcache_sim.control._view.KVView.pinned`) and one clock read, so the
+        (:meth:`~proposed.view.View.pinned`) and one clock read, so the
         prices are comparable, and the bookkeeping it writes needs nothing locked.
         Pricing a candidate reserves nothing (:meth:`_candidate`), so the losers leave
         no trace and the winner is chosen after the whole field is known. Both axes are

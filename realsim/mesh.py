@@ -47,6 +47,7 @@ mesh -- a run's ledger, which needs the mesh to exist first -- can claim it.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import cached_property
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from realsim.adapters.real_client import RealClientAdapter
@@ -157,7 +158,7 @@ class Mesh:
         }
 
     # -- accessors ---------------------------------------------------------- #
-    @property
+    @cached_property
     def view(self) -> View:
         """A :class:`~proposed.view.View` over this mesh's directory + topology.
 
@@ -169,6 +170,13 @@ class Mesh:
         control plane ranks the directory rather than an answer somebody has already
         ranked. Note what that also means -- a control plane's directory reads do not
         cross the handle, so they are not charged the hop a real one would pay.
+
+        One per mesh, because a view carries the scope one decision pins its directory
+        read in (:meth:`~proposed.view.View.pinned`): a second view over the same mesh
+        would be a second scope, so a reader holding it would walk the directory again
+        in the middle of a decision that had pinned it. Safe to cache because the ports
+        under it are fixed for the run -- the topology is copied at construction and
+        the directory adapter is built once.
         """
         return View(
             self.directory.service,

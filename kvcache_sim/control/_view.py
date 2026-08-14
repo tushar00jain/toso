@@ -28,19 +28,20 @@ so whatever ranks, prices or gates senses it here instead of being handed the se
 and the plane reports its own decision into them the same way. What does not come this
 way is a host's fact: the run puts a service in front of the cluster sensor for those.
 
-:meth:`PrefixView.pinned` is the second half of the prefix idea. A routing decision
-reads the prefix runs several times -- once for the candidate loop's local matches,
-once per candidate when it asks the source :class:`~proposed.selector.KeySelector` which
-peer would serve the gap -- and all of them must see the *same* directory state or the
-decision is incoherent. Pinning also means the directory is walked once per request,
-not once per read. The other three are live: they move only when a fact is folded or a
-decision commits, and neither happens inside a pin.
+Pinning (:meth:`~proposed.view.View.pinned`) is the second half of the prefix idea. A
+routing decision reads the prefix runs several times -- once for the candidate loop's
+local matches, once per candidate when it asks the source
+:class:`~proposed.selector.KeySelector` which peer would serve the gap -- and all of
+them must see the *same* directory state or the decision is incoherent. The pin is on
+the directory read those runs are derived from, so the scheduler names the keys once
+(:meth:`~kvcache_sim.control.scheduler._Scheduler._select_prefill`) and nothing here
+carries a snapshot of its own. The other three are live: they move only when a fact is
+folded or a decision commits, and neither happens inside a pin.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import AbstractSet, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import AbstractSet, Dict, Sequence
 
 from proposed import Sensed, SensorView, View
 
@@ -97,51 +98,17 @@ class PrefixView(View):
     no keyword and is never absent.
     """
 
-    #: The keys one decision pinned and the runs it read for them, while
-    #: :meth:`pinned` holds; ``None`` outside such a decision.
-    _snapshot: Optional[Tuple[List[str], Dict[str, int]]] = None
-
     def prefix_lengths(self, block_keys: Sequence[str]) -> Dict[str, int]:
         """``instance -> leading blocks of ``block_keys`` it holds contiguously``.
 
         Computed from the real ``locate_volumes`` result
         (``{key -> {volume_id -> StorageInfo}}``); the run stops at the first
         missing block, and instances holding none of the first block are omitted.
-        Served from the pinned snapshot while one is held.
+        A pure function of :meth:`~proposed.view.View.locate`, so it is coherent for
+        the whole of a decision that pinned these keys without knowing it was pinned.
         """
         keys = list(block_keys)
-        if self._snapshot is not None:
-            pinned_keys, counts = self._snapshot
-            assert keys == pinned_keys, (
-                "a pinned view answers for the keys it was pinned to; one decision "
-                "reads one snapshot"
-            )
-            return counts
         return prefix_lengths_of(self.locate(keys), keys)
-
-    @contextmanager
-    def pinned(self, block_keys: Sequence[str]) -> Iterator[None]:
-        """Read the directory once, and serve that snapshot for the block.
-
-        Scoped state on the view rather than a snapshot object passed around,
-        because every selector a decision consults senses through this same view
-        (:meth:`~proposed.selector.Selector.attach`) and would otherwise read past the
-        snapshot into the live directory.
-
-        Sound because one decision cannot be interleaved with another: the directory
-        read underneath it is a plain synchronous method
-        (:meth:`~proposed.deployment.Controller.locate_raw`), so there is no
-        suspension point between the pin and its release. Should one ever appear,
-        the assertions fire -- here on a second decision entering, in
-        :meth:`prefix_lengths` on a read of other keys arriving inside one.
-        """
-        assert self._snapshot is None, "a decision already holds this view's snapshot"
-        keys = list(block_keys)
-        self._snapshot = (keys, prefix_lengths_of(self.locate(keys), keys))
-        try:
-            yield
-        finally:
-            self._snapshot = None
 
 
 class ClusterView(SensorView):

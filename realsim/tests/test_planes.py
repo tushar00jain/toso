@@ -105,6 +105,10 @@ def test_view_reads_the_real_directory_topology_and_clock():
     assert locality(view.topology["a"], view.topology["c"]) is Tier.RDMA
     assert nearest(view.topology, ["c", "b"], "a") == "b"
     assert view.topology["a"].id == "vola"
+    # One view per mesh, and it is the one the run hands the control plane: a fresh
+    # view per access would carry a pin scope of its own, so a reader holding it would
+    # walk the directory inside a decision that had pinned it (View.pinned).
+    assert sim.mesh.view is sim.mesh.view is view
 
 
 def test_view_locate_reports_the_directory_and_not_a_preferred_answer():

@@ -250,7 +250,8 @@ class Directory(FanoutView):
         self._sensors.update(sensors)
         return self
 
-    def locate(self, keys):
+    def locate_live(self, keys):
+        """The port read staged, so :meth:`~proposed.view.View.locate` is the real one."""
         return {k: {v: None for v in sorted(self.by_key.get(k, ()))} for k in keys}
 
     @property

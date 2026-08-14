@@ -60,9 +60,12 @@ def _registered(view: FanoutView, facts: Sequence[Hashable]) -> List[Hashable]:
     The truth a readiness gate is opened against, read rather than remembered, and read
     afresh every time an answer is formed: volumes evict, so a peer that registered the
     key and later dropped it for a newer version is a peer the next requester has to
-    wait for again.
+    wait for again. Hence the live read
+    (:meth:`~proposed.view.View.locate_live`): a gate is correct only against the
+    directory *now*, and one opened against a directory read taken before the
+    registration landed would park its requester forever.
     """
-    located = view.locate([key for _volume, key in facts])
+    located = view.locate_live([key for _volume, key in facts])
     return [
         (volume, key)
         for volume, key in facts

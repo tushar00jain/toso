@@ -180,7 +180,8 @@ proposed/       every contract that outlives the simulator; imports nothing
                   (prefer(): what the store does with a preference)
   view.py         View -- read-only observation: locate, topology and locality,
                   the clock. Built over a Controller, and reads it through
-                  locate_raw alone
+                  locate_raw alone -- once per decision that pins it (pinned),
+                  or live (locate_live) for a caller needing the directory now
   deployment.py   Deployment -- how data-plane code reaches its store and the one
                   control plane it asks (control_plane_handle, whatever that plane
                   declares); and each service as a caller reaches it -- Controller,

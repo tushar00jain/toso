@@ -292,15 +292,18 @@ def test_real_directory_prefix_presence_and_eviction():
 # 2a. One decision, one directory. A routing decision reads the prefix runs once
 #     for its own candidate loop and again from every selector it consults, and
 #     all of those must see the same directory or the prices are not comparable.
-#     The snapshot is scoped state on the view because that is what those selectors
-#     sense through, so it has to be visible for the decision and gone after it.
-def test_a_pinned_view_serves_one_snapshot_and_releases_it():
+#     The pin is scoped state on the view because that is what those selectors sense
+#     through, so it has to be visible for the decision and gone after it -- and it
+#     belongs to the ROOT, so a view derived separately from the same root reads
+#     inside the pin instead of walking the directory beside it.
+def test_a_pinned_view_serves_one_directory_read_and_releases_it():
     topo = _make_topology(2)
     keys = _block_keys_for("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
     store = KVStore(sim)
     view = sim.view.derived(KVView)
+    beside = sim.view.derived(KVView)
 
     async def scenario():
         with sim.mesh.installed():
@@ -309,13 +312,15 @@ def test_a_pinned_view_serves_one_snapshot_and_releases_it():
                 pinned = view.prefix_lengths(list(keys))
                 await _evict(sim.mesh, "s0", [keys[1]])
                 held = view.prefix_lengths(list(keys))
-            return pinned, held, view.prefix_lengths(list(keys))
+                escaped = beside.prefix_lengths(list(keys))
+            return pinned, held, escaped, view.prefix_lengths(list(keys))
 
     try:
-        pinned, held, after = sim.loop.run_until_complete(scenario())
+        pinned, held, escaped, after = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    assert pinned == held == {"s0": 4}   # the snapshot, not the eviction under it
+    # The pinned read, not the eviction under it -- through either view.
+    assert pinned == held == escaped == {"s0": 4}
     assert after == {"s0": 1}            # ...and the live directory once released
 
 
