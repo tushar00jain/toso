@@ -250,7 +250,7 @@ kvcache_sim/
                           #   run so the opt-in proposed.selector.Discount can
                           #   spread reads over equally good replicas
     _view.py              #   KVView: what a decision senses, one class per
-                          #   sense composed onto proposed.View -- prefix runs
+                          #   sense and each a proposed.View -- prefix runs
                           #   (with the pinned snapshot one routing decision
                           #   reads them through), the cluster model above, and
                           #   the routed pulls, so what ranks or gates reads the

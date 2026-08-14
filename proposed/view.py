@@ -21,9 +21,10 @@ What the base view offers, and how a capability adds to it
   every instance's queue would read the cluster in the past.
 
 Anything more specific stays out, and is *composed* on instead: a capability adds
-one class per read it senses and builds a view out of them and this base
-(:meth:`View.derived`), so a selector reads the one sense it needs and the class
-statement is the list of what that capability's decisions sense. ``kvcache_sim``
+one class per read it senses, each a subclass of this base, and builds a view by
+naming them (:meth:`View.derived`), so a selector reads the one sense it needs, any
+one sense alone is already a view, and the class statement is the list of what that
+capability's decisions sense. ``kvcache_sim``
 composes leading-prefix-run lengths, which are a KV-cache notion (a block key
 chain); ``dedup_sim`` wants a fan-out tally, which is the selector's own
 bookkeeping, not observed state. Folding either into the base type would make it a
@@ -93,10 +94,12 @@ class View:
     def derived(self, cls: type, **senses: Any) -> "View":
         """A view of type ``cls`` over these same ports, carrying ``senses``.
 
-        How a capability composes its own reads in: ``cls`` is this base plus one class
-        per sense the capability adds -- ``kvcache_sim`` adds prefix runs, its model of
-        the cluster, and the pulls it has priced -- rather than a sensor it assembles
-        out of ports it would have to be handed one by one.
+        How a capability composes its own reads in: ``cls`` names the senses the
+        capability adds -- ``kvcache_sim`` adds prefix runs, its model of the cluster,
+        and the pulls it has priced -- rather than a sensor it assembles out of ports
+        it would have to be handed one by one. Each sense derives this base, so
+        composing a subset of them is a class statement and this base enters the
+        result's MRO once.
 
         ``senses`` is what the capability *already holds* and wants read through the
         same view as the run's ports, and nothing here supplies any of it (see the load

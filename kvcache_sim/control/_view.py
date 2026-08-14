@@ -1,7 +1,9 @@
 """The senses one KV-cache decision reads, composed: :class:`KVView`.
 
-A view is assembled out of senses -- one class per sense, composed onto
-:class:`~proposed.view.View` -- and a selector reads the one it needs:
+A sense is one read, as a class, and a :class:`~proposed.view.View` in its own right:
+a view is assembled by naming the senses a decision makes, and a capability needing
+one of them composes that one alone (``view.derived(ClusterSense, cluster=m)``). A
+selector reads the one it needs:
 
 * :class:`PrefixSense`: how many leading blocks of a prompt an instance holds
   contiguously. The base view stops at "who holds this key", and a cache is only
@@ -91,8 +93,8 @@ def prefix_lengths_of(
     return counts
 
 
-class PrefixSense:
-    """Prefix runs, off the directory of whatever view this is composed onto.
+class PrefixSense(View):
+    """Prefix runs, off this view's own directory.
 
     Derived rather than held: it reads :meth:`~proposed.view.View.locate`, so it takes
     no keyword and is never absent.
@@ -145,7 +147,7 @@ class PrefixSense:
             self._snapshot = None
 
 
-class ClusterSense:
+class ClusterSense(View):
     """The cluster this capability decides against: :attr:`cluster`.
 
     Its reads are the model's own members (``busy_until``, ``occupancy``,
@@ -177,7 +179,7 @@ class ClusterSense:
         return self._cluster
 
 
-class RoutedSense:
+class RoutedSense(View):
     """The pulls this plane has priced against a peer: :attr:`routed`.
 
     Written by the plane that priced them, read by the one link that answers a fetch
@@ -208,9 +210,11 @@ class RoutedSense:
         return self._routed
 
 
-class KVView(PrefixSense, ClusterSense, RoutedSense, View):
+class KVView(PrefixSense, ClusterSense, RoutedSense):
     """The senses a KV-cache decision reads, over the run's ports.
 
     Every sense is optional and independent, so a caller wanting the prefix runs alone
-    composes this same class and never touches the rest.
+    composes :class:`PrefixSense` and never names the rest. C3 puts
+    :class:`~proposed.view.View` once at the tail of this MRO, so the run's ports are
+    taken up once however many senses are named.
     """
