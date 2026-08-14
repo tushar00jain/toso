@@ -1,7 +1,8 @@
 """Control's model of the cluster: :class:`KVClusterModel`, and the facts it folds.
 
-Nothing here executes. What control knows about the running cluster is a *model*
-corrected by what the hosts report, never a live read:
+Nothing here executes. What control knows about what the cluster is *doing* is a
+*model* corrected by what the hosts report, never a live read -- two records, and a
+host's fact is what keeps each of them true:
 
 * the **prefill queue** (:attr:`KVClusterModel.busy_until`) is predicted -- a
   :class:`Committed` plan holds its instance until the TTFT it was priced at --
@@ -13,10 +14,12 @@ corrected by what the hosts report, never a live read:
   ``predicted_queue_wait``). On a **coupled** instance prefill and decode share one
   accelerator, so each decode step is mirrored back as :class:`ComputeBusy`;
 * **decode occupancy** is a per-instance list of estimated finish times, replaced
-  wholesale by :class:`DecodeState`;
-* the **prefills promised** and not yet landed
-  (:class:`kvcache_sim.control._pending.Reservations`) are written by
-  :class:`Committed` and dropped as they are read.
+  wholesale by :class:`DecodeState`.
+
+A prefill this plane has *promised* is neither: the control plane both writes and reads
+that, and no host corrects it, so it is a record and a sense of its own
+(:class:`kvcache_sim.control._pending.Reservations`,
+:class:`kvcache_sim.control._view.ReservedSense`).
 
 Folder-private: the port this answers (:class:`proposed.ClusterModel`) is the
 surface, and a host reaches it through the seam in front of it
@@ -34,8 +37,6 @@ from typing import (
 )
 
 from proposed import ClusterModel
-
-from ._pending import Reservation, Reservations
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .scheduler import Response
@@ -93,20 +94,18 @@ class DecodeState:
 
 @dataclass(frozen=True)
 class Committed:
-    """A decision the scheduler accepted: its instances are now spoken for.
+    """A decision the scheduler accepted: its prefill instance is now spoken for.
 
     The one fact control tells itself. Sent at commit rather than while pricing,
     so a candidate that lost -- or a decision a gate refused -- leaves nothing
-    behind. Carries ``output_tokens`` because a decode reservation is as long as the
-    generation, and the request itself is not part of the answer.
+    behind.
     """
 
     response: "Response"
-    output_tokens: int
 
 
 class KVClusterModel(ClusterModel):
-    """Every instance's predicted load, and what has been promised against it.
+    """Every instance's predicted prefill queue and observed decode batch.
 
     One per run, and that is load-bearing: a second one starts empty, and an empty
     model would report every host idle -- a run that looks healthy and is wrong.
@@ -119,20 +118,13 @@ class KVClusterModel(ClusterModel):
     Args:
         ids: every instance in the run -- the prefill and decode pools may each
             be a subset, but load is tracked over all of them.
-        lookahead: predict decode occupancy forward. What makes a promised
-            prefill worth remembering: without it nothing reads a reservation,
-            because the observed decode state is the whole of the picture.
     """
 
-    def __init__(self, ids: Sequence[str], *, lookahead: bool = False) -> None:
+    def __init__(self, ids: Sequence[str]) -> None:
         self._busy_until: Dict[str, float] = {i: 0.0 for i in ids}
         # instance -> one estimated finish time per request decoding or queued
         # there. Empty until the data plane reports.
         self._decode_finishes: Dict[str, List[float]] = {i: [] for i in ids}
-        self._lookahead = lookahead
-        # Promised and not yet carried out, self-expiring as it is read
-        # (:mod:`kvcache_sim.control._pending`).
-        self._reserved = Reservations()
         # fact type -> the bound method that folds it.
         self._folds: Dict[type, Callable[[Any], None]] = {
             ComputeBusy: self._compute_busy,
@@ -206,12 +198,7 @@ class KVClusterModel(ClusterModel):
 
     def _committed(self, fact: Committed) -> None:
         """Hold the prefill instance an accepted decision spoke for."""
-        plan = fact.response.plan
-        self._busy_until[fact.response.prefill] = plan.done_time
-        if self._lookahead:
-            self._reserved.reserve(
-                plan.done_time, fact.response.decode, fact.output_tokens
-            )
+        self._busy_until[fact.response.prefill] = fact.response.plan.done_time
 
     # -- what ranking against the load reads -------------------------------- #
     @property
@@ -230,11 +217,3 @@ class KVClusterModel(ClusterModel):
     def predict_occupancy(self, inst: str, at_t: float) -> int:
         """How many of those are estimated to still be decoding at ``at_t``."""
         return sum(1 for f in self._decode_finishes[inst] if f > at_t)
-
-    def pending(self, now: float) -> Sequence[Reservation]:
-        """Prefills promised and not landed as of ``now``, oldest first.
-
-        They stand in for requests the observed decode state cannot show yet
-        (:class:`~kvcache_sim.control._pending.Reservations`).
-        """
-        return self._reserved.pending(now)

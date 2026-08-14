@@ -12,8 +12,9 @@
   model of the cluster's load per run, behind :class:`proposed.ClusterModel`'s single
   write verb. The facts a host reports are here with the fold that applies them, and
   so are the reads everything that ranks or prices against that load makes;
-* :mod:`~kvcache_sim.control._pending` -- what was decided and not yet carried out,
-  each record expiring on its own terms as it is read;
+* :mod:`~kvcache_sim.control._pending` -- what this plane decided and has not yet seen
+  carried out (the prefills it promised, the pulls it priced), each record a sense of
+  its own and each expiring on its own terms as it is read;
 * :mod:`~kvcache_sim.control._source` -- the one part that *is* a store question,
   "which peer serves this prefix gap", as a :class:`proposed.selector.KeySelector`. It is
   used twice: the scheduler calls it to *price* a pull against recomputing, and it
@@ -23,7 +24,7 @@
 * :mod:`~kvcache_sim.control._view` -- what a decision senses, as one class per sense
   composed onto :class:`proposed.View`: per-instance prefix-run lengths (with the
   private prefix walk behind them and the pinned snapshot one decision reads them
-  through), the cluster model above, and the routed pulls from ``_pending`` -- so what
+  through), the cluster model above, and both records from ``_pending`` -- so what
   ranks, prices or gates reads the sense it needs rather than being handed a record.
 
 Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and nothing

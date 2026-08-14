@@ -77,9 +77,7 @@ from sim_common import config
 from ..control._cluster import KVClusterModel
 from ..control._source import LongestPrefixKeySelector
 from ..control.request import Request
-from ..control.scheduler import (
-    CacheAwareScheduler, LoadBalanceScheduler, predicts_decode,
-)
+from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from ..data._decode import DecodeEngine
 from ..data._prefill import PrefillEngine
@@ -181,9 +179,7 @@ def scheduler(
         raise ValueError(f"unknown scheduler kind {kind!r}")
     source = source_selector if source_selector is not None else LongestPrefixKeySelector()
     # Over ALL instances: the prefill and decode pools may each be a subset.
-    cluster = KVClusterModel(
-        sorted(topology), lookahead=predicts_decode(simulate_decode, early_rejection)
-    )
+    cluster = KVClusterModel(sorted(topology))
     knobs = dict(
         block_tokens=BLOCK_TOKENS,
         profile=DEFAULT_PROFILE,

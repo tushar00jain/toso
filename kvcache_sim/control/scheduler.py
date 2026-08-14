@@ -53,15 +53,19 @@ ranks, prices or gates, it judges against one
 :class:`~kvcache_sim.control._cluster.KVClusterModel` -- the predicted prefill
 queues and the observed decode batches, and what keeps each of them true. That model
 is one sense of the view this plane and everything it consults senses through
-(:class:`~kvcache_sim.control._view.KVView`), beside the prefix runs and the pulls this
-plane has already priced (:class:`RoutedPull`). Sensed rather than held because the
-hosts are what keep the model true: every other fact in it comes from them, over the
-service the run fronts it with (:attr:`_Scheduler.cluster`).
+(:class:`~kvcache_sim.control._view.KVView`), beside the prefix runs, the prefills this
+plane has promised and not seen land, and the pulls it has already priced
+(:class:`RoutedPull`). Sensed rather than held because the hosts are what keep the model
+true: every other fact in it comes from them, over the service the run fronts it with
+(:attr:`_Scheduler.cluster`).
 
 An accepted decision is reported back the same way, into each sense it moves
 (:meth:`_Scheduler._admit`): the model holds the prefill instance the plan spoke for
-(:class:`~kvcache_sim.control._cluster.Committed`), and the routed record remembers the
-peer the pull was priced against.
+(:class:`~kvcache_sim.control._cluster.Committed`), the reservation record stands in for
+a request no host can report yet, and the routed record remembers the peer the pull was
+priced against. A run that judges the TBT SLO against the occupancy observed now
+promises nothing and senses no reservation record at all, so the two halves of the
+prediction cannot come apart.
 
 The TTFT the metrics record is therefore the prediction, not a measurement (the
 README says why). Prefill cost is deterministic, so on the default path the two
@@ -87,7 +91,7 @@ from domain import (
 from ._cluster import (
     Committed, ComputeBusy, DecodeState, KVClusterModel, PrefillFinished,
 )
-from ._pending import RoutedPulls
+from ._pending import Reservations, RoutedPulls
 from ._source import LongestPrefixKeySelector
 from ._view import KVView
 from .request import Request
@@ -99,22 +103,22 @@ __all__ = [
     "Plan",
     "Response",
     "RoutedPull",
-    "predicts_decode",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
 ]
 
 
-def predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
+def _predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
     """Does this run roll decode occupancy forward to prefill completion?
 
     ``"predict"`` counts the prefills promised that will have landed by then, which
-    moves where decode lands even with no SLO to miss -- a fidelity setting of the
-    model rather than an admission rule, which is why the model is built with it and
-    admission applies the same two SLOs either way.
+    moves where decode lands even with no SLO to miss -- a fidelity setting of what a
+    decision senses rather than an admission rule, which is why admission applies the
+    same two SLOs either way.
 
-    Here rather than inside the scheduler because whoever builds the model early
-    (:func:`kvcache_sim.workload._serving.scheduler`) answers the same question.
+    Answered once, in :meth:`_Scheduler.__init__`, and it decides two things together:
+    whether a decision records what it promised, and whether the prediction reads
+    those promises.
     """
     return simulate_decode and early_rejection == "predict"
 
@@ -431,8 +435,11 @@ class _Scheduler(ControlPlane):
                 f"occupancy the TBT SLO is judged against, 'early' or 'predict'"
             )
         # The admission mode is spent here and never read again: both modes hold a
-        # decision to the same two SLOs and differ only in what the model feeds them.
-        self._lookahead = predicts_decode(simulate_decode, early_rejection)
+        # decision to the same two SLOs and differ only in what feeds them. This one
+        # answer governs the reservation record end to end -- composed in attach(),
+        # written on admission, read by the prediction -- so no two of the three can
+        # disagree about whether this run predicts.
+        self._lookahead = _predicts_decode(simulate_decode, early_rejection)
         # Filled by attach(): the run knows its servers only once its stack exists.
         self.topo: Dict[str, Endpoint] = {}
         self.ids: List[str] = []
@@ -454,10 +461,10 @@ class _Scheduler(ControlPlane):
 
         The view is composed into a :class:`~kvcache_sim.control._view.KVView` here,
         with the senses this capability's decisions read: prefix runs, the cluster
-        model, and the pulls this plane prices. None of the three is the store's
-        notion, so the run supplies none of them. Everything downstream then senses
-        one view -- both axes, the fetch chain -- and nothing is handed a record to
-        read.
+        model, the prefills this plane promised, and the pulls it priced. None of the
+        four is the store's notion, so the run supplies none of them. Everything
+        downstream then senses one view -- both axes, the fetch chain -- and nothing is
+        handed a record to read.
 
         The run's one :class:`~kvcache_sim.control._cluster.KVClusterModel` is built
         here unless a caller made it first (``cluster``): this is where the
@@ -465,17 +472,28 @@ class _Scheduler(ControlPlane):
         placed to build a second (empty) one -- and an empty one would report every
         host idle, which is a run that looks healthy and is wrong. It goes into the
         view and nowhere else; :attr:`cluster`, which the run harvests to put a
-        service in front of, reads it back from there. The routed-pull record is built
-        here for the same reason and never supplied: a second one would answer every
-        fetch "I decided nothing about this".
+        service in front of, reads it back from there.
+
+        This plane's own two records are built here and never supplied, because a
+        record handed to two planes would have each answering for the other's
+        decisions: a second routed-pull record would answer every fetch "I decided
+        nothing about this", and a second reservation record would leave every
+        predicted batch short. The reservation record is composed in only for a run
+        that rolls occupancy forward, so a run that does not predict has no empty
+        record to read (:class:`~kvcache_sim.control._view.ReservedSense`).
         """
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
         cluster, self._supplied_cluster = self._supplied_cluster, None
         if cluster is None:
             # Over ALL instances: the prefill and decode pools may each be a subset.
-            cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
-        self.view = view.derived(KVView, cluster=cluster, routed=RoutedPulls())
+            cluster = KVClusterModel(self.ids)
+        self.view = view.derived(
+            KVView,
+            cluster=cluster,
+            reserved=Reservations() if self._lookahead else None,
+            routed=RoutedPulls(),
+        )
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
         )
@@ -649,7 +667,12 @@ class _Scheduler(ControlPlane):
     # -- decode-side TBT prediction / admission -------------------------- #
     def _predicted_batch(self, d: str, done_time: float) -> int:
         """Predicted decode batch size on ``d`` seen by a request admitted at
-        ``done_time`` (its prefill completion). Drives TBT prediction."""
+        ``done_time`` (its prefill completion). Drives TBT prediction.
+
+        The flag that picks between the two readings is the one that decided whether
+        the reservation record was composed at all (:func:`_predicts_decode`), so the
+        second reading finds a record to read exactly when it takes it.
+        """
         if not self.tbt_enabled:
             return 0
         if not self._lookahead:
@@ -657,7 +680,7 @@ class _Scheduler(ControlPlane):
         n = self.view.cluster.predict_occupancy(d, done_time)
         # Requests whose prefill has not landed are invisible to the observed
         # decode state; the outstanding reservations stand in for them.
-        for res in self.view.cluster.pending(self.view.now()):
+        for res in self.view.reserved.pending(self.view.now()):
             if (
                 res.decode_id == d
                 and res.prefill_done <= done_time
@@ -713,16 +736,22 @@ class _Scheduler(ControlPlane):
         if self.tbt_enabled and response.pred_tbt > self.slo_tbt:
             return None
         # Accepted, so each sense this decision moves is told: the model holds the
-        # instance the plan spoke for, and the routed record remembers the peer its
-        # pull was priced against for when the fetch asks (:class:`RoutedPull`).
+        # instance the plan spoke for, the reservation stands in for a request the
+        # observed decode state cannot show until its prefill lands, and the routed
+        # record remembers the peer its pull was priced against for when the fetch asks
+        # (:class:`RoutedPull`).
         #
         # Local writes, not the endpoint a host reports over: control is in the same
-        # process, and plain calls are what keep this decision atomic. Both land in
+        # process, and plain calls are what keep this decision atomic. All three land in
         # one non-suspending window -- this method has no ``await`` -- and they touch
         # disjoint records, so nothing can read a half-committed decision and their
         # order here is unobservable.
-        self.view.cluster.notify_sync(Committed(response, request.output_tokens))
+        self.view.cluster.notify_sync(Committed(response))
         plan = response.plan
+        if self._lookahead:
+            self.view.reserved.reserve(
+                plan.done_time, response.decode, request.output_tokens
+            )
         if plan.reuse_source is not None and plan.pull_keys:
             self.view.routed.route(response.prefill, plan.pull_keys, plan.reuse_source)
         return response

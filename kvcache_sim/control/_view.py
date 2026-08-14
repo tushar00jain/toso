@@ -11,6 +11,9 @@ selector reads the one it needs:
 * :class:`ClusterSense`: the predicted prefill queues and observed decode batches
   (:class:`~kvcache_sim.control._cluster.KVClusterModel`), which is what ranks, prices
   and gates a candidate host;
+* :class:`ReservedSense`: the prefills this plane promised and has not seen land
+  (:class:`~kvcache_sim.control._pending.Reservations`), read by the decode-side
+  prediction of a run that rolls occupancy forward, and composed in only by such a run;
 * :class:`RoutedSense`: the pulls a decision priced against a peer
   (:class:`~kvcache_sim.control._pending.RoutedPulls`), read by the fetch chain's head
   link alone (:class:`~kvcache_sim.control.scheduler.RoutedPull`).
@@ -46,12 +49,13 @@ from proposed import View
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ._cluster import KVClusterModel
-    from ._pending import RoutedPulls
+    from ._pending import Reservations, RoutedPulls
 
 __all__ = [
     "prefix_lengths_of",
     "PrefixSense",
     "ClusterSense",
+    "ReservedSense",
     "RoutedSense",
     "KVView",
 ]
@@ -151,7 +155,7 @@ class ClusterSense(View):
     """The cluster this capability decides against: :attr:`cluster`.
 
     Its reads are the model's own members (``busy_until``, ``occupancy``,
-    ``predict_occupancy``, ``pending``), stated once where the model is.
+    ``predict_occupancy``), stated once where the model is.
     """
 
     def __init__(
@@ -177,6 +181,40 @@ class ClusterSense(View):
                 "be ranked, priced or gated against the cluster"
             )
         return self._cluster
+
+
+class ReservedSense(View):
+    """The prefills this plane promised and has not seen land: :attr:`reserved`.
+
+    Written when a decision commits, read when the next one predicts the decode batch
+    it will meet, and self-expiring on that read
+    (:meth:`~kvcache_sim.control._pending.Reservations.pending`).
+    """
+
+    def __init__(
+        self,
+        *ports: Any,
+        reserved: Optional["Reservations"] = None,
+        **senses: Any,
+    ) -> None:
+        super().__init__(*ports, **senses)
+        self._reserved = reserved
+
+    @property
+    def reserved(self) -> "Reservations":
+        """The prefills promised and not yet landed.
+
+        Raises like :attr:`ClusterSense.cluster` does, and for its reason: a run that
+        promises nothing composes no record, and reading one that was never written
+        would under-count every predicted batch and report no error.
+        """
+        if self._reserved is None:
+            raise RuntimeError(
+                "this view was composed without a reservation record, so this run "
+                "does not roll decode occupancy forward and nothing here can read "
+                "the prefills it promised"
+            )
+        return self._reserved
 
 
 class RoutedSense(View):
@@ -210,7 +248,7 @@ class RoutedSense(View):
         return self._routed
 
 
-class KVView(PrefixSense, ClusterSense, RoutedSense):
+class KVView(PrefixSense, ClusterSense, ReservedSense, RoutedSense):
     """The senses a KV-cache decision reads, over the run's ports.
 
     Every sense is optional and independent, so a caller wanting the prefix runs alone

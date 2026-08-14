@@ -32,6 +32,10 @@ class Reservations:
     Held because a request routed now shares its decode instance with requests
     whose prefill has not completed yet: they are invisible to the observed decode
     state and would otherwise be predicted as absent.
+
+    One sense of the scheduler's view
+    (:class:`~kvcache_sim.control._view.ReservedSense`): the plane that promises a
+    prefill writes it, and the decode-side prediction reads it.
     """
 
     def __init__(self) -> None:
