@@ -30,10 +30,10 @@ host already knows which blocks it computed, and a volume that runs out of room
 drops its own coldest keys and tells the directory afterwards
 (:mod:`realsim.seams._retention`). Every argument and return is a value.
 
-Both names are *presets* of one scheduler, parameterized on two axes, neither of
-them reachable from outside it: **reuse**, a selector asked once per decision to
-"rank the peers holding this prefix, or name nobody", and **the rank key**, which
-sorts the candidates this scheduler priced.
+Both names are *presets* of one scheduler, parameterized on two axes, both of them
+selectors and neither reachable from outside it: **reuse**, asked once per decision to
+"rank the peers holding this prefix, or name nobody", and **the winner**, asked to rank
+the candidates this scheduler priced.
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
@@ -41,9 +41,10 @@ sorts the candidates this scheduler priced.
   over the **global** prefix-match directory. Which peer serves the gap is a selector
   again (:mod:`kvcache_sim.control._source`).
 
-Admission is a setting rather than an axis: ``early_rejection`` names what the TBT
-gate is fed -- the decode occupancy of the moment (``early``) or the occupancy
-predicted at prefill completion (``predict``).
+Admission is a setting rather than an axis: what a preset varies is whether the TBT SLO
+applies at all, and ``early_rejection`` names which decode occupancy it is judged
+against -- the one observed now (``early``) or the one predicted at prefill completion
+(``predict``).
 
 What a decision senses
 ----------------------
@@ -73,7 +74,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
-from proposed import ControlPlane, Endpoint, Key, KeySelector, Selection, VolumeId
+from proposed import (
+    AnySelector, ControlPlane, Endpoint, Key, KeySelector, Selection, VolumeId,
+)
 from proposed.selector import FirstMatch, Selector
 
 from domain import (
@@ -108,7 +111,7 @@ def predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
     ``"predict"`` counts the prefills promised that will have landed by then, which
     moves where decode lands even with no SLO to miss -- a fidelity setting of the
     model rather than an admission rule, which is why the model is built with it and
-    the scheduler installs the same gates either way.
+    admission applies the same two SLOs either way.
 
     Here rather than inside the scheduler because whoever builds the model early
     (:func:`kvcache_sim.workload._serving.scheduler`) answers the same question.
@@ -165,8 +168,9 @@ class Response:
         prefill / decode: the two instances chosen, one from each selection.
         plan: what prefilling on ``prefill`` was priced at.
         pred_batch / pred_tbt: the decode batch this request was predicted to meet
-            and the inter-token gap that implies. Read by the TBT gate, which is why
-            they are here and not on the plan -- they are the decode side's.
+            and the inter-token gap that implies. What the TBT SLO is applied to
+            (:meth:`_Scheduler._admit`), which is why they are here and not on the plan
+            -- they are the decode side's.
     """
 
     prefill: VolumeId
@@ -178,14 +182,14 @@ class Response:
 
 # -- the first axis: which peer a prefix is pulled from ---------------------- #
 # Everything a routing decision does is the same whichever scheduler is running.
-# What differs is the two axes and which admission gates are installed.
+# What differs is the two axes and whether the TBT SLO applies.
 #
-# Only this first axis is a selector at all, and it answers the store-shaped half
-# -- rank the peers holding this prefix, best first (:mod:`kvcache_sim.control._source`,
-# a real KeySelector), or name nobody. Awaited once per decision inside the pinned
-# snapshot (:meth:`_Scheduler._select_prefill`), so it runs to completion without
-# suspending, and once because the ranking is over the prefix: which peers hold it does
-# not depend on who would prefill.
+# This first axis answers the store-shaped half -- rank the peers holding this prefix,
+# best first (:mod:`kvcache_sim.control._source`, a real KeySelector), or name nobody.
+# Awaited once per decision inside the pinned snapshot
+# (:meth:`_Scheduler._select_prefill`), so it runs to completion without suspending,
+# and once because the ranking is over the prefix: which peers hold it does not depend
+# on who would prefill.
 #
 # The tests that *do* depend on the candidate are applied to that one ranking, per
 # candidate, through :meth:`~proposed.selector.Selection.require` -- a method on the
@@ -193,10 +197,12 @@ class Response:
 # That is what makes the hoist above visible rather than hidden inside a funnel that
 # would have to be asked afresh for every candidate.
 #
-# The second axis is further below, and is a sort key rather than a selector: it ranks
-# what this scheduler already priced, reads no directory and answers nobody. What is
-# not a selection at all is the rest of what a scheduler decides -- admission and the
-# SLO gates answer yes or no, and a ranked set of sources cannot say that.
+# The second axis is further below and is a selector too, over this scheduler's own
+# priced candidates rather than over keys. A rank that is *not* an axis is a plain sort
+# key applied here: both presets pick a decode instance the same way
+# (:func:`_by_batch`), so there is nothing for a preset to choose. And admission is not
+# a selection at all -- holding a plan to an SLO answers yes or no, and a ranked set of
+# sources cannot say that (:meth:`_Scheduler._admit`).
 
 
 #: The price a selector here answers in, left open on the two that answer without
@@ -247,76 +253,65 @@ def _worth_pulling(
 #: What either ranking here sorts: one candidate as the pair a
 #: :class:`~proposed.selector.Selection` is built out of -- the instance, and what
 #: this scheduler priced it at. A :class:`Plan` when the choice is which host
-#: prefills, a predicted batch size when it is which host decodes.
+#: prefills, a predicted batch size when it is which host decodes. Every key over
+#: either ends in the instance, read off the candidate rather than out of what it was
+#: priced at, which is what makes a rank total and a run reproducible.
 _Priced = Tuple[VolumeId, Plan]
 _Batched = Tuple[VolumeId, int]
 
 
-#: How a priced candidate sorts: the key ``sorted`` is handed, smallest first.
-#: Takes the sensor as its second argument, because everything a rank reads beyond
-#: the candidate is observed state -- the cluster's load included
-#: (:class:`~kvcache_sim.control._view.KVView`). A :data:`_Gate` is handed the
-#: scheduler instead: what it judges against is an SLO, which is a setting and not
-#: something sensed. Neither is reachable from outside this scheduler, so neither is
-#: a selector. The instance is read off the candidate rather than out of what it was
-#: priced at, so every key can end in it -- which is what makes a rank total and a
-#: run reproducible.
-_RankKey = Callable[[_Priced, KVView], Tuple]
-
-
-def _by_load(candidate: _Priced, view: KVView) -> Tuple:
-    """The shortest predicted prefill queue, whatever reuse bought (the baseline).
-
-    Sorts on ``busy_until`` rather than the candidate's ``queue_wait``, which is
-    that tail clamped at the clock: two instances idle since different moments both
-    wait zero, so the choice would fall to the id tie-break and a different one
-    would win. This scheduler's claim is that it picks by load and nothing else.
-    """
-    instance, _ = candidate
-    return (view.cluster.busy_until[instance], instance)
-
-
-def _by_ttft(candidate: _Priced, view: KVView) -> Tuple:
+class _ByTTFT(AnySelector[Sequence[_Priced], Plan]):
     """The lowest predicted queue + transfer + prefill.
 
-    Why reuse is *priced* rather than preferred: a longer match on a busier
-    instance can still lose.
+    Why reuse is *priced* rather than preferred: a longer match on a busier instance
+    can still lose. Senses nothing: the price it ranks by is one this scheduler
+    already worked out per candidate.
     """
-    instance, plan = candidate
-    return (plan.ttft, instance)
+
+    name = "by-ttft"
+
+    async def select(
+        self, candidates: Sequence[_Priced], requester: str
+    ) -> Selection[Plan]:
+        return Selection.priced(sorted(
+            candidates, key=lambda c: (c[1].ttft, c[0])
+        ))
+
+
+class _ByLoad(AnySelector[Sequence[_Priced], Plan]):
+    """The shortest predicted prefill queue, whatever reuse bought (the baseline).
+
+    Sorts on ``busy_until`` rather than the candidate's ``queue_wait``, which is that
+    tail clamped at the clock: two instances idle since different moments both wait
+    zero, so the choice would fall to the id tie-break and a different one would win.
+    This scheduler's claim is that it picks by load and nothing else.
+
+    The queue is sensed through the attached view
+    (:class:`~kvcache_sim.control._view.ClusterSense`) and read once for the whole
+    ranking, so every candidate is ranked against one state of the cluster.
+    """
+
+    name = "by-load"
+
+    async def select(
+        self, candidates: Sequence[_Priced], requester: str
+    ) -> Selection[Plan]:
+        busy = self.view.cluster.busy_until
+        return Selection.priced(sorted(
+            candidates, key=lambda c: (busy[c[0]], c[0])
+        ))
 
 
 def _by_batch(candidate: _Batched) -> Tuple:
     """The smallest predicted decode batch, instance id breaking the tie.
 
     The other host pick of a routing decision, over a predicted batch rather than a
-    plan. Not an axis -- both presets pick a decode instance this way, so the
-    scheduler applies it directly instead of being handed it, which is why this one
-    needs no model.
+    plan. A sort key and not a selector because it is not an axis: both presets pick a
+    decode instance this way, so there is nothing for a preset to hand in -- and
+    nothing here is sensed either.
     """
     instance, batch = candidate
     return (batch, instance)
-
-
-#: An admission gate: does this decision clear one SLO? Installed as a list --
-#: :attr:`_Scheduler._gates` -- rather than tested behind a mode string, so no
-#: decision below has a mode to branch on. A gate holds no settings of its own, so
-#: it is handed the scheduler whose SLOs it holds a decision to.
-_Gate = Callable[["Response", "_Scheduler"], bool]
-
-
-def _ttft_gate(response: "Response", sched: "_Scheduler") -> bool:
-    """The TTFT SLO. The one gate every run installs."""
-    return response.plan.ttft <= sched.slo_ttft
-
-
-def _predicted_tbt_gate(response: "Response", sched: "_Scheduler") -> bool:
-    """The TBT SLO, on the batch this request is predicted to join.
-
-    Runs at routing, before the prefill: what it refuses costs nothing, which is the
-    whole of why admission is decided here and not once the compute has been spent.
-    """
-    return response.pred_tbt <= sched.slo_tbt
 
 
 class RoutedPull(KeySelector[_P]):
@@ -361,14 +356,15 @@ class _Scheduler(ControlPlane):
     together.
 
     Args:
-        reuse / rank: the two axes a preset picks (see above), both used while
-            forming the one answer :meth:`decide` gives. ``reuse`` is a selector
-            and ``rank`` a sort key (:data:`_RankKey`), which is why only the first
-            is attached. It ranks the peers holding a prefix, priced in blocks of that
-            prefix (``Selector[Sequence[Key], int]``); what a peer is *worth* to one
-            candidate is this scheduler's to work out, off the snapshot it read itself
-            (:meth:`_priced_reuse`), so a re-ranking under the axis cannot move a
-            price this scheduler compares.
+        reuse / rank: the two axes a preset picks (see above), both selectors, both
+            attached in :meth:`attach`, and both used while forming the one answer
+            :meth:`decide` gives. ``reuse`` ranks the peers holding a prefix, priced in
+            blocks of that prefix (``Selector[Sequence[Key], int]``); what a peer is
+            *worth* to one candidate is this scheduler's to work out, off the snapshot
+            it read itself (:meth:`_priced_reuse`), so a re-ranking under the axis
+            cannot move a price this scheduler compares. ``rank`` ranks the candidates
+            this scheduler priced, so its subject is those candidates and its price
+            their :class:`Plan`.
         balance_threshold: how much longer the head's prefix run must be than a
             candidate's own before pulling beats recomputing
             (:func:`_longer_than_local`). Unread when ``reuse`` names nobody.
@@ -381,11 +377,11 @@ class _Scheduler(ControlPlane):
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
-        slo_ttft / slo_tbt: what the gates hold a plan to.
+        slo_ttft / slo_tbt: what admission holds a decision to (:meth:`_admit`).
         simulate_decode: whether the run models batched decode at all.
         early_rejection: ``"early"`` | ``"predict"`` -- whether the decode occupancy
-            the TBT gate is fed is the one observed now or the one predicted at
-            prefill completion.
+            the TBT SLO is judged against is the one observed now or the one predicted
+            at prefill completion.
         cluster: the run's one :class:`~kvcache_sim.control._cluster.KVClusterModel`,
             when a caller has to make it first. ``None`` -- the default -- builds it
             in :meth:`attach`, where the instances become known. Either way
@@ -397,7 +393,7 @@ class _Scheduler(ControlPlane):
         self,
         *,
         reuse: Selector[Sequence[Key], int],
-        rank: _RankKey,
+        rank: AnySelector[Sequence[_Priced], Plan],
         balance_threshold: float = 1.5,
         source_selector: Optional[KeySelector[int]] = None,
         block_tokens: int,
@@ -431,16 +427,11 @@ class _Scheduler(ControlPlane):
             # routing whatever a caller passes, so a mode this does not know is a
             # caller expecting a rule this scheduler has no way to apply.
             raise ValueError(
-                f"unknown early_rejection {early_rejection!r}: the choice is what "
-                f"the TBT gate is fed, 'early' or 'predict'"
+                f"unknown early_rejection {early_rejection!r}: the choice is which "
+                f"occupancy the TBT SLO is judged against, 'early' or 'predict'"
             )
-        # Which gates this run installs. A run that does not model decode has no
-        # batch to hold to a TBT SLO, so it installs only the TTFT one.
-        self._gates: List[_Gate] = [_ttft_gate]
-        if simulate_decode:
-            self._gates.append(_predicted_tbt_gate)
-        # The admission mode is spent here and never read again: both modes install
-        # the same gates (above) and differ only in what the model feeds them.
+        # The admission mode is spent here and never read again: both modes hold a
+        # decision to the same two SLOs and differ only in what the model feeds them.
         self._lookahead = predicts_decode(simulate_decode, early_rejection)
         # Filled by attach(): the run knows its servers only once its stack exists.
         self.topo: Dict[str, Endpoint] = {}
@@ -465,8 +456,8 @@ class _Scheduler(ControlPlane):
         with the senses this capability's decisions read: prefix runs, the cluster
         model, and the pulls this plane prices. None of the three is the store's
         notion, so the run supplies none of them. Everything downstream then senses
-        one view -- the rank keys, the reuse axis, the fetch chain -- and nothing is
-        handed a record to read.
+        one view -- both axes, the fetch chain -- and nothing is handed a record to
+        read.
 
         The run's one :class:`~kvcache_sim.control._cluster.KVClusterModel` is built
         here unless a caller made it first (``cluster``): this is where the
@@ -502,6 +493,7 @@ class _Scheduler(ControlPlane):
         self._fetch = FirstMatch([RoutedPull(), self._source])
         self._fetch.attach(self.view)
         self._reuse.attach(self.view)
+        self._rank.attach(self.view)
 
     @property
     def cluster(self) -> Optional[KVClusterModel]:
@@ -542,10 +534,11 @@ class _Scheduler(ControlPlane):
         refusal costs nothing because nothing has run.
 
         ``requester`` is the host the request landed on. Nothing that ranks, prices or
-        gates a *candidate host* reads it -- where a request should run is a fact about
-        the cluster, not about who was asked. It reaches the reuse ranking only as the
-        answer to that ranking's own question, "who wants these bytes"; the candidate
-        under test is what the tests behind it are handed.
+        holds a *candidate host* to an SLO reads it -- where a request should run is a
+        fact about the cluster, not about who was asked. Both axes are handed it because
+        every selector is, and only the reuse ranking has a use for it: it is the answer
+        to that ranking's own question, "who wants these bytes". The candidate under
+        test is what the tests behind that ranking are handed.
         """
         prefill = await self._select_prefill(request, requester)
         decode = await self._select_decode(prefill.winner)
@@ -562,7 +555,8 @@ class _Scheduler(ControlPlane):
         (:meth:`~kvcache_sim.control._view.KVView.pinned`) and one clock read, so the
         prices are comparable, and the bookkeeping it writes needs nothing locked.
         Pricing a candidate reserves nothing (:meth:`_candidate`), so the losers leave
-        no trace and the winner is chosen after the whole field is known.
+        no trace and the winner is chosen after the whole field is known. Both axes are
+        awaited inside the pin and neither suspends, so no second decision can enter it.
 
         The reuse ranking is asked once and tested per candidate: which peers hold this
         prefix is the same question whoever would prefill it, and only the tests behind
@@ -587,9 +581,7 @@ class _Scheduler(ControlPlane):
                 candidates.append((inst, self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
                 )))
-            return Selection.priced(sorted(
-                candidates, key=lambda candidate: self._rank(candidate, self.view)
-            ))
+            return await self._rank.select(candidates, requester)
 
     @staticmethod
     def _priced_reuse(
@@ -632,7 +624,8 @@ class _Scheduler(ControlPlane):
 
         Reserves nothing and mutates nothing, so a losing candidate leaves no trace
         (:class:`~kvcache_sim.control._cluster.Committed` records a decision actually
-        taken). Which candidate wins is the rank key's business (:data:`_RankKey`).
+        taken). Which candidate wins is the rank axis's business
+        (:class:`_ByLoad` / :class:`_ByTTFT`).
         """
         cached = min(match * self.B, request.prompt_tokens)
         uncached = request.prompt_tokens - cached
@@ -694,11 +687,12 @@ class _Scheduler(ControlPlane):
         prefill: Selection[Plan],
         decode: Selection[int],
     ) -> Optional[Response]:
-        """The two winners as one :class:`Response`, gated and committed.
+        """The two winners as one :class:`Response`, held to the SLOs and committed.
 
-        Assembled before the gates rather than after, so the value the gates judge is
-        the value the answer carries. ``None`` == rejected, and rejected here costs
-        nothing: this runs before the prefill does.
+        Assembled before the SLOs are checked rather than after, so the value they
+        judge is the value the answer carries. ``None`` == rejected, and rejected here
+        costs nothing: this runs before the prefill does, which is the whole of why
+        admission is decided at routing.
         """
         instance = decode.sources[0]
         batch = decode.payload[instance]
@@ -713,7 +707,10 @@ class _Scheduler(ControlPlane):
                 else 0.0
             ),
         )
-        if not all(gate(response, self) for gate in self._gates):
+        if response.plan.ttft > self.slo_ttft:
+            return None
+        # A run that does not model decode has no batch to hold to a TBT SLO.
+        if self.tbt_enabled and response.pred_tbt > self.slo_tbt:
             return None
         # Accepted, so each sense this decision moves is told: the model holds the
         # instance the plan spoke for, and the routed record remembers the peer its
@@ -740,7 +737,7 @@ class LoadBalanceScheduler(_Scheduler):
     """Baseline (~vLLM): least-loaded instance, local-only cache reuse."""
 
     def __init__(self, **knobs: Any) -> None:
-        super().__init__(reuse=_LocalOnly(), rank=_by_load, **knobs)
+        super().__init__(reuse=_LocalOnly(), rank=_ByLoad(), **knobs)
 
 
 class CacheAwareScheduler(_Scheduler):
@@ -769,7 +766,7 @@ class CacheAwareScheduler(_Scheduler):
         super().__init__(
             reuse=source_selector if replicate else _LocalOnly(),
             balance_threshold=balance_threshold,
-            rank=_by_ttft,
+            rank=_ByTTFT(),
             source_selector=source_selector,
             **knobs,
         )
