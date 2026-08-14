@@ -293,20 +293,17 @@ class _Scheduler(ControlPlane):
         self.decode_ids = (
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
-        # What a fetch is answered with. Both this and the reuse axis sense through
-        # the KVView above -- the fetch because its head link reads the routed-pull
-        # sensor (:class:`~kvcache_sim.control._selector.RoutedPull`), the reuse axis
-        # because one routing decision pins that view's snapshot for the whole of
-        # itself (:meth:`~proposed.view.View.pinned`) and a ranking
-        # consulted inside the pin must not read past it into the live directory. The
-        # source ranking is a link of both and gets attached twice, to the same view
-        # either way, so no order here is load-bearing.
-        self._fetch = FirstMatch([RoutedPull(), self._source]).attach(self.view)
-        self._reuse.attach(self.view)
-        self._rank.attach(self.view)
-        # Senses nothing, but attached like every other ranking here, so wrapping it in
-        # one that does needs nothing else moved.
-        self._decode.attach(self.view)
+        # Every ranking senses the view its own header declares
+        # (:attr:`~proposed.selector.Selector.sensors`), composed out of the KVView
+        # above. Each such subset shares that view's pin
+        # (:meth:`~proposed.view.View.subset`), so a ranking consulted inside a routing
+        # decision reads the snapshot the decision pinned rather than past it into the
+        # live directory. The source ranking is a link of the fetch chain and the reuse
+        # axis both, and is attached twice to the same subset either way, so no order
+        # here is load-bearing.
+        self._fetch = FirstMatch([RoutedPull(), self._source])
+        for ranking in (self._fetch, self._reuse, self._rank, self._decode):
+            ranking.attach(self.view.subset(*ranking.sensors))
 
     @property
     def sensor(self) -> Optional[ClusterSensor]:

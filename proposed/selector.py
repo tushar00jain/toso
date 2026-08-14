@@ -325,6 +325,13 @@ class Selector(ABC, Generic[_S, _P]):
     #: read by one that ranks only what it is handed.
     view: Optional[View] = None
 
+    #: The views this selector reads, as :class:`~proposed.view.View` subclasses. What
+    #: it is attached to composes exactly these (:meth:`~proposed.view.View.subset`),
+    #: so the header says what a ranking senses and an undeclared read raises instead
+    #: of quietly working. ``()`` -- the default -- is the whole view, which is also
+    #: what a ranking sensing nothing is handed.
+    sensors: Tuple[type, ...] = ()
+
     def attach(self: _Sel, view: Any) -> _Sel:
         """Keep the view this selector senses and prices through, and return it.
 
@@ -388,6 +395,18 @@ class NaiveKeySelector(KeySelector[_P]):
         return Selection()
 
 
+def _declared(view: Any, selector: "Selector[Any, Any]") -> Any:
+    """The view ``selector`` declared, out of the one a combinator was handed.
+
+    A combinator declares nothing of its own, so what it narrows to is each link's own
+    header -- otherwise a chain would be the one place a declaration is not a fact, and
+    both of ``dedup_sim``'s links sit inside one. Something that is no view at all is
+    handed on untouched, which only a selector declaring nothing can be attached to
+    anyway (:attr:`Selector.sensors`).
+    """
+    return view.subset(*selector.sensors) if selector.sensors else view
+
+
 class FirstMatch(KeySelector[_P]):
     """Ask each selector in order; the first one that answers is the answer.
 
@@ -430,14 +449,14 @@ class FirstMatch(KeySelector[_P]):
             )
 
     def attach(self, view: Any) -> "FirstMatch[_P]":
-        """Hand the stack's ports to every wrapped selector, answering or not.
+        """Hand every wrapped selector the view it declared, answering or not.
 
         One that senses through a view of its own must be brought up even if it
         never answers, so a link behind an earlier answer is still sensing when its
         turn comes.
         """
         for selector in self.selectors:
-            selector.attach(view)
+            selector.attach(_declared(view, selector))
         return self
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
@@ -587,9 +606,9 @@ class Discount(Selector[_S, int]):
         self._grants = _Grants(window)
 
     def attach(self, view: Any) -> "Discount[_S]":
-        """Sense through ``view``, and hand it down to the ranking as well."""
+        """Sense through ``view``, and hand the ranking the view it declared."""
         super().attach(view)
-        self.ranking.attach(view)
+        self.ranking.attach(_declared(view, self.ranking))
         return self
 
     async def select(self, subject: _S, requester: str) -> Selection[int]:

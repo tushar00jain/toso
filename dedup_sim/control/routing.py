@@ -52,7 +52,7 @@ class Dedup(ControlPlane):
         The sensor is built here and never accepted from a caller, because one held by
         two planes would have each answering for the other's decisions: a requester
         would be handed a slot the other plane planned and then wait on a put only the
-        other plane is told about. The links reach it through the view
+        other plane is told about. The links reach it through the view each declares
         (:class:`~dedup_sim.control._view.FanoutView`), so
         :meth:`~proposed.selector.FirstMatch.attach` is the whole of the wiring and no
         link is handed a sensor.

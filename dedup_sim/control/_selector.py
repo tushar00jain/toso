@@ -159,6 +159,7 @@ class PlannedPeer(KeySelector[_P]):
     """
 
     name = "planned-peer"
+    sensors = (FanoutView,)
 
     def __init__(self, *, trace: Optional[DecisionLog] = None) -> None:
         self.trace = trace
@@ -205,6 +206,7 @@ class HolderRanking(KeySelector[int]):
     """
 
     name = "holder"
+    sensors = (FanoutView,)
 
     def __init__(self, *, trace: Optional[DecisionLog] = None) -> None:
         self.trace = trace

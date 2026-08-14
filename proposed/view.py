@@ -28,13 +28,14 @@ What the base view offers, and how a capability adds to it
 Anything more specific stays out, and is *composed* on instead: a capability adds
 one subclass of this base per read it senses -- a sensor it holds is one line,
 ``cluster = Sensed()`` on a :class:`SensorView` -- and builds a view by naming them
-(:meth:`View.derived`), so a selector takes the one view carrying the read it needs,
-any one of them alone is already a view, and the class statement is the list of what
-that capability's decisions sense. ``kvcache_sim``
-composes leading-prefix-run lengths, which are a KV-cache notion (a block key
-chain); ``dedup_sim`` composes the fan-out tree it has planned, which is one plane's
-own bookkeeping and no directory's. Folding either into the base type would make it a
-union serving neither caller -- and per-node *load* is the same trap twice over: the
+(:meth:`View.derived`), so a selector takes the one view carrying the read it needs
+(:meth:`View.subset`, off what it declared in
+:attr:`~proposed.selector.Selector.sensors`), any one of them alone is already a view,
+and the class statement is the list of what that capability's decisions sense.
+``kvcache_sim`` composes leading-prefix-run lengths, which are a KV-cache notion (a
+block key chain); ``dedup_sim`` composes the fan-out tree it has planned, which is one
+plane's own bookkeeping and no directory's. Folding either into the base type would
+make it a union serving neither caller -- and per-node *load* is the same trap twice over: the
 KV-cache scheduler's load signal is its own predicted prefill queue (a control-plane
 model, not an observation) and dedup's is its planned tree, so a base
 ``load()`` would be a stub with two incompatible meanings. It is left out until a
@@ -54,7 +55,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from typing import Any, Dict, FrozenSet, Iterator, Optional, Sequence
+from typing import Any, Dict, FrozenSet, Iterator, Optional, Sequence, Tuple
 
 from proposed.cost import TransferCost
 from proposed.deployment import Controller
@@ -103,6 +104,10 @@ class View:
             decisions price nothing, which is every capability but ``kvcache_sim``.
     """
 
+    #: The sensors composed in, under the name the :class:`Sensed` attribute claiming
+    #: each registered. This base composes none.
+    _sensors: Dict[str, Any] = {}
+
     def __init__(
         self,
         directory: Controller,
@@ -113,6 +118,7 @@ class View:
         self._topology = dict(topology)
         self._cost = cost
         self._pin = _Pin()
+        self._subsets: Dict[Tuple[type, ...], "View"] = {}
 
     def derived(self, cls: type, **sensors: Any) -> "View":
         """A view of type ``cls`` over these same ports, carrying ``sensors``.
@@ -137,6 +143,33 @@ class View:
         """
         view = cls(self._directory, self._topology, self._cost, **sensors)
         view._pin = self._pin
+        return view
+
+    def subset(self, *views: type) -> "View":
+        """A view over these same ports composing exactly ``views``, and nothing more.
+
+        What a selector is attached to, out of what it declared
+        (:attr:`~proposed.selector.Selector.sensors`): a read it did not declare is not
+        an attribute of what it senses through, which is what makes the declaration a
+        fact rather than a comment. Declaring nothing is this view itself.
+
+        Built through :meth:`derived`, so the pin travels by reference: a decision that
+        pinned this view walks the directory once and every subset of it answers off
+        that snapshot. A sensor one of ``views`` claims and this view never carried
+        arrives absent, so reading it raises (:class:`Sensed`) rather than reaching past
+        the view the caller was given. One instance per distinct declaration, so a
+        selector attached twice senses through the same object both times.
+        """
+        if not views:
+            return self
+        view = self._subsets.get(views)
+        if view is None:
+            cls = views[0] if len(views) == 1 else type(
+                "+".join(v.__name__ for v in views), views, {}
+            )
+            view = self._subsets[views] = self.derived(
+                cls, **{name: self._sensors.get(name) for name in _sensed(cls)}
+            )
         return view
 
     @property

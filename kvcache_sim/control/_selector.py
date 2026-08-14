@@ -35,7 +35,7 @@ from proposed import AnySelector, Key, KeySelector, Selection
 from proposed.selector import Selector
 
 from ._answer import Batched, Plan, Priced
-from ._view import prefix_lengths_of, PrefixView
+from ._view import ClusterView, prefix_lengths_of, PrefixView, RoutedView
 
 __all__ = [
     "LongestPrefixKeySelector",
@@ -74,6 +74,7 @@ class LongestPrefixKeySelector(KeySelector[int]):
     """
 
     name = "longest-prefix"
+    sensors = (PrefixView,)
 
     async def select(
         self, keys: Sequence[Key], requester: str
@@ -95,11 +96,9 @@ class LongestPrefixKeySelector(KeySelector[int]):
     def _prefix_runs(self, keys: Sequence[Key]) -> Dict[str, int]:
         """Per-instance prefix runs, off whichever view this selector was attached to.
 
-        The scheduler attaches its :class:`~kvcache_sim.control._view.KVView`, whose
-        snapshot a routing decision pins, so the whole decision reads one directory.
-        A run that stands this selector up on its own can only attach the plain
-        :class:`~proposed.view.View`, since a prefix run is a KV-cache notion the
-        store has no reason to know. Read it off the view that carries it, derive it
+        A run that stands this selector up on its own can attach the plain
+        :class:`~proposed.view.View`, since a prefix run is a KV-cache notion the store
+        has no reason to know. Read it off the view that carries it, derive it
         otherwise, off one shared definition.
         """
         if isinstance(self.view, PrefixView):
@@ -120,6 +119,7 @@ class LocalOnly(Selector[Sequence[Key], _P]):
     """
 
     name = "local-only"
+    sensors = ()
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
         return Selection.of([])
@@ -129,11 +129,12 @@ class ByTTFT(AnySelector[Sequence[Priced], Plan]):
     """The lowest predicted queue + transfer + prefill.
 
     Why reuse is *priced* rather than preferred: a longer match on a busier instance
-    can still lose. Senses nothing: the price it ranks by is one the scheduler already
-    worked out per candidate.
+    can still lose. The price it ranks by is one the scheduler already worked out per
+    candidate.
     """
 
     name = "by-ttft"
+    sensors = ()
 
     async def select(
         self, candidates: Sequence[Priced], requester: str
@@ -151,12 +152,12 @@ class ByLoad(AnySelector[Sequence[Priced], Plan]):
     zero, so the choice would fall to the id tie-break and a different one would win.
     This ranking's claim is that it picks by load and nothing else.
 
-    The queue is sensed through the attached view
-    (:class:`~kvcache_sim.control._view.ClusterView`) and read once for the whole
-    ranking, so every candidate is ranked against one state of the cluster.
+    The queue is read once for the whole ranking, so every candidate is ranked against
+    one state of the cluster.
     """
 
     name = "by-load"
+    sensors = (ClusterView,)
 
     async def select(
         self, candidates: Sequence[Priced], requester: str
@@ -171,7 +172,7 @@ class ByBatch(AnySelector[Sequence[Batched], int]):
     """The smallest predicted decode batch, instance id breaking the tie.
 
     The other host pick of a routing decision, over a predicted batch rather than a
-    plan. Senses nothing: the scheduler predicted every batch before asking.
+    plan; the scheduler predicted every batch before asking.
 
     Priced at the **negated batch** -- headroom, since a price is better when it is
     higher, which is what lets a re-ranking weigh it
@@ -184,6 +185,7 @@ class ByBatch(AnySelector[Sequence[Batched], int]):
     """
 
     name = "by-batch"
+    sensors = ()
 
     async def select(
         self, candidates: Sequence[Batched], requester: str
@@ -203,10 +205,8 @@ class RoutedPull(KeySelector[_P]):
     charge a cross-node read for a same-node prediction. A caller with no routed
     pull falls through to the ranking behind this link.
 
-    A selector like any other, sensing through the view it is attached to
-    (:meth:`~proposed.selector.Selector.attach`) -- the sensor is one that view carries
-    (:class:`~kvcache_sim.control._view.RoutedView`), so it arrives the way
-    every other read does and nothing hands this one the sensor.
+    A selector like any other: the sensor arrives on the view it is attached to, the way
+    every other read does, and nothing hands this one the sensor.
 
     Reading it **consumes** it
     (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim` expires the entry on
@@ -220,6 +220,7 @@ class RoutedPull(KeySelector[_P]):
     """
 
     name = "routed-pull"
+    sensors = (RoutedView,)
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
         peer = self.view.routed.claim(requester, keys)

@@ -1824,9 +1824,9 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     assert sched.sensor is None, "no view to read the sensor out of before attach"
     sim = Simulation(_make_topology(2), control=sched)   # attach builds the chain
     try:
-        # The memo link reads the plane's own sensor, through the one view everything
-        # here senses through -- it is handed no sensor of its own.
-        assert sched._fetch.selectors[0].view is sched.view
+        # The memo link reads the plane's own sensor, off the view it declared and out
+        # of the plane's -- it is handed no sensor of its own.
+        assert sched._fetch.selectors[0].view.routed is sched.view.routed
         assert sched._fetch.selectors[-1] is sched._reuse
         # And what the run fronted for the hosts is that same view's cluster sensor:
         # the plane keeps no second reference to reach it by.

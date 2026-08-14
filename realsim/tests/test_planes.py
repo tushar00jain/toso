@@ -15,9 +15,10 @@ pin the contract each one owes its callers:
    withholds itself until its readiness gate opens and crosses a service boundary
    without it -- and the two combinators built on it tell an *abstention* from the
    *naive answer*, carry a wrapped selector's gate and prices through, and wake every
-   selector they hold whether or not they consult it. ``FirstMatch`` picks between
-   alternatives, ``Discount`` re-ranks one answer by how much it has lately named
-   each source, and a ranking narrows itself in place (``require``, ``take``);
+   selector they hold -- off the view that selector declared -- whether or not they
+   consult it. ``FirstMatch`` picks between alternatives, ``Discount`` re-ranks one
+   answer by how much it has lately named each source, and a ranking narrows itself
+   in place (``require``, ``take``);
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -49,7 +50,7 @@ from proposed.selector import (
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
 from realsim.seams.transport import Endpoint
-from proposed import locality, nearest, View
+from proposed import locality, nearest, Sensed, SensorView, View
 from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier
@@ -581,6 +582,38 @@ def test_first_match_keeps_the_winner_s_readiness_gate():
 
     chained = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"], ready=gate))])
     assert _select(chained).ready is gate
+
+
+class _Thing(SensorView):
+    """One sensor, for a link that declares it."""
+
+    thing = Sensed()
+
+
+class _SensesThing(_Fixed):
+    """A link whose header says which view it reads."""
+
+    sensors = (_Thing,)
+
+
+def test_a_combinator_hands_each_link_the_view_that_link_declared():
+    """A combinator declares nothing, so it narrows on each link's own header instead.
+
+    Which is what keeps a chain from being the one place a declaration is not a fact --
+    both of ``dedup_sim``'s links sit inside one. A link declaring nothing is handed
+    what the combinator was given, which is what lets a ranking be wired to a stand-in
+    that is no view at all.
+    """
+    view = View(None, {}).derived(_Thing, thing="sensed")
+    declares, plain = _SensesThing(Selection.of([])), _Fixed(Selection.of(["v1"]))
+    FirstMatch([declares, plain]).attach(view)
+    assert declares.view.thing == "sensed"     # composed out of the one it was given
+    assert declares.view is not view
+    assert plain.view is view
+
+    under = _SensesThing(Selection.priced([("v0", 1)]))
+    Discount(under).attach(view)
+    assert under.view is declares.view         # one view per distinct declaration
 
 
 def test_first_match_attaches_every_selector_even_unconsulted_ones():

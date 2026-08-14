@@ -6,6 +6,9 @@ ways to get that wrong, and both have to be loud, because the quiet versions are
 run that looks healthy: a sensor nobody composed answering as if it were empty, and
 a keyword nobody claims being dropped on the floor.
 
+And what a selector's declared views buy (:attr:`~proposed.selector.Selector.sensors`):
+it senses those and nothing else, off the same pin the decision consulting it holds.
+
 Run from the repo root::
 
     PYTHONPATH=. .venv/bin/python -m pytest kvcache_sim/tests/test_view.py -q
@@ -13,16 +16,30 @@ Run from the repo root::
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from kvcache_sim.control._selector import ByBatch, ByLoad, LongestPrefixKeySelector
 from kvcache_sim.control._sensor import ClusterSensor, ReservationSensor
-from kvcache_sim.control._view import ClusterView, KVView, PrefixView
+from kvcache_sim.control._view import ClusterView, KVView, PrefixView, RoutedView
 from proposed.view import View
 
 
 def _view(**sensors):
     """A view over no directory: nothing here reads one."""
     return View(None, {}).derived(KVView, **sensors)
+
+
+class _Walks:
+    """A directory in which ``s0`` holds every key, counting the walks it is asked for."""
+
+    def __init__(self) -> None:
+        self.walks = 0
+
+    def locate_raw(self, keys, missing_ok: bool = False):
+        self.walks += 1
+        return {key: {"s0": None} for key in keys}
 
 
 @pytest.mark.parametrize(
@@ -65,6 +82,61 @@ def test_a_view_composing_no_sensor_is_the_base_view():
     """Nothing is added by asking for nothing, so a plane that senses the directory
     alone needs no view of its own."""
     assert type(View(None, {}).derived(View)) is View
+
+
+def test_a_selector_senses_the_views_it_declared_and_nothing_else():
+    """The header is the list, and what it leaves out is unreachable, not empty.
+
+    A ranking cannot read past what it declared by accident: the attribute is not on
+    the view it was attached to at all.
+    """
+    view = _view(cluster=ClusterSensor(["s0"]), reserved=None, routed=None)
+    assert ByLoad.sensors == (ClusterView,)
+    sensed = view.subset(*ByLoad.sensors)
+    assert sensed.cluster is view.cluster            # the run's one sensor
+    with pytest.raises(AttributeError):
+        sensed.routed                                # not declared, so not there
+    assert not hasattr(sensed, "prefix_lengths")
+
+
+def test_a_ranking_that_declares_nothing_senses_nothing():
+    """``()`` is a claim as much as a view is, and it holds the same way.
+
+    Attached to a view composing no sensor at all, so any sensor read on it raises and
+    this ranking still answers -- which is what makes "reads nothing" a fact.
+    """
+    bare = View(None, {})
+    assert ByBatch.sensors == ()
+    assert ByBatch().attach(bare.subset(*ByBatch.sensors)).view is bare
+    with pytest.raises(AttributeError):
+        bare.cluster
+    ranked = asyncio.run(ByBatch().attach(bare).select([("s0", 3), ("s1", 1)], "r"))
+    assert ranked.sources == ("s1", "s0")
+
+
+def test_a_subset_composing_a_sensor_this_view_never_carried_raises():
+    """Declaring a view is not a way to reach past the one a caller was given."""
+    cluster_only = View(None, {}).derived(ClusterView, cluster=ClusterSensor(["s0"]))
+    with pytest.raises(RuntimeError, match="routed-pull"):
+        cluster_only.subset(RoutedView).routed
+
+
+def test_a_subset_reads_the_pin_and_walks_the_directory_no_further():
+    """One decision, one directory -- through every subset of the view it pinned.
+
+    The pin is the root view's cell, shared by reference, so a ranking sensing through
+    the view it declared is inside the decision's snapshot rather than beside it.
+    """
+    directory = _Walks()
+    view = View(directory, {}).derived(KVView)
+    sensed = view.subset(*LongestPrefixKeySelector.sensors)
+    keys = ["k0", "k1"]
+    with view.pinned(keys):
+        assert directory.walks == 1                  # the decision's one walk
+        assert sensed.prefix_lengths(keys) == {"s0": 2}
+        assert directory.walks == 1                  # and the subset added none
+    assert sensed.prefix_lengths(keys) == {"s0": 2}
+    assert directory.walks == 2                      # live again once released
 
 
 def test_the_sensors_a_run_composes_answer_once_composed():
