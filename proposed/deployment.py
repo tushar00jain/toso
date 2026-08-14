@@ -136,6 +136,16 @@ class Controller(Protocol):
         A store that is handed no preference answers exactly as it does today, and
         one that is handed a preference still consults nothing: whoever asked a
         control plane did so itself, before calling this.
+
+        **How many of the volumes named get read depends on how the key was stored**,
+        which a caller ranking several of them has to know. ``LocalClient`` builds one
+        request per key for an ``OBJECT`` or a ``TENSOR`` and stops at the first volume
+        offering it, so a ranking is a *preference* and only the head is read. For a
+        slice-stored key it expands slices from **every** volume named, so the same
+        ranking is a *fan-out*. A capability moving a whole value once therefore reads
+        one source however many it ranks -- which is what makes ``dedup_sim``'s 1x
+        fabric hold with a ranked answer -- and one storing a key in slices pays for
+        each source it names.
         """
 
     async def notify_put_batch(
