@@ -50,7 +50,7 @@ from proposed.selector import (
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
 from realsim.seams.transport import Endpoint
-from proposed import View
+from proposed import locality, nearest, View
 from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier
@@ -96,15 +96,16 @@ def test_view_reads_the_real_directory_topology_and_clock():
             return located, view.now()
 
     (located, now) = _drive(sim, scenario())
-    assert View.holders(located, "W") == ["a"]
+    assert list(located["W"]) == ["a"]
     # Absent keys are simply missing -- a sensor reports, it does not raise.
-    assert View.holders(located, "absent") == []
+    assert "absent" not in located
     assert now >= 2.0
-    # Topology reads: b is on a's node, c is not.
-    assert view.locality("a", "b") is Tier.NVLINK
-    assert view.locality("a", "c") is Tier.RDMA
-    assert view.nearest(["c", "b"], "a") == "b"
-    assert view.endpoint("a").id == "vola"
+    # Distance is arithmetic on the topology the view carries, not a read of it:
+    # b is on a's node, c is not.
+    assert locality(view.topology["a"], view.topology["b"]) is Tier.NVLINK
+    assert locality(view.topology["a"], view.topology["c"]) is Tier.RDMA
+    assert nearest(view.topology, ["c", "b"], "a") == "b"
+    assert view.topology["a"].id == "vola"
 
 
 def test_view_locate_reports_the_directory_and_not_a_preferred_answer():

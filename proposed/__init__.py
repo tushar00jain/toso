@@ -57,7 +57,7 @@ from .deployment import (
 )
 from .plane import ControlPlane, DataPlane
 from .selector import DecisionLog, AnySelector, KeySelector, Selection
-from .topology import Endpoint, locality, Tier, TIER_LABEL
+from .topology import Endpoint, locality, nearest, Tier, TIER_LABEL
 from .view import View
 
 __all__ = [
@@ -77,6 +77,7 @@ __all__ = [
     "Tier",
     "TIER_LABEL",
     "locality",
+    "nearest",
     # ports the application depends on
     "Deployment",
     "ControlPlane",

@@ -51,11 +51,21 @@ from typing import (
     Any, Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple,
 )
 
-from proposed import ControlPlane, DecisionLog, Key, Selection, View
+from proposed import ControlPlane, DecisionLog, Key, nearest, Selection, View
 
 from ._readiness import Readiness
 
 __all__ = ["Dedup"]
+
+
+def _holders(located: Dict[str, Dict[str, Any]], key: str) -> List[str]:
+    """Volumes holding ``key`` in a :meth:`~proposed.view.View.locate` answer.
+
+    In directory order, and empty when nobody holds it -- a missing key is absent
+    from the answer rather than an error in it. Local because reading a located map
+    is this selector's arithmetic, not a member the store owes anyone.
+    """
+    return list(located.get(key, {}))
 
 
 class Dedup(ControlPlane):
@@ -201,14 +211,14 @@ class Dedup(ControlPlane):
         # First requester: the closest volume that already holds every key -- the
         # one hop whose source is an origin, and the 1x fabric cost.
         located = self.view.locate(keys)
-        holders = set(self.view.holders(located, keys[0]))
+        candidates = set(_holders(located, keys[0]))
         for key in keys[1:]:
-            holders &= set(self.view.holders(located, key))
-        holders.discard(requester)
-        if not holders:
+            candidates &= set(_holders(located, key))
+        candidates.discard(requester)
+        if not candidates:
             return None
         self._offer(requester)
-        return self.view.nearest(sorted(holders), requester)
+        return nearest(self.view.topology, sorted(candidates), requester)
 
     def _offer(self, requester: str) -> None:
         """Offer ``requester`` as a source for up to ``cap`` later peers.
@@ -237,7 +247,7 @@ class Dedup(ControlPlane):
         return [
             (volume, key)
             for volume, key in facts
-            if volume in self.view.holders(located, key)
+            if volume in _holders(located, key)
         ]
 
     async def published(self, requester: str, keys: Sequence[Key]) -> None:

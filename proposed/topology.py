@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict
+from typing import Dict, Optional, Sequence, Optional, Sequence
 
-__all__ = ["Endpoint", "Tier", "TIER_LABEL", "locality"]
+__all__ = ["Endpoint", "Tier", "TIER_LABEL", "locality", "nearest"]
 
 @dataclass(frozen=True)
 class Endpoint:
@@ -58,3 +58,17 @@ def locality(src, dst) -> Tier:
     if src.node == dst.node:
         return Tier.NVLINK
     return Tier.RDMA
+
+
+def nearest(
+    topology: Dict[str, "Endpoint"], candidates: Sequence[str], to: str
+) -> Optional[str]:
+    """The closest of ``candidates`` to ``to``: locality first, id as the tie-break.
+
+    Over the topology map rather than off a :class:`~proposed.view.View`, because
+    distance is arithmetic on endpoints and needs no directory read. ``None`` for no
+    candidates. The id tie-break is what makes the answer total, hence reproducible.
+    """
+    if not candidates:
+        return None
+    return min(candidates, key=lambda v: (int(locality(topology[v], topology[to])), v))

@@ -46,6 +46,7 @@ from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
 
 from dedup_sim.control.routing import Dedup
+from proposed import Endpoint
 from dedup_sim.data.read_through import ReadThroughPlane
 
 #: The version that displaces ``W`` in a one-deep reader volume.
@@ -210,6 +211,13 @@ def test_the_fabric_is_1x_per_read_for_any_fanout_cap():
 # --------------------------------------------------------------------------
 
 
+class _OwnNode(dict):
+    """``volume id -> Endpoint``, inventing one per id: its own host and node."""
+
+    def __missing__(self, volume_id: str) -> Endpoint:
+        return Endpoint(id=volume_id, host=volume_id, node=volume_id)
+
+
 class Directory:
     """The reads a selector makes, over a ``key -> volumes`` map a test controls.
 
@@ -233,12 +241,14 @@ class Directory:
     def locate(self, keys):
         return {k: {v: None for v in sorted(self.by_key.get(k, ()))} for k in keys}
 
-    @staticmethod
-    def holders(located, key):
-        return list(located.get(key, {}))
+    @property
+    def topology(self):
+        """Every volume on a node of its own, so distance never breaks an id tie.
 
-    def nearest(self, candidates, to):
-        return sorted(candidates)[0]
+        ``nearest`` then answers in id order, which is what these tests stage
+        against: which peer is *closest* is not what any of them is about.
+        """
+        return _OwnNode()
 
     def now(self) -> float:
         return 0.0

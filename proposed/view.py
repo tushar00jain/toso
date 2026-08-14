@@ -44,10 +44,10 @@ builds one via ``Mesh.view``; a real controller would build one over itself.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Sequence
 
 from proposed.deployment import Controller
-from proposed.topology import Endpoint, locality, Tier
+from proposed.topology import Endpoint
 
 __all__ = ["View"]
 
@@ -88,30 +88,11 @@ class View:
             return {}
         return self._directory.locate_raw(list(keys), missing_ok=True)
 
-    @staticmethod
-    def holders(located: Dict[str, Dict[str, Any]], key: str) -> List[str]:
-        """Volumes holding ``key``, in directory order (empty if none)."""
-        return list(located.get(key, {}))
-
     # -- topology ----------------------------------------------------------- #
     @property
     def topology(self) -> Dict[str, Endpoint]:
         """``volume_id -> Endpoint`` for the whole run."""
         return self._topology
-
-    def endpoint(self, volume_id: str) -> Endpoint:
-        """``volume_id``'s locality endpoint."""
-        return self._topology[volume_id]
-
-    def locality(self, src_id: str, dst_id: str) -> Tier:
-        """Locality tier between two volumes (cheapest tier compares smallest)."""
-        return locality(self._topology[src_id], self._topology[dst_id])
-
-    def nearest(self, candidates: Sequence[str], to: str) -> Optional[str]:
-        """The closest of ``candidates`` to ``to`` (locality, id tie-break)."""
-        if not candidates:
-            return None
-        return min(candidates, key=lambda v: (int(self.locality(v, to)), v))
 
     # -- clock -------------------------------------------------------------- #
     def now(self) -> float:
