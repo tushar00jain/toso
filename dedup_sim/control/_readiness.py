@@ -5,7 +5,7 @@ to withhold its answer until it does. That is a gate per fact still outstanding,
 and getting it right is concurrency work, not routing work: the gate must never be
 created for something that has already happened, or the waiter is never woken.
 
-So it lives here, in one object, and :mod:`dedup_sim.control.routing` is left with
+So it lives here, in one object, and :mod:`dedup_sim.control._source` is left with
 the tree it is actually shaping. A *fact* is any hashable the caller invents; this
 module never interprets one, and it never decides whether one is true either --
 that answer is read from wherever the caller says the truth lives, which for dedup
@@ -43,7 +43,7 @@ Why it is safe
 What is *not* here: whether waiting for a fact is a good idea. A gate nothing will
 ever record hangs the requester behind it forever, and only the caller knows which
 facts are coming -- for dedup, the registration a routed peer owes. That check is
-in :mod:`dedup_sim.control.routing`, next to the state that answers it.
+in :mod:`dedup_sim.control._source`, next to the state that answers it.
 
 Folder-private because dedup is the only capability that waits today; it is the
 mechanism behind ``Selection.ready`` and knows nothing about dedup, so it is what

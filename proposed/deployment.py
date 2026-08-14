@@ -111,7 +111,7 @@ class Controller(Protocol):
         suspend, so everything a control plane does between reading the directory
         and writing its own bookkeeping runs to completion before the next
         requester's does -- which is what lets a routing decision be a
-        read-modify-write with no lock (``dedup_sim.control.routing``) and lets a
+        read-modify-write with no lock (``dedup_sim.control._source``) and lets a
         set of priced candidates be comparable
         (``kvcache_sim.control.scheduler``). It is a plain local method for the same
         reason it can be one: the caller is a control plane sensing through a view

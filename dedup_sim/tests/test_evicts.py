@@ -123,15 +123,15 @@ def _run(num_readers: int = 3, *, fanout_cap: int = 1) -> tuple[Result, Dedup]:
     # eviction rather than an accumulation.
     profile = replace(DEFAULT_PROFILE, storage_capacity_bytes=PAYLOAD_BYTES)
     workload = VersionedRounds(num_readers, profile=profile)
-    selector = Dedup(fanout_cap=fanout_cap)
+    plane = Dedup(fanout_cap=fanout_cap)
     result = Run(
         f"cap={fanout_cap}",
         workload,
-        control=selector,
+        control=plane,
         data=lambda sim: ItemDispatch(_per_item(sim, workload)),
         profile=profile,
     ).execute()
-    return result, selector
+    return result, plane
 
 
 def _directory(result: Result) -> dict:
@@ -146,7 +146,7 @@ def _directory(result: Result) -> dict:
 
 def test_the_rounds_do_not_overlap():
     """Each round finishes inside its own window, so round 3 sees round 2 whole."""
-    result, _selector = _run()
+    result, _plane = _run()
     assert result.ledger.items_done == result.ledger.items_total == 9
     for row in result.ledger.rows:
         assert row.done < row.released + ROUND, row.id
@@ -154,7 +154,7 @@ def test_the_rounds_do_not_overlap():
 
 def test_the_next_version_evicts_the_one_the_reader_cached():
     """A one-deep volume that takes on a new version drops the old one."""
-    result, _selector = _run()
+    result, _plane = _run()
     for reader in result.workload.reader_ids:
         volume = result.sim.mesh.volumes[reader].service
         # Round 3 re-read W, which evicted the version round 2 put there: a
@@ -179,7 +179,7 @@ def test_the_chain_re_forms_after_the_peers_evict():
     from a remembered registration would release them at once and send them all
     to the origin (or to a volume holding nothing at all).
     """
-    result, _selector = _run()
+    result, _plane = _run()
     origin = result.workload.origin_id
 
     assert result.ledger.origin_bytes == 2 * PAYLOAD_BYTES  # 1x per read of W
@@ -191,7 +191,7 @@ def test_the_chain_re_forms_after_the_peers_evict():
 
 def test_every_reader_still_receives_the_payload_in_both_rounds():
     """Routing to a peer that has to re-fetch first is still a correct answer."""
-    result, _selector = _run()
+    result, _plane = _run()
     expected = result.workload.expected
     for item_id, payload in result.results.items():
         if item_id.endswith("-read"):
@@ -202,7 +202,7 @@ def test_every_reader_still_receives_the_payload_in_both_rounds():
 def test_the_fabric_is_1x_per_read_for_any_fanout_cap():
     """The cap trades depth against wallclock; it does not spend fabric."""
     for cap in (1, 2, 3):
-        result, _selector = _run(4, fanout_cap=cap)
+        result, _plane = _run(4, fanout_cap=cap)
         assert result.ledger.origin_bytes == 2 * PAYLOAD_BYTES, cap
 
 
@@ -257,8 +257,8 @@ class Directory:
     def publish(self, volume: str, key: str) -> None:
         """``volume``'s read-through lands: the directory gains it.
 
-        Only the directory. Telling the selector is the *reader's* to do, after its
-        put -- ``await selector.published(volume, [key])`` -- and in that order,
+        Only the directory. Telling the plane is the *reader's* to do, after its
+        put -- ``await plane.published(volume, [key])`` -- and in that order,
         which is what a released waiter depends on: it re-reads this map.
         """
         self.by_key.setdefault(key, set()).add(volume)
@@ -269,13 +269,13 @@ class Directory:
 
 
 def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
-    """A selector sensing through ``directory``, as a run's ``attach`` leaves it.
+    """A plane whose selector senses ``directory``, as a run's ``attach`` leaves it.
 
     Nothing here is priced, so the transfer-cost half of the port is ``None``.
     """
-    selector = Dedup(fanout_cap=fanout_cap)
-    selector.attach(directory)
-    return selector
+    plane = Dedup(fanout_cap=fanout_cap)
+    plane.attach(directory)
+    return plane
 
 
 def test_one_registration_releases_every_requester_waiting_on_it():
@@ -286,7 +286,7 @@ def test_one_registration_releases_every_requester_waiting_on_it():
     of them. (Dropping the released gate does not strand the second: each
     waiter holds the event itself, not a lookup of it.)
 
-    The waiting is inside ``select``: this plane answers over a service boundary, so
+    The waiting is inside ``sources``: this plane answers over a service boundary, so
     a requester whose source is not usable yet is a requester whose *answer has not
     come back*. Which is why each ask is a task here -- there is no gate to hand out
     and park on separately.
@@ -294,12 +294,12 @@ def test_one_registration_releases_every_requester_waiting_on_it():
 
     async def _burst():
         directory = Directory(W="p")
-        selector = _sensing(directory, fanout_cap=2)
-        await selector.sources([KEY], "r0")  # r0 <- p, the origin: usable now
+        plane = _sensing(directory, fanout_cap=2)
+        await plane.sources([KEY], "r0")  # r0 <- p, the origin: usable now
         answered: List[str] = []
 
         async def ask(name: str):
-            selection = await selector.sources([KEY], name)
+            selection = await plane.sources([KEY], name)
             answered.append(name)
             return selection
 
@@ -308,7 +308,7 @@ def test_one_registration_releases_every_requester_waiting_on_it():
         await asyncio.sleep(0)
         assert answered == [], "answered before the peer published"
         directory.publish("r0", KEY)
-        await selector.published("r0", [KEY])  # the one registration
+        await plane.published("r0", [KEY])  # the one registration
         waiters = await asyncio.gather(*tasks)
         assert all(w.sources == ("r0",) for w in waiters)
         # Nothing that crossed the boundary carries a closure with it.
@@ -332,21 +332,21 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
 
     async def _after_the_eviction():
         directory = Directory(W="p")
-        selector = _sensing(directory, fanout_cap=3)
-        await selector.sources([KEY], "r0")  # r0 <- p
+        plane = _sensing(directory, fanout_cap=3)
+        await plane.sources([KEY], "r0")  # r0 <- p
         directory.publish("r0", KEY)  # r0's read-through lands
-        await selector.published("r0", [KEY])
+        await plane.published("r0", [KEY])
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
         # It answers at all, which is the hang that would not: nothing to wait for,
         # and nobody to be sent to, so the directory's own answer.
-        stale = await selector.sources([KEY], "r1")
+        stale = await plane.sources([KEY], "r1")
         assert stale.sources is None, "parked on a registration nobody owes"
 
         # r1 is a live source though -- it is fetching now -- so r2 attaches to it
         # rather than to the peer that was retired. Its decision therefore gates,
-        # which is why this reads the decision rather than awaiting the answer.
-        return await selector._decide([KEY], "r2")
+        # which is why this asks the selector rather than awaiting the plane's answer.
+        return await plane.selector.select([KEY], "r2")
 
     selection, _trace = run_sim(_after_the_eviction())
     assert selection.sources == ("r1",)
@@ -365,30 +365,30 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
     feed ``2 x cap``, and the cap the run was configured with would not be the
     one it got.
 
-    Reads the *decision* rather than awaiting the answer, because most of these
-    requesters are routed to a peer that never publishes here: what is under test is
-    who was assigned to whom, and ``select`` would rightly still be waiting.
+    Asks the selector rather than the plane, because most of these requesters are
+    routed to a peer that never publishes here: what is under test is who was
+    assigned to whom, and ``sources`` would rightly still be waiting.
     """
     cap = 2
 
     async def _fanout_across_a_retire() -> int:
         directory = Directory(W="p")
-        selector = _sensing(directory, fanout_cap=cap)
+        plane = _sensing(directory, fanout_cap=cap)
         # r0 pulls from the origin and publishes: a source for cap peers now.
-        await selector.sources([KEY], "r0")
+        await plane.sources([KEY], "r0")
         directory.publish("r0", KEY)
-        await selector.published("r0", [KEY])
+        await plane.published("r0", [KEY])
         served = 0
         for i in range(cap):  # ...and every one of those slots is taken
-            if (await selector._decide([KEY], f"r{i + 1}")).sources == ("r0",):
+            if (await plane.selector.select([KEY], f"r{i + 1}")).sources == ("r0",):
                 served += 1
         # The origin drops the key, so r0's source holds nothing and owes nothing:
         # it is retired, and r0 is assigned afresh on the ask after that.
         directory.evict("p", KEY)
-        await selector._decide([KEY], "r0")
-        await selector._decide([KEY], "r0")
+        await plane.selector.select([KEY], "r0")
+        await plane.selector.select([KEY], "r0")
         for i in range(2 * cap):
-            if (await selector._decide([KEY], f"x{i}")).sources == ("r0",):
+            if (await plane.selector.select([KEY], f"x{i}")).sources == ("r0",):
                 served += 1
         return served
 
@@ -403,6 +403,6 @@ def test_the_selector_remembers_no_registrations():
     run touched; it holds gates for facts still being waited on and nothing else,
     so a finished run leaves it empty.
     """
-    result, selector = _run()
-    assert selector._ready._gates == {}
-    assert set(selector._route) == set(result.workload.reader_ids)
+    result, plane = _run()
+    assert plane.selector._ready._gates == {}
+    assert set(plane.selector._route) == set(result.workload.reader_ids)

@@ -32,7 +32,7 @@ capability's whole control plane, reached as a service of its own:
    key. Peers are handed out FIFO under a fan-out cap (`fanout_cap=1` -> a chain,
    `>=2` -> a shallow tree).
 3. That peer has not registered yet, so the decision carries a **readiness gate**
-   and `select` *does not answer* until the peer's read-through put lands. The
+   and `sources` *does not answer* until the peer's read-through put lands. The
    caller's read is then an unmodified `client.get` with a preference passed to it:
    no client change is needed, nothing is installed in the store, and no client is
    lied to.
@@ -117,7 +117,10 @@ dedup_sim/
   control/                # DECIDES
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
                           #   with a source once it is usable, published() hears the
-                          #   put that makes it so; from a read-only View
+                          #   put that makes it so; both off the selector it holds
+    _source.py            #   PeerKeySelector: the routing itself -- a peer per
+                          #   requester under a fan-out cap, gated on the put that
+                          #   peer owes; from a read-only View
     _readiness.py         #   Readiness: a gate per fact not true yet, opened
                           #   against the directory (nothing remembered, because
                           #   volumes evict) -- the waiting, out of the routing
@@ -144,7 +147,7 @@ visible from which folders exist and how thick they are:
 
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
-| `control/` — what is decided | `routing.py`: one plane, `sources` + `published` | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_source.py` (the ranking it uses) + `_cluster.py` (the model) + `_view.py` (prefix runs) |
+| `control/` — what is decided | `routing.py`: one plane, `sources` + `published` + `_source.py` (the ranking behind both) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_source.py` (the ranking it uses) + `_cluster.py` (the model) + `_view.py` (prefix runs) |
 | `data/` — what executes | `read_through.py`: one member — ask, get, local put, report | `serving.py` (the per-request lifecycle) + `_decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |

@@ -170,7 +170,7 @@ def test_the_ask_is_local_and_synchronous():
     """What torchstore is asked for is a method, not an endpoint or a coroutine.
 
     A directory read that cannot suspend is what a control plane's atomicity rests
-    on (``dedup_sim.control.routing._assign``,
+    on (``dedup_sim.control._source.PeerKeySelector._assign``,
     ``kvcache_sim.control.scheduler._Scheduler._select_prefill``). ``async`` on it
     would not be a detail: it would put the interleaving back. Nor is it reached
     across a boundary -- it is absent from the handle, which is what a caller holds.
