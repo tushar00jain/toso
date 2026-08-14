@@ -50,7 +50,11 @@ Control's model of the cluster
 Nothing here executes, and nothing here is a live read. Every host this scheduler
 ranks, prices or gates, it judges against one
 :class:`~kvcache_sim.control._cluster.KVClusterModel` -- the predicted prefill
-queues and the observed decode batches, and what keeps each of them true.
+queues and the observed decode batches, and what keeps each of them true. Its
+*reads* arrive the way the directory's do, through the one sensor this plane and
+everything it consults senses through (:class:`~kvcache_sim.control._view.KVView`);
+the plane keeps the model itself for the one thing that is not a read, recording a
+decision it accepted.
 
 The TTFT the metrics record is therefore the prediction, not a measurement (the
 README says why). Prefill cost is deterministic, so on the default path the two
@@ -249,15 +253,18 @@ _Batched = Tuple[VolumeId, int]
 
 
 #: How a priced candidate sorts: the key ``sorted`` is handed, smallest first.
-#: Takes the run's model as its second argument like :data:`_Gate` does, since both
-#: judge one candidate against the cluster, and neither is reachable from outside
-#: this scheduler, so neither is a selector. The instance is read off the candidate
-#: rather than out of what it was priced at, so every key can end in it -- which is
-#: what makes a rank total and a run reproducible.
-_RankKey = Callable[[_Priced, "_Scheduler"], Tuple]
+#: Takes the sensor as its second argument, because everything a rank reads beyond
+#: the candidate is observed state -- the cluster's load included
+#: (:class:`~kvcache_sim.control._view.KVView`). A :data:`_Gate` is handed the
+#: scheduler instead: what it judges against is an SLO, which is a setting and not
+#: something sensed. Neither is reachable from outside this scheduler, so neither is
+#: a selector. The instance is read off the candidate rather than out of what it was
+#: priced at, so every key can end in it -- which is what makes a rank total and a
+#: run reproducible.
+_RankKey = Callable[[_Priced, KVView], Tuple]
 
 
-def _by_load(candidate: _Priced, sched: "_Scheduler") -> Tuple:
+def _by_load(candidate: _Priced, view: KVView) -> Tuple:
     """The shortest predicted prefill queue, whatever reuse bought (the baseline).
 
     Sorts on ``busy_until`` rather than the candidate's ``queue_wait``, which is
@@ -266,10 +273,10 @@ def _by_load(candidate: _Priced, sched: "_Scheduler") -> Tuple:
     would win. This scheduler's claim is that it picks by load and nothing else.
     """
     instance, _ = candidate
-    return (sched.cluster.busy_until[instance], instance)
+    return (view.cluster.busy_until[instance], instance)
 
 
-def _by_ttft(candidate: _Priced, sched: "_Scheduler") -> Tuple:
+def _by_ttft(candidate: _Priced, view: KVView) -> Tuple:
     """The lowest predicted queue + transfer + prefill.
 
     Why reuse is *priced* rather than preferred: a longer match on a busier
@@ -294,7 +301,7 @@ def _by_batch(candidate: _Batched) -> Tuple:
 #: An admission gate: does this decision clear one SLO? Installed as a list --
 #: :attr:`_Scheduler._gates` -- rather than tested behind a mode string, so no
 #: decision below has a mode to branch on. A gate holds no settings of its own, so
-#: it is handed the model it gates against.
+#: it is handed the scheduler whose SLOs it holds a decision to.
 _Gate = Callable[["Response", "_Scheduler"], bool]
 
 
@@ -321,6 +328,11 @@ class RoutedPull(KeySelector[None]):
     charge a cross-node read for a same-node prediction. A caller with no routed
     pull falls through to the ranking behind this link.
 
+    A selector like any other, sensing through the view it is attached to
+    (:meth:`~proposed.selector.Selector.attach`) -- the record is a read of the
+    cluster, so it arrives the way every other read does and nothing hands this one
+    the model.
+
     Reading it **consumes** it (:meth:`~kvcache_sim.control._cluster.KVClusterModel.claim`
     expires the record on a match), so this belongs at the head of a
     :class:`~proposed.selector.FirstMatch` chain and under no combinator that can drop
@@ -332,11 +344,8 @@ class RoutedPull(KeySelector[None]):
 
     name = "routed-pull"
 
-    def __init__(self, cluster: KVClusterModel) -> None:
-        self._cluster = cluster
-
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
-        peer = self._cluster.claim(requester, keys)
+        peer = self.view.cluster.claim(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
 
@@ -355,15 +364,14 @@ class FetchRouting(KeySelectorChain[None]):
     Neither link gates on anything, so what it answers is already values.
 
     Args:
-        cluster: the run's model, which this scheduler records a priced pull into.
         source: ranks the holders of a prefix. The same object the reuse axis names a
             peer with, so the peer chosen while pricing is the peer this answers with.
     """
 
     name = "fetch-routing"
 
-    def __init__(self, cluster: KVClusterModel, source: KeySelector[None]) -> None:
-        super().__init__([RoutedPull(cluster), source])
+    def __init__(self, source: KeySelector[None]) -> None:
+        super().__init__([RoutedPull(), source])
 
 
 class _Scheduler(ControlPlane):
@@ -466,41 +474,42 @@ class _Scheduler(ControlPlane):
         (``MyControl(knobs)``) and let the run hand it the stack afterwards.
 
         The view is upgraded to a :class:`~kvcache_sim.control._view.KVView` here:
-        prefix runs are this capability's notion, not the store's.
+        prefix runs are this capability's notion, not the store's, and so is the
+        cluster model, which goes *into* that sensor. Everything downstream then
+        senses one object -- the rank keys, the reuse axis, the fetch chain -- and
+        nothing is handed the model to read.
 
         The run's one :class:`~kvcache_sim.control._cluster.KVClusterModel` is built
         here unless a caller made it first (``cluster``): this is where the
         instances become known, and this runs once per run, so nothing else is
         placed to build a second (empty) one -- and an empty one would report every
-        host idle, which is a run that looks healthy and is wrong. Everything that
-        ranks, prices or gates is handed that one model.
+        host idle, which is a run that looks healthy and is wrong. The plane keeps it
+        because a plane owns what it wrote (:class:`Committed`) and the run harvests
+        it (:attr:`~proposed.plane.ControlPlane.cluster`) to put a service in front
+        of; reading it is the view's.
         """
-        self.view = view.derived(KVView)
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
         if self.cluster is None:
             # Over ALL instances: the prefill and decode pools may each be a subset.
             self.cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
+        self.view = view.derived(KVView, cluster=self.cluster)
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
         )
         self.decode_ids = (
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
-        # What a fetch is answered with, over the model just settled above.
-        self._fetch = FetchRouting(self.cluster, self._source)
-        self._fetch.attach(view)
-        # The reuse axis senses through the same view this one does, which is what
-        # lets one routing decision pin one directory snapshot for both
-        # (:meth:`~kvcache_sim.control._view.KVView.pinned`). The rank keys need no
-        # view: they sort what this scheduler already priced.
-        #
-        # **Second, and that is load-bearing.** A reuse axis that ranks peers brings up
-        # the source ranking it funnels (:meth:`~proposed.selector.Refine.attach`), and
-        # that same ranking is a link of the chain attached just above, to the plain
-        # view. This is the attach that leaves it sensing through the pinned view: a
-        # ranking a decision consults inside its pin must not read past the snapshot
-        # into the live directory.
+        # What a fetch is answered with. Both this and the reuse axis sense through
+        # the KVView above -- the fetch because its head link reads the model
+        # (:class:`RoutedPull`), the reuse axis because one routing decision pins that
+        # view's snapshot for the whole of itself
+        # (:meth:`~kvcache_sim.control._view.KVView.pinned`) and a ranking consulted
+        # inside the pin must not read past it into the live directory. The source
+        # ranking is a link of both and gets attached twice, to the same view either
+        # way, so no order here is load-bearing.
+        self._fetch = FetchRouting(self._source)
+        self._fetch.attach(self.view)
         self._reuse.attach(self.view)
 
     # -- what a serving host asks, at the two moments it has a question ------- #
@@ -561,7 +570,7 @@ class _Scheduler(ControlPlane):
                     request, inst, now, match=match, source=src, pull_keys=pull
                 )))
             return Selection.priced(sorted(
-                candidates, key=lambda candidate: self._rank(candidate, self)
+                candidates, key=lambda candidate: self._rank(candidate, self.view)
             ))
 
     @staticmethod
@@ -586,7 +595,7 @@ class _Scheduler(ControlPlane):
     # -- prediction (no mutation) ---------------------------------------- #
     def _predict(self, inst: str, now: float, transfer_t: float, prefill_t: float):
         """Return ``(queue_wait, ttft, done_time)`` without reserving the server."""
-        avail = max(now, self.cluster.busy_until[inst])
+        avail = max(now, self.view.cluster.busy_until[inst])
         queue_wait = avail - now
         done = avail + transfer_t + prefill_t
         return queue_wait, done - now, done
@@ -633,11 +642,11 @@ class _Scheduler(ControlPlane):
         if not self.tbt_enabled:
             return 0
         if not self._lookahead:
-            return self.cluster.occupancy(d)
-        n = self.cluster.predict_occupancy(d, done_time)
+            return self.view.cluster.occupancy(d)
+        n = self.view.cluster.predict_occupancy(d, done_time)
         # Requests whose prefill has not landed are invisible to the observed
         # decode state; the outstanding reservations stand in for them.
-        for res in self.cluster.pending(self.view.now()):
+        for res in self.view.cluster.pending(self.view.now()):
             if (
                 res.decode_id == d
                 and res.prefill_done <= done_time

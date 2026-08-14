@@ -1812,7 +1812,10 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     sim = Simulation(_make_topology(2), control=sched)   # attach builds the chain
     try:
         assert sched.cluster is not None
-        assert sched._fetch.selectors[0]._cluster is sched.cluster
+        # The memo link reads the plane's own model, through the one sensor everything
+        # here senses through -- it is handed no model of its own.
+        assert sched._fetch.selectors[0].view is sched.view
+        assert sched.view.cluster is sched.cluster
         assert sched._fetch.selectors[-1] is sched._reuse.source
     finally:
         sim.loop.close()

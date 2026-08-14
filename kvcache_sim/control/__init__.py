@@ -19,9 +19,11 @@
   used twice: the scheduler calls it to *price* a pull against recomputing, and it
   sits behind the plane a fetch asks, so the read is *served* by the peer that was
   priced;
-* :mod:`~kvcache_sim.control._view` -- the single derived directory read the
-  scheduler needs (per-instance prefix-run lengths, and the private prefix walk
-  behind them), plus the pinned snapshot one decision reads it through.
+* :mod:`~kvcache_sim.control._view` -- everything a decision senses, as one object:
+  the single derived directory read the scheduler needs (per-instance prefix-run
+  lengths, and the private prefix walk behind them), the pinned snapshot one decision
+  reads it through, and the cluster model above -- so what ranks, prices or gates
+  senses it rather than being handed it.
 
 Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and nothing
 reaches into the simulator -- all checked by the repo's contract lint. Control

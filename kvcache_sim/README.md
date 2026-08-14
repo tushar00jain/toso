@@ -245,8 +245,11 @@ kvcache_sim/
                           #   SpreadReadsKeySelector, which spreads reads over
                           #   equally good replicas): the one store question
                           #   ("which peer serves this gap"), a proposed.KeySelector
-    _view.py              #   KVView: per-instance prefix-run lengths, plus the
-                          #   pinned snapshot one routing decision reads through
+    _view.py              #   KVView: everything a decision senses, as one
+                          #   object -- per-instance prefix-run lengths, the
+                          #   pinned snapshot one routing decision reads them
+                          #   through, and the cluster model above, so nothing
+                          #   that ranks or gates is handed a model of its own
                           #   (underscored: the coordinator builds its own, so
                           #   nothing outside control/ names this)
     request.py            #   inference Request, carrying its prompt (a
