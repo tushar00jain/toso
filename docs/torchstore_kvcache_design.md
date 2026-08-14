@@ -69,7 +69,7 @@ TorchStore already has three of Mooncake's four parts. The table is the crux of 
 | **KVCache pool** — objects over spare CPU/DRAM/SSD | `StorageVolume` / `InMemoryStore` (`storage_volume.py`), one per rank/host; already a distributed byte pool | add **eviction** + optional **SSD tier** |
 | **Transfer Engine** — RDMA block movement, multi-NIC device selection | Transport layer (`transport/*`): shm → Monarch RDMA → TorchComms RDMA → Gloo → RPC, auto-selected per transfer | **none** — reuse as-is; the primitives line up 1:1 |
 | **Metadata master** — global directory, no data flow | `Controller` directory `key → {volume_id → StorageInfo}` + prefix `Trie` (`controller.py`) | **none** — reuse; blocks are just keys |
-| **Client + transfer submitter** | `LocalClient` (`client.py`) driving `put`/`get` over the transport | **none** — reuse |
+| **Client + transfer submitter** | `LocalClient` (`client.py`) driving `put`/`get` over the transport | one **optional source preference** on the read path: `locate_volumes(keys, prefer=...)` applies a caller-supplied volume ranking to its own answer before the client picks a holder per key (§5.2). The store consults nothing; whoever asked the coordinator did so itself |
 | **KV-cache event feed** — stored/removed event stream | *(nothing)* — Controller has no stored/removed event stream | **NEW seam** (optional): Controller emits stored/removed events the coordinator subscribes to (§4) |
 | **Conductor** — cache-aware prefill/decode scheduler | *(nothing)* | **NEW control plane**: a `CacheCoordinator` layered in front of the `Controller` (a selector actor over the dumb directory) |
 | **Prefix-hash block id** — computed in the serving-engine connector, not the store | opaque string keys (any scheme allowed) | **naming convention** only, no code change |
@@ -200,21 +200,33 @@ volumes/directory are untouched.
 
 ### 5.2 API
 
-Two coordinator endpoints, plus ordinary block `put`/`get` underneath:
+Three coordinator endpoints, plus ordinary block `put`/`get` underneath:
 
 ```python
 # 1) locate + route: the Conductor query
 plan = await cache.schedule(request)     # request = (model_id, prompt_tokens, out_len, slos)
 # plan -> (prefill_instance, decode_instance, prefix_match_len,
-#          reuse_source_instance_or_None, predicted_ttft)  |  Reject(429)
+#          reuse_source_instance_or_None, gap_block_keys, predicted_ttft)  |  Reject(429)
 
-# 2) after prefill, the instance publishes the blocks it computed (read-through, K4)
+# 2) which peers serve this pull, as a source preference for the read
+srcs = await cache.sources(plan.gap_block_keys, plan.prefill_instance)
+await client.get_batch(plan.gap_block_keys, prefer=srcs)
+
+# 3) after prefill, the instance publishes the blocks it computed (read-through, K4)
 await cache.publish(prefill_instance, new_block_keys)   # -> notify_put_batch under the hood
 ```
 
-The serving engine calls `schedule`, runs prefill on `plan.prefill_instance` for the
-**uncached suffix only** (fetching `plan.prefix_match_len` blocks from
-`reuse_source_instance` if remote), then `publish`es the blocks it produced.
+The serving engine calls `schedule`, fetches the **gap** — the matched blocks the picked
+instance does not already hold — runs prefill on `plan.prefill_instance` for the
+**uncached suffix only**, then `publish`es the blocks it produced.
+
+`sources` is what makes the priced peer the peer that serves: a `get` picks whichever
+holder the directory lists first, so with a replicated hot block the peer §5.4 measured
+its TTFT against and the peer that answers are different volumes at different locality
+tiers. The coordinator answers the pull from the routing decision it already made, and
+the store applies that ranking to its own directory answer (`locate_volumes(...,
+prefer=)`, §2) without consulting anybody. Deciding twice would not even agree — routing
+ranks over the request's whole block chain, the pull names only the gap.
 
 ### 5.3 Coordinator state
 
@@ -262,7 +274,9 @@ on schedule(request):                          # runs atomically
   if best_len / prefix_on(pick) > balance_threshold:        # §5.6 hot-block migration
       schedule_replicate(best_inst, pick, block_keys[prefix_on(pick):best_len])
   load[pick].add(best_ttft); decode_load[d].add(...)
-  return Plan(prefill=pick, decode=d, prefix_match_len=..., reuse_source=src, ttft=best_ttft)
+  gap = block_keys[prefix_on(pick):best_len] if src else []   # what pick must pull (§5.6)
+  return Plan(prefill=pick, decode=d, prefix_match_len=..., reuse_source=src,
+              gap_block_keys=gap, ttft=best_ttft)
 ```
 
 `prefill_cost` / `transfer_cost` are offline-fit predictors — the paper notes prefill
@@ -314,6 +328,14 @@ instance pulls and stores it locally** (read-through, K4) — otherwise prefer l
 recompute. This reuses the peer-source + read-through pattern (K3/K4), triggered by
 *access skew over time*, and the replica **persists**
 in the cache (subject to eviction) rather than living only for one version window.
+
+The pull names the **gap** only — the matched blocks the picked instance is not already
+holding — so read-through replication cannot make a request re-fetch what it has. That
+also bounds what a stale plan costs: between routing and the pull, this very mechanism
+changes who holds what, and a source that has since evicted a gap block simply fails to
+serve it. The picked instance then recomputes the gap on top of the prefix it does hold,
+which is a cache miss and not an error (§5.9) — no second directory round trip, and no
+wasted prefill.
 
 Make replication **config- and strategy-driven** rather than an ad-hoc heuristic: a
 per-block replica target plus a pluggable **placement strategy**. Two useful strategies:
@@ -462,22 +484,3 @@ for. Only the *selector* is new.
 - **Consistency across model versions:** a weight update (new selector in RL) invalidates
   the KV cache. Tie KV `block_key`s to the weight `version` (MAPPING marker) so a sync
   bump auto-invalidates stale KV.
-- **A read cannot target a volume.** §5.6 assumes a prefix is pulled from the *chosen*
-  peer, but `client.get` takes no source argument and the client serves from whichever
-  holder comes first in the directory map — so the peer the coordinator picks (and prices
-  its TTFT against) is not the peer that serves. With a replicated hot block the two
-  differ, at a different locality tier, so routing is decided against a cost that is
-  never paid. Measured in `kvcache_sim`: ~1 pulled block in 4.
-  - Add a source argument (or locality-aware selection) to `client.get` — upstream change.
-  - Narrow the caller's directory view to the chosen volume — works today, no API change
-    (`dedup_sim` does this), but every caller reimplements it.
-  - Accept whatever serves and price the plan on the *closest* holder — cheapest, loses
-    the guarantee.
-- **A routing decision goes stale before it executes.** Between routing and the pull,
-  read-through replication (§5.6, the design's own mechanism) changes who holds what: the
-  prefix may have landed on the prefill instance itself, or the planned source may have
-  evicted it. The design does not say what to do about it.
-  - Re-plan at execution time — correct, costs a second directory round trip.
-  - Pull only the blocks still missing *locally*, recompute the rest — cheap, and strictly
-    better than today (`kvcache_sim` currently re-pulls blocks it already holds).
-  - Pin the plan and fail the pull if the source moved — simplest, wastes the prefill.
