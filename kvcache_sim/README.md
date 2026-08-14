@@ -78,10 +78,11 @@ python -m kvcache_sim --help            # usage + valid scenario names
 - `-v` / `--verbose` / `--debug` raises the log level to DEBUG so the `(a)` event
   trace prints (capped to the first 60 events per scenario); the default INFO level
   prints only the `(b)` summaries.
-- `--spread-reads` gives the **hotspot** scenario's cache-aware runs
-  `SpreadReadsKeySelector` as their source ranking instead of longest-prefix-then-id, so
-  one replica of a hot prefix does not serve every read of it. Off by default: it
-  changes which replica answers, so it is not byte-identical.
+- `--spread-reads` puts the **hotspot** scenario's cache-aware source ranking under
+  `proposed.selector.Discount`, so longest-prefix-then-id becomes
+  longest-prefix-minus-recent-load and one replica of a hot prefix does not serve
+  every read of it. Off by default: it changes which replica answers, so it is not
+  byte-identical.
 
 ## The scenarios
 
@@ -241,10 +242,11 @@ kvcache_sim/
     _pending.py           #   Reservations / RoutedPulls: what was decided and
                           #   not yet done. Each expires on its own terms, when
                           #   read -- so no decision method carries a sweep
-    _source.py            #   LongestPrefixKeySelector (+ the opt-in
-                          #   SpreadReadsKeySelector, which spreads reads over
-                          #   equally good replicas): the one store question
-                          #   ("which peer serves this gap"), a proposed.KeySelector
+    _source.py            #   LongestPrefixKeySelector: the one store question
+                          #   ("which peer serves this gap"), a
+                          #   proposed.KeySelector, priced in blocks of prefix
+                          #   run so the opt-in proposed.selector.Discount can
+                          #   spread reads over equally good replicas
     _view.py              #   KVView: everything a decision senses, as one
                           #   object -- per-instance prefix-run lengths, the
                           #   pinned snapshot one routing decision reads them

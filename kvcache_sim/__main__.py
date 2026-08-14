@@ -64,8 +64,8 @@ class KVCacheDemo(Demo):
     def flags(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--spread-reads", action="store_true",
-            help="give the hotspot scenario's cache-aware runs SpreadReadsKeySelector "
-            "as their source ranking instead of longest-prefix-then-id, so one "
+            help="put the hotspot scenario's cache-aware source ranking under a "
+            "Discount, so a replica recently routed to is ranked down and one "
             "replica of a hot prefix does not serve every read of it. Off by "
             "default: it changes which replica answers, so it is not "
             "byte-identical.",

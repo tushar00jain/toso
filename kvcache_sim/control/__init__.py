@@ -18,7 +18,8 @@
   "which peer serves this prefix gap", as a :class:`proposed.selector.KeySelector`. It is
   used twice: the scheduler calls it to *price* a pull against recomputing, and it
   sits behind the plane a fetch asks, so the read is *served* by the peer that was
-  priced;
+  priced. Spreading reads over the replicas of a hot prefix is that ranking under
+  :class:`proposed.selector.Discount`, which is a composition and so lives there;
 * :mod:`~kvcache_sim.control._view` -- everything a decision senses, as one object:
   the single derived directory read the scheduler needs (per-instance prefix-run
   lengths, and the private prefix walk behind them), the pinned snapshot one decision

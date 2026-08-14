@@ -33,10 +33,16 @@ does not belong in a :class:`Selection` at all. A gate rides *with* one instead 
 a selector that refuses abstains (``Selection.of([])``), and what it would have
 answered is simply not in the ranking.
 
-Selectors compose one way, and it is not a selector holding another:
+Selectors compose two ways, both of them one selector holding others:
 :class:`FirstMatch` picks between alternatives -- ask each in order, take the first
-answer. Every link takes keys, checked at construction, so the chain is a
-:class:`KeySelector` too and says so in its type.
+answer. :class:`Discount` re-ranks one answer -- ask, then push back a source it has
+lately named, by a bounded amount. Both hand the subject down untouched, so both are
+a :class:`KeySelector` themselves and say so in their type; ``FirstMatch`` checks
+that of its links at construction.
+
+Re-ranking is why a ranking's *price* belongs in its type. A ranking that prices
+nothing can only be re-ordered by overruling it, so :class:`Discount` does its
+arithmetic on the base's own price and refuses a ranking that has none.
 
 Narrowing an answer is not a composition of selectors at all: a test an application
 owns is applied to the ranking it was given, by the caller that has both
@@ -48,8 +54,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (
-    Any, Awaitable, Callable, Dict, Generic, Mapping, Optional, Protocol,
-    Sequence, Tuple, TypeVar, get_args, get_origin,
+    Any, Awaitable, Callable, Dict, Generic, List, Mapping, NamedTuple, Optional,
+    Protocol, Sequence, Tuple, TypeVar, get_args, get_origin,
 )
 
 from proposed.deployment import Key, VolumeId
@@ -57,7 +63,7 @@ from proposed.view import View
 
 __all__ = [
     "Ready", "Selection", "prefer", "DecisionLog", "Selector", "KeySelector",
-    "AnySelector", "NaiveKeySelector", "FirstMatch",
+    "AnySelector", "NaiveKeySelector", "FirstMatch", "Discount",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -289,9 +295,9 @@ class Selector(ABC, Generic[_S, _P]):
         the subject alone (``KeySelector[None]``), so the argument to read is the
         one lining up with :data:`_S` in that base's own ``__parameters__``. A class
         no base of which binds :data:`_S` inherits its parent's subject, which is how
-        both a narrowing subclass (``SpreadReadsKeySelector``) and a priced-only
-        header resolve. One that declares ``subject_type`` itself is left alone, since
-        a computed subject would be overwritten here.
+        both a priced-only header (``KeySelector[int]``) and one that leaves the price
+        open too (``KeySelector[_P]``) resolve. One that declares ``subject_type``
+        itself is left alone, since a computed subject would be overwritten here.
 
         Reads ``cls.__dict__`` rather than :func:`getattr`, which would find the
         base's ``__orig_bases__`` and give every unparameterized subclass the bare
@@ -426,3 +432,181 @@ class FirstMatch(KeySelector[_P]):
             if selection.sources is None or selection.sources:
                 return selection
         return Selection.of([])
+
+
+class _Grant(NamedTuple):
+    """One source handed out, and the moment it stops counting as recent."""
+
+    expires_at: float
+    source: VolumeId
+
+
+class _Grants:
+    """Sources a :class:`Discount` has named lately, tallied per source.
+
+    A window rather than a running total: a total that only grows is not a load
+    signal -- after enough traffic the differences between sources wash out and the
+    ranking decays back to the base's own order, the one thing a discount exists to
+    change.
+
+    Expiry runs on the **read**: a selection reads the tally before it adds to it, so
+    sweeping on the write would leave stale grants in place for precisely the read
+    about to be answered against them.
+
+    **The count is a model, not a measurement.** A grant records that a discount
+    *named* a source, not that any byte moved -- a caller that asks while pricing and
+    then acts on one of the answers leaves most grants standing for sources it never
+    read from, and since nothing counts a source that served a read no discount
+    granted, the tally drifts one-way *above* reality: read it as "recently pointed
+    at", not "currently serving". A prediction whose caller hears what actually
+    happened is corrected by it, and **this has no such correction path** -- a window
+    only bounds how long a wrong count can persist, it never learns that it was
+    wrong. The fix is a measurement: real per-volume serving load, counted in the
+    data plane and surfaced on :class:`~proposed.view.View`, the observation
+    :mod:`proposed.view` leaves ``load()`` out for "until a caller can observe one".
+    Then the ranking stays and the private tally goes.
+    """
+
+    def __init__(self, window: float) -> None:
+        self.window = window
+        self._issued: List[_Grant] = []
+
+    def issue(self, at: float, source: VolumeId) -> None:
+        """Record that ``source`` was named at ``at``; it counts for one window."""
+        self._issued.append(_Grant(at + self.window, source))
+
+    def outstanding(self, now: float) -> Dict[VolumeId, int]:
+        """``source -> grants still inside their window``, dropping the rest.
+
+        A non-positive window expires every grant the instant it is issued, which
+        leaves the base ranking exactly as it was.
+        """
+        self._issued = [g for g in self._issued if g.expires_at > now]
+        counts: Dict[VolumeId, int] = {}
+        for grant in self._issued:
+            counts[grant.source] = counts.get(grant.source, 0) + 1
+        return counts
+
+
+class Discount(KeySelector[int]):
+    """One ranking, re-ranked by a bounded discount for sources named lately.
+
+    Load spreading as a layer over *any* ranking that prices, rather than a property
+    of one ranking: sources a ranking prices the same sort on whatever its last
+    tie-break is -- an id, typically -- and every read then goes to the same volume.
+    This moves that tie onto something that changes. The load signal is this
+    combinator's own bookkeeping, because :mod:`proposed.view` has no ``load()`` to
+    read and :meth:`select` is chokepoint enough: every read the ranking under it
+    influences passes through here.
+
+    The key the base's answer is sorted by, over the base's own price -- higher is
+    better, and an integer, so no rank turns on a float:
+
+        ``(-(price - min(outstanding, max_discount)), outstanding, id)``
+
+    ``max_discount`` is in the base's units, so what load may cancel is stated in the
+    same terms as what it is weighed against: a source ahead by more than that wins
+    however busy it is. Among sources the discount has levelled, the raw grant count
+    decides, so two equally priced sources alternate indefinitely instead of
+    reverting to id order once the discount saturates.
+
+    The prices ride through unchanged (:meth:`Selection.only`), so a caller pricing
+    the winner against something of its own reads what the *base* said about it and
+    never a discounted figure.
+
+    Determinism: every component of the key is an integer or an id, the id is last,
+    and no branch reads a wall clock or an unseeded RNG, so a rank is total and a run
+    reproduces. ``window`` is measured on :meth:`~proposed.view.View.now`. The tally
+    is read and written with nothing awaited in between -- whatever the base does to
+    reach its answer is over by then -- so two decisions cannot interleave inside one
+    update, however the ranking under this one gets its answer.
+
+    What the tally can and cannot be read as: :class:`_Grants`.
+
+    Args:
+        ranking: the selector asked, which must price every source it ranks.
+        window: seconds a grant counts for, and the one number this cannot derive:
+            too short and it forgets a source it has just piled work onto, too long
+            and it goes on penalising one that has finished. Non-positive means no
+            memory, which reproduces ``ranking``'s own order exactly.
+        max_discount: the most price load may cancel out. ``0`` makes the load term
+            a pure tie-break between sources already priced the same, which is
+            enough when the point is replicas of one hot thing.
+        trace: optional :class:`DecisionLog`. Records only.
+    """
+
+    name = "discount"
+
+    def __init__(
+        self,
+        ranking: KeySelector[int],
+        *,
+        window: float = 1.0,
+        max_discount: int = 1,
+        trace: Optional[DecisionLog] = None,
+    ) -> None:
+        self.ranking = ranking
+        self.max_discount = max_discount
+        self.trace = trace
+        self._grants = _Grants(window)
+
+    def attach(self, view: Any) -> None:
+        """Sense through ``view``, and hand it down to the ranking as well."""
+        super().attach(view)
+        self.ranking.attach(view)
+
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[int]:
+        """``ranking``'s answer re-ordered, its head recorded as a grant.
+
+        The whole ranking is re-ordered rather than only its head, so a caller that
+        rejects the first source still has the rest in a useful order. Only the head
+        counts as a grant: it is the one a caller acts on, and counting a source
+        nobody was going to read from would widen the drift :class:`_Grants`
+        describes.
+
+        An answer with no source to re-order goes back untouched and grants nothing.
+        Both empties qualify, for the same reason and not by accident: an abstention
+        names nobody, and the default selection names every holder in directory order
+        rather than any source in particular.
+
+        Raises:
+            ValueError: if ``ranking`` left a source it ranked unpriced. A discount is
+                arithmetic on a price; re-ordering a ranking without one would be
+                overruling it.
+        """
+        ranked = await self.ranking.select(keys, requester)
+        if not ranked.sources:
+            return ranked
+        unpriced = [s for s in ranked.sources if s not in ranked.payload]
+        if unpriced:
+            raise ValueError(
+                f"{type(self.ranking).__name__} ranked {', '.join(unpriced)} without "
+                f"pricing them, so a discount has nothing to weigh: a ranking under "
+                f"one prices every source it ranks"
+            )
+        now = self.view.now()
+        outstanding = self._grants.outstanding(now)
+        order = sorted(
+            ranked.sources,
+            key=lambda source: self._rank(source, ranked.payload, outstanding),
+        )
+        chosen = order[0]
+        self._grants.issue(now, chosen)
+        if self.trace is not None:
+            self.trace.record(
+                now,
+                self.name,
+                f"{requester} <- {chosen} (priced {ranked.payload[chosen]}, "
+                f"{outstanding.get(chosen, 0)} outstanding)",
+            )
+        return ranked.only(order)
+
+    def _rank(
+        self,
+        source: VolumeId,
+        priced: Mapping[VolumeId, int],
+        outstanding: Mapping[VolumeId, int],
+    ) -> Tuple[int, int, VolumeId]:
+        """Sort key for one source: discounted price, raw load, id. Total, always."""
+        held = outstanding.get(source, 0)
+        return (-(priced[source] - min(held, self.max_discount)), held, source)

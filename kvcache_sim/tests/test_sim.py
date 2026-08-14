@@ -30,8 +30,8 @@ from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data._store import KVStore
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, KeySelector
-from proposed.selector import FirstMatch
-from kvcache_sim.control._source import LongestPrefixKeySelector, SpreadReadsKeySelector
+from proposed.selector import Discount, FirstMatch
+from kvcache_sim.control._source import LongestPrefixKeySelector
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished, _LocalOnly,
 )
@@ -1510,12 +1510,19 @@ def test_the_source_selector_accepts_a_plain_view():
     assert ranked.sources == ("s1",)            # ...and now the holder is ranked
 
 
-# 19. Spreading reads: the opt-in source selector breaks the prefix tie on load.
+# 19. Spreading reads: the prefix ranking under a Discount breaks its tie on load.
 #     Reuse value is a property of the prefix, so replicas of a hot prefix rank
-#     identically and the id tie-break sends every read to the same host.
-#     SpreadReadsKeySelector counts the grants it issued -- its own bookkeeping, since
-#     nothing in the repo observes per-volume load -- and lets that settle the tie,
-#     under a bound that keeps a genuinely longer prefix winning.
+#     identically and the id tie-break sends every read to the same host. The
+#     combinator counts the grants it issued -- its own bookkeeping, since nothing in
+#     the repo observes per-volume load -- and lets that settle the tie, under a bound
+#     that keeps a genuinely longer prefix winning. What is asserted here is what the
+#     pairing does to *prefix runs*; the combinator's own mechanics are in
+#     realsim/tests/test_planes.py.
+def _spread(**knobs):
+    """The opt-in source ranking: longest prefix, discounted by recent grants."""
+    return Discount(LongestPrefixKeySelector(), **knobs)
+
+
 def _replicated(holders, blocks, *, num=4):
     """A sim where each of ``holders`` holds ``blocks[holder]`` leading blocks.
 
@@ -1557,7 +1564,7 @@ def test_spread_reads_rotates_between_equal_prefix_replicas():
     """Three replicas of one prefix, so the ranking has nothing else to go on."""
     sim, keys = _replicated(["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 4})
     try:
-        heads = _select_heads(sim, SpreadReadsKeySelector(), keys, count=6)
+        heads = _select_heads(sim, _spread(), keys, count=6)
         # ...and the same replicas under the default selector, which cannot spread.
         stuck = _select_heads(sim, LongestPrefixKeySelector(), keys, count=6)
     finally:
@@ -1574,11 +1581,11 @@ def test_spread_reads_still_prefers_a_materially_longer_prefix():
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 2, "s2": 4})
     try:
-        heads = _select_heads(sim, SpreadReadsKeySelector(max_discount=1), keys, count=5)
+        heads = _select_heads(sim, _spread(max_discount=1), keys, count=5)
         # A discount wide enough to cover the gap does trade reuse away, and only
         # once it has been fully spent -- stated here because it is the knob's
         # meaning, not a defect.
-        wide = _select_heads(sim, SpreadReadsKeySelector(max_discount=4), keys, count=3)
+        wide = _select_heads(sim, _spread(max_discount=4), keys, count=3)
     finally:
         sim.loop.close()
     assert heads == ["s2"] * 5
@@ -1594,12 +1601,12 @@ def test_spread_reads_forgets_a_grant_once_its_window_passes():
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 4, "s2": 4})
     try:
-        prompt = _select_heads(sim, SpreadReadsKeySelector(window=1.0), keys, count=4)
+        prompt = _select_heads(sim, _spread(window=1.0), keys, count=4)
         aged = _select_heads(
-            sim, SpreadReadsKeySelector(window=1.0), keys, count=4, gap=2.0
+            sim, _spread(window=1.0), keys, count=4, gap=2.0
         )
         # window <= 0 is no memory at all: the default selector's ranking, exactly.
-        forgetful = _select_heads(sim, SpreadReadsKeySelector(window=0.0), keys, count=4)
+        forgetful = _select_heads(sim, _spread(window=0.0), keys, count=4)
     finally:
         sim.loop.close()
     assert prompt == ["s1", "s2", "s1", "s2"]
@@ -1616,7 +1623,7 @@ def test_spread_reads_ranks_deterministically():
     reads the rest of it.
     """
     async def rankings(sim, keys):
-        selector = SpreadReadsKeySelector()
+        selector = _spread()
         selector.attach(sim.view)
         out = []
         with sim.mesh.installed():
@@ -1658,7 +1665,7 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     # The one ranking the plane holds: it prices against it and answers a fetch with
     # it, so this is where a run's own selector is reachable.
     selectors = [run.control._source for run in aware]
-    assert all(isinstance(p, SpreadReadsKeySelector) for p in selectors)
+    assert all(isinstance(p, Discount) for p in selectors)
     assert selectors[0] is not selectors[1], "a shared tally would count both runs"
 
     def pull_sources(result):

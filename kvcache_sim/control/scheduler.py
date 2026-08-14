@@ -5,7 +5,7 @@ what this capability decides. Two members, asked at the two moments a serving ho
 has a question::
 
     await decide(request, me)   -> Optional[Response]   # where should this run
-    await sources(keys, me)     -> Selection[None]      # who serves this fetch
+    await sources(keys, me)     -> Selection[int]       # who serves this fetch
 
 The second exists because the first already answered it: routing prices a pull
 against recomputing and records the peer it priced, and the fetch that follows asks
@@ -65,7 +65,7 @@ each move the executed cost off it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from proposed import ControlPlane, Endpoint, Key, KeySelector, Selection, VolumeId
 from proposed.selector import FirstMatch, Selector
@@ -192,7 +192,15 @@ class Response:
 # SLO gates answer yes or no, and a ranked set of sources cannot say that.
 
 
-class _LocalOnly(Selector[Sequence[Key], None]):
+#: The price a selector here answers in, left open on the two that answer without
+#: quoting one: :class:`_LocalOnly` names nobody, and :class:`RoutedPull` names the
+#: peer this scheduler already priced itself. Their payload is empty, and an empty
+#: payload is a payload in whatever terms the holder prices in -- so neither claims a
+#: unit it never quotes, and both fit a chain pricing in blocks of prefix run.
+_P = TypeVar("_P")
+
+
+class _LocalOnly(Selector[Sequence[Key], _P]):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
     A plain :class:`~proposed.selector.Selector`: its subject is keys, but the
@@ -206,7 +214,7 @@ class _LocalOnly(Selector[Sequence[Key], None]):
 
     name = "local-only"
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
         return Selection.of([])
 
 
@@ -304,7 +312,7 @@ def _predicted_tbt_gate(response: "Response", sched: "_Scheduler") -> bool:
     return response.pred_tbt <= sched.slo_tbt
 
 
-class RoutedPull(KeySelector[None]):
+class RoutedPull(KeySelector[_P]):
     """The peer a fetch's pull was already priced against, or an abstention.
 
     Answering the fetch from what routing decided, rather than deciding twice:
@@ -321,15 +329,16 @@ class RoutedPull(KeySelector[None]):
     Reading it **consumes** it (:meth:`~kvcache_sim.control._cluster.KVClusterModel.claim`
     expires the record on a match), so this belongs at the head of a
     :class:`~proposed.selector.FirstMatch` chain and under no combinator that can drop
-    an answer. In that one position spending and using coincide: a link that answers
-    wins the chain, an abstention matched nothing and spends nothing. Under one that
-    could reject the peer, the record would be gone and the fetch would fall through
-    to a ranking that never saw it.
+    the answer or rank it down (:class:`~proposed.selector.Discount`). In that one
+    position spending and using coincide: a link that answers wins the chain, an
+    abstention matched nothing and spends nothing. Under one that could reject the
+    peer, the record would be gone and the fetch would fall through to a ranking that
+    never saw it.
     """
 
     name = "routed-pull"
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
         peer = self.view.cluster.claim(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
@@ -348,9 +357,11 @@ class _Scheduler(ControlPlane):
         reuse / rank: the two axes a preset picks (see above), both used while
             forming the one answer :meth:`decide` gives. ``reuse`` is a selector
             and ``rank`` a sort key (:data:`_RankKey`), which is why only the first
-            is attached. It ranks the peers holding a prefix and prices nothing
-            (``Selector[Sequence[Key], None]``): what a peer is worth to one candidate
-            is this scheduler's to work out (:meth:`_priced_reuse`).
+            is attached. It ranks the peers holding a prefix, priced in blocks of that
+            prefix (``Selector[Sequence[Key], int]``); what a peer is *worth* to one
+            candidate is this scheduler's to work out, off the snapshot it read itself
+            (:meth:`_priced_reuse`), so a re-ranking under the axis cannot move a
+            price this scheduler compares.
         balance_threshold: how much longer the head's prefix run must be than a
             candidate's own before pulling beats recomputing
             (:func:`_longer_than_local`). Unread when ``reuse`` names nobody.
@@ -376,10 +387,10 @@ class _Scheduler(ControlPlane):
     def __init__(
         self,
         *,
-        reuse: Selector[Sequence[Key], None],
+        reuse: Selector[Sequence[Key], int],
         rank: _RankKey,
         balance_threshold: float = 1.5,
-        source_selector: Optional[KeySelector[None]] = None,
+        source_selector: Optional[KeySelector[int]] = None,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
@@ -429,7 +440,7 @@ class _Scheduler(ControlPlane):
         self.decode_ids: List[str] = []
         self.cluster: Optional[KVClusterModel] = cluster
         # Built in attach(), where the model it reads exists.
-        self._fetch: Optional[FirstMatch[None]] = None
+        self._fetch: Optional[FirstMatch[int]] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view) -> None:
@@ -478,7 +489,7 @@ class _Scheduler(ControlPlane):
         self._reuse.attach(self.view)
 
     # -- what a serving host asks, at the two moments it has a question ------- #
-    async def sources(self, keys: Sequence[Key], requester: str) -> Selection[None]:
+    async def sources(self, keys: Sequence[Key], requester: str) -> Selection[int]:
         """Which peers should serve ``requester``'s fetch of ``keys``, best first.
 
         The pull :meth:`decide` already priced for this caller (:class:`RoutedPull`),
@@ -557,7 +568,7 @@ class _Scheduler(ControlPlane):
     @staticmethod
     def _priced_reuse(
         counts: Dict[str, int], keys: Sequence[Key], inst: str,
-        peer: Selection[None],
+        peer: Selection[int],
     ) -> Tuple[int, Optional[str], Sequence[str]]:
         """What one peer buys ``inst``: ``(match, source, pull_keys)``.
 
@@ -714,15 +725,15 @@ class CacheAwareScheduler(_Scheduler):
             ``replicate=False`` never asks it anything while pricing, and a fetch
             still is.
 
-            Required here, and deliberately without a default: this ranking keeps
-            state across the decisions it makes
-            (:class:`~kvcache_sim.control._source.SpreadReadsKeySelector`), so which
-            one a run uses is the run's to choose
-            (:func:`kvcache_sim.workload._serving.scheduler`).
+            Required here, and deliberately without a default: this ranking may keep
+            state across the decisions it makes (one under a
+            :class:`~proposed.selector.Discount` does), so which one a run uses is the
+            run's to choose (:func:`kvcache_sim.workload._serving.scheduler`).
     """
 
-    def __init__(self, *, source_selector: KeySelector, balance_threshold: float = 1.5,
-                 replicate: bool = True, **knobs: Any) -> None:
+    def __init__(self, *, source_selector: KeySelector[int],
+                 balance_threshold: float = 1.5, replicate: bool = True,
+                 **knobs: Any) -> None:
         super().__init__(
             reuse=source_selector if replicate else _LocalOnly(),
             balance_threshold=balance_threshold,

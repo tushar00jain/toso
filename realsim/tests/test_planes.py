@@ -14,10 +14,10 @@ pin the contract each one owes its callers:
 3. a preference reorders a directory answer to its ranked sources, a selection
    withholds itself until its readiness gate opens and crosses a service boundary
    without it -- and the two combinators built on it tell an *abstention* from the
-   *naive answer*, carry a wrapped selector's gate through, and wake every selector
-   they hold, whichever subtype (``KeySelector`` over keys, ``AnySelector`` over an
-   application payload) that selector is. ``FirstMatch`` picks between alternatives
-   over keys, and a ranking narrows itself in place (``require``, ``take``);
+   *naive answer*, carry a wrapped selector's gate and prices through, and wake every
+   selector they hold whether or not they consult it. ``FirstMatch`` picks between
+   alternatives, ``Discount`` re-ranks one answer by how much it has lately named
+   each source, and a ranking narrows itself in place (``require``, ``take``);
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -44,7 +44,7 @@ from proposed import AnySelector, ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
-    FirstMatch, NaiveKeySelector, prefer, Selector,
+    Discount, FirstMatch, NaiveKeySelector, prefer, Selector,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
@@ -512,6 +512,31 @@ def _select(selector: Selector, keys=("K",), requester="r") -> Selection:
     return asyncio.run(selector.select(list(keys), requester))
 
 
+class _Clock:
+    """The whole of what a ``Discount`` senses: ``now()``, moved by hand.
+
+    A ``View`` would bring a directory nothing here reads, and time here has to be
+    driveable a window at a time.
+    """
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def now(self) -> float:
+        return self.t
+
+
+def _heads(selector: Selector, *, count: int, gap: float = 0.0) -> list:
+    """The head of ``count`` successive rankings, ``gap`` virtual seconds apart."""
+    clock = _Clock()
+    selector.attach(clock)
+    heads = []
+    for _ in range(count):
+        heads.append(_select(selector).head)
+        clock.t += gap
+    return heads
+
+
 def test_first_match_takes_the_first_answer_and_stops():
     first, second = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
     assert _select(FirstMatch([first, second])).sources == ("v0",)
@@ -582,6 +607,93 @@ def test_a_chain_is_a_key_selector_and_refuses_a_link_that_is_not():
 
     with pytest.raises(TypeError, match="every link must be a KeySelector"):
         FirstMatch([_Fixed(), _FixedPlacement()])
+
+
+def test_discount_moves_the_tie_between_equally_priced_sources():
+    """The point of the combinator: two sources a ranking cannot separate.
+
+    The base answers the same way every time, so the alternation is the discount's
+    and nothing else's -- and it goes on alternating rather than reverting to id order
+    once both sources carry a grant, because the raw count breaks the tie the bounded
+    discount levelled.
+    """
+    discounted = Discount(_Fixed(Selection.priced([("v0", 5), ("v1", 5)])))
+    assert isinstance(discounted, KeySelector)   # so a chain can still hold it
+    assert _heads(discounted, count=4) == ["v0", "v1", "v0", "v1"]
+
+
+def test_discount_cannot_outvote_a_source_ahead_by_more_than_the_bound():
+    """``max_discount`` is in the base's units, so the bound is a price gap.
+
+    A discount wide enough to cover the gap does trade the price away, and only once
+    it has been fully spent -- stated here because that is the knob's meaning.
+    """
+    apart = Selection.priced([("v0", 9), ("v1", 5)])
+    assert _heads(Discount(_Fixed(apart), max_discount=1), count=4) == ["v0"] * 4
+    assert _heads(Discount(_Fixed(apart), max_discount=4), count=5) == [
+        "v0", "v0", "v0", "v0", "v1",
+    ]
+
+
+def test_discount_forgets_a_grant_once_its_window_passes():
+    """A window, not a running total, so load cannot accumulate.
+
+    Spaced further apart than the window, every read finds an empty tally and the
+    base's own order answers again -- the difference between "recently named" and
+    "has ever been named". A non-positive window is that with no memory at all.
+    """
+    equal = Selection.priced([("v0", 5), ("v1", 5)])
+    assert _heads(Discount(_Fixed(equal), window=1.0), count=4, gap=2.0) == ["v0"] * 4
+    assert _heads(Discount(_Fixed(equal), window=0.0), count=4) == ["v0"] * 4
+
+
+def test_discount_passes_an_answer_with_no_source_to_rank_straight_through():
+    """The two empties again: neither names a source, so neither is re-ranked.
+
+    Returned as they were built, which is also what keeps the grant honest -- nothing
+    was named, so nothing is tallied and the next real answer is undiscounted.
+    """
+    for empty in (Selection.of([]), Selection()):
+        discounted = Discount(_Fixed(empty))
+        discounted.attach(_Clock())
+        assert _select(discounted) is empty
+        assert _select(discounted) is empty
+
+
+def test_discount_refuses_a_ranking_that_prices_nothing():
+    """A discount is arithmetic on a price; without one it would overrule the base.
+
+    Which is why a ranking's price is in its type: re-ordering an unpriced ranking
+    could only mean ignoring the order it chose.
+    """
+    discounted = Discount(_Fixed(Selection.of(["v0", "v1"])))
+    discounted.attach(_Clock())
+    with pytest.raises(ValueError, match="prices every source"):
+        _select(discounted)
+
+
+def test_discount_attaches_the_ranking_under_it_and_keeps_what_it_answered():
+    """The wrapped selector is sensing, and the answer is re-ordered and nothing else.
+
+    The gate rides through and every kept source keeps the *base's* price, so a caller
+    pricing the winner against something of its own never reads a discounted figure.
+    """
+
+    async def gate() -> None:
+        return None
+
+    base = _Fixed(Selection.priced([("v0", 5), ("v1", 5)], ready=gate))
+    discounted = Discount(base)
+    clock = _Clock()
+    discounted.attach(clock)
+
+    assert base.view is clock                       # brought up by its holder
+    _select(discounted)                             # v0 granted ...
+    second = _select(discounted)                    # ... so v1 leads now
+    assert second.sources == ("v1", "v0")
+    assert second.ready is gate
+    assert (second.head, second.winner) == ("v1", 5)
+    assert second.payload == {"v0": 5, "v1": 5}
 
 
 # --------------------------------------------------------------------------

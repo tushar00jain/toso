@@ -155,7 +155,7 @@ def scheduler(
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
-    source_selector: Optional[KeySelector[None]] = None,
+    source_selector: Optional[KeySelector[int]] = None,
 ) -> ControlPlane:
     """This run's **control plane**, as an object a scenario can just declare.
 
@@ -170,12 +170,12 @@ def scheduler(
     and the plane accepts one so that stays possible.
 
     ``source_selector`` is the one knob that is an object rather than a value: which
-    peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and it keeps
-    state across the decisions it makes
-    (:class:`~kvcache_sim.control._source.SpreadReadsKeySelector`). ``None`` -- the
-    default -- is :class:`~kvcache_sim.control._source.LongestPrefixKeySelector`. Give
-    each run its own: two runs sharing one would tally each other's grants and
-    neither would reproduce alone.
+    peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and one
+    under a :class:`~proposed.selector.Discount` keeps state across the decisions it
+    makes. ``None`` -- the default -- is
+    :class:`~kvcache_sim.control._source.LongestPrefixKeySelector`. Give each run its
+    own: two runs sharing one would tally each other's grants and neither would
+    reproduce alone.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
