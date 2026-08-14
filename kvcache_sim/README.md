@@ -229,10 +229,24 @@ kvcache_sim/
                           #   pull-vs-recompute, SLO gates, decode placement,
                           #   every one of them priced against the cluster
                           #   sensor below. LoadBalance (baseline) and
-                          #   CacheAware are presets of it -- two selectors, one
-                          #   naming a peer to pull from and one ranking the
-                          #   priced candidates, and admission as two SLO
-                          #   comparisons
+                          #   CacheAware are presets of it -- one choice each on
+                          #   two of the rankings below, and admission as two
+                          #   SLO comparisons
+    _answer.py            #   Plan / Response: what a decision IS, as values --
+                          #   what one candidate was priced at, and the two
+                          #   hosts a request runs on. Under both of the modules
+                          #   above and below it, so a ranking may be typed on a
+                          #   plan and nothing cycles
+    _selector.py          #   every ranking a decision here makes, each a
+                          #   proposed selector: LongestPrefixKeySelector (the
+                          #   one store question, "which peer serves this gap",
+                          #   priced in blocks of prefix run so the opt-in
+                          #   proposed.selector.Discount can spread reads over
+                          #   equally good replicas), LocalOnly, ByTTFT/ByLoad
+                          #   over the priced prefill candidates, ByBatch over
+                          #   the decode ones, and RoutedPull answering a fetch
+                          #   with the pull already priced for it. A ranking is
+                          #   a selector; an SLO gate and a cost are not
     _sensor/              #   one sensor per kind of fact this plane holds
       _cluster.py         #     ClusterSensor behind proposed.NotifiedSensor:
                           #     the PREDICTED prefill queue and the observed
@@ -248,11 +262,6 @@ kvcache_sim/
                           #     notify and no service fronts them. Each expires
                           #     on its own terms, when read -- so no decision
                           #     method carries a sweep
-    _source.py            #   LongestPrefixKeySelector: the one store question
-                          #   ("which peer serves this gap"), a
-                          #   proposed.KeySelector, priced in blocks of prefix
-                          #   run so the opt-in proposed.selector.Discount can
-                          #   spread reads over equally good replicas
     _view.py              #   KVView: what a decision senses, one class per read
                           #   and each a proposed.View -- prefix runs (with the
                           #   pinned snapshot one routing decision reads them

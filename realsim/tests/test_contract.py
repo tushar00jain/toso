@@ -536,7 +536,7 @@ def test_lint_flags_the_proposal_leaning_on_the_simulator():
         "from realsim.mesh import Mesh\n",
         "from realsim.seams.controller_handle import LocalControllerHandle\n",
         "import torchstore\n",
-        "from kvcache_sim.control._source import LongestPrefixKeySelector\n",
+        "from kvcache_sim.control._selector import LongestPrefixKeySelector\n",
     ):
         assert "proposed-imports-simulator" in _codes(line, path=PROPOSED), line
 

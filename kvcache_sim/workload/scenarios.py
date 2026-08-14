@@ -24,7 +24,7 @@ from realsim.demo import Console, Scenario
 from realsim.run import Result, Run
 from sim_common.trace import Trace
 
-from ..control._source import LongestPrefixKeySelector
+from ..control._selector import LongestPrefixKeySelector
 from ..report.metrics import Metrics
 from ..report.summary import (
     CacheVsBaselineReport,

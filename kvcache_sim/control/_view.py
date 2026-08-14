@@ -16,7 +16,7 @@ takes the one it needs:
   prediction of a run that rolls occupancy forward, and composed in only by such a run;
 * :class:`RoutedView`: the pulls a decision priced against a peer
   (:class:`~kvcache_sim.control._sensor.RoutedPullSensor`), read by the fetch chain's
-  head link alone (:class:`~kvcache_sim.control.scheduler.RoutedPull`).
+  head link alone (:class:`~kvcache_sim.control._selector.RoutedPull`).
 
 Each claims its own keyword through :meth:`~proposed.view.View.derived`, carries its
 own sensor and raises its own "this run supplied none", so composing one in is a name
@@ -82,8 +82,8 @@ def prefix_lengths_of(
 
     Split from the read that feeds it: :meth:`PrefixView.prefix_lengths` reads the
     directory (or serves a pinned snapshot), while
-    :class:`~kvcache_sim.control._source.LongestPrefixKeySelector` may be attached to a
-    plain :class:`~proposed.view.View` and reads it itself. One definition either
+    :class:`~kvcache_sim.control._selector.LongestPrefixKeySelector` may be attached
+    to a plain :class:`~proposed.view.View` and reads it itself. One definition either
     way.
     """
     keys = list(block_keys)
@@ -220,7 +220,7 @@ class RoutedView(View):
     """The pulls this plane has priced against a peer: :attr:`routed`.
 
     Written by the plane that priced them, read by the one link that answers a fetch
-    from them (:class:`~kvcache_sim.control.scheduler.RoutedPull`) -- and reading one
+    from them (:class:`~kvcache_sim.control._selector.RoutedPull`) -- and reading one
     consumes it (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim`).
     """
 

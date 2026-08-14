@@ -31,9 +31,9 @@ from kvcache_sim.data._store import KVStore
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, KeySelector
 from proposed.selector import Discount, FirstMatch
-from kvcache_sim.control._source import LongestPrefixKeySelector
+from kvcache_sim.control._selector import LocalOnly, LongestPrefixKeySelector
 from kvcache_sim.control.scheduler import (
-    ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished, _LocalOnly,
+    ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished,
 )
 from kvcache_sim.workload._serving import scheduler
 from kvcache_sim.workload._generator import _block_keys_for, make_workload
@@ -1485,7 +1485,7 @@ def test_a_pull_is_served_by_the_peer_that_was_priced():
 #     controller-side call carries an already-chosen source and short-circuits
 #     before reaching it -- so nothing but this test holds the plain view up.
 def test_the_source_selector_accepts_a_plain_view():
-    from kvcache_sim.control._source import LongestPrefixKeySelector
+    from kvcache_sim.control._selector import LongestPrefixKeySelector
     from realsim.simulation import Simulation
 
     topo = _make_topology(2)
@@ -1804,7 +1804,7 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
     assert not isinstance(sched, KeySelector)   # a plane is asked, not consulted
     assert {"decide", "sources"} <= set(dir(sched))
     with pytest.raises(TypeError, match="every link must be a KeySelector"):
-        FirstMatch([LongestPrefixKeySelector(), _LocalOnly()])
+        FirstMatch([LongestPrefixKeySelector(), LocalOnly()])
 
 
 def test_one_plane_answers_a_fetch_with_the_pull_it_priced():

@@ -36,9 +36,11 @@ answered is simply not in the ranking.
 Selectors compose two ways, both of them one selector holding others:
 :class:`FirstMatch` picks between alternatives -- ask each in order, take the first
 answer. :class:`Discount` re-ranks one answer -- ask, then push back a source it has
-lately named, by a bounded amount. Both hand the subject down untouched, so both are
-a :class:`KeySelector` themselves and say so in their type; ``FirstMatch`` checks
-that of its links at construction.
+lately named, by a bounded amount. Both hand the subject down untouched, which is why
+one ``Discount`` re-ranks a ranking over keys and one over an application's own
+candidates alike, taking the kind of whichever it wraps. ``FirstMatch`` is over keys
+only, and checks its links are at construction: a chain hands *one* subject to every
+link.
 
 Re-ranking is why a ranking's *price* belongs in its type. A ranking that prices
 nothing can only be re-ordered by overruling it, so :class:`Discount` does its
@@ -491,7 +493,7 @@ class _Grants:
         return counts
 
 
-class Discount(KeySelector[int]):
+class Discount(Selector[_S, int]):
     """One ranking, re-ranked by a bounded discount for sources named lately.
 
     Load spreading as a layer over *any* ranking that prices, rather than a property
@@ -501,6 +503,10 @@ class Discount(KeySelector[int]):
     combinator's own bookkeeping, because :mod:`proposed.view` has no ``load()`` to
     read and :meth:`select` is chokepoint enough: every read the ranking under it
     influences passes through here.
+
+    Over any subject, because the subject is handed to ``ranking`` untouched and never
+    read here -- one wrapper serves a ranking over keys and one over an application's
+    own candidates alike. Which *kind* it is follows what it wraps (:meth:`__new__`).
 
     The key the base's answer is sorted by, over the base's own price -- higher is
     better, and an integer, so no rank turns on a float:
@@ -540,15 +546,32 @@ class Discount(KeySelector[int]):
 
     name = "discount"
 
+    def __new__(cls, ranking: "Selector[_S, int]", **kwargs: Any) -> "Discount[_S]":
+        """Take the kind of the ranking wrapped: over keys, a :class:`KeySelector`.
+
+        A discount asks whatever question its ranking asks, so the kind cannot be
+        declared once here -- and it has to be a type, because that is how a chain
+        checks its links (:class:`FirstMatch`). So a discounted key ranking is a chain
+        link and a discounted application ranking is refused by one, which is the same
+        answer the ranking itself would get.
+        """
+        return object.__new__(
+            _KeyDiscount if cls is Discount and isinstance(ranking, KeySelector)
+            else cls
+        )
+
     def __init__(
         self,
-        ranking: KeySelector[int],
+        ranking: Selector[_S, int],
         *,
         window: float = 1.0,
         max_discount: int = 1,
         trace: Optional[DecisionLog] = None,
     ) -> None:
         self.ranking = ranking
+        #: What it re-ranks, which is what it takes: the subject is not this
+        #: combinator's, so it is read off the ranking rather than declared.
+        self.subject_type = ranking.subject_type
         self.max_discount = max_discount
         self.trace = trace
         self._grants = _Grants(window)
@@ -558,7 +581,7 @@ class Discount(KeySelector[int]):
         super().attach(view)
         self.ranking.attach(view)
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[int]:
+    async def select(self, subject: _S, requester: str) -> Selection[int]:
         """``ranking``'s answer re-ordered, its head recorded as a grant.
 
         The whole ranking is re-ordered rather than only its head, so a caller that
@@ -577,7 +600,7 @@ class Discount(KeySelector[int]):
                 arithmetic on a price; re-ordering a ranking without one would be
                 overruling it.
         """
-        ranked = await self.ranking.select(keys, requester)
+        ranked = await self.ranking.select(subject, requester)
         if not ranked.sources:
             return ranked
         unpriced = [s for s in ranked.sources if s not in ranked.payload]
@@ -613,3 +636,11 @@ class Discount(KeySelector[int]):
         """Sort key for one source: discounted price, raw load, id. Total, always."""
         held = outstanding.get(source, 0)
         return (-(priced[source] - min(held, self.max_discount)), held, source)
+
+
+class _KeyDiscount(Discount[Sequence[Key]], KeySelector[int]):
+    """A :class:`Discount` over keys, and so the store's own question.
+
+    What :class:`Discount` answers with when the ranking it wraps is a
+    :class:`KeySelector`, so such a one is a chain link like the ranking under it.
+    """

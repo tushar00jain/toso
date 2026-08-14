@@ -38,7 +38,7 @@ from typing import (
 from proposed import NotifiedSensor
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from ..scheduler import Response
+    from .._answer import Response
 
 __all__ = [
     "ComputeBusy",

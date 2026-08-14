@@ -6,20 +6,23 @@
   ``workload/`` because all three planes pass it;
 * :mod:`~kvcache_sim.control.scheduler` -- the serving scheduler: which instance
   prefills, pull-vs-recompute, the TTFT/TBT admission gates, where decode lands.
-  These are *compute* decisions the store knows nothing about, which is why they
-  are app code and not part of the shared selector interface;
+  These are *compute* decisions the store knows nothing about, which is why what they
+  rank is this application's own candidates and not keys;
+* :mod:`~kvcache_sim.control._answer` -- what those decisions *are*, as values: the
+  ``Plan`` one candidate was priced at and the ``Response`` naming both of a request's
+  hosts. The layer under everything else here, which is what lets a ranking be typed on
+  a plan without a cycle back into the plane that builds one;
+* :mod:`~kvcache_sim.control._selector` -- every ranking those decisions make, each a
+  :class:`proposed.selector.Selector`: which peer serves a prefix gap (the one part that
+  *is* a store question, so the only ranking here over keys), which priced candidate
+  prefills, which host decodes, and the pull a fetch was already answered with. What is
+  not a ranking is not here -- an SLO gate answers yes or no, and a cost is arithmetic;
 * :mod:`~kvcache_sim.control._sensor` -- what those decisions are made against: one
   sensor per kind of fact this plane holds. The cluster's load, behind
   :class:`proposed.NotifiedSensor`'s single write verb, with the facts a host reports
   and the fold that applies them; and what this plane decided and has not yet seen
   carried out (the prefills it promised, the pulls it priced), each expiring on its own
   terms as it is read;
-* :mod:`~kvcache_sim.control._source` -- the one part that *is* a store question,
-  "which peer serves this prefix gap", as a :class:`proposed.selector.KeySelector`. It is
-  used twice: the scheduler calls it to *price* a pull against recomputing, and it
-  sits behind the plane a fetch asks, so the read is *served* by the peer that was
-  priced. Spreading reads over the replicas of a hot prefix is that ranking under
-  :class:`proposed.selector.Discount`, which is a composition and so lives there;
 * :mod:`~kvcache_sim.control._view` -- what a decision senses, as one class per read
   composed onto :class:`proposed.View`: per-instance prefix-run lengths (with the
   private prefix walk behind them and the pinned snapshot one decision reads them

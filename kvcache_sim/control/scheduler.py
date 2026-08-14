@@ -10,12 +10,13 @@ has a question::
 The second exists because the first already answered it: routing prices a pull
 against recomputing and records the peer it priced, and the fetch that follows asks
 which peer to read from. Two objects would have to keep that note in step across a
-boundary; one plane just reads its own sensor (:class:`RoutedPull`).
+boundary; one plane just reads its own sensor
+(:class:`~kvcache_sim.control._selector.RoutedPull`).
 
 Not a selector, because the decision is made of **two** selections and a selection
 holds one: the prefill hosts this scheduler priced, and the decode hosts it ranked
-against the winner among them. Both rankings are real, and both stay here -- what
-leaves is the winner of each and the price of the one that won (:class:`Response`),
+against the winner among them. Both rankings are real, and neither leaves this plane --
+what does is the winner of each and the price of the one that won (:class:`Response`),
 since nothing outside asks what lost. A refusal (an SLO miss) is ``None``.
 
 One ask settles both halves, before anything runs -- which is what makes a refusal
@@ -30,16 +31,14 @@ host already knows which blocks it computed, and a volume that runs out of room
 drops its own coldest keys and tells the directory afterwards
 (:mod:`realsim.seams._retention`). Every argument and return is a value.
 
-Both names are *presets* of one scheduler, parameterized on two axes, both of them
-selectors and neither reachable from outside it: **reuse**, asked once per decision to
-"rank the peers holding this prefix, or name nobody", and **the winner**, asked to rank
-the candidates this scheduler priced.
+Both names are *presets* of one scheduler, each one choice on each of its two axes --
+reuse and the winner, both selectors (:mod:`kvcache_sim.control._selector`, where every
+ranking a decision here makes lives) and neither reachable from outside this plane:
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
 * ``CacheAwareScheduler`` = pull under a balance threshold, lowest predicted TTFT,
-  over the **global** prefix-match directory. Which peer serves the gap is a selector
-  again (:mod:`kvcache_sim.control._source`).
+  over the **global** prefix-match directory.
 
 Admission is a setting rather than an axis: what a preset varies is whether the TBT SLO
 applies at all, and ``early_rejection`` names which decode occupancy it is judged
@@ -55,9 +54,9 @@ queues and the observed decode batches, and what keeps each of them true. That s
 is read through the view this plane and everything it consults senses through
 (:class:`~kvcache_sim.control._view.KVView`), beside the prefix runs, the prefills this
 plane has promised and not seen land, and the pulls it has already priced
-(:class:`RoutedPull`). Sensed rather than held because the hosts are what keep it
-true: every other fact in it comes from them, over the service the run fronts it with
-(:attr:`_Scheduler.sensor`).
+(:class:`~kvcache_sim.control._selector.RoutedPull`). Sensed rather than held because
+the hosts are what keep it true: every other fact in it comes from them, over the
+service the run fronts it with (:attr:`_Scheduler.sensor`).
 
 An accepted decision is reported back the same way, into each sensor it moves
 (:meth:`_Scheduler._admit`): the cluster sensor holds the prefill instance the plan
@@ -75,12 +74,9 @@ each move the executed cost off it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from proposed import (
-    AnySelector, ControlPlane, Endpoint, Key, KeySelector, Selection, VolumeId,
-)
+from proposed import AnySelector, ControlPlane, Endpoint, Key, KeySelector, Selection
 from proposed.selector import FirstMatch, Selector
 
 from domain import (
@@ -88,11 +84,14 @@ from domain import (
     prefill_time,
 )
 
+from ._answer import Batched, Plan, Priced, Response
+from ._selector import (
+    ByBatch, ByLoad, ByTTFT, LocalOnly, LongestPrefixKeySelector, RoutedPull,
+)
 from ._sensor import (
     ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
     ReservationSensor, RoutedPullSensor,
 )
-from ._source import LongestPrefixKeySelector
 from ._view import KVView
 from .request import Request
 
@@ -102,7 +101,6 @@ __all__ = [
     "DecodeState",
     "Plan",
     "Response",
-    "RoutedPull",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
 ]
@@ -123,116 +121,7 @@ def _predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
     return simulate_decode and early_rejection == "predict"
 
 
-# -- what this application's control plane answers with ---------------------- #
-# The answer is here; the facts a host reports are with the sensor they write
-# (:mod:`kvcache_sim.control._sensor`).
-
-
-@dataclass
-class Plan:
-    """What prefilling one request on one instance was priced at.
-
-    One candidate's price and nothing else: which instance this is, and which one
-    decodes, are the two selections' winners and live on the :class:`Response`. Every
-    field here is about the prefill, so a losing candidate is a complete value too.
-    """
-
-    match_blocks: int            # reused prefix length (blocks)
-    cached_tokens: int
-    uncached_tokens: int
-    reuse_source: Optional[str]  # remote instance a prefix gap is pulled from
-    transfer_bytes: int
-    queue_wait: float
-    ttft: float                  # time-to-first-token (queue + transfer + prefill)
-    done_time: float             # absolute sim time prefill completes
-    prefill_t: float = 0.0       # prefill compute duration
-    transfer_t: float = 0.0      # predicted remote-pull fetch duration
-    pull_keys: List[str] = field(default_factory=list)  # gap blocks to fetch
-
-    @property
-    def local_blocks(self) -> int:
-        """Blocks the prefill host already held: the match, minus what it pulls.
-
-        Derived rather than a field: the data plane needs it three times over (reuse
-        to report, suffix to publish, prefix to fall back on when a planned pull is
-        gone) and all three have to agree.
-        """
-        return self.match_blocks - len(self.pull_keys)
-
-
-@dataclass(frozen=True)
-class Response:
-    """Where one request runs: the winner of each selection, and the price of one.
-
-    What :meth:`_Scheduler.decide` answers and the only part of a decision that
-    travels. The rankings behind it stay inside the scheduler: nothing outside asks
-    what lost.
-
-    Args:
-        prefill / decode: the two instances chosen, one from each selection.
-        plan: what prefilling on ``prefill`` was priced at.
-        pred_batch / pred_tbt: the decode batch this request was predicted to meet
-            and the inter-token gap that implies. What the TBT SLO is applied to
-            (:meth:`_Scheduler._admit`), which is why they are here and not on the plan
-            -- they are the decode side's.
-    """
-
-    prefill: VolumeId
-    decode: VolumeId
-    plan: Plan
-    pred_batch: int = 0
-    pred_tbt: float = 0.0
-
-
-# -- the first axis: which peer a prefix is pulled from ---------------------- #
-# Everything a routing decision does is the same whichever scheduler is running.
-# What differs is the two axes and whether the TBT SLO applies.
-#
-# This first axis answers the store-shaped half -- rank the peers holding this prefix,
-# best first (:mod:`kvcache_sim.control._source`, a real KeySelector), or name nobody.
-# Awaited once per decision inside the pinned snapshot
-# (:meth:`_Scheduler._select_prefill`), so it runs to completion without suspending,
-# and once because the ranking is over the prefix: which peers hold it does not depend
-# on who would prefill.
-#
-# The tests that *do* depend on the candidate are applied to that one ranking, per
-# candidate, through :meth:`~proposed.selector.Selection.require` -- a method on the
-# ranking, so a test needs no object to live in and composes by being called again.
-# That is what makes the hoist above visible rather than hidden inside a funnel that
-# would have to be asked afresh for every candidate.
-#
-# The second axis is further below and is a selector too, over this scheduler's own
-# priced candidates rather than over keys. A rank that is *not* an axis is a plain sort
-# key applied here: both presets pick a decode instance the same way
-# (:func:`_by_batch`), so there is nothing for a preset to choose. And admission is not
-# a selection at all -- holding a plan to an SLO answers yes or no, and a ranked set of
-# sources cannot say that (:meth:`_Scheduler._admit`).
-
-
-#: The price a selector here answers in, left open on the two that answer without
-#: quoting one: :class:`_LocalOnly` names nobody, and :class:`RoutedPull` names the
-#: peer this scheduler already priced itself. Their payload is empty, and an empty
-#: payload is a payload in whatever terms the holder prices in -- so neither claims a
-#: unit it never quotes, and both fit a chain pricing in blocks of prefix run.
-_P = TypeVar("_P")
-
-
-class _LocalOnly(Selector[Sequence[Key], _P]):
-    """Name nobody, ever -- the baseline reuses only what a host already holds.
-
-    A plain :class:`~proposed.selector.Selector`: its subject is keys, but the
-    scheduler is the only thing that asks it, so it is not fronted by a service at
-    all.
-
-    ``Selection.of([])``, which is :class:`~proposed.selector.FirstMatch`'s
-    *abstention*: no source, so the caller recomputes the gap. Deliberately not
-    ``Selection()``, which is a decision meaning every holder in directory order.
-    """
-
-    name = "local-only"
-
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
-        return Selection.of([])
+# -- pull or recompute: a test the reuse ranking's head is held to ----------- #
 
 
 def _worth_pulling(
@@ -251,105 +140,6 @@ def _worth_pulling(
     return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
 
 
-# -- the second axis: which priced candidate wins ---------------------------- #
-
-
-#: What either ranking here sorts: one candidate as the pair a
-#: :class:`~proposed.selector.Selection` is built out of -- the instance, and what
-#: this scheduler priced it at. A :class:`Plan` when the choice is which host
-#: prefills, a predicted batch size when it is which host decodes. Every key over
-#: either ends in the instance, read off the candidate rather than out of what it was
-#: priced at, which is what makes a rank total and a run reproducible.
-_Priced = Tuple[VolumeId, Plan]
-_Batched = Tuple[VolumeId, int]
-
-
-class _ByTTFT(AnySelector[Sequence[_Priced], Plan]):
-    """The lowest predicted queue + transfer + prefill.
-
-    Why reuse is *priced* rather than preferred: a longer match on a busier instance
-    can still lose. Senses nothing: the price it ranks by is one this scheduler
-    already worked out per candidate.
-    """
-
-    name = "by-ttft"
-
-    async def select(
-        self, candidates: Sequence[_Priced], requester: str
-    ) -> Selection[Plan]:
-        return Selection.priced(sorted(
-            candidates, key=lambda c: (c[1].ttft, c[0])
-        ))
-
-
-class _ByLoad(AnySelector[Sequence[_Priced], Plan]):
-    """The shortest predicted prefill queue, whatever reuse bought (the baseline).
-
-    Sorts on ``busy_until`` rather than the candidate's ``queue_wait``, which is that
-    tail clamped at the clock: two instances idle since different moments both wait
-    zero, so the choice would fall to the id tie-break and a different one would win.
-    This scheduler's claim is that it picks by load and nothing else.
-
-    The queue is sensed through the attached view
-    (:class:`~kvcache_sim.control._view.ClusterView`) and read once for the whole
-    ranking, so every candidate is ranked against one state of the cluster.
-    """
-
-    name = "by-load"
-
-    async def select(
-        self, candidates: Sequence[_Priced], requester: str
-    ) -> Selection[Plan]:
-        busy = self.view.cluster.busy_until
-        return Selection.priced(sorted(
-            candidates, key=lambda c: (busy[c[0]], c[0])
-        ))
-
-
-def _by_batch(candidate: _Batched) -> Tuple:
-    """The smallest predicted decode batch, instance id breaking the tie.
-
-    The other host pick of a routing decision, over a predicted batch rather than a
-    plan. A sort key and not a selector because it is not an axis: both presets pick a
-    decode instance this way, so there is nothing for a preset to hand in -- and
-    nothing here is sensed either.
-    """
-    instance, batch = candidate
-    return (batch, instance)
-
-
-class RoutedPull(KeySelector[_P]):
-    """The peer a fetch's pull was already priced against, or an abstention.
-
-    Answering the fetch from what routing decided, rather than deciding twice:
-    re-deriving would not even agree (routing ranks over the request's whole block
-    chain, the fetch names only the gap), and naming a different holder would
-    charge a cross-node read for a same-node prediction. A caller with no routed
-    pull falls through to the ranking behind this link.
-
-    A selector like any other, sensing through the view it is attached to
-    (:meth:`~proposed.selector.Selector.attach`) -- the sensor is one that view carries
-    (:class:`~kvcache_sim.control._view.RoutedView`), so it arrives the way
-    every other read does and nothing hands this one the sensor.
-
-    Reading it **consumes** it
-    (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim` expires the entry on
-    a match), so this belongs at the head of a
-    :class:`~proposed.selector.FirstMatch` chain and under no combinator that can drop
-    the answer or rank it down (:class:`~proposed.selector.Discount`). In that one
-    position spending and using coincide: a link that answers wins the chain, an
-    abstention matched nothing and spends nothing. Under one that could reject the
-    peer, the entry would be gone and the fetch would fall through to a ranking that
-    never saw it.
-    """
-
-    name = "routed-pull"
-
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
-        peer = self.view.routed.claim(requester, keys)
-        return Selection.of([peer] if peer is not None else [])
-
-
 class _Scheduler(ControlPlane):
     """The pricing, ranking and admission both schedulers share.
 
@@ -361,22 +151,22 @@ class _Scheduler(ControlPlane):
     together.
 
     Args:
-        reuse / rank: the two axes a preset picks (see above), both selectors, both
-            attached in :meth:`attach`, and both used while forming the one answer
-            :meth:`decide` gives. ``reuse`` ranks the peers holding a prefix, priced in
-            blocks of that prefix (``Selector[Sequence[Key], int]``); what a peer is
-            *worth* to one candidate is this scheduler's to work out, off the snapshot
-            it read itself (:meth:`_priced_reuse`), so a re-ranking under the axis
-            cannot move a price this scheduler compares. ``rank`` ranks the candidates
-            this scheduler priced, so its subject is those candidates and its price
-            their :class:`Plan`.
+        reuse / rank: the two axes a preset picks, both selectors, both attached in
+            :meth:`attach`, and both used while forming the one answer :meth:`decide`
+            gives. ``reuse`` ranks the peers holding a prefix, priced in blocks of that
+            prefix (``Selector[Sequence[Key], int]``); what a peer is *worth* to one
+            candidate is this scheduler's to work out, off the snapshot it read itself
+            (:meth:`_priced_reuse`), so a re-ranking under the axis cannot move a price
+            this scheduler compares. ``rank`` ranks the candidates this scheduler
+            priced, so its subject is those candidates and its price their
+            :class:`~kvcache_sim.control._answer.Plan`.
         balance_threshold: how much longer the head's prefix run must be than a
-            candidate's own before pulling beats recomputing
-            (:func:`_longer_than_local`). Unread when ``reuse`` names nobody.
+            candidate's own before pulling beats recomputing (:func:`_worth_pulling`).
+            Unread when ``reuse`` names nobody.
         source_selector: ranks the holders of a prefix, and what :meth:`sources`
             answers a fetch with behind the pull it already priced
-            (:class:`RoutedPull`). ``None`` builds a
-            :class:`~kvcache_sim.control._source.LongestPrefixKeySelector`. A pulling
+            (:class:`~kvcache_sim.control._selector.RoutedPull`). ``None`` builds a
+            :class:`~kvcache_sim.control._selector.LongestPrefixKeySelector`. A pulling
             preset hands the *same* object to its reuse axis, so the peer priced is
             the peer read from.
         block_tokens: tokens per KV block.
@@ -398,7 +188,7 @@ class _Scheduler(ControlPlane):
         self,
         *,
         reuse: Selector[Sequence[Key], int],
-        rank: AnySelector[Sequence[_Priced], Plan],
+        rank: AnySelector[Sequence[Priced], Plan],
         balance_threshold: float = 1.5,
         source_selector: Optional[KeySelector[int]] = None,
         block_tokens: int,
@@ -417,6 +207,8 @@ class _Scheduler(ControlPlane):
         self.model = model
         self._reuse = reuse
         self._rank = rank
+        # Built rather than handed in: not an axis (see the module it comes from).
+        self._decode = ByBatch()
         self._threshold = balance_threshold
         self._source = (
             source_selector if source_selector is not None
@@ -503,16 +295,19 @@ class _Scheduler(ControlPlane):
         )
         # What a fetch is answered with. Both this and the reuse axis sense through
         # the KVView above -- the fetch because its head link reads the routed-pull
-        # sensor (:class:`RoutedPull`), the reuse axis because one routing decision
-        # pins that view's snapshot for the whole of itself
-        # (:meth:`~kvcache_sim.control._view.KVView.pinned`) and a ranking consulted
-        # inside the pin must not read past it into the live directory. The source
-        # ranking is a link of both and gets attached twice, to the same view either
-        # way, so no order here is load-bearing.
+        # sensor (:class:`~kvcache_sim.control._selector.RoutedPull`), the reuse axis
+        # because one routing decision pins that view's snapshot for the whole of
+        # itself (:meth:`~kvcache_sim.control._view.KVView.pinned`) and a ranking
+        # consulted inside the pin must not read past it into the live directory. The
+        # source ranking is a link of both and gets attached twice, to the same view
+        # either way, so no order here is load-bearing.
         self._fetch = FirstMatch([RoutedPull(), self._source])
         self._fetch.attach(self.view)
         self._reuse.attach(self.view)
         self._rank.attach(self.view)
+        # Senses nothing, but attached like every other ranking here, so wrapping it in
+        # one that does needs nothing else moved.
+        self._decode.attach(self.view)
 
     @property
     def sensor(self) -> Optional[ClusterSensor]:
@@ -530,7 +325,8 @@ class _Scheduler(ControlPlane):
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection[int]:
         """Which peers should serve ``requester``'s fetch of ``keys``, best first.
 
-        The pull :meth:`decide` already priced for this caller (:class:`RoutedPull`),
+        The pull :meth:`decide` already priced for this caller
+        (:class:`~kvcache_sim.control._selector.RoutedPull`),
         else whoever holds the longest prefix -- a
         :class:`~proposed.selector.FirstMatch`, so the fall-through is that chain's
         abstention rule rather than an ``if`` here. ``Selection.of([])`` names nobody,
@@ -555,13 +351,13 @@ class _Scheduler(ControlPlane):
 
         ``requester`` is the host the request landed on. Nothing that ranks, prices or
         holds a *candidate host* to an SLO reads it -- where a request should run is a
-        fact about the cluster, not about who was asked. Both axes are handed it because
-        every selector is, and only the reuse ranking has a use for it: it is the answer
-        to that ranking's own question, "who wants these bytes". The candidate under
-        test is what the tests behind that ranking are handed.
+        fact about the cluster, not about who was asked. Every ranking is handed it
+        because every selector is, and only the reuse ranking has a use for it: it is
+        the answer to that ranking's own question, "who wants these bytes". The
+        candidate under test is what the tests behind that ranking are handed.
         """
         prefill = await self._select_prefill(request, requester)
-        decode = await self._select_decode(prefill.winner)
+        decode = await self._select_decode(prefill.winner, requester)
         return self._admit(request, prefill, decode)
 
     async def _select_prefill(self, request: Request, requester: str) -> Selection[Plan]:
@@ -587,7 +383,7 @@ class _Scheduler(ControlPlane):
         with self.view.pinned(keys):
             counts = self.view.prefix_lengths(keys)
             ranked = await self._reuse.select(keys, requester)
-            candidates: List[_Priced] = []
+            candidates: List[Priced] = []
             for inst in self.prefill_ids:
                 # A host is not its own peer, and a peer is only worth the transfer if
                 # it holds materially more than this candidate already does.
@@ -645,7 +441,8 @@ class _Scheduler(ControlPlane):
         Reserves nothing and mutates nothing, so a losing candidate leaves no trace
         (:class:`~kvcache_sim.control._sensor.Committed` records a decision actually
         taken). Which candidate wins is the rank axis's business
-        (:class:`_ByLoad` / :class:`_ByTTFT`).
+        (:class:`~kvcache_sim.control._selector.ByLoad` /
+        :class:`~kvcache_sim.control._selector.ByTTFT`).
         """
         cached = min(match * self.B, request.prompt_tokens)
         uncached = request.prompt_tokens - cached
@@ -694,17 +491,18 @@ class _Scheduler(ControlPlane):
                 n += 1
         return n
 
-    async def _select_decode(self, plan: Plan) -> Selection[int]:
+    async def _select_decode(self, plan: Plan, requester: str) -> Selection[int]:
         """Decode instances, each with the batch a request admitted at ``plan``'s
         completion is predicted to meet there.
 
-        Ranked by :func:`_by_batch`. With decode unmodelled every candidate prices at
-        zero, so the id tie-break is the whole of the choice.
+        Ranked by :class:`~kvcache_sim.control._selector.ByBatch`. With decode
+        unmodelled every candidate prices at zero, so the id tie-break is the whole of
+        the choice.
         """
-        batches = [
+        batches: List[Batched] = [
             (d, self._predicted_batch(d, plan.done_time)) for d in self.decode_ids
         ]
-        return Selection.priced(sorted(batches, key=_by_batch))
+        return await self._decode.select(batches, requester)
 
     def _admit(
         self,
@@ -720,7 +518,9 @@ class _Scheduler(ControlPlane):
         admission is decided at routing.
         """
         instance = decode.sources[0]
-        batch = decode.payload[instance]
+        # The decode ranking prices headroom, and what the TBT SLO is judged on is the
+        # occupancy behind it (:class:`~kvcache_sim.control._selector.ByBatch`).
+        batch = -decode.payload[instance]
         response = Response(
             prefill=prefill.sources[0],
             decode=instance,
@@ -741,7 +541,7 @@ class _Scheduler(ControlPlane):
         # instance the plan spoke for, the reservation stands in for a request the
         # observed decode state cannot show until its prefill lands, and the routed
         # pull remembers the peer it was priced against for when the fetch asks
-        # (:class:`RoutedPull`).
+        # (:class:`~kvcache_sim.control._selector.RoutedPull`).
         #
         # Local writes, not the endpoint a host reports over: control is in the same
         # process, and plain calls are what keep this decision atomic. All three land in
@@ -768,7 +568,7 @@ class LoadBalanceScheduler(_Scheduler):
     """Baseline (~vLLM): least-loaded instance, local-only cache reuse."""
 
     def __init__(self, **knobs: Any) -> None:
-        super().__init__(reuse=_LocalOnly(), rank=_ByLoad(), **knobs)
+        super().__init__(reuse=LocalOnly(), rank=ByLoad(), **knobs)
 
 
 class CacheAwareScheduler(_Scheduler):
@@ -795,9 +595,9 @@ class CacheAwareScheduler(_Scheduler):
                  balance_threshold: float = 1.5, replicate: bool = True,
                  **knobs: Any) -> None:
         super().__init__(
-            reuse=source_selector if replicate else _LocalOnly(),
+            reuse=source_selector if replicate else LocalOnly(),
             balance_threshold=balance_threshold,
-            rank=_ByTTFT(),
+            rank=ByTTFT(),
             source_selector=source_selector,
             **knobs,
         )

@@ -75,7 +75,7 @@ from realsim.run import Workload
 from sim_common import config
 
 from ..control._sensor import ClusterSensor
-from ..control._source import LongestPrefixKeySelector
+from ..control._selector import LongestPrefixKeySelector
 from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
@@ -171,7 +171,7 @@ def scheduler(
     peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and one
     under a :class:`~proposed.selector.Discount` keeps state across the decisions it
     makes. ``None`` -- the default -- is
-    :class:`~kvcache_sim.control._source.LongestPrefixKeySelector`. Give each run its
+    :class:`~kvcache_sim.control._selector.LongestPrefixKeySelector`. Give each run its
     own: two runs sharing one would tally each other's grants and neither would
     reproduce alone.
     """

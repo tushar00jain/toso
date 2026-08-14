@@ -17,10 +17,10 @@ simulator, ``proposed`` is the design being argued for.
   :class:`~proposed.selector.NaiveKeySelector` answers with the directory's own order,
   so preferring what it names changes nothing until a real one is written. It,
   :func:`~proposed.selector.prefer` (what the store does with a preference), the two
-  combinators -- :class:`~proposed.selector.FirstMatch` (try selectors in order) and
-  :class:`~proposed.selector.Discount` (re-rank one ranking by how much it has lately
-  named each source) -- and the :class:`~proposed.selector.Selector` base they are
-  typed on are reached through the module rather than re-exported here: what a
+  combinators -- :class:`~proposed.selector.FirstMatch` (try key selectors in order)
+  and :class:`~proposed.selector.Discount` (re-rank any one ranking by how much it has
+  lately named each source) -- and the :class:`~proposed.selector.Selector` base they
+  are typed on are reached through the module rather than re-exported here: what a
   deployment has to *implement* is one of the two named subjects above.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
   directory surface a caller reaches (torchstore names this type but never declares
