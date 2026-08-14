@@ -229,21 +229,22 @@ kvcache_sim/
                           #   pull-vs-recompute, SLO gates, decode placement,
                           #   every one of them priced against the cluster model
                           #   below. LoadBalance (baseline) and CacheAware are
-                          #   presets of it -- two Placements, one naming a peer
+                          #   presets of it -- two selectors, one naming a peer
                           #   to pull from and one ranking the priced
-                          #   candidates, and admission as a list of gates
+                          #   candidates, and admission as two SLO comparisons
     _cluster.py           #   KVClusterModel behind proposed.ClusterModel: the
-                          #   PREDICTED prefill queue, the observed decode
-                          #   batches, and the prefills promised against them.
-                          #   One per run, built in attach() and written only by
-                          #   notify(fact) -- the facts a host reports live here
-                          #   with the fold that applies them, and so do the
-                          #   reads everything that ranks hosts by load makes
-    _pending.py           #   Reservations / RoutedPulls: what was decided and
-                          #   not yet done -- the first read through the model
-                          #   above, the second a sense of its own. Each expires
-                          #   on its own terms, when read -- so no decision
-                          #   method carries a sweep
+                          #   PREDICTED prefill queue and the observed decode
+                          #   batches -- what a host keeps true, and nothing
+                          #   else. One per run, built in attach() and written
+                          #   only by notify(fact) -- the facts a host reports
+                          #   live here with the fold that applies them, and so
+                          #   do the reads everything that ranks hosts by load
+                          #   makes
+    _pending.py           #   Reservations / RoutedPulls: what this plane decided
+                          #   and has not yet seen carried out, each a sense of
+                          #   its own and neither corrected by a host. Each
+                          #   expires on its own terms, when read -- so no
+                          #   decision method carries a sweep
     _source.py            #   LongestPrefixKeySelector: the one store question
                           #   ("which peer serves this gap"), a
                           #   proposed.KeySelector, priced in blocks of prefix
@@ -252,9 +253,11 @@ kvcache_sim/
     _view.py              #   KVView: what a decision senses, one class per
                           #   sense and each a proposed.View -- prefix runs
                           #   (with the pinned snapshot one routing decision
-                          #   reads them through), the cluster model above, and
-                          #   the routed pulls, so what ranks or gates reads the
-                          #   sense it needs and is handed no record of its own
+                          #   reads them through), the cluster model above, the
+                          #   prefills promised (composed in only by a run that
+                          #   predicts decode occupancy forward) and the routed
+                          #   pulls, so what ranks or gates reads the sense it
+                          #   needs and is handed no record of its own
                           #   (underscored: the coordinator builds its own, so
                           #   nothing outside control/ names this)
     request.py            #   inference Request, carrying its prompt (a
