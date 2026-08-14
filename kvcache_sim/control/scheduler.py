@@ -91,7 +91,6 @@ __all__ = [
     "Plan",
     "Response",
     "RoutedPull",
-    "FetchRouting",
     "predicts_decode",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
@@ -349,31 +348,6 @@ class RoutedPull(KeySelector[None]):
         return Selection.of([peer] if peer is not None else [])
 
 
-class FetchRouting(KeySelectorChain[None]):
-    """How :meth:`_Scheduler.sources` answers: the priced pull, else the ranking.
-
-    The pull this scheduler already priced for the caller (:class:`RoutedPull`), else
-    ``source``'s ranking of whoever holds the longest prefix.
-
-    A chain rather than an ``if``, so the fall-through is
-    :class:`~proposed.selector.FirstMatch`'s abstention rule and not a second copy of
-    it here, and a :class:`~proposed.selector.KeySelectorChain` because the subject is
-    keys and both links select over them. A utility the plane holds, not a plane: it
-    ranks, and the plane is what a caller reaches.
-
-    Neither link gates on anything, so what it answers is already values.
-
-    Args:
-        source: ranks the holders of a prefix. The same object the reuse axis names a
-            peer with, so the peer chosen while pricing is the peer this answers with.
-    """
-
-    name = "fetch-routing"
-
-    def __init__(self, source: KeySelector[None]) -> None:
-        super().__init__([RoutedPull(), source])
-
-
 class _Scheduler(ControlPlane):
     """The pricing, ranking and admission both schedulers share.
 
@@ -393,7 +367,7 @@ class _Scheduler(ControlPlane):
             this scheduler's to work out (:meth:`_priced_reuse`).
         source_selector: ranks the holders of a prefix, and what :meth:`sources`
             answers a fetch with behind the pull it already priced
-            (:class:`FetchRouting`). ``None`` builds a
+            (:class:`RoutedPull`). ``None`` builds a
             :class:`~kvcache_sim.control._source.LongestPrefixKeySelector`. A pulling
             preset hands the *same* object to its reuse axis, so the peer priced is
             the peer read from.
@@ -464,7 +438,7 @@ class _Scheduler(ControlPlane):
         self.decode_ids: List[str] = []
         self.cluster: Optional[KVClusterModel] = cluster
         # Built in attach(), where the model it reads exists.
-        self._fetch: Optional[FetchRouting] = None
+        self._fetch: Optional[KeySelectorChain[None]] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view) -> None:
@@ -508,7 +482,7 @@ class _Scheduler(ControlPlane):
         # inside the pin must not read past it into the live directory. The source
         # ranking is a link of both and gets attached twice, to the same view either
         # way, so no order here is load-bearing.
-        self._fetch = FetchRouting(self._source)
+        self._fetch = KeySelectorChain([RoutedPull(), self._source])
         self._fetch.attach(self.view)
         self._reuse.attach(self.view)
 
@@ -516,9 +490,12 @@ class _Scheduler(ControlPlane):
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection[None]:
         """Which peers should serve ``requester``'s fetch of ``keys``, best first.
 
-        The pull :meth:`decide` already priced for this caller, else whoever holds the
-        longest prefix (:class:`FetchRouting`). ``Selection.of([])`` names nobody,
-        which leaves the read to the directory's own order.
+        The pull :meth:`decide` already priced for this caller (:class:`RoutedPull`),
+        else whoever holds the longest prefix -- a
+        :class:`~proposed.selector.KeySelectorChain`, so the fall-through is
+        :class:`~proposed.selector.FirstMatch`'s abstention rule rather than an ``if``
+        here. ``Selection.of([])`` names nobody, which leaves the read to the
+        directory's own order.
 
         Settled before it travels, like any answer this plane gives: neither link
         gates, so there is nothing to wait for, and saying so here is what keeps that
