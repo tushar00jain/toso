@@ -30,7 +30,7 @@ from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data._store import KVStore
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, KeySelector
-from proposed.selector import KeySelectorChain
+from proposed.selector import FirstMatch
 from kvcache_sim.control._source import LongestPrefixKeySelector, SpreadReadsKeySelector
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished, _LocalOnly,
@@ -1797,7 +1797,7 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
     assert not isinstance(sched, KeySelector)   # a plane is asked, not consulted
     assert {"decide", "sources"} <= set(dir(sched))
     with pytest.raises(TypeError, match="every link must be a KeySelector"):
-        KeySelectorChain([LongestPrefixKeySelector(), _LocalOnly()])
+        FirstMatch([LongestPrefixKeySelector(), _LocalOnly()])
 
 
 def test_one_plane_answers_a_fetch_with_the_pull_it_priced():

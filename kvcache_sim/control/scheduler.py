@@ -68,7 +68,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from proposed import ControlPlane, Endpoint, Key, KeySelector, Selection, VolumeId
-from proposed.selector import KeySelectorChain, Selector
+from proposed.selector import FirstMatch, Selector
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -429,7 +429,7 @@ class _Scheduler(ControlPlane):
         self.decode_ids: List[str] = []
         self.cluster: Optional[KVClusterModel] = cluster
         # Built in attach(), where the model it reads exists.
-        self._fetch: Optional[KeySelectorChain[None]] = None
+        self._fetch: Optional[FirstMatch[None]] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view) -> None:
@@ -473,7 +473,7 @@ class _Scheduler(ControlPlane):
         # inside the pin must not read past it into the live directory. The source
         # ranking is a link of both and gets attached twice, to the same view either
         # way, so no order here is load-bearing.
-        self._fetch = KeySelectorChain([RoutedPull(), self._source])
+        self._fetch = FirstMatch([RoutedPull(), self._source])
         self._fetch.attach(self.view)
         self._reuse.attach(self.view)
 
@@ -483,10 +483,9 @@ class _Scheduler(ControlPlane):
 
         The pull :meth:`decide` already priced for this caller (:class:`RoutedPull`),
         else whoever holds the longest prefix -- a
-        :class:`~proposed.selector.KeySelectorChain`, so the fall-through is
-        :class:`~proposed.selector.FirstMatch`'s abstention rule rather than an ``if``
-        here. ``Selection.of([])`` names nobody, which leaves the read to the
-        directory's own order.
+        :class:`~proposed.selector.FirstMatch`, so the fall-through is that chain's
+        abstention rule rather than an ``if`` here. ``Selection.of([])`` names nobody,
+        which leaves the read to the directory's own order.
 
         Settled before it travels, like any answer this plane gives: neither link
         gates, so there is nothing to wait for, and saying so here is what keeps that

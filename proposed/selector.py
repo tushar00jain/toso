@@ -35,10 +35,8 @@ answered is simply not in the ranking.
 
 Selectors compose one way, and it is not a selector holding another:
 :class:`FirstMatch` picks between alternatives -- ask each in order, take the first
-answer. It wraps either kind and *is* a plain :class:`Selector` whatever it wraps, so
-a chain mixing the two kinds is possible and harmless. A chain whose links all take
-keys is a :class:`KeySelectorChain`, which says so in its type and checks it at
-construction.
+answer. Every link takes keys, checked at construction, so the chain is a
+:class:`KeySelector` too and says so in its type.
 
 Narrowing an answer is not a composition of selectors at all: a test an application
 owns is applied to the ranking it was given, by the caller that has both
@@ -59,7 +57,7 @@ from proposed.view import View
 
 __all__ = [
     "Ready", "Selection", "prefer", "DecisionLog", "Selector", "KeySelector",
-    "AnySelector", "NaiveKeySelector", "FirstMatch", "KeySelectorChain",
+    "AnySelector", "NaiveKeySelector", "FirstMatch",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -110,12 +108,15 @@ class Selection(Generic[_P]):
         sources: Sequence[VolumeId],
         *,
         ready: Optional[Ready] = None,
-        payload: Optional[Mapping[VolumeId, _P]] = None,
     ) -> "Selection[_P]":
-        """A selection ranking ``sources`` best-first."""
-        return cls(
-            sources=tuple(sources), ready=ready, payload=dict(payload or {})
-        )
+        """A selection ranking ``sources`` best-first, priced at nothing.
+
+        The two builders are the two kinds of selector: this one for a ranking,
+        :meth:`priced` for a ranking whose sources carry what they were priced at.
+        Prices are not reachable from here, so a ranking and the prices for it cannot
+        be built out of step with each other.
+        """
+        return cls(sources=tuple(sources), ready=ready)
 
     @classmethod
     def priced(
@@ -124,11 +125,7 @@ class Selection(Generic[_P]):
         *,
         ready: Optional[Ready] = None,
     ) -> "Selection[_P]":
-        """Ranked ids and what each was priced at, from one ordered sequence.
-
-        The safe form of :meth:`of` for a selector that prices: one argument, so
-        the ranking and the prices cannot be built out of step with each other.
-        """
+        """Ranked ids and what each was priced at, from one ordered sequence."""
         return cls(
             sources=tuple(i for i, _ in candidates),
             ready=ready,
@@ -340,8 +337,7 @@ class KeySelector(Selector[Sequence[Key], _P]):
 
     The store's own question, and what a control plane answering "which volumes
     should serve this read" ranks with. A type as well as a :attr:`subject_type`, so
-    that a chain over keys can check its links are all over keys
-    (:class:`KeySelectorChain`).
+    that a chain can check its links are all over keys (:class:`FirstMatch`).
     """
 
 
@@ -372,7 +368,7 @@ class NaiveKeySelector(KeySelector[None]):
         return Selection()
 
 
-class FirstMatch(Selector[_S, _P]):
+class FirstMatch(KeySelector[_P]):
     """Ask each selector in order; the first one that answers is the answer.
 
     A :class:`Selection` can be empty in two ways, and they mean opposite things:
@@ -389,16 +385,29 @@ class FirstMatch(Selector[_S, _P]):
     should always answer ends with a :class:`NaiveKeySelector`. The winner is returned
     exactly as built, so a readiness gate rides along untouched.
 
+    Over keys, and so a :class:`KeySelector` itself: the subject goes down every link
+    untouched, so a link reading it as anything else would answer a question it was not
+    asked -- checked at construction rather than trusted. A chain of alternatives over
+    an application's own subject has no caller, and would be this class with ``keys``
+    read as that subject.
+
     Args:
-        selectors: consulted left to right, each taking the chain's subject and
-            pricing in its terms -- a chain answers as its links do, which is what
-            the two parameters say. An empty chain is legal and abstains.
+        selectors: consulted left to right, each a :class:`KeySelector` pricing in the
+            chain's terms -- a chain answers as its links do, which is what the price
+            parameter says. An empty chain is legal and abstains.
     """
 
     name = "first-match"
 
-    def __init__(self, selectors: Sequence[Selector[_S, _P]]) -> None:
-        self.selectors: Tuple[Selector[_S, _P], ...] = tuple(selectors)
+    def __init__(self, selectors: Sequence[KeySelector[_P]]) -> None:
+        self.selectors: Tuple[KeySelector[_P], ...] = tuple(selectors)
+        wrong = [type(s).__name__ for s in self.selectors if not isinstance(s, KeySelector)]
+        if wrong:
+            raise TypeError(
+                f"a FirstMatch chain selects over keys, so every link must be a "
+                f"KeySelector; {', '.join(wrong)} "
+                f"{'is' if len(wrong) == 1 else 'are'} not"
+            )
 
     def attach(self, view: Any) -> None:
         """Hand the stack's ports to every wrapped selector, answering or not.
@@ -410,36 +419,10 @@ class FirstMatch(Selector[_S, _P]):
         for selector in self.selectors:
             selector.attach(view)
 
-    async def select(self, subject: _S, requester: str) -> Selection[_P]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
         """The first non-abstaining answer, or an abstention if there is none."""
         for selector in self.selectors:
-            selection = await selector.select(subject, requester)
+            selection = await selector.select(keys, requester)
             if selection.sources is None or selection.sources:
                 return selection
         return Selection.of([])
-
-
-class KeySelectorChain(FirstMatch[Sequence[Key], _P], KeySelector[_P]):
-    """A :class:`FirstMatch` every link of which selects over keys, so it does too.
-
-    The claim is checked at construction rather than trusted, so being this type says
-    exactly what :class:`KeySelector` says: the keys a caller asks about go down every
-    link, and one that read them as anything else would answer a question it was not
-    asked.
-
-    Args:
-        selectors: consulted left to right; each must be a :class:`KeySelector`.
-            Typed as the base's, since the claim is what is *checked* below -- an
-            annotation would only restate what a caller can ignore.
-    """
-
-    name = "selector-chain"
-
-    def __init__(self, selectors: Sequence[Selector[Sequence[Key], _P]]) -> None:
-        super().__init__(selectors)
-        wrong = [type(s).__name__ for s in self.selectors if not isinstance(s, KeySelector)]
-        if wrong:
-            raise TypeError(
-                f"a KeySelectorChain selects over keys, so every link must be a KeySelector; "
-                f"{', '.join(wrong)} {'is' if len(wrong) == 1 else 'are'} not"
-            )

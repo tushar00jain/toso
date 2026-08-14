@@ -16,8 +16,8 @@ pin the contract each one owes its callers:
    without it -- and the two combinators built on it tell an *abstention* from the
    *naive answer*, carry a wrapped selector's gate through, and wake every selector
    they hold, whichever subtype (``KeySelector`` over keys, ``AnySelector`` over an
-   application payload) that selector is. ``FirstMatch`` picks between alternatives,
-   and a ranking narrows itself in place (``require``, ``take``);
+   application payload) that selector is. ``FirstMatch`` picks between alternatives
+   over keys, and a ranking narrows itself in place (``require``, ``take``);
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -44,7 +44,7 @@ from proposed import AnySelector, ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
-    FirstMatch, KeySelectorChain, NaiveKeySelector, prefer, Selector,
+    FirstMatch, NaiveKeySelector, prefer, Selector,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
@@ -280,15 +280,6 @@ def test_taking_keys_is_not_the_same_claim_as_answering_for_the_store():
     assert not isinstance(_KeysButNotTheStore(), (KeySelector, AnySelector))  # neither kind
 
 
-def test_a_chain_of_key_selectors_is_one_and_a_mixed_chain_is_not():
-    """The subject a chain hands down is the subject its links must take."""
-    chain = KeySelectorChain([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"]))])
-    assert isinstance(chain, KeySelector)
-    assert chain.subject_type == Sequence[Key]
-    with pytest.raises(TypeError, match="every link must be a KeySelector"):
-        KeySelectorChain([_Fixed(), _FixedPlacement()])
-
-
 def test_a_plane_declares_whatever_it_wants_told():
     """A plane that gates on a write hears about it from whoever made the write.
 
@@ -468,7 +459,7 @@ def test_a_settled_selection_has_waited_and_carries_no_gate():
 
     async def scenario():
         answer = asyncio.get_running_loop().create_task(
-            Selection.of(["v0"], ready=gate, payload={"v0": 7}).settled()
+            Selection.priced([("v0", 7)], ready=gate).settled()
         )
         await asyncio.sleep(0)
         assert not answer.done(), "answered before the source was usable"
@@ -577,18 +568,20 @@ def test_first_match_attaches_every_selector_even_unconsulted_ones():
     assert front.view is behind.view == "a-view"   # ... but is brought up
 
 
-def test_a_combinator_holds_either_kind_and_is_neither():
-    """Mixing kinds is allowed because a combinator claims neither.
+def test_a_chain_is_a_key_selector_and_refuses_a_link_that_is_not():
+    """The subject a chain hands down is the subject its links must take.
 
-    A combinator is a plain ``Selector`` whatever it wraps, so a chain of two key
-    selectors says no more about its subject than one mixing in an application's --
-    which is what makes the mixture harmless rather than something to reject.
+    ``select`` passes the keys through untouched, so a link reading them as an
+    application's payload would answer a question it was not asked. Checked at
+    construction, which is what lets the chain claim the kind.
     """
-    mixed = FirstMatch([_Fixed(Selection.of([])), _FixedPlacement(Selection.of(["v1"]))])
-    assert _select(mixed).sources == ("v1",)
-    for combinator in (mixed, FirstMatch([_Fixed(Selection())])):
-        assert isinstance(combinator, Selector)
-        assert not isinstance(combinator, (KeySelector, AnySelector))
+    chain = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"]))])
+    assert _select(chain).sources == ("v1",)
+    assert isinstance(chain, KeySelector)
+    assert chain.subject_type == Sequence[Key]
+
+    with pytest.raises(TypeError, match="every link must be a KeySelector"):
+        FirstMatch([_Fixed(), _FixedPlacement()])
 
 
 # --------------------------------------------------------------------------
@@ -631,9 +624,7 @@ def test_a_narrowed_selection_keeps_its_gate_and_the_prices_it_kept():
     async def gate() -> None:
         return None
 
-    narrowed = Selection.of(
-        ["v0", "v1"], ready=gate, payload={"v0": 7, "v1": 9}
-    ).take(1)
+    narrowed = Selection.priced([("v0", 7), ("v1", 9)], ready=gate).take(1)
 
     assert narrowed.sources == ("v0",)
     assert narrowed.ready is gate
@@ -643,7 +634,7 @@ def test_a_narrowed_selection_keeps_its_gate_and_the_prices_it_kept():
 
 def test_head_is_the_id_where_winner_is_the_price_under_it():
     """Both empties read as ``None``: neither names a source to act on."""
-    ranked = Selection.of(["v0", "v1"], payload={"v0": 7})
+    ranked = Selection.priced([("v0", 7), ("v1", 9)])
     assert (ranked.head, ranked.winner) == ("v0", 7)
     assert Selection.of([]).head is None
     assert Selection().head is None

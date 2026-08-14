@@ -17,9 +17,8 @@ simulator, ``proposed`` is the design being argued for.
   :class:`~proposed.selector.NaiveKeySelector` answers with the directory's own order,
   so preferring what it names changes nothing until a real one is written. It,
   :func:`~proposed.selector.prefer` (what the store does with a preference), the
-  combinators -- :class:`~proposed.selector.FirstMatch` (try selectors in order) and
-  :class:`~proposed.selector.KeySelectorChain` (the same over keys) -- and the
-  :class:`~proposed.selector.Selector` base they are typed on are
+  one combinator -- :class:`~proposed.selector.FirstMatch` (try selectors in order) --
+  and the :class:`~proposed.selector.Selector` base they are typed on are
   reached through the module rather than re-exported here: what a deployment has to
   *implement* is one of the two named subjects above.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
