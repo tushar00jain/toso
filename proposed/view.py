@@ -1,4 +1,4 @@
-"""The read-only observation a selector is handed: :class:`View`.
+"""The read-only observation a control plane is handed: :class:`View`.
 
 A :class:`~proposed.selector.KeySelector` never touches a client, a volume or the
 mesh -- it is given a ``View`` and returns a decision. The ``View`` is the sensor
@@ -8,9 +8,10 @@ kind.
 What the base view offers, and why that is all it offers
 --------------------------------------------------------
 * :meth:`locate` -- the real directory answer for a set of keys, read straight
-  from the real ``Controller`` body. It deliberately bypasses the controller's
-  routing hook (see :mod:`proposed.selector`): a sensor must report the directory
-  as it *is*, and a selector reading its own answer back would recurse.
+  from the real ``Controller`` body, with no caller's source preference applied to
+  it (see :mod:`proposed.selector`): a sensor must report the directory as it *is*,
+  and a selector ranking an answer somebody has already reordered would be reading
+  its own output back.
 * :meth:`holders` / :meth:`topology` / :meth:`endpoint` / :meth:`locality` --
   who holds a key and how far away they are, the two inputs every source
   decision has needed so far.
@@ -78,10 +79,10 @@ class View:
         """``key -> {volume_id -> StorageInfo}`` from the REAL directory.
 
         Missing keys are simply absent (``missing_ok=True``): a sensor reports
-        what is there, it does not raise at the observer. Reads the raw
-        controller body, so the routing hook a selector may be installed behind is
-        not re-entered -- and cannot suspend, which is what a decision formed
-        against it relies on (:meth:`~proposed.deployment.Controller.locate_raw`).
+        what is there, it does not raise at the observer. Reads the raw controller
+        body, so no caller's preference is folded into what a decision is made
+        against -- and it cannot suspend, which is what that decision relies on
+        (:meth:`~proposed.deployment.Controller.locate_raw`).
         """
         if not keys:
             return {}

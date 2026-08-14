@@ -53,7 +53,7 @@ class BaselineReport(Report):
     """The unrouted baseline's own fabric summary.
 
     The counterpart to :class:`DedupReport`: what the same burst costs with no
-    selector installed, which is the number dedup is measured against.
+    control plane, which is the number dedup is measured against.
     """
 
     def __init__(self, naive: Result) -> None:

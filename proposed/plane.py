@@ -9,11 +9,11 @@ implementing these and nothing else.
 * :class:`ControlPlane` -- the deciding half's lifecycle: knobs at construction,
   the stack's ports at :meth:`ControlPlane.attach`, and the one thing a run
   harvests off it once attached -- the model it decides against
-  (:attr:`ControlPlane.cluster`), to put a service in front of. Where a plane is
-  *reached* from is its type, not a field: a
-  :class:`~proposed.selector.KeySelector` is installed in the directory and a
-  the plane an application's own hosts ask is given a service, so a capability
-  deciding in both places is two planes rather than one naming the other;
+  (:attr:`ControlPlane.cluster`), to put a service in front of. **One per
+  capability**, whatever it is asked: which volumes should serve this read, where
+  this request should run, both. A capability that answered two questions from two
+  objects would have to keep them agreeing, and they already share the state the
+  answers are formed from;
 * :class:`DataPlane` -- the executing half's lifecycle, and only that: knobs at
   construction, the deployment at :meth:`DataPlane.attach`. What it *does* with
   those ports is its own members' business, because moving bytes is an ordinary
@@ -93,20 +93,26 @@ class ControlPlane:
     """What a capability's *deciding* half looks like to a harness.
 
     The sibling of :class:`DataPlane`, and as capability-agnostic: it says nothing
-    about what is decided, only how such an object is brought up. Construct it with
-    its knobs, and it is handed the stack's ports once those exist --
-    :meth:`attach` -- because a control plane senses through a
+    about what is decided or what may be asked, only how such an object is brought
+    up. The questions are the capability's to name, and whoever fronts one reads them
+    off the object (``realsim.seams.control_plane_service``), which is why a
+    capability that grows a second question changes nothing outside itself.
+
+    Construct it with its knobs, and it is handed the stack's ports once those exist
+    -- :meth:`attach` -- because a control plane senses through a
     :class:`~proposed.view.View` and prices through a
     :class:`~proposed.cost.TransferCost`, neither of which a caller has before the
-    store is assembled.
+    store is assembled. It passes those ports on to whatever it ranks with
+    (:class:`~proposed.selector.Selector`), which is a utility it holds rather than a
+    plane of its own.
 
     That two-phase shape is torchstore's own: ``TorchStoreStrategy`` takes its
     knobs at construction and receives the cluster later through
     ``set_storage_volumes``.
 
-    The default is real behaviour, not a stub: a control plane that decides from
-    what it is asked -- a :class:`~proposed.selector.AnySelector` ranking the values in
-    its subject -- needs no ports of its own and inherits this no-op.
+    The default is real behaviour, not a stub: a plane that decides from what it is
+    asked -- ranking the values in its subject and reading no directory -- needs no
+    ports of its own and inherits this no-op.
     """
 
     #: The picture this control plane decides against, if it keeps one. Read after

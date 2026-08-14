@@ -44,15 +44,21 @@ nothing, so per-instance prefix presence is a control-plane view
 (:class:`kvcache_sim.control._view.KVView`). That includes re-reading it to see
 whether a planned pull is still available -- :meth:`KVStore.fetch` asks for what it
 was told to and lets the store answer.
+
+What *is* here is the asking. A fetch is the one verb whose source matters, so it
+asks the control plane which peers should serve it and passes the answer to the
+client as a preference. Two ordinary calls in one order, with nothing installed
+anywhere: the plane is reached over a port like any other service, and the store
+applies a value rather than consulting anybody.
 """
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
-from proposed import Deployment, StorageFull
+from proposed import ControlPlane, Deployment, StorageFull
 
 __all__ = ["KVStore"]
 
@@ -77,6 +83,9 @@ class KVStore:
 
     def __init__(self, deployment: Deployment) -> None:
         self.deployment = deployment
+        #: The control plane a fetch asks which peers should serve it. ``None`` when
+        #: the run stands up none, which is a run whose reads are not routed.
+        self.control: Optional[ControlPlane] = deployment.control_plane_handle
 
     # -- real data-plane ops (presence + fabric cost) --------------------- #
     async def publish(
@@ -126,14 +135,27 @@ class KVStore:
             return
         await self.deployment.volume_handle(inst).touch.call_one(list(keys))
 
+    async def _sources(self, inst: str, keys: List[str]) -> Optional[Tuple[str, ...]]:
+        """Which peers should serve ``keys`` for ``inst``, best first.
+
+        One call to the control plane, which answers from what it already priced for
+        this caller and does not answer until those peers are usable. ``None`` -- the
+        directory's own order -- when the run stands up no control plane.
+        """
+        if self.control is None:
+            return None
+        selection = await self.control.sources.call_one(list(keys), inst)
+        return selection.sources
+
     async def fetch(self, inst: str, keys: List[str]) -> List[torch.Tensor]:
         """Pull ``keys`` into ``inst`` via a real ``get_batch`` (charges fabric).
 
         Drives the real client planning core + transport seam, so the storage / RAM
         / network cost is charged by the real cost model against the peer that
         actually serves the blocks. That peer is the one the control plane priced:
-        the installed selector *is* that control plane, so nothing has to be threaded
-        through this call.
+        this asks it for the ranking (:meth:`_sources`) and hands that to the client as
+        a preference, so the read itself is an ordinary ``get_batch`` and the store
+        decides nothing.
 
         Answers with the KV, one block per key in the order asked for
         (``get_batch`` answers with a dict, so the prefix order is re-imposed here).
@@ -149,5 +171,8 @@ class KVStore:
         """
         if not keys:
             return []
-        got = await self.deployment.client_for(inst).get_batch(list(keys))
+        prefer = await self._sources(inst, keys)
+        got = await self.deployment.client_for(
+            inst, prefer=prefer
+        ).get_batch(list(keys))
         return [got[k] for k in keys]

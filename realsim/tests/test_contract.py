@@ -351,14 +351,12 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
 
     A serving host reaches control twice -- it asks a ``ControlPlane`` and reports
     to a ``ClusterModel`` -- and each is found on its own mark: the first *is* the
-    base every port derives (and a ``AnySelector`` would derive it two levels up,
-    ``AnySelector`` -> ``Selector`` -> ``ControlPlane``, which is why the closure is
-    transitive); the second is one of
-    the all-coroutine services ``proposed.deployment`` declares. Both are imported
-    from ``proposed`` rather than from a sibling ``control/``, so this also pins the
-    half of :func:`_control_ports` that follows a package import: were it to look
-    only at ``control/``, rule 6 would go quiet on kvcache's data plane instead of
-    failing.
+    base every port derives (followed transitively, so a capability declaring a
+    narrower plane in ``proposed`` is caught too); the second is one of the
+    all-coroutine services ``proposed.deployment`` declares. Both are imported from
+    ``proposed`` rather than from a sibling ``control/``, so this also pins the half
+    of :func:`_control_ports` that follows a package import: were it to look only at
+    ``control/``, rule 6 would go quiet on kvcache's data plane instead of failing.
     """
     root, pkgs = check_structure.REPO_ROOT, check_structure.GRAPH_PKGS
     mods = check_structure._module_map(root, pkgs)
@@ -379,7 +377,7 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
     assert ports == {"ControlPlane", "ClusterModel"}, ports
     # ...and that the plane's fields are recognised as holding them.
     _local, attrs = check_structure._port_names(tree, ports)
-    assert {"placement", "cluster"} <= attrs, attrs
+    assert {"control", "cluster"} <= attrs, attrs
 
 
 def test_structure_lint_reads_a_layout_block():

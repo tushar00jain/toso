@@ -3,7 +3,8 @@
 A single-threaded, deterministic discrete-event simulation that drives the
 **real** TorchStore client planning core, the **real** controller directory, and
 the **real** in-memory transport/store off-actor, under a virtual clock. It models
-only the pieces a capability plugs in: the routing selector and what it executes.
+only the pieces a capability plugs in: the control planes it asks and what it
+executes.
 
 `realsim` is the real-code foundation that [`putget_sim/`](../putget_sim/),
 [`dedup_sim/`](../dedup_sim/) and [`kvcache_sim/`](../kvcache_sim/) build on: all
@@ -17,7 +18,7 @@ substituted with in-process seams.
 
 **See [`../docs/realsim_design.md`](../docs/realsim_design.md) for the full design**
 — the concurrency model, how each real object is driven off-actor, the cost model,
-the allocation-free data plane, the selector seam, and the concurrency contract.
+the allocation-free data plane, the control-plane seams, and the concurrency contract.
 
 ## What executes
 
@@ -27,9 +28,9 @@ the allocation-free data plane, the selector seam, and the concurrency contract.
   real `Trie`; the two ~5-line read-endpoint bodies are mirrored verbatim).
 - **Real** `MonarchRPCTransportBuffer` + `InMemoryStore` put/get lifecycle.
 - **Model:** the four types a capability plugs into — `KeySelector` (which volume
-  serves these keys for this requester, and when; consulted *inside* the real
-  `locate_volumes`, naive by default), `View` (the read-only observation a selector
-  is handed), `DataPlane` (what a capability does after a transfer lands) and
+  serves these keys for this requester, and when; a service the data plane asks
+  before it reads, naive by default), `View` (the read-only observation a control
+  plane senses through), `DataPlane` (a capability's executing half) and
   `Runner` + `ItemDispatch` (release work items on the virtual clock, install the
   mesh once, gather).
 - **Virtual clock:** every resource cost advances time via `asyncio.sleep` on
@@ -166,28 +167,28 @@ realsim/
                   check_structure.py: the shape of a sim package
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
                   perf guard, composability, mesh wiring, the shared plane types
-putget_sim/     the unrouted put/get burst (no selector, no data plane) -- the m x
+putget_sim/     the unrouted put/get burst (no control plane, no data plane) -- the m x
                 baseline, and the fixture realsim's own tests drive
   workload/       put_get.py: seed a key, then m clients get it; meta/metadata
                   carrier + full resource-cost exercise. scenarios.py: its Runs
   report/         summary.py: fabric/wallclock summary + source->dest tree
   __main__.py     the Demo declaration (`python -m putget_sim`)
 proposed/       every contract that outlives the simulator; imports nothing
-  selector.py       KeySelector.select(keys, requester) -> ranked sources +
-                  readiness. Naive (all holders, directory order) is the
-                  default; the controller consults it inside locate_volumes.
-                  A selector that gates on a registration subscribes to the
-                  directory itself (Controller.subscribe)
+  selector.py     KeySelector.select(keys, requester) -> ranked sources, once
+                  they are usable. Naive is all holders in directory order. The
+                  data plane asks it and passes the answer to an ordinary read
+                  (prefer(): what the store does with a preference)
   view.py         View -- read-only observation: locate, topology and locality,
                   the clock. Built over a Controller, and reads it through
                   locate_raw alone
-  deployment.py   Deployment -- how data-plane code reaches its store; and each
-                  service as a caller reaches it -- Controller, StorageVolume,
-                  ClusterModel (notify(fact): the load a store cannot see,
-                  written by the hosts that make it)
+  deployment.py   Deployment -- how data-plane code reaches its store and the one
+                  control plane it asks (control_plane_handle, whatever that plane
+                  declares); and each service as a caller reaches it -- Controller,
+                  StorageVolume, ClusterModel (notify(fact): the load a store
+                  cannot see, written by the hosts that make it)
   plane.py        ControlPlane -- attach(view, cost) + cluster, the model a run
-                  puts a service in front of; DataPlane -- after(requester,
-                  result), defaulting to no-op
+                  puts a service in front of; DataPlane -- attach(deployment),
+                  and no verbs: what a capability does is its own to name
   cost.py         TransferCost -- what a fetch is predicted to cost
   topology.py     Endpoint / Tier / locality -- where a volume is
 domain/

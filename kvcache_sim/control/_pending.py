@@ -56,9 +56,9 @@ class RoutedPulls:
     """Pulls priced against a chosen peer, waiting for the store to ask about them.
 
     A pull is routed when the request is planned and fetched later, and in between
-    the directory will ask who should serve it. This is the note that lets the
-    answer be the decision already made rather than a second, differently-derived
-    one.
+    the host that fetches will ask who should serve it. This is the note that lets
+    the answer be the decision already made rather than a second,
+    differently-derived one.
     """
 
     def __init__(self) -> None:

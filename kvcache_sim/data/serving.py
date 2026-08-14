@@ -97,14 +97,16 @@ Simplification (documented in SPEC): a block becomes reusable at prefill
 *completion*, not while in flight, so two requests racing for the same brand-new
 prefix may both compute it. Arrivals are typically spaced enough that this is rare.
 
-Control is not on this host, and it is two services
----------------------------------------------------
+Control is not on this host, and it is two ports
+-----------------------------------------------
 Control runs as a service, so this plane reaches it the way it reaches the store:
-through a port, over calls that carry values. There are two, and the split is
+through a port, over calls that carry values. There are two ports, and the split is
 between asking and telling:
 
-* :class:`~proposed.plane.ControlPlane` -- the **question**: where should this run.
-  A question is answered, so it is called and waited for. The answer is a
+* :class:`~proposed.plane.ControlPlane` -- the **questions**: where should this run
+  (``decide``, here), and which peer serves a fetch (``sources``, asked by
+  :mod:`kvcache_sim.data._store` where the fetch is). One plane answers both, and a
+  question is answered, so it is called and waited for. ``decide``'s answer is a
   :class:`~kvcache_sim.control.scheduler.Response` -- a value naming both of the
   request's hosts, and what prefilling on the first was priced at -- which this plane
   carries to each leg beside the request it already holds;
@@ -200,7 +202,7 @@ class ServingHost(DataPlane):
         self.me = me
         # Filled by attach(): none of the three exists before the deployment does.
         self.store: Optional[KVStore] = None
-        self.placement: Optional[ControlPlane] = None
+        self.control: Optional[ControlPlane] = None
         self.cluster: Optional[ClusterModel] = None
         self.trace = trace
         self.metrics = metrics
@@ -237,7 +239,7 @@ class ServingHost(DataPlane):
         and so does each of a simulation's.
         """
         self.store = KVStore(deployment)
-        self.placement = deployment.control_plane_handle
+        self.control = deployment.control_plane_handle
         self.cluster = deployment.cluster_handle
 
     def _now(self) -> float:
@@ -268,7 +270,7 @@ class ServingHost(DataPlane):
         The request itself is not in that answer and does not need to be: the client
         holds it already and hands it to each leg beside the decision.
         """
-        response = await self.placement.decide.call_one(request, self.me)
+        response = await self.control.decide.call_one(request, self.me)
         if response is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"

@@ -267,7 +267,7 @@ def test_real_directory_prefix_presence_and_eviction():
     keys = _block_keys_for("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
-    store = KVStore(sim.mesh)
+    store = KVStore(sim)
     view = KVView(sim.view.directory, sim.topology)
 
     async def scenario():
@@ -299,7 +299,7 @@ def test_a_pinned_view_serves_one_snapshot_and_releases_it():
     keys = _block_keys_for("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
-    store = KVStore(sim.mesh)
+    store = KVStore(sim)
     view = KVView(sim.view.directory, sim.topology)
 
     async def scenario():
@@ -330,7 +330,7 @@ def test_a_fetch_whose_block_vanished_raises_and_moves_nothing():
     keys = _block_keys_for("m0", [0, 1])
 
     sim = Simulation(topo)
-    store = KVStore(sim.mesh)
+    store = KVStore(sim)
 
     async def scenario():
         with sim.mesh.installed():
@@ -753,7 +753,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
 
     sim = Simulation(
         _make_topology(2),
-        placement=LoadBalanceScheduler(
+        control=LoadBalanceScheduler(
             block_tokens=BLOCK_TOKENS, simulate_decode=True
         ),
         profile=_replace(
@@ -761,7 +761,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
         ),
         ledger=Metrics(),
     )
-    store = KVStore(sim.mesh)
+    store = KVStore(sim)
     keys = list(_block_keys_for("m0", [0, 1]))
     request = _request(
         id="r0", arrival=0.0, block_keys=tuple(keys),
@@ -1497,7 +1497,7 @@ def test_the_source_selector_accepts_a_plain_view():
     async def scenario():
         with sim.mesh.installed():
             empty = await selector.select(keys, "s0")
-            store = KVStore(sim.mesh)
+            store = KVStore(sim)
             await store.publish("s1", list(keys), _kv(len(keys)))
             ranked = await selector.select(keys, "s0")
         return empty, ranked
@@ -1528,7 +1528,7 @@ def _replicated(holders, blocks, *, num=4):
 
     async def fill():
         with sim.mesh.installed():
-            store = KVStore(sim.mesh)
+            store = KVStore(sim)
             for holder in holders:
                 held = keys[: blocks[holder]]
                 await store.publish(holder, list(held), _kv(len(held)))
@@ -1647,17 +1647,17 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     the scenario reads it off the parsed command line and gives each cache-aware
     run its *own* selector, and which peer serves a pull changes. What does not
     change is that a *planned* pull is fetched from the peer it was priced against
-    -- the ranking sits behind the routed-pull memo in the store-side chain, so a
-    different ranking cannot redirect a pull already decided.
+    -- the ranking sits behind the routed-pull memo in the chain the plane answers a
+    fetch with, so a different ranking cannot redirect a pull already decided.
     """
     parser = argparse.ArgumentParser()
     KVCacheDemo().flags(parser)
     args = parser.parse_args(["--spread-reads"])
 
     aware = scenarios.Hotspot(0).runs(args)[1:]
-    # The ranking is the last link of the store-side plane, which is where it is
-    # reachable: the scheduler only sees it through the reuse placement that pulls.
-    selectors = [run.control.selectors[-1] for run in aware]
+    # The one ranking the plane holds: it prices against it and answers a fetch with
+    # it, so this is where a run's own selector is reachable.
+    selectors = [run.control._source for run in aware]
     assert all(isinstance(p, SpreadReadsKeySelector) for p in selectors)
     assert selectors[0] is not selectors[1], "a shared tally would count both runs"
 
@@ -1784,35 +1784,37 @@ def test_an_unknown_fact_is_refused_not_guessed():
         sim.loop.close()
 
 
-def test_the_store_side_chain_is_a_key_selector_and_refuses_anything_else():
-    """What the run installs in the directory selects over keys, and says so.
+def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
+    """One plane per capability; a selector is a utility it holds.
 
-    A run declares two control planes and each is reached by its type, so being a
-    ``KeySelector`` is the claim that makes installing this one legal -- checked here
-    rather than asserted in prose, and checked again at every link.
+    So nothing checks a *plane's* subject -- a run hands it the ports and asks it
+    whatever it declares. What is checked is the chain behind the fetch answer, at
+    every link, because a link reading those keys as anything else would answer a
+    question it was not asked.
     """
-    routing, sched = scheduler("cache_aware", _make_topology(2))
-    assert isinstance(routing, KeySelector)          # installable, and says so
-    assert not isinstance(sched, KeySelector)        # asked by hosts, not the store
+    sched = scheduler("cache_aware", _make_topology(2))
     assert isinstance(sched, ControlPlane)
+    assert not isinstance(sched, KeySelector)   # a plane is asked, not consulted
+    assert {"decide", "sources"} <= set(dir(sched))
     with pytest.raises(TypeError, match="every link must be a KeySelector"):
         KeySelectorChain([LongestPrefixKeySelector(), _LocalOnly()])
 
 
-def test_a_scheduler_does_not_hold_what_the_directory_is_told():
-    """The two planes meet at the model and nowhere else.
+def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
+    """Why one plane: neither the memo nor the ranking crosses a boundary.
 
-    The scheduler answers the application and knows nothing of the chain the
-    directory consults; the chain answers the store and knows nothing of the
-    scheduler. What passes between them is the pull one records and the other
-    consumes, which is the model's.
+    The peer a pull was priced against is recorded in this plane's own model and read
+    back by the member a fetch asks, and the ranking behind that memo is the *same
+    object* the pricing ranked with. Two planes had to keep both in step; one holds
+    them.
     """
-    routing, sched = scheduler("cache_aware", _make_topology(2))
-    assert not any(
-        isinstance(getattr(sched, name), KeySelector) and getattr(sched, name) is routing
-        for name in vars(sched)
-    ), "the scheduler holds the chain the run installs in the directory"
-    assert sched.cluster is not None
-    assert routing.selectors[0]._cluster is sched.cluster
+    sched = scheduler("cache_aware", _make_topology(2))
+    sim = Simulation(_make_topology(2), control=sched)   # attach builds the chain
+    try:
+        assert sched.cluster is not None
+        assert sched._fetch.selectors[0]._cluster is sched.cluster
+        assert sched._fetch.selectors[-1] is sched._reuse.source
+    finally:
+        sim.loop.close()
 
 

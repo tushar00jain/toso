@@ -103,8 +103,8 @@ class SimConfig:
     # into (LocalClusterModelHandle), which sit at one distance because the
     # control plane holding the model is what reads it -- and ``controller_rtt``
     # for anyone reaching the directory
-    # (LocalControllerHandle) -- which is every capability, the baseline included,
-    # and every consultation of a selector installed there. Like ``contention``
+    # (LocalControllerHandle) -- which is every capability, the baseline included.
+    # Like ``contention``
     # these are fidelity knobs that DO change measured timing, and deliberately
     # so: a request pays a hop out and back before it can proceed, so a
     # control hop lands in TTFT, which is the number kvcache exists to move.

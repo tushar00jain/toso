@@ -201,7 +201,7 @@ class KVClusterModel(ClusterModel):
     def _committed(self, fact: Committed) -> None:
         """Hold the prefill instance for an accepted decision, and note its pull."""
         plan = fact.response.plan
-        # The peer this pull was priced against, for when the directory asks
+        # The peer this pull was priced against, for when the fetch asks
         # (:meth:`claim`).
         if plan.reuse_source is not None and plan.pull_keys:
             self._routed.route(

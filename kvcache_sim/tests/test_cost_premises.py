@@ -310,7 +310,7 @@ def test_a_real_pull_costs_what_get_time_predicted():
     keys = ["blk0"]
 
     sim = Simulation(topo)
-    cl = KVStore(sim.mesh)
+    cl = KVStore(sim)
     gpu = SimulatedAccelerator(block_tokens=BLOCK_TOKENS)
 
     async def scenario():

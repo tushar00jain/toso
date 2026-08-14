@@ -3,8 +3,8 @@
 `realsim` is a single-threaded, deterministic discrete-event simulation (DES)
 that drives the **real** TorchStore client planning core, the **real** controller
 directory, and the **real** in-memory transport/store off-actor, under a virtual
-clock. It models only the *new* read coordinator — the one component that does not
-exist in production yet — behind a pluggable selector seam.
+clock. It models only the *new* control planes — the components that do not exist in
+production yet — each fronted as a service of its own, exactly as the store's is.
 
 `realsim` is the real-code foundation the two capability simulations build on:
 both [`dedup_sim/`](../dedup_sim/) and [`kvcache_sim/`](../kvcache_sim/) `import
@@ -18,8 +18,8 @@ substituted with in-process seams.
 
 This document is the single design reference for `realsim`: the concurrency model
 that makes it sound, the architecture, exactly how each real object is driven
-off-actor, the cost model and allocation-free data plane, the coordinator and its
-selector seam, the CI-enforced concurrency contract, and how the capability sims
+off-actor, the cost model and allocation-free data plane, the control-plane seams,
+the CI-enforced concurrency contract, and how the capability sims
 consume it. For a narrative walk-through of the whole DES foundation and how the
 two capability sims differ, see [`des_explained.md`](des_explained.md).
 
@@ -142,9 +142,9 @@ realsim/
   mesh.py                     # Mesh — multi-client wiring: per-node volumes + real clients,
                               #   one directory + registry, one shared transport factory
                               #   MeshView is the base every consumer of a mesh shares
-  selector.py                   # KeySelector.select(keys, requester) -> ranked sources +
-                              #   readiness. Naive is the default; consulted inside the
-                              #   real locate_volumes body
+  selector.py                 # KeySelector.select(keys, requester) -> ranked sources,
+                              #   once they are usable. Naive is the default; the data
+                              #   plane asks it and prefers what it names on the read
   view.py                     # View — read-only observation: locate, topology and
                               #   locality, the clock. No mutation
   plane.py                    # ControlPlane — attach(view, cost); DataPlane —
@@ -177,9 +177,9 @@ realsim/
     test_planes.py            # the shared KeySelector / View / DataPlane / Runner contracts
     test_demos.py             # every Demo declares its parts, and every scenario runs
 
-putget_sim/                   # the unrouted put/get burst (repo root) — no selector, no
-                              #   data plane: the m x baseline, and the fixture the
-                              #   realsim tests above drive
+putget_sim/                   # the unrouted put/get burst (repo root) — no control
+                              #   plane, no data plane: the m x baseline, and the
+                              #   fixture the realsim tests above drive
   workload/put_get.py         # PutGetBurst, a Workload: seed a key, then m clients get
                               #   it; meta/metadata carrier + full cost exercise
   workload/scenarios.py       # its Runs — here, the single unrouted one
@@ -426,37 +426,35 @@ directory handle, trace, profile, registry, install).
 
 - **`KeySelector.select(keys, requester) -> Selection`.** One interface,
   answering one question: which volume serves these keys for this requester, and
-  *when* is it usable. A `Selection` is a ranked list of sources plus an optional
-  **readiness gate**. It is invoked in two named places: inside the real
-  controller's `locate_volumes` body, after it reads the directory and before it
-  returns (so a scenario that just calls `client.get(K)` is routed without knowing
-  a selector exists, and the controller can *withhold* its answer until the gate
-  opens); and directly from an app, when the app wants to price the alternatives
-  rather than be handed one. Either way the selector senses through the `View`
-  it was attached with, so the caller passes a subject and a requester. The default implementation is
-  **naive** — every holder, in directory order — which is precisely what the real
-  directory answers unaided, so installing it is byte-identical to installing
-  nothing.
+  *when* is it usable. A `Selection` is a ranked list of sources, and a decision that
+  gates on something not yet true carries a **readiness gate** the plane spends
+  itself, so `select` simply does not answer until its sources are usable and what
+  crosses the boundary is values. It is reached in two named places: as a service the
+  data plane asks before an ordinary `client.get`, passing the answer along as a
+  source preference the store applies (`prefer()`); and directly from an app, when
+  the app wants to price the alternatives rather than be handed one. Either way the
+  selector senses through the `View` it was attached with, so the caller passes a
+  subject and a requester. The default implementation is **naive** — every holder, in
+  directory order — which is precisely what the real directory answers unaided, so
+  preferring what it names is byte-identical to naming nothing.
   What deliberately does *not* go through it: compute placement, admission and SLO
   gates. The moment `select` answers those it becomes a union type serving neither
   caller.
 - **`View`.** The read-only observation a selector is handed: `locate` (the raw
-  directory body, so a selector reading it back does not re-enter the hook),
-  topology/locality, and the virtual clock. Awaited reads, no mutation. It stops
+  directory body, so a selector ranks the directory and not an answer already put in
+  somebody's order), topology/locality, and the virtual clock. Awaited reads, no mutation. It stops
   there on purpose — `kvcache_sim`'s prefix-run lengths are a KV notion and live
   in its own `control/`, and neither capability's *load* signal is an observation
   (the scheduler's is its own predicted queue, the dedup selector's is its planned
   tree), so there is no `load()` on the base type.
-- **`DataPlane`.** One member — `after(requester, result)`, what a capability does
-  once a transfer has landed — defaulting to real behaviour (nothing). Moving the
-  bytes is an ordinary client call and needs no interface. `dedup_sim` implements
-  it; a plain fetch and `kvcache_sim` do not. It names a *requester* rather than a
-  work item so a deployment can implement it: the run-shaped members it used to
-  carry (`execute` / `drain` / `writes_own_outcomes`) were the runner's contract
-  wearing the capability's name, and the two that survived are now
-  `realsim.runner.ItemDispatch`. `drain` did not survive: its only caller was a
-  decode batch outliving the request that fed it, which was a bug in the request's
-  leg rather than a phase a run needs.
+- **`DataPlane`.** One member — `attach(deployment)` — and no verbs. Moving bytes is
+  an ordinary client call and needs no interface, and what a capability does around
+  those calls it declares itself: `dedup_sim`'s plane reads through and reports the
+  put, `kvcache_sim`'s host walks three legs. The run-shaped members it used to carry
+  (`execute` / `drain` / `writes_own_outcomes`) were the runner's contract wearing the
+  capability's name, and the two that survived are now `realsim.runner.ItemDispatch`.
+  `drain` did not survive: its only caller was a decode batch outliving the request
+  that fed it, which was a bug in the request's leg rather than a phase a run needs.
 - **`Runner`.** The generic half of the two private drivers this replaced: order
   work by `(release_time, id)`, install the mesh's shared transport factory
   **once**, release each item at its time and gather, and record one ledger row
@@ -484,7 +482,7 @@ default `"cuda"`). A selector and a data plane are *not* its arguments — a
 capability puts those on the `realsim.run.Run`, so the workload is identical
 between a routed run and the baseline.
 The scenario body is ordinary user code — a `client.put` and a gather of
-`client.get` — and installing a selector is the *only* change that turns the same
+`client.get` — and adding the two planes is the *only* change that turns the same
 `m×` run into a 1× one, which is exactly what `dedup_sim` does with it.
 `render_burst_summary` prints the fabric/wallclock digest + the ASCII source→dest
 tree.
@@ -571,9 +569,9 @@ Both capability sims consume `realsim` directly, speaking the real torchstore
 `Request` / `TensorSlice` / `StorageInfo` / `Trie` types natively — so there is no
 region↔`TensorSlice` translation layer anywhere:
 
-- [`dedup_sim/`](../dedup_sim/) implements dedup routing as a real `KeySelector`
-  (`DedupKeySelector`) consulted inside the real `locate_volumes`, driving the real
-  `Controller` directory + `LocalClient` to a 1× peer read-through.
+- [`dedup_sim/`](../dedup_sim/) implements dedup routing as one `ControlPlane`
+  (`Dedup`) its data plane asks before each read and reports each put to, driving the
+  real `Controller` directory + `LocalClient` to a 1× peer read-through.
 - [`kvcache_sim/`](../kvcache_sim/) consults the real `Controller` directory for
   KV-block presence (`KVView.prefix_lengths` over `locate_volumes`) and drives
   real per-instance clients for prefix publish / remote pull / eviction.

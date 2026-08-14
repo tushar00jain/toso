@@ -11,7 +11,7 @@ It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsi
   directory (`keys_to_storage_volumes`), driven off-actor through `realsim`'s
   `RealControllerAdapter` / `LocalControllerHandle`. A KV block is a directory **key**
   (the prefix-hash chain string); "instance X holds block K" is the directory entry
-  `K -> volume_X`. Routing consults the real `locate_volumes`.
+  `K -> volume_X`. Routing reads it through the real `locate_volumes`.
 - **Real clients + real tensors.** Each serving instance is a real storage volume
   with a co-located real `LocalClient` (`realsim`'s `RealClientAdapter`). Prefill
   returns the KV it produced -- one `torch.Tensor` per block, `device="meta"`, so it
@@ -182,7 +182,7 @@ Five consequences, and they are the reason for the shape:
 The only calls a "serving engine" makes are:
 
 ```python
-answer = await placement.decide(request, me)           # route; None => rejected
+answer = await control.decide(request, me)             # route; None => rejected
 ...                                                    # pull remote prefix + prefill
 await store.publish(me, fresh, kv)                     # cache fill + decode handoff
 await cluster.notify(PrefillFinished(me, now))
@@ -282,9 +282,11 @@ kvcache_sim/
                           #   it (all three underscored: nothing outside data/
                           #   drives them)
     _store.py             #   publish / reuse / fetch over a Deployment's clients,
-                          #   moving whatever KV it is handed. It holds no notion
-                          #   of what a block is or how big one is -- that is the
-                          #   accelerator's, which produces them
+                          #   moving whatever KV it is handed. A fetch asks the
+                          #   control plane which peers should serve it and passes
+                          #   that to get_batch as a preference. It holds no
+                          #   notion of what a block is or how big one is -- that is
+                          #   the accelerator's, which produces them
   workload/               # WHAT IS SIMULATED
     _generator.py         #   seeded synthetic stream of multi-turn Conversations
                           #   (Zipf over turn depth, Poisson dialogue starts,
@@ -375,13 +377,13 @@ plus the prefix-run read that express KV caching on a mesh.
   fetch runs after the prefill queue; if a peer evicted a planned block meanwhile,
   the read-through fetches only what remains present (the rest is recomputed) -- the
   faithful real-directory behavior. The peer it pulls *from* is the one the
-  coordinator priced: the run installs the *scheduler* in the directory, and its
-  `select` answers a fetch with the pull it already routed (falling back to
-  `LongestPrefixKeySelector` when it routed none), so `locate_volumes` narrows to that
-  peer. Without it the
-  client takes whichever holder the directory lists first, which for a block several
-  instances hold (a shared system prompt, anything replicated) can be a different
-  locality tier than the one the TTFT prediction was built on.
+  coordinator priced: the host about to fetch asks the control plane's `sources`,
+  which answers with the pull already routed for it (falling back to
+  `LongestPrefixKeySelector` when it routed none), and passes that answer to
+  `get_batch` as a source preference. Without it the client takes whichever
+  holder the directory lists first, which for a block several instances hold (a shared
+  system prompt, anything replicated) can be a different locality tier than the one
+  the TTFT prediction was built on.
 - **The prefill queue is real, and it disagrees with the scheduler that predicted
   it.** The forward pass is *submitted* to the host's accelerator, after the KV
   fetch, and runs when that accelerator is free, behind whatever prefill or decode

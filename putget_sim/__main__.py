@@ -28,7 +28,7 @@ class PutGetDemo(Demo):
     name = "putget_sim"
     description = (
         "Deterministic read-burst simulation over the REAL TorchStore "
-        "client/controller/transport, with no selector installed. Prints the "
+        "client/controller/transport, with no control plane at all. Prints the "
         "summary + source->dest tree (INFO) and, with -v, the full per-event "
         "trace (DEBUG)."
     )

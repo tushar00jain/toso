@@ -9,24 +9,24 @@ What differs is the **subject**, and every selector names its own in its header:
     class RoutedPull(KeySelector[None]):        # keys, ranked without pricing
     class Hosts(AnySelector[Request, Plan]):    # an application's subject, priced
 
-Two of those subjects are *types* as well, because a run reaches a selector by
-which one it is:
+A selector is a **utility**, not a plane. Nothing outside a capability reaches one:
+a run knows about the capability's :class:`~proposed.plane.ControlPlane`, that plane
+declares the questions its callers may ask, and a selector is one of the things it
+may work the answer out with. So a selector needs no lifecycle beyond the sensor it
+ranks against (:meth:`Selector.attach`), and a ranking that never leaves the plane
+that built it may hold whatever it likes -- including a readiness gate. What crosses
+a service boundary is the plane's business (:meth:`Selection.settled`).
+
+The two named subjects are types as well, because what a selector takes is worth
+saying in the header a reader already looks at:
 
 * :class:`KeySelector` -- ``Sequence[Key]``: which volume serves these bytes, the
   store's own question. ``dedup_sim`` wants a reader routed to a *peer* about to
-  hold the key, ``kvcache_sim`` the peer holding the longest reusable prefix. The
-  only kind installable in the controller.
+  hold the key, ``kvcache_sim`` the peer holding the longest reusable prefix.
 * :class:`AnySelector` -- an application's own subject, whatever it is: which peer
-  to source a prefix from, which host prefills, which host decodes. Never
-  installed; an application's hosts reach one as a service of its own. Its
+  to source a prefix from, which host prefills, which host decodes. Its
   ``subject_type`` stays ``Any`` and a subclass narrows it, since this package
   cannot name a type an application invented.
-
-Types rather than ``subject_type`` alone, because taking keys does not by itself
-mean *the store may ask you*: :class:`Refine` and ``kvcache_sim``'s reuse axis take
-the same keys and must not be installed. A selector that is neither type is reached
-from nowhere -- another selector consults it -- and being plain :class:`Selector`
-is what keeps it out of both call sites.
 
 Admission and SLO gates are neither: an answer that is not a ranked set of sources
 does not belong in a :class:`Selection` at all. A gate rides *with* one instead --
@@ -36,15 +36,14 @@ answered is simply not in the ranking.
 Selectors compose two ways, and neither one is a selector holding another:
 
 * :class:`FirstMatch` picks between alternatives -- ask each in order, take the
-  first answer. It wraps either kind and *is* a plain :class:`Selector` whatever
-  it wraps, so a chain mixing the two kinds is possible and harmless -- and
-  thereby barred from the controller, the one place the mixture would matter. A
-  chain whose links all take keys is a :class:`KeySelectorChain`, which is a
-  :class:`KeySelector` and may be installed.
+  first answer. It wraps either kind and *is* a plain :class:`Selector` whatever it
+  wraps, so a chain mixing the two kinds is possible and harmless. A chain whose
+  links all take keys is a :class:`KeySelectorChain`, which says so in its type and
+  checks it at construction.
 * :class:`Refine` funnels a single answer -- one selector's ranking, narrowed by
   each :class:`Refinement` behind it. That is how a test an application owns is
-  applied to a ranking the store produced, with the composition in the object
-  that holds both rather than inside either.
+  applied to a ranking over the store's own subject, with the composition in the
+  object that holds both rather than inside either.
 """
 
 from __future__ import annotations
@@ -57,12 +56,11 @@ from typing import (
 )
 
 from proposed.deployment import Key, VolumeId
-from proposed.plane import ControlPlane
 from proposed.view import View
 
 __all__ = [
-    "Ready", "Selection", "DecisionLog", "Selector", "KeySelector", "AnySelector",
-    "NaiveKeySelector", "FirstMatch", "KeySelectorChain",
+    "Ready", "Selection", "prefer", "DecisionLog", "Selector", "KeySelector",
+    "AnySelector", "NaiveKeySelector", "FirstMatch", "KeySelectorChain",
     "Refinement", "Refine", "AbstainOnSelf", "TakeHead",
 ]
 
@@ -90,10 +88,11 @@ class Selection(Generic[_P]):
     Args:
         sources: volume ids, best first. ``None`` -- the default -- means *every
             holder, in directory order*, which is what the real directory returns
-            on its own, so a ``None`` selection leaves the controller's answer
-            untouched.
-        ready: optional gate awaited before the answer is released, for a selector
-            that routes a requester to a peer which has not registered yet.
+            on its own, so a ``None`` selection leaves the store's answer untouched
+            (:func:`prefer`).
+        ready: optional gate, for a selector that routes a requester to a peer
+            which has not registered yet. Spent by :meth:`settled` before the
+            answer travels, never handed to whoever asked.
         payload: ``source id -> what this selector holds about that source``,
             application-defined because this package cannot read an application's
             values. A ranking alone loses what produced it, and a selector handed
@@ -157,6 +156,20 @@ class Selection(Generic[_P]):
         if self.ready is not None:
             await self.ready()
 
+    async def settled(self) -> "Selection[_P]":
+        """This selection with its gate spent: awaited, then dropped.
+
+        What a plane reached as a service answers with. :attr:`ready` is a closure,
+        so it cannot cross the boundary a handle stands for -- the ranking and the
+        prices can, being values. Awaiting it here is also what makes the answer
+        true when it arrives: the caller is about to read from these sources, and
+        a ranking released early names a volume holding nothing yet.
+        """
+        await self.wait()
+        if self.ready is None:
+            return self
+        return Selection(sources=self.sources, payload=self.payload)
+
     def only(self, sources: Sequence[VolumeId]) -> "Selection[_P]":
         """This selection cut down to ``sources``, in the order given.
 
@@ -170,23 +183,30 @@ class Selection(Generic[_P]):
             payload={s: self.payload[s] for s in kept if s in self.payload},
         )
 
-    def narrow(
-        self, located: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
-        """Restrict a directory answer to the selected sources, in rank order.
 
-        A key none of the selected sources holds is left untouched: the selection
-        is a preference, not a filter that can make data disappear.
-        """
-        if self.sources is None:
-            return located
-        scoped: Dict[str, Dict[str, Any]] = {}
-        for key, volume_map in located.items():
-            ranked = {
-                vid: volume_map[vid] for vid in self.sources if vid in volume_map
-            }
-            scoped[key] = ranked if ranked else volume_map
-        return scoped
+def prefer(
+    located: Dict[str, Dict[str, Any]],
+    sources: Optional[Sequence[VolumeId]],
+) -> Dict[str, Dict[str, Any]]:
+    """A directory answer reordered to put ``sources`` first, best first.
+
+    What the store does with a preference its caller handed it: ``locate_volumes``
+    reads the directory and then applies this, so a client that takes the first
+    volume listed per key reads from the source the caller named. It consults
+    nothing -- ``sources`` is a value, typically :attr:`Selection.sources` from a
+    control plane the caller asked itself.
+
+    ``None`` -- no preference -- is the directory's own answer, returned unchanged.
+    A key none of ``sources`` holds is also left untouched: this is a preference,
+    not a filter that can make data disappear.
+    """
+    if sources is None:
+        return located
+    scoped: Dict[str, Dict[str, Any]] = {}
+    for key, volume_map in located.items():
+        ranked = {vid: volume_map[vid] for vid in sources if vid in volume_map}
+        scoped[key] = ranked if ranked else volume_map
+    return scoped
 
 
 class DecisionLog(Protocol):
@@ -200,7 +220,7 @@ class DecisionLog(Protocol):
         ...
 
 
-class Selector(ControlPlane, ABC, Generic[_S, _P]):
+class Selector(ABC, Generic[_S, _P]):
     """Rank the sources that should serve a subject, and say when they are usable.
 
     Written with the subject it takes and the price it hands each source back with
@@ -208,15 +228,12 @@ class Selector(ControlPlane, ABC, Generic[_S, _P]):
     in the header a reader already looks at. ``None`` is the price of a selector
     that only ranks.
 
-    Everything shared by every kind lives here -- ``select``, ``subject_type``,
-    the :class:`~proposed.plane.ControlPlane` lifecycle -- so :class:`KeySelector`
-    and :class:`AnySelector` cannot drift apart. Implement one of those, or this
-    base directly for a selector nothing reaches from outside.
-
-    A selector that must wait for a source to appear subscribes to the directory
-    in its own :meth:`attach` (:meth:`proposed.deployment.Controller.subscribe`),
-    reached through the view it is handed there. Nothing about that is declared
-    here: a wakeup is the directory's to deliver, not a member every selector owes.
+    A utility a control plane consults, and deliberately **not** a
+    :class:`~proposed.plane.ControlPlane`: a run never holds one, so it needs no
+    ``cluster`` to harvest and no service in front of it. Everything shared by every
+    kind lives here -- ``select``, ``subject_type``, the sensor -- so
+    :class:`KeySelector` and :class:`AnySelector` cannot drift apart. Implement one
+    of those, or this base directly.
     """
 
     name = "selector"
@@ -260,11 +277,12 @@ class Selector(ControlPlane, ABC, Generic[_S, _P]):
     view: Optional[View] = None
 
     def attach(self, view: Any, transfer_cost: Any) -> None:
-        """Keep the view this selector reads the directory through.
+        """Keep the ports this selector senses and prices through.
 
-        A selector consulted inside ``locate_volumes`` runs on the same side as the
-        service consulting it, so the sensor is the run's and not a per-call
-        argument: one selector, one view, whoever asks.
+        The same two the plane holding it was handed
+        (:meth:`proposed.plane.ControlPlane.attach`), passed straight down: a
+        selector runs beside the directory it senses, so the sensor is the run's and
+        not a per-call argument -- one selector, one view, whoever asks.
         """
         self.view = view
 
@@ -280,13 +298,10 @@ class Selector(ControlPlane, ABC, Generic[_S, _P]):
 class KeySelector(Selector[Sequence[Key], _P]):
     """A selector whose subject is **keys**: which volume serves these bytes.
 
-    The store's own question, and the only kind a controller may install in
-    ``locate_volumes``: being this type *is* the claim, which is what makes
-    installing one checkable (``isinstance(control, KeySelector)`` at the seam).
-
-    A type as well as a :attr:`subject_type`, because taking keys does not by
-    itself mean the store may ask you -- a selector an application consults while
-    routing takes the same keys and must stay out of the directory.
+    The store's own question, and what a control plane answering "which volumes
+    should serve this read" ranks with. A type as well as a :attr:`subject_type`, so
+    that a chain over keys can check its links are all over keys
+    (:class:`KeySelectorChain`).
     """
 
 
@@ -297,15 +312,9 @@ class AnySelector(Selector[_S, _P]):
     An application question that happens to be a selection -- which host prefills,
     which host decodes, which of these priced candidates wins. :attr:`subject_type`
     stays ``Any`` here and a subclass narrows it: this package cannot name a type an
-    application invented, and the run does not need the name -- it reaches one of
-    these by *being* one. Being this type instead of :class:`KeySelector` is what
-    keeps it out of the controller, where a subject the store cannot read would make
-    ``locate_volumes`` answer a question it was not asked.
-
-    One that an application's own hosts ask is given a service of its own by the
-    run (:mod:`realsim.seams.control_plane_service`), so the subject and the answer
-    both have to be values a wire could carry: the ranking is source ids, and what
-    the winner was chosen with rides in :attr:`Selection.payload`.
+    application invented. Being this type instead of :class:`KeySelector` says the
+    subject is not the store's, which is worth saying where the ranking looks
+    otherwise identical.
     """
 
 
@@ -313,8 +322,8 @@ class NaiveKeySelector(KeySelector[None]):
     """Every holder, in directory order, usable now.
 
     Precisely the real directory's own answer, so this returns the empty
-    :class:`Selection` rather than re-deriving it: installing it is byte-identical
-    to installing no selector at all.
+    :class:`Selection` rather than re-deriving it: a read preferring what it names is
+    byte-identical to a read that names nothing (:func:`prefer`).
     """
 
     name = "naive"
@@ -355,8 +364,8 @@ class FirstMatch(Selector[_S, _P]):
         """Hand the stack's ports to every wrapped selector, answering or not.
 
         One that senses through a view of its own must be brought up even if it
-        never answers -- and one that subscribes to the directory does it here, so
-        a link behind an earlier answer still has its wakeups.
+        never answers, so a link behind an earlier answer is still sensing when its
+        turn comes.
         """
         for selector in self.selectors:
             selector.attach(view, transfer_cost)
@@ -373,11 +382,10 @@ class FirstMatch(Selector[_S, _P]):
 class KeySelectorChain(FirstMatch[Sequence[Key], _P], KeySelector[_P]):
     """A :class:`FirstMatch` every link of which selects over keys, so it does too.
 
-    Installable in the controller, which a plain chain is not. The claim is checked
-    at construction rather than trusted, so being this type says exactly what
-    :class:`KeySelector` says: a ``locate_volumes`` hands its subject down every link,
-    and one that read it as anything but keys would answer a question the directory
-    did not ask.
+    The claim is checked at construction rather than trusted, so being this type says
+    exactly what :class:`KeySelector` says: the keys a caller asks about go down every
+    link, and one that read them as anything else would answer a question it was not
+    asked.
 
     Args:
         selectors: consulted left to right; each must be a :class:`KeySelector`.
@@ -397,7 +405,7 @@ class KeySelectorChain(FirstMatch[Sequence[Key], _P], KeySelector[_P]):
             )
 
 
-class Refinement(ControlPlane, ABC, Generic[_S, _P]):
+class Refinement(ABC, Generic[_S, _P]):
     """Narrow a ranking some selector already produced.
 
     Not a :class:`Selector`: it has no subject of its own, and ``select`` has
@@ -431,9 +439,8 @@ class Refine(Selector[_S, _P]):
     """One selector's ranking, put through each :class:`Refinement` in turn.
 
     A plain :class:`Selector` whatever it wraps, for :class:`FirstMatch`'s reason:
-    narrowing a selector's ranking with an application's test asks something the
-    store cannot read, and being neither subtype is what bars the result from the
-    controller.
+    narrowing a ranking over one subject with a test that reads another leaves a
+    funnel that answers its source's question, so it claims neither subtype.
 
     A step that abstains (``Selection.of([])``) ends the funnel -- the steps behind
     it are not consulted and the abstention is the answer. ``Selection()``, every
@@ -458,11 +465,7 @@ class Refine(Selector[_S, _P]):
 
     @property
     def subject_type(self) -> Any:
-        """Its source's: a funnel narrows an answer, it does not reinterpret one.
-
-        Which is why a :class:`Refine` over a :class:`KeySelector` is still not one
-        -- it takes keys and is barred from the directory all the same.
-        """
+        """Its source's: a funnel narrows an answer, it does not reinterpret one."""
         return self.source.subject_type
 
     def attach(self, view: Any, transfer_cost: Any) -> None:

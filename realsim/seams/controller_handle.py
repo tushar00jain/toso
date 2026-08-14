@@ -17,15 +17,12 @@ In a deployment there is nothing here to keep. ``get_or_spawn_controller`` retur
 Monarch's own handle, whose endpoints do the same thing over the wire; this class
 is the `[S]` that disappears. Which is also why it does not implement
 :class:`proposed.deployment.Controller`: the *service* implements that, and a
-reference to a service is a different shape. Fusing the two into one object is what
-used to make "is this the client side or the server side?" unanswerable about this
-file -- the mirrored endpoint bodies and the selector hook now live in the service,
-where they always belonged.
+reference to a service is a different shape.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 from realsim.seams.link import LocalEndpoint, ServiceHop
 
@@ -58,12 +55,3 @@ class LocalControllerHandle:
     def controller(self):
         """The real ``Controller`` behind the service, for tests asserting on it."""
         return self.service.controller
-
-    def install_selector(self, selector: Any) -> None:
-        """Install a control plane in the service this refers to.
-
-        The selector runs in the *service* and is stored there; this exists for the
-        one caller that holds a handle and not a service
-        (:class:`realsim.mesh.Mesh`, assembling a run).
-        """
-        self.service.install_selector(selector)

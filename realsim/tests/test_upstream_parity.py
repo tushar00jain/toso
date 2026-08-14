@@ -6,13 +6,15 @@ All are deliberate and all can rot silently:
   ``proposed`` must not import torchstore -- it is what torchstore would gain, so
   depending on it would invert the claim. The signatures are therefore a copy,
   except for the members that *are* the ask (``THE_ASK``), which upstream has yet
-  to have;
+  to have. The half of the ask that is not a member -- a source preference on the
+  read path -- is pinned on the client instead (``CLIENT_READ_PARAMETERS``), since
+  what makes the simulator's stand-in necessary is the argument that is *not* there;
 * :class:`proposed.deployment.StorageVolume` declares the storage surface the same
   way, and asks for nothing: every member is a copy, and each endpoint left out is
   listed with a reason (``VOLUME_NOT_DECLARED``) so a narrower surface stays a
   decision rather than an oversight;
-* :class:`realsim.seams.controller_handle.LocalControllerHandle` mirrors the bodies
-  of ``locate_volumes`` and ``keys`` **verbatim**, because ``@endpoint`` makes them
+* :class:`realsim.seams.controller_service.ControllerService` mirrors the bodies of
+  ``locate_volumes`` and ``keys`` **verbatim**, because ``@endpoint`` makes them
   ``EndpointProperty`` descriptors that cannot be invoked off-actor, and torchstore
   has not extracted sync helpers for them the way it has for ``_notify_put``.
 
@@ -30,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 
+from torchstore.client import LocalClient as RealClient
 from torchstore.controller import Controller as RealController
 from torchstore.storage_volume import StorageVolume as RealStorageVolume
 
@@ -42,7 +45,7 @@ from realsim.seams.volume_service import VolumeService
 
 #: Endpoints whose bodies are mirrored verbatim, and the digest of the source we
 #: mirrored. A failure here is not a bug: it means upstream edited the body and the
-#: mirror in ``LocalControllerHandle`` has to be re-copied (then update the digest).
+#: mirror in ``ControllerService`` has to be re-copied (then update the digest).
 MIRRORED_BODIES = {
     "locate_volumes": "9604ec9210bbb386841f4c0cb447900a",
     "keys": "f3b003d0a74bf6e671bc2242cf2cb114",
@@ -59,11 +62,31 @@ COPIED_FROM_UPSTREAM = [
 ]
 
 #: Members that are the *ask* -- declared here because torchstore would have to gain
-#: them. ``locate_raw`` is ``locate_volumes`` with the selector hook skipped, which is
-#: what a controller hands its own selector through a ``View``, and it is asked for as
-#: a plain **synchronous local method**: a directory read that cannot suspend is
-#: what makes a routing decision atomic without a lock.
-THE_ASK = ["locate_raw", "subscribe"]
+#: them. ``locate_raw`` is ``locate_volumes`` with no caller's preference applied,
+#: which is what a control plane senses through a ``View``, and it is asked for as a
+#: plain **synchronous local method**: a directory read that cannot suspend is what
+#: makes a routing decision atomic without a lock.
+#:
+#: One member, because the rest of the ask is not a member: ``locate_volumes`` takes
+#: a source preference and applies it, which changes a signature rather than adding
+#: one. That half is pinned on the client instead -- see
+#: :data:`CLIENT_READ_PARAMETERS`.
+THE_ASK = ["locate_raw"]
+
+#: What ``LocalClient``'s read path takes today, in full. The other half of the ask
+#: is that it takes one thing more: an optional **source preference**, applied to the
+#: located map before ``_build_volume_requests`` takes the first volume listed per
+#: key. Until it does, the simulator carries that preference in a coroutine binding
+#: (:func:`realsim.seams.factory.bind_prefer`), which is the one thing here standing
+#: in for something upstream does not have.
+#:
+#: Spelled as the whole parameter list rather than a name guessed at, so *any* change
+#: to the read surface fails here and gets looked at -- including the one being asked
+#: for.
+CLIENT_READ_PARAMETERS = {
+    "get": ["self", "key", "inplace_tensor", "tensor_slice_spec"],
+    "get_batch": ["self", "keys"],
+}
 
 
 def _real(name: str):
@@ -126,16 +149,31 @@ def test_the_ask_is_still_an_ask():
         )
 
 
-def test_the_ask_is_local_and_synchronous():
-    """What torchstore is asked for is methods, not endpoints or coroutines.
+def test_the_client_read_path_has_no_source_preference():
+    """The one thing the simulator stands in for, pinned where it is missing.
 
-    Both for the same reason. A directory read that cannot suspend is what a
-    control plane's atomicity rests on (``dedup_sim.control.routing._assign``,
-    ``kvcache_sim.control.scheduler._Scheduler._decide_route``); a subscriber runs
-    inside ``notify_put_batch``, so one that could suspend would let a second
-    registration interleave with the first. ``async`` on either would not be a
-    detail: it would put the interleaving back. Neither is reached across a
-    boundary -- both are absent from the handle, which is what a caller holds.
+    ``realsim.seams.factory.bind_prefer`` exists *because* these signatures have
+    nowhere to put a preference: a coroutine binding is how an unmodified client can
+    be handed one at all. When ``get`` grows the parameter, this fails -- and the
+    binding can go, along with ``client_for``'s keyword.
+    """
+    for name, expected in CLIENT_READ_PARAMETERS.items():
+        ours = list(inspect.signature(getattr(RealClient, name)).parameters)
+        assert ours == expected, (
+            f"LocalClient.{name} takes {ours}, not {expected}. If that is the source "
+            f"preference arriving, the simulator's coroutine binding stops being a "
+            f"stand-in and becomes a duplicate: pass it as this argument instead"
+        )
+
+
+def test_the_ask_is_local_and_synchronous():
+    """What torchstore is asked for is a method, not an endpoint or a coroutine.
+
+    A directory read that cannot suspend is what a control plane's atomicity rests
+    on (``dedup_sim.control.routing._assign``,
+    ``kvcache_sim.control.scheduler._Scheduler._select_prefill``). ``async`` on it
+    would not be a detail: it would put the interleaving back. Nor is it reached
+    across a boundary -- it is absent from the handle, which is what a caller holds.
     """
     service = ControllerService(RealController())
     handle = LocalControllerHandle(service)
@@ -150,9 +188,9 @@ def test_the_ask_is_local_and_synchronous():
             f"implements the surface it is meant to"
         )
         assert not hasattr(handle, name), (
-            f"the handle offers {name}: the unrouted read has no caller across the "
-            f"boundary, and one reaching it there would be routed nowhere and "
-            f"charged a hop"
+            f"the handle offers {name}: the raw read has no caller across the "
+            f"boundary, and one reaching it there would be charged a hop for a read "
+            f"a control plane makes beside the directory"
         )
 
 
@@ -160,7 +198,7 @@ def test_the_mirrored_bodies_are_still_the_ones_we_mirrored():
     """A verbatim copy has to be told when the original changes."""
     for name, expected in MIRRORED_BODIES.items():
         assert _digest(name) == expected, (
-            f"Controller.{name}'s body changed upstream. LocalControllerHandle "
+            f"Controller.{name}'s body changed upstream. ControllerService "
             f"mirrors it verbatim, so re-copy the body and update the digest in "
             f"MIRRORED_BODIES."
         )
@@ -176,10 +214,10 @@ def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
     every real caller, which is why the two are separate objects.
 
     The handle carries every member a *caller* reaches, and ``locate_raw`` is not
-    one: the only reader of the unrouted read is the selector running inside the
-    service, sensing through a ``View`` built over the service itself, so nothing
-    crosses the boundary the handle stands for. Which is why it is asked for as a
-    plain synchronous method -- see :func:`test_the_ask_is_a_local_synchronous_read`.
+    one: its only reader is a control plane sensing through a ``View`` built over the
+    service itself, so nothing crosses the boundary the handle stands for. Which is
+    why it is asked for as a plain synchronous method -- see
+    :func:`test_the_ask_is_local_and_synchronous`.
     """
     service = ControllerService(RealController())
     handle = LocalControllerHandle(service)

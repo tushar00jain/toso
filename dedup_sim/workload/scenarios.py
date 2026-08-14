@@ -7,9 +7,9 @@ nothing; :meth:`realsim.demo.Demo.main` does that with
 :meth:`realsim.run.Run.execute`.
 
 Every run shares one :class:`~putget_sim.workload.put_get.PutGetBurst` -- ordinary
-user code: seed ``W``, then a gather of ``client.get(W)``. The baseline installs
+user code: seed ``W``, then a gather of ``client.get(W)``. The baseline adds
 nothing and gets ``m x``; the routed runs add
-:class:`~dedup_sim.control.routing.DedupKeySelector` and the read-through
+:class:`~dedup_sim.control.routing.Dedup` and the read-through
 :class:`~dedup_sim.data.read_through.ReadThroughPlane` and get 1x. Same topology,
 payload, cost model and client calls -- the *only* difference is what the ``Run``
 carries, which is what makes the comparison mean something.
@@ -25,7 +25,7 @@ from realsim.runner import ItemDispatch
 from realsim.run import Result, Run
 from sim_common.trace import Trace
 
-from ..control.routing import DedupKeySelector
+from ..control import routing
 from ..data.read_through import ReadThroughPlane
 from ..report.summary import BaselineReport, DedupReport
 
@@ -75,15 +75,15 @@ class Dedup(Scenario):
         burst = self.burst or PutGetBurst(self.num_readers)
         runs = [Run("baseline", burst, profile=burst.profile)]
         for cap in self.caps:
-            # The selector records into the same trace the run reports, and it is
-            # installed in the controller when the mesh is built -- so the trace has
-            # to exist before the stack, which is why the Run carries it.
+            # The plane records into the same trace the run reports, and it is
+            # attached when the stack is built -- so the trace has to exist before
+            # the stack, which is why the Run carries it.
             trace = Trace()
             runs.append(
                 Run(
                     f"cap={cap}",
                     burst,
-                    control=DedupKeySelector(fanout_cap=cap, trace=trace),
+                    control=routing.Dedup(fanout_cap=cap, trace=trace),
                     # The capability is the plane's one member; what the runner
                     # drives is the dispatch that calls it. Wiring, so it is here
                     # and not in ``data/``. The plane is built with its knobs and

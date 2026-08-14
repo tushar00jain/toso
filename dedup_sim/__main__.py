@@ -7,9 +7,9 @@ Run from the repo root so the package resolves::
 The demo drives a synchronized read burst over the **real** ``Controller``
 directory + **real** client/transport (via ``realsim``) under two selectors:
 
-  * the unrouted baseline (no selector installed): every reader pulls from the
+  * the unrouted baseline (no control plane at all): every reader pulls from the
     origin -- ``m x`` fabric; and
-  * the dedup selector (:class:`dedup_sim.control.routing.DedupKeySelector`): the
+  * the dedup control plane (:class:`dedup_sim.control.routing.Dedup`): the
     controller routes each reader to a peer and withholds the answer until that
     peer's read-through put registers, so the burst becomes a chain
     (``fanout_cap=1``) or tree (``fanout_cap=2``) and each unique byte crosses

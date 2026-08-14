@@ -1,14 +1,16 @@
 """One scheduler, two presets: ``LoadBalanceScheduler`` / ``CacheAwareScheduler``.
 
-Both are a plain :class:`~proposed.plane.ControlPlane`, whose one member --
-``decide`` -- is the whole surface the data plane may *ask*. Beside either runs a
-second control plane, :class:`FetchRouting`, which is what the *directory* consults;
-a run is handed the two separately (:func:`kvcache_sim.workload._serving.scheduler`)
-and they meet only at the cluster model.
+Both are a plain :class:`~proposed.plane.ControlPlane`, and one plane is the whole of
+what this capability decides. Two members, asked at the two moments a serving host
+has a question::
 
-This application's one question::
+    await decide(request, me)   -> Optional[Response]   # where should this run
+    await sources(keys, me)     -> Selection[None]      # who serves this fetch
 
-    await decide(request, me) -> Optional[Response]
+The second exists because the first already answered it: routing prices a pull
+against recomputing and records the peer it priced, and the fetch that follows asks
+which peer to read from. Two objects would have to keep that record in step across a
+boundary; one plane just reads its own model (:class:`RoutedPull`).
 
 Not a selector, because the decision is made of **two** selections and a selection
 holds one: the prefill hosts this scheduler priced, and the decode hosts it ranked
@@ -75,6 +77,7 @@ from proposed import TransferCost
 from ._cluster import (
     Committed, ComputeBusy, DecodeState, KVClusterModel, PrefillFinished,
 )
+from ._source import LongestPrefixKeySelector
 from ._view import KVView
 from .request import Request
 
@@ -174,10 +177,9 @@ class Response:
 # -- name a peer to pull from, or nobody. So it is the source ranking
 # (:mod:`kvcache_sim.control._source`, a real KeySelector) under the one test that is
 # not the store's: is pulling worth more than recomputing here. That composition is a
-# :class:`~proposed.selector.Refine`, a plain Selector, which is what keeps it out of
-# the controller without either half holding the other. Its ``select`` is awaited
-# inside the pinned snapshot (:meth:`_Scheduler._select_prefill`), so it runs to
-# completion without suspending.
+# :class:`~proposed.selector.Refine`, so the composition lives in the object holding
+# both rather than inside either. Its ``select`` is awaited inside the pinned snapshot
+# (:meth:`_Scheduler._select_prefill`), so it runs to completion without suspending.
 #
 # The second axis is below, and is a sort key rather than a selector: it ranks what
 # this scheduler already priced, reads no directory and answers nobody. What is not
@@ -189,8 +191,8 @@ class _LocalOnly(Selector[Sequence[Key], None]):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
     A plain :class:`~proposed.selector.Selector`: its subject is keys, but the
-    scheduler is the only thing that asks it, so it is neither installed in the
-    directory nor fronted by a service.
+    scheduler is the only thing that asks it, so it is not fronted by a service at
+    all.
 
     ``Selection.of([])``, which is :class:`~proposed.selector.FirstMatch`'s
     *abstention*: no source, so the caller recomputes the gap. Deliberately not
@@ -314,7 +316,7 @@ def _predicted_tbt_gate(response: "Response", sched: "_Scheduler") -> bool:
 class RoutedPull(KeySelector[None]):
     """The peer a fetch's pull was already priced against, or an abstention.
 
-    Answering the store from what routing decided, rather than deciding twice:
+    Answering the fetch from what routing decided, rather than deciding twice:
     re-deriving would not even agree (routing ranks over the request's whole block
     chain, the fetch names only the gap), and naming a different holder would
     charge a cross-node read for a same-node prediction. A caller with no routed
@@ -327,9 +329,6 @@ class RoutedPull(KeySelector[None]):
     wins the chain, an abstention matched nothing and spends nothing. Under one that
     could reject the peer, the record would be gone and the fetch would fall through
     to a ranking that never saw it.
-
-    The model is the whole of what this shares with the scheduler that priced the
-    pull: one writes it, the other consumes it, and neither holds the other.
     """
 
     name = "routed-pull"
@@ -343,24 +342,23 @@ class RoutedPull(KeySelector[None]):
 
 
 class FetchRouting(KeySelectorChain[None]):
-    """This capability's **store-side control plane**: who serves a fetch.
+    """How :meth:`_Scheduler.sources` answers: the priced pull, else the ranking.
 
-    What a run installs in the directory, beside the scheduler it installs as a
-    service. The pull the scheduler already priced for this caller
-    (:class:`RoutedPull`), else ``source``'s ranking of whoever holds the longest
-    prefix.
+    The pull this scheduler already priced for the caller (:class:`RoutedPull`), else
+    ``source``'s ranking of whoever holds the longest prefix.
 
     A chain rather than an ``if``, so the fall-through is
     :class:`~proposed.selector.FirstMatch`'s abstention rule and not a second copy of
-    it here, and a :class:`~proposed.selector.KeySelectorChain` because the directory is
-    handed this and both links select over keys.
+    it here, and a :class:`~proposed.selector.KeySelectorChain` because the subject is
+    keys and both links select over them. A utility the plane holds, not a plane: it
+    ranks, and the plane is what a caller reaches.
+
+    Neither link gates on anything, so what it answers is already values.
 
     Args:
-        cluster: the run's model, which the scheduler records a priced pull into.
-            The whole of what the two planes share.
-        source: ranks the holders of a prefix. The same object a pulling
-            scheduler's reuse axis names a peer with, so the peer chosen
-            while pricing is the peer this answers with.
+        cluster: the run's model, which this scheduler records a priced pull into.
+        source: ranks the holders of a prefix. The same object the reuse axis names a
+            peer with, so the peer chosen while pricing is the peer this answers with.
     """
 
     name = "fetch-routing"
@@ -372,13 +370,12 @@ class FetchRouting(KeySelectorChain[None]):
 class _Scheduler(ControlPlane):
     """The pricing, ranking and admission both schedulers share.
 
-    A :class:`~proposed.plane.ControlPlane` and nothing more specific: a serving
-    host asks it as a service (:meth:`decide`), which is the whole of its surface.
-    What the *directory* is told is a second control
-    plane the run installs beside this one
-    (:class:`FetchRouting`), and the two meet at the model -- this one prices a
-    pull and records it, that one answers the fetch with it -- so nothing is
-    threaded through the data plane to carry it and neither object holds the other.
+    A :class:`~proposed.plane.ControlPlane` and nothing more specific: a serving host
+    asks it as a service, and its two members (:meth:`decide`, :meth:`sources`) are
+    the whole of its surface. The second is answered from what the first recorded --
+    the peer a pull was priced against -- so a plan and the read that carries it out
+    cannot disagree, and nothing is threaded through the data plane to keep them
+    together.
 
     Args:
         reuse / rank: the two axes a preset picks (see above), both used while
@@ -387,6 +384,12 @@ class _Scheduler(ControlPlane):
             is attached. It names a peer for a candidate's block keys and prices
             nothing (``Selector[Sequence[Key], None]``): what a peer is worth is
             this scheduler's to work out (:meth:`_priced_reuse`).
+        source_selector: ranks the holders of a prefix, and what :meth:`sources`
+            answers a fetch with behind the pull it already priced
+            (:class:`FetchRouting`). ``None`` builds a
+            :class:`~kvcache_sim.control._source.LongestPrefixKeySelector`. A pulling
+            preset hands the *same* object to its reuse axis, so the peer priced is
+            the peer read from.
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -396,9 +399,8 @@ class _Scheduler(ControlPlane):
             the TBT gate is fed is the one observed now or the one predicted at
             prefill completion.
         cluster: the run's one :class:`~kvcache_sim.control._cluster.KVClusterModel`,
-            when a caller is building the store-side plane against it too and so
-            has to make it first. ``None`` -- the default -- builds it in
-            :meth:`attach`, where the instances become known.
+            when a caller has to make it first. ``None`` -- the default -- builds it
+            in :meth:`attach`, where the instances become known.
     """
 
     def __init__(
@@ -406,6 +408,7 @@ class _Scheduler(ControlPlane):
         *,
         reuse: Selector[Sequence[Key], None],
         rank: _RankKey,
+        source_selector: Optional[KeySelector[None]] = None,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
@@ -422,6 +425,10 @@ class _Scheduler(ControlPlane):
         self.model = model
         self._reuse = reuse
         self._rank = rank
+        self._source = (
+            source_selector if source_selector is not None
+            else LongestPrefixKeySelector()
+        )
         self._prefill_pool = prefill_pool
         self._decode_pool = decode_pool
         self.slo_ttft = slo_ttft
@@ -450,6 +457,8 @@ class _Scheduler(ControlPlane):
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
         self.cluster: Optional[KVClusterModel] = cluster
+        # Built in attach(), where the model it reads exists.
+        self._fetch: Optional[FetchRouting] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view, transfer_cost: TransferCost) -> None:
@@ -483,22 +492,36 @@ class _Scheduler(ControlPlane):
         self.decode_ids = (
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
+        # What a fetch is answered with, over the model just settled above.
+        self._fetch = FetchRouting(self.cluster, self._source)
+        self._fetch.attach(view, transfer_cost)
         # The reuse axis senses through the same view this one does, which is what
         # lets one routing decision pin one directory snapshot for both
         # (:meth:`~kvcache_sim.control._view.KVView.pinned`). The rank keys need no
         # view: they sort what this scheduler already priced.
         #
-        # A reuse axis that ranks peers brings up the source ranking it funnels
-        # (:meth:`~proposed.selector.Refine.attach`), and that ranking is also a link
-        # of the store-side chain, which the run attaches to the plain view it hands
-        # every control plane. This attach is the one that leaves it sensing through
-        # the pinned view, so it has to run **second**: a ranking a decision consults
-        # inside its pin must not read past the snapshot into the live directory.
-        # A run attaches its ``control`` plane before its ``placement`` plane, so
-        # passing this one as ``placement`` is what orders the two.
+        # **Second, and that is load-bearing.** A reuse axis that ranks peers brings up
+        # the source ranking it funnels (:meth:`~proposed.selector.Refine.attach`), and
+        # that same ranking is a link of the chain attached just above, to the plain
+        # view. This is the attach that leaves it sensing through the pinned view: a
+        # ranking a decision consults inside its pin must not read past the snapshot
+        # into the live directory.
         self._reuse.attach(self.view, transfer_cost)
 
-    # -- the one member a serving host asks ---------------------------------- #
+    # -- what a serving host asks, at the two moments it has a question ------- #
+    async def sources(self, keys: Sequence[Key], requester: str) -> Selection[None]:
+        """Which peers should serve ``requester``'s fetch of ``keys``, best first.
+
+        The pull :meth:`decide` already priced for this caller, else whoever holds the
+        longest prefix (:class:`FetchRouting`). ``Selection.of([])`` names nobody,
+        which leaves the read to the directory's own order.
+
+        Settled before it travels, like any answer this plane gives: neither link
+        gates, so there is nothing to wait for, and saying so here is what keeps that
+        a property of the ranking rather than of the caller.
+        """
+        return await (await self._fetch.select(list(keys), requester)).settled()
+
     async def decide(self, request: Request, requester: str) -> Optional[Response]:
         """Where should ``request`` run? Both selections, or ``None`` if refused.
 
@@ -671,8 +694,8 @@ class _Scheduler(ControlPlane):
         if not all(gate(response, self) for gate in self._gates):
             return None
         # Accepted: the model holds the instances this plan spoke for, and remembers
-        # the peer its pull was priced against for when the directory asks
-        # (:class:`_RoutedPull`).
+        # the peer its pull was priced against for when the fetch asks
+        # (:class:`RoutedPull`).
         #
         # The local write, not the endpoint a host reports over: control is in the
         # model's process, and a plain call is what keeps this decision atomic.
@@ -700,17 +723,17 @@ class CacheAwareScheduler(_Scheduler):
     the candidate loop tests.
 
     Args:
-        source_selector: ranks peers for a prefix pull, and the same object the
-            store-side plane answers a fetch with, so the peer named while pricing
-            is the peer the directory serves. Read only through the reuse
-            axis, which is why ``replicate=False`` never asks it anything.
+        source_selector: ranks peers for a prefix pull. Handed to the reuse axis
+            *and* on to :meth:`~_Scheduler.sources`, which is the point: one object,
+            so the peer named while pricing is the peer that serves the read.
+            ``replicate=False`` never asks it anything while pricing, and a fetch
+            still is.
 
-            Required, and deliberately without a default: the ranking has to be the
-            *same object* the run gives :class:`FetchRouting`, so whoever builds the
-            pair chooses it (:func:`kvcache_sim.workload._serving.scheduler`). A
-            default here would be a second one, and a scheduler pricing against a
-            ranking the directory does not consult is a pull charged to a peer that
-            never serves it.
+            Required here, and deliberately without a default: this ranking keeps
+            state across the decisions it makes
+            (:class:`~kvcache_sim.control._source.SpreadReadsKeySelector`), so which
+            one a run uses is the run's to choose
+            (:func:`kvcache_sim.workload._serving.scheduler`).
     """
 
     def __init__(self, *, source_selector: KeySelector, balance_threshold: float = 1.5,
@@ -727,5 +750,6 @@ class CacheAwareScheduler(_Scheduler):
                 else _LocalOnly()
             ),
             rank=_by_ttft,
+            source_selector=source_selector,
             **knobs,
         )

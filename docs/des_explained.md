@@ -63,14 +63,14 @@ one directory, and the meta / metadata-only payload carriers — lives in
 
 | Type | What it is |
 |---|---|
-| `KeySelector.select(keys, requester)` | Which volume serves these keys for this requester, and **when** it is usable (ranked sources + an optional readiness gate). Naive — every holder, directory order — is the default, and is exactly what the real directory answers unaided. Consulted *inside* the real `locate_volumes`, so a scenario that just calls `client.get(K)` is routed without knowing a selector exists; an app that wants to *price* alternatives calls it itself. |
-| `View` | The read-only observation a selector is handed: `locate`, topology/locality, the virtual clock. Synchronous reads, no mutation — a directory read is not a coroutine, so a decision formed against it cannot be interleaved with another. |
-| `DataPlane` | One member — `after(requester, result)`: what a capability does once a transfer has landed, defaulting to real no-op behaviour. Moving the bytes is an ordinary client call, so no interface declares it. Named by requester, not work item, so a deployment can implement it — how a *run* is driven is `realsim.runner.ItemDispatch`. |
+| `KeySelector.select(keys, requester)` | Which volume serves these keys for this requester, and **when** it is usable — ranked sources, and it does not answer until they are usable. Naive — every holder, directory order — is the default, and is exactly what the real directory answers unaided. Reached as a service of its own: the data plane asks it and hands the answer to an ordinary `client.get` as a source preference (`prefer()`), so nothing is installed in the store and an app that wants to *price* alternatives asks the same object itself. |
+| `View` | The read-only observation a control plane senses through: `locate`, topology/locality, the virtual clock. Synchronous reads, no mutation — a directory read is not a coroutine, so a decision formed against it cannot be interleaved with another. |
+| `DataPlane` | One member — `attach(deployment)`, and no verbs: moving bytes is an ordinary client call and what a capability does around it is its own to name. Which member the runner drives is `realsim.runner.ItemDispatch`'s to say. |
 | `Runner` | Releases work items on the virtual clock in `(release_time, id)` order, installs the mesh once, gathers. The gather is the whole wait — there is no drain phase behind it. |
 
 Both sims `import realsim` and add only their own decision + execution code. So
 does [`putget_sim`](../putget_sim/), which is not a capability at all: it is the
-same put/get workload with **no** `KeySelector` and **no** `DataPlane` installed, and
+same put/get workload with **no** `KeySelector` and **no** `DataPlane`, and
 therefore the unrouted *m×* baseline dedup measures against. Dedup imports its
 `PutGetBurst` unchanged, which is what makes the two runs comparable.
 
@@ -94,44 +94,47 @@ stdlib-only — the same dependency `realsim` has.
 overlapping shards) that lives on a trainer, can we move each unique byte across
 the slow cross-node fabric **exactly once** (1×) instead of *m* times?
 
-`dedup_sim` implements this as a real `realsim.selector.KeySelector`
-(`dedup_sim.control.routing.DedupKeySelector`), consulted inside the **real**
-`Controller`'s `locate_volumes`, over the real `LocalClient` and in-memory
-transport, on real types throughout.
+`dedup_sim` implements this as one `proposed.plane.ControlPlane`
+(`dedup_sim.control.routing.Dedup`), asked by the data plane before each read and
+told when its put lands, over the real `LocalClient`, the **real** `Controller`
+directory and the real in-memory transport, on real types throughout.
 
 ### Components it adds (everything else comes from `realsim` / `sim_common`)
 
 | Component | File | Role |
 |---|---|---|
-| `DedupKeySelector` | `control/routing.py` | A real `KeySelector`. Assigns each requester, as it asks, a source under a fan-out cap, and returns it with a **readiness gate** when that source has not registered yet. Holds no client, no volume, no mesh — and no burst loop. |
-| `ReadThroughPlane` | `data/read_through.py` | Dedup's whole executing half, one member: it awaits the reader's own `get`, then `put`s the key into that reader's co-located volume, which through the real `client.put` path also calls the real `notify_put_batch`. That registration is what opens the next reader's gate. |
-| dedup scenario | `workload/scenarios.py` | Runs `putget_sim`'s ordinary put/get fixture twice — unrouted (the *m×* baseline) and with the selector + plane installed (1×) — so the comparison is byte-for-byte the same topology, payload and cost model. |
+| `Dedup` | `control/routing.py` | The capability's whole control plane, two members: `sources(keys, me)` assigns each requester a source under a fan-out cap and does not answer until that source is usable, and `published(me, keys)` is how it hears that a put landed. Holds no client, no volume, no mesh — and no burst loop. |
+| `ReadThroughPlane` | `data/read_through.py` | Dedup's whole executing half, one member: ask routing who serves this key, `get` from what it named, `put` the key into that reader's co-located volume (which through the real `client.put` path also calls the real `notify_put_batch`), then report that put back to routing. The report is what opens the next reader's gate. |
+| dedup scenario | `workload/scenarios.py` | Runs `putget_sim`'s ordinary put/get fixture twice — unrouted (the *m×* baseline) and with the two planes added (1×) — so the comparison is byte-for-byte the same topology, payload and cost model. |
 | demo entrypoint | `__main__.py` | `python -m dedup_sim` — fabric summary + ASCII diagram (INFO), full per-event trace (DEBUG, `-v`). |
 
 ### How it reaches 1× on the real directory
 
-With no selector installed, every reader `locate_volumes` the origin before anyone
+With no control plane, every reader `locate_volumes` the origin before anyone
 finishes, so each pulls from the origin — *m×* fabric.
 
-`DedupKeySelector` answers that same `locate_volumes` differently:
+`Dedup` is asked first, and the read prefers what it named:
 
-1. Readers reach the controller in order. The **first** is routed to a volume that
-   already holds the key (the single fabric hop), chosen by locality.
+1. Readers ask it in order. The **first** is routed to a volume that already holds
+   the key (the single fabric hop), chosen by locality.
 2. Every later one is routed to a **peer**: a reader that is *about to* hold the
    key, handed out FIFO under a fan-out cap (`fanout_cap=1` → a chain, `≥2` → a
    shallow tree). No later reader is ever routed to an origin.
-3. That peer has not registered yet, so the selection carries a **readiness gate**
-   and the controller *withholds its answer* until the peer's read-through put
-   lands. No client change is needed, and no client is lied to.
-4. The read-through is the data plane's one job: a zero-fabric local `put` that,
+3. That peer has not registered yet, so the decision carries a **readiness gate**
+   and `select` *does not answer* until the peer's read-through put lands. The read
+   itself is then an unmodified `client.get` with a preference passed to it: no
+   client change is needed, nothing is installed in the store, and no client is
+   lied to.
+4. The read-through is the data plane's other job: a zero-fabric local `put` that,
    via the real `client.put` path, both stores the payload there and calls the
-   real `notify_put_batch` — which opens the next reader's gate.
+   real `notify_put_batch` — and then one call telling routing it landed, which
+   opens the next reader's gate.
 
 Because exactly one reader ever pulls from an origin, the only origin-sourced
 transfer is that first hop: `origin_bytes == 1×` the payload, for **any** fan-out
 cap. The unrouted baseline stays *m×*. There is no burst loop anywhere: the
 scenario is a `client.put` and a gather of `client.get`, and the chain is an
-emergent consequence of step 4 changing the directory step 1 reads.
+emergent consequence of step 4 changing the directory step 1 reads, and saying so.
 
 **The payoff metric is fabric bytes** — dedup moves each unique region 1× vs
 naive's *m×*; wallclock depends on the fan-out topology (a `cap=1` chain has more
@@ -228,8 +231,8 @@ which folder something belongs in is **does it advance the clock or move bytes?*
 | Directory | **Real** `Controller` (`locate_volumes` → `StorageInfo`/`TensorSlice`) | **Real** `Controller` (`keys_to_storage_volumes`, key = prefix-hash chain) |
 | Client / transport | Real `LocalClient` + real in-memory transport (via `realsim`) | Same |
 | Unit of data | 1-D tensor slices, allocation-free carriers | fixed-size **KV blocks** (prefix-hash keys), one zero-storage meta tensor each |
-| Decision-maker | `DedupKeySelector` (a real `KeySelector`, consulted in the controller) | the scheduler's `decide(request, me)` (a plain `ControlPlane`, asked as its own service), which delegates only "which peer" to a source `KeySelector` (`LongestPrefixKeySelector` by default) |
-| Concurrency primitive | The controller withholds a routed answer until the planned peer registers, so an about-to-be source becomes a real one | Servers reserved in the scheduler's predicted `busy_until`; SLO gate; no in-flight-as-source |
+| Decision-maker | `Dedup` — one `ControlPlane`, asked `sources(keys, me)` | one `ControlPlane` too, asked `decide(request, me)` for compute placement and `sources(keys, me)` for the fetch that plan implies; it ranks with a `KeySelector` utility (`LongestPrefixKeySelector` by default) |
+| Concurrency primitive | The plane withholds its answer until the planned peer registers, so an about-to-be source becomes a real one | Servers reserved in the scheduler's predicted `busy_until`; SLO gate; no in-flight-as-source |
 | Cache | Read-through peer replication | Read-through + bounded **LRU eviction** |
 | Decode model | n/a (weight transfer only) | Batched, stepped decode (`DecodeEngine`): per-step **TBT** rises with batch size; VRAM cap; coupled vs disaggregated |
 | Randomness | None (fixed scenarios) | One seeded Zipf + Poisson workload |

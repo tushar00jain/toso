@@ -6,9 +6,12 @@ which instance prefills, whether to pull at all or recompute locally, the TTFT/T
 gates, where decode lands -- is compute placement, which the store knows nothing
 about, and stays in :mod:`kvcache_sim.control.scheduler`.
 
-Not installed in the controller, unlike ``dedup_sim``'s selector: the scheduler
-wants to *price* a source against recomputing the prefix rather than be handed
-one, so it calls :meth:`select` itself and then decides.
+Read twice by the one plane that holds it, which is why it is a ranking and not a
+member of that plane's surface: the scheduler prices a source against recomputing the
+prefix rather than being handed one, so it calls :meth:`select` itself while deciding
+-- and the same object sits behind the answer it later gives a fetch
+(:meth:`~kvcache_sim.control.scheduler._Scheduler.sources`), so the peer priced is the
+peer read from.
 
 :class:`LongestPrefixKeySelector` ranks on reuse value alone and is the default.
 :class:`SpreadReadsKeySelector` is that same ranking with a bounded discount for how
@@ -61,7 +64,7 @@ class LongestPrefixKeySelector(KeySelector[None]):
 
         The scheduler attaches its :class:`~kvcache_sim.control._view.KVView`, whose
         snapshot a routing decision pins, so the whole decision reads one directory.
-        A run that installs this selector on its own can only attach the plain
+        A run that stands this selector up on its own can only attach the plain
         :class:`~proposed.view.View`, since a prefix run is a KV-cache notion the
         store has no reason to know. Use the derived read when offered, derive it
         otherwise, off one shared definition.

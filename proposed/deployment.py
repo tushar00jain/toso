@@ -17,10 +17,7 @@ is not payload, so it is declared: :class:`Controller` says which methods the
 directory service offers and with what arguments. What a caller *holds* is a
 reference to that service rather than the service itself -- a different shape,
 declared by Monarch, and left untyped here for the reason given on
-:attr:`Deployment.controller_handle`. Leaving that as ``Any``
-made the directory look like it had no interface at all, which in turn made
-:class:`~proposed.selector.KeySelector` look like the primary one instead of a hook
-consulted inside this surface.
+:attr:`Deployment.controller_handle`.
 
 The endpoint indirection a caller goes through (``locate_volumes.call_one(...)``
 rather than ``locate_volumes(...)``) is Monarch's own, and Monarch declares it --
@@ -30,10 +27,10 @@ surface declares the methods, which is where the signatures are.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
-    "ClusterModel", "Controller", "Deployment", "Key", "Registered",
+    "ClusterModel", "Controller", "Deployment", "Key",
     "StorageFull", "StorageVolume", "VolumeId",
 ]
 
@@ -44,10 +41,6 @@ Key = str
 #: What the store answers *with*: a storage volume's directory identity, and what
 #: every :class:`~proposed.selector.Selection` ranks, whatever its subject.
 VolumeId = str
-
-#: A directory subscriber: ``(volume_id, keys)``, called once per registration.
-#: Synchronous -- see :meth:`Controller.subscribe`.
-Registered = Callable[[VolumeId, Sequence[Key]], None]
 
 
 class StorageFull(Exception):
@@ -85,17 +78,20 @@ class Controller(Protocol):
     the same convention torchstore already uses.
 
     The difference between this protocol and torchstore's class *is* the ask, and
-    it is three things. One cannot be declared: ``locate_volumes`` gains a hook that
-    consults a :class:`~proposed.selector.KeySelector`, which changes no signature, so it
-    is stated here instead. The others are :meth:`locate_raw`, the same directory
-    read with that hook skipped, and :meth:`subscribe`, which is how anything hears
-    that the directory changed. Every other member already exists upstream, spelled
-    the same way.
+    it is two things. One is :meth:`locate_raw`, a directory read with nothing
+    applied to it, which is what a control plane senses through. The other cannot
+    be declared as a member: ``locate_volumes`` gains an optional **source
+    preference** -- a list of volume ids its caller hands it -- and applies it to
+    the answer (:func:`proposed.selector.prefer`) before returning. The store
+    consults nobody to do that; it reorders a value it was given, which is why
+    nothing here declares a plane. Every other member already exists upstream,
+    spelled the same way.
 
-    A caller does not hold one of these -- it holds a :class:`ControllerHandle`.
-    torchstore's ``Controller`` implements this; under simulation the two bodies
-    Monarch will not let us invoke off-actor are mirrored privately inside
-    :class:`realsim.seams.controller_handle.LocalControllerHandle`.
+    A caller does not hold one of these -- it holds a reference
+    (:attr:`Deployment.controller_handle`). torchstore's ``Controller`` implements
+    this; under simulation the endpoint bodies Monarch will not let us invoke
+    off-actor are mirrored inside
+    :class:`realsim.seams.controller_service.ControllerService`.
     """
 
     def locate_raw(
@@ -104,12 +100,12 @@ class Controller(Protocol):
         missing_ok: bool = False,
         require_fully_committed: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
-        """``{key -> {volume_id -> StorageInfo}}``, *unrouted*: no selector consulted.
+        """``{key -> {volume_id -> StorageInfo}}``, with nothing applied to it.
 
-        A controller implementing this proposal needs both reads. This is the one it
-        hands its own selector, through a :class:`~proposed.view.View`: a selector
-        sensing the directory must see it as it *is*, and reading it back through
-        ``locate_volumes`` would re-enter the hook the selector is being called from.
+        A controller implementing this proposal needs both reads. This is the one a
+        control plane senses through, via a :class:`~proposed.view.View`: what it
+        sees has to be the directory as it *is*, not an answer already reordered
+        for somebody.
 
         **Not a coroutine, and that is load-bearing.** A directory read cannot
         suspend, so everything a control plane does between reading the directory
@@ -118,9 +114,9 @@ class Controller(Protocol):
         read-modify-write with no lock (``dedup_sim.control.routing``) and lets a
         set of priced candidates be comparable
         (``kvcache_sim.control.scheduler``). It is a plain local method for the same
-        reason it can be one: the only caller is the controller's own selector,
-        sensing through a view built over the directory in this process, so nothing
-        crosses a boundary and there is nothing to wait for.
+        reason it can be one: the caller is a control plane sensing through a view
+        built over the directory in its own process, so nothing crosses a boundary
+        and there is nothing to wait for.
         """
 
     async def locate_volumes(
@@ -129,28 +125,17 @@ class Controller(Protocol):
         missing_ok: bool = False,
         require_fully_committed: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
-        """``{key -> {volume_id -> StorageInfo}}``, routed."""
+        """``{key -> {volume_id -> StorageInfo}}``, the caller's preference applied.
 
-    def subscribe(self, on_register: Registered) -> None:
-        """Call ``on_register(volume_id, keys)`` after every registration.
+        That preference is the ask (see the class docstring): upstream, one optional
+        parameter on the read path, applied to the located map before the client
+        picks a volume per key. The simulator carries it in a coroutine binding
+        instead, because the real client has no such parameter yet
+        (:func:`realsim.seams.factory.bind_prefer`).
 
-        How anything hears that the directory changed, and the whole of it: the
-        subscriber is a plain callable, so a directory carries no notion of what a
-        control plane is. A capability that needs one registers in its own
-        :meth:`~proposed.selector.Selector.attach`, through the
-        :class:`~proposed.view.View` it is already handed.
-
-        **Not a coroutine, for :meth:`locate_raw`'s reason.** A subscriber runs
-        inside ``notify_put_batch``'s body, so one that could suspend would let a
-        second registration interleave with the first, and a waiter released by the
-        first would resume against a directory the second had already changed. In
-        process, synchronous, and cheap enough to run on every put.
-
-        **Registrations only.** Deregistration emits nothing, because this delivers
-        a *wakeup* and nothing waits for a key to disappear. A subscriber that needs
-        to know who holds a key right now reads the directory as it forms its
-        answer, the only reading that survives an eviction. A caller that genuinely
-        needs to watch deletions has nowhere to say so yet.
+        A store that is handed no preference answers exactly as it does today, and
+        one that is handed a preference still consults nothing: whoever asked a
+        control plane did so itself, before calling this.
         """
 
     async def notify_put_batch(
@@ -277,12 +262,23 @@ class Deployment(Protocol):
     plane run under the simulator and over a real deployment.
     """
 
-    def client_for(self, node_id: str) -> Any:
+    def client_for(
+        self, node_id: str, *, prefer: Optional[Sequence[VolumeId]] = None
+    ) -> Any:
         """The torchstore client for ``node_id``, ready to be driven.
 
-        A deployment that runs one node per process ignores the argument and
-        returns its own client. A harness running many nodes in one process
-        resolves the node and attributes the work to it.
+        A deployment that runs one node per process ignores the id and returns its
+        own client. A harness running many nodes in one process resolves the node
+        and attributes the work to it.
+
+        ``prefer`` is the source preference the reads made through this client apply
+        (:func:`proposed.selector.prefer`) -- volume ids, best first, typically what
+        a data plane just got back from :attr:`control_plane_handle`. ``None`` is no
+        preference: the read is exactly the ordinary one. Upstream this belongs on
+        ``get`` / ``get_batch`` rather than here; it is a keyword on the member that
+        already binds the caller's identity because the real client has no such
+        parameter yet, and threading it through every call site of a client this
+        object vends would be the same edit twice.
         """
         ...
 
@@ -319,18 +315,26 @@ class Deployment(Protocol):
 
     @property
     def control_plane_handle(self) -> Any:
-        """A reference to the control plane this application's hosts ask.
+        """A reference to this capability's control plane: everything it may be asked.
 
-        Untyped for :attr:`controller_handle`'s reason -- a reference, whose shape
-        Monarch declares -- and one endpoint per member the plane declares, since
-        what a capability answers is the capability's to name
-        (:class:`~proposed.plane.ControlPlane`).
+        One plane, and one endpoint per member *it* declares
+        (:class:`~proposed.plane.ControlPlane`), because what a capability answers is
+        the capability's to name. Which volumes should serve this read, where this
+        request should run, and whatever a capability written next needs are members
+        on the same reference:
 
-        Here rather than handed to a data plane separately: a host reaching its
-        control plane is reaching *this deployment's* control plane, and a plane
-        that had to be given the two ports one at a time could not be constructed
-        before whoever knew about both. ``None`` when the deployment stands up no
-        such service, which is a capability deciding only inside the directory.
+            selection = await control_plane_handle.sources.call_one(keys, me)
+            await client_for(me, prefer=selection.sources).get_batch(keys)
+
+        Including whatever member it wants a *write* reported over -- a plane that
+        withholds an answer until a peer holds a key has to hear that the put landed,
+        and the caller that made the put is what tells it.
+
+        Untyped for :attr:`controller_handle`'s reason: a reference, whose shape
+        Monarch declares. Here rather than handed to a data plane separately -- a
+        host reaching its control plane is reaching *this deployment's* control plane.
+        ``None`` when the deployment stands up no such service, which is a run that
+        decides nothing.
         """
         ...
 

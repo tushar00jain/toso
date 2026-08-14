@@ -1,8 +1,9 @@
-"""1x-fabric dedup routing, as a :class:`proposed.selector.KeySelector`.
+"""1x-fabric dedup routing: :class:`Dedup`, the capability's whole control plane.
 
-The question a synchronized read burst asks the store is exactly the one the
-selector interface answers: *given this key and this requester, which volume serves
-it, and when is that volume usable?* Answering it is the whole capability.
+Two members, and between them everything a reader needs: *which volumes serve this
+key for me, and when are they usable* (:meth:`Dedup.sources`), and *my read-through
+has landed* (:meth:`Dedup.published`). A reader asks, reads from what it was told,
+puts, and says so. Nothing else is decided here and nothing else is told.
 
 How 1x falls out
 ----------------
@@ -10,27 +11,26 @@ With no routing, ``m`` readers of one key all ``locate_volumes`` before anyone
 finishes, so all ``m`` are told "the origin" and each pulls from it -- ``m x``
 fabric.
 
-``DedupKeySelector`` answers differently. Readers arrive at the controller in order;
-the first is routed to the volume that already holds the key (the single fabric
-hop), and every later one is routed to a **peer** -- a reader that is *about to*
-hold it. Because that peer has not registered yet, the selection carries a
-readiness gate, and the controller withholds its answer until the peer's
-read-through put lands -- which this selector hears because it subscribed to the
-directory (:meth:`DedupKeySelector.attach`). Peers are handed out FIFO under a fan-out
-cap, so cap 1 builds a chain and cap >= 2 a shallow tree.
+:class:`Dedup` answers differently. Readers ask it in order; the first is routed to
+the volume that already holds the key (the single fabric hop), and every later one is
+routed to a **peer** -- a reader that is *about to* hold it. Because that peer has not
+registered yet, the decision carries a readiness gate, and :meth:`Dedup.sources` does
+not answer until the peer's read-through put lands -- which this plane hears because
+the reader that made it says so (:meth:`Dedup.published`). Peers are handed out FIFO
+under a fan-out cap, so cap 1 builds a chain and cap >= 2 a shallow tree.
 
 Whether a peer holds the key is asked of the directory every time an answer is
-formed (:meth:`DedupKeySelector._registered`), never remembered: volumes evict, so a
-peer that registered the key and later dropped it for a newer version is a peer
-the next requester has to wait for again.
+formed (:meth:`Dedup._registered`), never remembered: volumes evict, so a peer that
+registered the key and later dropped it for a newer version is a peer the next
+requester has to wait for again.
 
 Which raises the question of when waiting is safe at all, because a gate that
-nothing will ever open hangs the requester behind it. The answer is the debt the
-selector is already tracking: a requester it routes is going to read the key
-through, so from the moment it asks it *owes* that registration, and waiting for
-it is bounded. A source that owes nothing has to hold the key already, and one
-that holds nothing and owes nothing is no longer a source at all -- it is retired
-and the directory answers for that requester (:meth:`DedupKeySelector._retire`).
+nothing will ever open hangs the requester behind it. The answer is the debt this
+plane is already tracking: a requester it routes is going to read the key through, so
+from the moment it asks it *owes* that registration, and waiting for it is bounded. A
+source that owes nothing has to hold the key already, and one that holds nothing and
+owes nothing is no longer a source at all -- it is retired and the directory answers
+for that requester (:meth:`Dedup._retire`).
 
 Exactly one reader is ever routed to a pre-existing holder, so exactly one
 transfer's source is an origin: ``origin_bytes`` is the 1x union whatever the cap.
@@ -47,24 +47,26 @@ schedule this module runs.
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any, Deque, Dict, Hashable, List, Optional, Sequence, Set, Tuple,
+)
 
-from proposed import DecisionLog, Key, KeySelector, Selection
+from proposed import ControlPlane, DecisionLog, Key, Selection, View
 
 from ._readiness import Readiness
 
-__all__ = ["DedupKeySelector"]
+__all__ = ["Dedup"]
 
 
-class DedupKeySelector(KeySelector[None]):
-    """Route each requester to a peer, not the origin (a real ``KeySelector``).
+class Dedup(ControlPlane):
+    """Route each requester to a peer, not the origin.
 
     Args:
         fanout_cap: how many peers one source may be planned to feed (1 = a
             chain, >= 2 = a shallow tree). The fabric stays 1x for any cap; the
             cap only trades wallclock against tree depth.
         trace: optional :class:`~proposed.selector.DecisionLog` to record each
-            routing decision into. Changes no metric; the selector behaves
+            routing decision into. Changes no metric; this plane behaves
             identically with none attached.
     """
 
@@ -90,7 +92,7 @@ class DedupKeySelector(KeySelector[None]):
         # The (volume, key) publications planned and not yet seen to land: a routed
         # requester reads the key through into its own volume, so from the moment it
         # is routed it OWES that registration. The only thing that makes waiting for
-        # a source safe -- see :meth:`select`.
+        # a source safe -- see :meth:`sources`.
         self._promised: Set[Tuple[str, str]] = set()
         # Waiting for the (volume, key) pairs the real directory has not registered
         # yet. The concurrency lives there, as does the rule that the directory --
@@ -98,23 +100,39 @@ class DedupKeySelector(KeySelector[None]):
         # that evicts makes one false again.
         self._ready = Readiness()
 
-    def attach(self, view, transfer_cost) -> None:
-        """Sense through the view, and ask the directory to say when it changes.
+    #: What this plane senses through: ``None`` until :meth:`attach`.
+    view: Optional[View] = None
 
-        The subscription is made here rather than by whoever assembles the run: a
-        gate is this selector's own business, and the directory it subscribes to is
-        the one behind the view it was just handed, so the two cannot disagree.
+    def attach(self, view: Any, transfer_cost: Any) -> None:
+        """Keep the view this plane reads the directory through.
+
+        It ranks nothing but holders, so the transfer-cost half of the port goes
+        unused: which peer is nearest is a locality question the view answers.
         """
-        super().attach(view, transfer_cost)
-        view.directory.subscribe(self._registered_now)
+        self.view = view
 
-    # -- decide -------------------------------------------------------------- #
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
+    # -- what a reader asks -------------------------------------------------- #
+    async def sources(self, keys: Sequence[Key], requester: str) -> Selection[None]:
+        """Which volumes serve ``keys`` for ``requester``, once they are usable.
+
+        Two things, because a caller reaches this plane as a service: the decision
+        (:meth:`_decide`) and the wait. A decision that routes a requester to a peer
+        still fetching carries a gate, and a gate is a closure -- it cannot travel to
+        whoever asked, so it is spent here
+        (:meth:`~proposed.selector.Selection.settled`) and what goes back is the
+        ranking. Which is also what a caller wants: it is about to read from these
+        sources, so an answer released before they hold the key would send it to a
+        volume with nothing to serve.
+        """
+        selection = await self._decide(list(keys), requester)
+        return await selection.settled()
+
+    async def _decide(self, keys: Sequence[Key], requester: str) -> Selection[None]:
         """Route ``requester`` to a peer (or, if it is first, to a holder)."""
         # Asking is the promise: this requester is about to fetch these keys and the
-        # read-through plane publishes what it fetched, so it now owes the directory
-        # that registration. Recorded before any source is handed out, which is what
-        # makes the invariant below hold -- a peer is only ever offered as a source
+        # read-through plane publishes what it fetched and reports it here, so it now
+        # owes that registration. Recorded before any source is handed out, which is
+        # what makes the invariant below hold -- a peer is only ever offered as a source
         # after it has asked, hence after it has promised.
         self._promised.update((requester, key) for key in keys)
         source = self._route.get(requester)
@@ -222,17 +240,21 @@ class DedupKeySelector(KeySelector[None]):
             if volume in self.view.holders(located, key)
         ]
 
-    def _registered_now(self, volume_id: str, keys: Sequence[Key]) -> None:
-        """The real directory just registered ``keys`` on ``volume_id``.
+    async def published(self, requester: str, keys: Sequence[Key]) -> None:
+        """``requester``'s read-through has landed: ``keys`` are on its volume now.
 
-        Releases any requester whose answer was withheld pending that volume, and
-        settles the debt: the publication happened, so from here on the directory
-        is what says whether that volume still holds the key.
+        The other half of this plane's surface, and the reason it can gate at all:
+        the data plane reports its own put (:mod:`dedup_sim.data.read_through`), so
+        this hears a registration without the directory having to know that anything
+        is listening. Releases whoever was parked on that volume, and settles the
+        debt -- the publication happened, so from here on the directory is what says
+        whether the volume still holds the key.
 
-        Subscribed in :meth:`attach`, and synchronous because the directory calls
-        it inside ``notify_put_batch``
-        (:meth:`proposed.deployment.Controller.subscribe`).
+        Reported *after* the put, so the directory already lists ``requester`` when a
+        waiter released here re-reads it. Awaited for the ordering rather than an
+        answer: the reporter's next ask must be decided against a plane that has
+        folded this one in.
         """
         for key in keys:
-            self._promised.discard((volume_id, key))
-            self._ready.record((volume_id, key))
+            self._promised.discard((requester, key))
+            self._ready.record((requester, key))

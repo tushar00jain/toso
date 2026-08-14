@@ -37,12 +37,13 @@ client/controller/transport), so they depend on the from-source
 - [`realsim/`](realsim/) — the **real-code** cooperative DES foundation: it drives
   the **real** TorchStore client planning core, controller directory, and
   in-memory transport/store off-actor on a deterministic virtual clock. It models
-  only what a capability plugs in, through four shared types: `KeySelector` (which
-  volume serves these keys for this requester, and when — consulted *inside* the
-  real `locate_volumes`, naive by default), `View` (the read-only observation a
-  selector is handed), `DataPlane` (what a capability does after a transfer lands)
-  and `Runner` + `ItemDispatch` (release work on the clock, install the mesh once,
-  gather). `Mesh` is the
+  only what a capability plugs in, through four shared types: `ControlPlane` (one per
+  capability, asked whatever it declares — which volumes serve this read, where this
+  request runs — and fronted as a service), `KeySelector` (the ranking such a plane
+  answers a source question with: which volume serves these keys, naive by default),
+  `View` (the read-only observation a control plane senses through), `DataPlane` (a
+  capability's executing half) and `Runner` + `ItemDispatch` (release work on the
+  clock, install the mesh once, gather). `Mesh` is the
   multi-client wiring the capability sims build on — per-node volumes + real
   clients, one directory, one resource registry, and the single shared transport
   factory — so a capability package holds only capability code. It runs
@@ -52,22 +53,22 @@ client/controller/transport), so they depend on the from-source
   *target-machine* `MachineProfile`, never measured on the box running the sim.
   It is the foundation only: it has no scenario and no demo of its own.
 - [`putget_sim/`](putget_sim/) — the unrouted put/get burst: seed one key, then
-  `m` clients get it, with **no selector and no data plane**, so every reader pulls
+  `m` clients get it, with **no control plane and no data plane**, so every reader pulls
   the origin and fabric is *m×* the payload. The smallest thing that exercises
   the whole real stack while deciding nothing, and the baseline `dedup_sim`
   measures against.
 - [`dedup_sim/`](dedup_sim/) — the dedup capability **on the real directory**: a
-  real `KeySelector` that routes each reader to a peer and withholds the controller's
-  answer until that peer's read-through put registers, plus the one-method data
-  plane that does the put. The scenario is `putget_sim`'s ordinary put/get
-  fixture, unchanged — installing the selector is the whole difference between *m×*
-  and 1× fabric.
+  control plane that routes each reader to a peer and does not answer until that
+  peer's read-through put registers, plus the one-method data plane that asks it,
+  reads from what it named, puts, and reports the put. The scenario is `putget_sim`'s
+  ordinary put/get fixture, unchanged — adding the two planes is the whole difference
+  between *m×* and 1× fabric.
 - [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
-  real directory**: the scheduler keeps its compute decisions (prefill placement,
-  pull-vs-recompute, SLO gates, decode placement) and delegates only "which peer
-  serves this prefix gap" to the same `KeySelector.select`; the serving loop and the
-  batched decode engine drive real fetches via `realsim`'s `Mesh`/client/engine/
-  cost model.
+  real directory**: one control plane holding the compute decisions (prefill
+  placement, pull-vs-recompute, SLO gates, decode placement) *and* the answer to
+  "which peer serves this prefix gap", which it ranks with the same `KeySelector`
+  dedup's plane uses; the serving loop and the batched decode engine drive real
+  fetches via `realsim`'s `Mesh`/client/engine/cost model.
 
   All three sim packages are split the same way, **by plane** — `control/`
   decides, `data/` executes, plus `workload/` (what is simulated) and `report/`

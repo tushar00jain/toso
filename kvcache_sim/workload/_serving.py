@@ -5,8 +5,8 @@ Two separate things, deliberately:
 * :class:`KVWorkload` is *the work* -- a stream of conversations, one
   :class:`~realsim.runner.WorkItem` per conversation at its first turn's arrival
   time. It builds no store, no scheduler and no plane;
-* :func:`scheduler` and :func:`serving_plane` are the *capability wiring*, one
-  per plane: the scheduler over the view, and the store plus one
+* :func:`scheduler` and :func:`serving_plane` are the *capability wiring*, one per
+  plane: the control plane over the view, and the store plus one
   :class:`~kvcache_sim.data.serving.ServingHost` per instance over it. Both are
   factories because they reach for the view, the mesh and the ledger, none of
   which exists before the stack does.
@@ -51,7 +51,7 @@ the run used to need -- when decode outlived the request's coroutine, something
 had to keep the loop alive for the tail, and nothing was left holding the request
 to measure it.
 
-They are two functions because they are two services. The plane factory does not
+They are two functions because they are the two halves. The plane factory does not
 build the scheduler; it takes ``sim.control_plane_handle`` and ``sim.cluster_handle``,
 the handles :meth:`realsim.run.Run.execute` put in front of whatever
 :func:`scheduler` returned and of the model it decides against. A scenario names
@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
@@ -78,7 +78,7 @@ from ..control._cluster import KVClusterModel
 from ..control._source import LongestPrefixKeySelector
 from ..control.request import Request
 from ..control.scheduler import (
-    CacheAwareScheduler, FetchRouting, LoadBalanceScheduler, predicts_decode,
+    CacheAwareScheduler, LoadBalanceScheduler, predicts_decode,
 )
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from ..data._decode import DecodeEngine
@@ -156,29 +156,18 @@ def scheduler(
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
     source_selector: Optional[KeySelector[None]] = None,
-) -> Tuple[FetchRouting, ControlPlane]:
-    """This run's **two control planes**, as objects a scenario can just declare.
+) -> ControlPlane:
+    """This run's **control plane**, as an object a scenario can just declare.
 
     ``kind`` is ``"cache_aware"`` (the scheduler under test) or ``"load_balance"``
     (the baseline). Knobs only: the stack's ports arrive later through
-    :meth:`~proposed.plane.ControlPlane.attach`, which is what lets these be values
-    rather than factories the harness must call at the right moment.
+    :meth:`~proposed.plane.ControlPlane.attach`, which is what lets this be a value
+    rather than a factory the harness must call at the right moment.
 
-    Two planes because kvcache decides in two places, and each goes to the
-    :class:`~realsim.run.Run` argument that says which: ``control`` installs the
-    :class:`FetchRouting` chain in the directory (it answers the store's routing
-    question), ``placement`` fronts the scheduler with a
-    :class:`~realsim.seams.control_plane_handle.LocalControlPlaneHandle` (its hosts ask it
-    where to run). Returned in that order. They share the cluster model, which is
-    why it is built here: the scheduler prices a pull and records it there, and the
-    chain answers the fetch with it.
-
-    Both bring up the one ``source_selector``, and the scheduler's attach is the one
-    that must come last -- it leaves that ranking sensing through the pinned
-    :class:`~kvcache_sim.control._view.KVView` a routing decision reads
-    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`). ``Run`` attaches
-    ``control`` before ``placement``, so passing them as those two arguments is what
-    orders them.
+    One plane, asked where a request should run and, later, which peer serves the
+    fetch that plan implies. Its cluster model is built here rather than in
+    ``attach`` for one reason: a scenario may want to hand the same model to a test,
+    and the plane accepts one so that stays possible.
 
     ``source_selector`` is the one knob that is an object rather than a value: which
     peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and it keeps
@@ -205,17 +194,16 @@ def scheduler(
         decode_pool=decode_pool,
         early_rejection=early_rejection,
         cluster=cluster,
+        source_selector=source,
     )
     if kind == "cache_aware":
-        # The ranking goes to the scheduler only because its reuse placement is
-        # what names a peer; the baseline never pulls and never asks one.
-        placement = CacheAwareScheduler(
-            balance_threshold=balance_threshold, replicate=replicate,
-            source_selector=source, **knobs
+        # The same ranking twice over: the reuse axis names a peer while pricing, and
+        # a fetch is answered with it. The baseline never pulls, so it prices against
+        # nobody -- and still answers a fetch with the ranking.
+        return CacheAwareScheduler(
+            balance_threshold=balance_threshold, replicate=replicate, **knobs
         )
-    else:
-        placement = LoadBalanceScheduler(**knobs)
-    return FetchRouting(cluster, source), placement
+    return LoadBalanceScheduler(**knobs)
 
 
 class _ServingEndpoints:
@@ -460,7 +448,7 @@ def serving_plane(
     def build(sim: Simulation) -> ItemDispatch:
         # The simulation *is* the deployment (:class:`~proposed.deployment.Deployment`):
         # it vends the client for an instance, holds the directory, and carries the
-        # two control services a host reaches. So each host is handed it and takes
+        # control services a host reaches. So each host is handed it and takes
         # what it needs (:meth:`~kvcache_sim.data.serving.ServingHost.attach`) --
         # nothing here plumbs a port.
         hop = ServiceHop(config.current().client_rtt)

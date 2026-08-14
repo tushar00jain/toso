@@ -5,19 +5,19 @@
 :class:`~realsim.runner.Runner` / :class:`~realsim.runner.ItemDispatch` (drive a run) are the generic half of both capabilities. These tests
 pin the contract each one owes its callers:
 
-1. the view reads the *real* directory and the run's virtual clock, and reading
-   it never re-enters the controller's routing hook;
-2. the naive selector is the directory's own answer -- installing it changes
-   nothing, byte for byte, which is what lets a capability selector be swapped in
-   as the only difference between two runs;
-3. a selection narrows a directory answer to its ranked sources, and withholds
-   the answer until its readiness gate opens -- and the two combinators built on
-   it tell an *abstention* from the *naive answer*, carry a wrapped selector's
-   gate through, and wake every selector they hold, whichever subtype (``KeySelector``
-   over keys, ``AnySelector`` over an application payload) that selector is.
-   ``FirstMatch`` picks between alternatives; ``Refine`` funnels one ranking
-   through the tests behind it, and is barred from the controller for the same
-   reason;
+1. the view reads the *real* directory and the run's virtual clock, and what it
+   reports is the directory itself -- never an answer already put in some caller's
+   preferred order;
+2. the naive selector is the directory's own answer -- preferring what it names
+   changes nothing, byte for byte, which is what lets a capability selector be
+   swapped in as the only difference between two runs;
+3. a preference reorders a directory answer to its ranked sources, a selection
+   withholds itself until its readiness gate opens and crosses a service boundary
+   without it -- and the two combinators built on it tell an *abstention* from the
+   *naive answer*, carry a wrapped selector's gate through, and wake every selector
+   they hold, whichever subtype (``KeySelector`` over keys, ``AnySelector`` over an
+   application payload) that selector is. ``FirstMatch`` picks between alternatives;
+   ``Refine`` funnels one ranking through the tests behind it;
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -44,7 +44,7 @@ from proposed import AnySelector, ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
-    AbstainOnSelf, FirstMatch, KeySelectorChain, NaiveKeySelector, Refine,
+    AbstainOnSelf, FirstMatch, KeySelectorChain, NaiveKeySelector, prefer, Refine,
     Refinement, Selector, TakeHead,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
@@ -107,32 +107,26 @@ def test_view_reads_the_real_directory_topology_and_clock():
     assert view.endpoint("a").id == "vola"
 
 
-def test_view_locate_does_not_re_enter_the_routing_hook():
-    """A selector senses through the view, so the view must read the raw body."""
+def test_view_locate_reports_the_directory_and_not_a_preferred_answer():
+    """A sensor reads what is there, whatever the caller of a read prefers.
 
-    seen: list[str] = []
-
-    class _Counting(KeySelector):
-        async def select(self, keys, requester):
-            seen.append(requester)
-            # Reading the directory from inside select must not recurse.
-            self.view.locate(keys)
-            return Selection()
-
-    sim = Simulation(_topology(), control=_Counting())
+    A control plane ranks the directory; handed an answer already put in somebody's
+    order, it would be ranking its own output back.
+    """
+    sim = Simulation(_topology())
 
     async def scenario():
         with sim.mesh.installed():
-            sim.mesh.bind_source("a")
-            await sim.mesh.client("a").put("W", _payload())
-            sim.mesh.bind_source("c")
-            return await sim.mesh.client("c").get("W")
+            await sim.mesh.client_for("a").put("W", _payload())
+            await sim.mesh.client_for("b").put("W", _payload())
+            # A reader that was told to prefer b, and the same directory as sensed.
+            sim.mesh.client_for("c", prefer=["b"])
+            preferred = await sim.controller_handle.locate_volumes.call_one(["W"])
+            return preferred, sim.view.locate(["W"])
 
-    got = _drive(sim, scenario())
-    assert got is not None
-    # Exactly one consultation: c's get. The put never locates, and the view read
-    # inside select bypasses the hook.
-    assert seen == ["c"]
+    preferred, sensed = _drive(sim, scenario())
+    assert list(preferred["W"]) == ["b"]          # what the caller asked for
+    assert list(sensed["W"]) == ["a", "b"]        # what the directory holds
 
 
 # --------------------------------------------------------------------------
@@ -140,36 +134,59 @@ def test_view_locate_does_not_re_enter_the_routing_hook():
 # --------------------------------------------------------------------------
 
 
+class _Ranks(ControlPlane):
+    """A plane whose one member answers with what a selector ranked.
+
+    The shape every capability has: the plane is what a run holds and a caller asks,
+    the selector is a utility it consults, and the gate is spent before the answer
+    travels.
+    """
+
+    def __init__(self, selector: Selector) -> None:
+        self.selector = selector
+
+    def attach(self, view, transfer_cost) -> None:
+        self.selector.attach(view, transfer_cost)
+
+    async def sources(self, keys, requester) -> Selection:
+        return await (await self.selector.select(list(keys), requester)).settled()
+
+
 def _burst_trace(selector) -> str:
-    """Run the same two-reader burst with/without a selector; return its trace."""
+    """Run the same two-reader burst, asking ``selector`` or nobody; its trace."""
     trace = Trace()
-    sim = Simulation(_topology(), trace=trace, control=selector)
+    sim = Simulation(
+        _topology(), trace=trace,
+        control=_Ranks(selector) if selector is not None else None,
+    )
 
     async def scenario():
         with sim.mesh.installed():
-            sim.mesh.bind_source("a")
-            await sim.mesh.client("a").put("W", _payload())
-            sim.mesh.bind_source("b")
-            await sim.mesh.client("b").get("W")
-            sim.mesh.bind_source("c")
-            await sim.mesh.client("c").get("W")
+            await sim.mesh.client_for("a").put("W", _payload())
+            for reader in ("b", "c"):
+                chosen = (
+                    await sim.control_plane_handle.sources.call_one(["W"], reader)
+                    if sim.control_plane_handle is not None
+                    else Selection()
+                )
+                await sim.client_for(reader, prefer=chosen.sources).get("W")
         return True
 
     _drive(sim, scenario())
     return trace.render()
 
 
-def test_installing_the_naive_selector_changes_nothing():
+def test_preferring_the_naive_answer_changes_nothing():
     assert _burst_trace(NaiveKeySelector()) == _burst_trace(None)
 
 
-def test_naive_selection_leaves_a_directory_answer_untouched():
+def test_no_preference_leaves_a_directory_answer_untouched():
     located = {"K": {"v1": "info1", "v0": "info0"}}
-    assert Selection().narrow(located) is located
+    assert prefer(located, Selection().sources) is located
 
 
 # --------------------------------------------------------------------------
-# 2b. One base, two subjects: only a KeySelector reaches the controller.
+# 2b. One base, two subjects -- and a selector is a utility, not a plane.
 # --------------------------------------------------------------------------
 
 
@@ -199,7 +216,7 @@ class _FixedPlacement(_Answers, AnySelector):
 
 
 def test_the_subtypes_add_a_subject_and_nothing_else():
-    """Each kind is a subject plus a place it is reached from -- no second interface.
+    """Each kind is a subject and nothing more -- no second interface.
 
     ``KeySelector`` names the one subject the store can hand down; ``AnySelector``
     leaves it open because this package cannot name a type an application invented.
@@ -216,8 +233,8 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
     """``Selector[X, ...]`` is the only place a subject is written; the value follows.
 
     Two annotations for one fact would drift. The parameter is what a reader sees
-    and mypy checks; ``subject_type`` is the same type as something the install
-    gate can compare, since :pep:`484` erases the parameter at runtime.
+    and mypy checks; ``subject_type`` is the same type as something a gate can
+    compare, since :pep:`484` erases the parameter at runtime.
     """
 
     class _Parameterised(Selector[Sequence[Key], None]):
@@ -247,13 +264,12 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
     assert AnySelector.subject_type is Any
 
 
-def test_taking_keys_is_not_the_same_claim_as_being_installable():
+def test_taking_keys_is_not_the_same_claim_as_answering_for_the_store():
     """Why the kinds are types and not just a ``subject_type`` comparison.
 
-    A funnel over a key selector takes keys and must still stay out of the
-    directory: its judgement is the application's, made while routing, and the
-    store-side answer is a different plane. A gate reading ``subject_type`` alone
-    would install it.
+    A funnel over a key selector takes keys and is still not one: its judgement is
+    the application's, made while routing, and which volume serves a read is a
+    different question. Reading ``subject_type`` alone could not tell them apart.
     """
     funnel = Refine(_Fixed(Selection.of(["v0"])), TakeHead())
     assert funnel.subject_type == KeySelector.subject_type   # same subject ...
@@ -269,98 +285,87 @@ def test_a_chain_of_key_selectors_is_one_and_a_mixed_chain_is_not():
         KeySelectorChain([_Fixed(), _FixedPlacement()])
 
 
-def test_a_selector_hears_registrations_by_subscribing_for_itself():
-    """The directory calls back plain callables and knows nothing of selectors.
+def test_a_plane_declares_whatever_it_wants_told():
+    """A plane that gates on a write hears about it from whoever made the write.
 
-    Subscribing in ``attach`` is what makes that possible: the view a selector is
-    handed exposes the directory behind it, so the wakeup needs no member on
-    ``Selector`` and no help from whoever assembles the run.
+    The directory has no notion that anything is listening: the plane names the
+    member, the seam reads it off the plane like any other, and the data plane calls
+    it after its put. Which is the same mechanism as a question -- there is no second
+    kind of member here.
     """
     heard: list[tuple[str, tuple[str, ...]]] = []
 
-    class _Subscribes(KeySelector):
-        def attach(self, view, transfer_cost):
-            super().attach(view, transfer_cost)
-            view.directory.subscribe(
-                lambda volume_id, keys: heard.append((volume_id, tuple(keys)))
-            )
-
-        async def select(self, keys, requester):
+    class _Hears(ControlPlane):
+        async def sources(self, keys, requester):
             return Selection()
 
-    sim = Simulation(_topology(), control=_Subscribes())
+        async def published(self, requester, keys):
+            heard.append((requester, tuple(keys)))
 
-    async def scenario():
-        with sim.mesh.installed():
-            sim.mesh.bind_source("a")
-            await sim.mesh.client("a").put("W", _payload())
-
-    _drive(sim, scenario())
+    sim = Simulation(_topology(), control=_Hears())
+    assert sim.control_plane_handle.asked == ("published", "sources")
+    _drive(sim, sim.control_plane_handle.published.call_one("a", ["W"]))
     assert heard == [("a", ("W",))]
 
 
-def test_a_registration_reaches_a_subscriber_before_the_put_returns():
-    """Synchronous and inside ``notify_put_batch``: no window, no interleaving.
+def test_the_directory_holds_nothing_that_decides():
+    """The control plane is not *in* the store: no hook, no callback, no selector.
 
-    A subscriber that could suspend would let a second registration land while
-    the first was still being delivered, and a waiter released by the first would
-    resume against a directory the second had already changed.
+    What the directory does with a preference is apply it, so there is nothing on the
+    service for a capability to install itself into and nothing it calls back. Pinned
+    mechanically, because the whole of this arrangement is what the service does
+    *not* have.
     """
     service = Simulation(_topology()).mesh.directory.service
-    seen: list[str] = []
-    service.subscribe(lambda volume_id, keys: seen.append(volume_id))
-    assert not asyncio.iscoroutinefunction(type(service).subscribe)
-    assert seen == []
+    assert {name for name in dir(service) if not name.startswith("_")} == {
+        "controller", "keys", "locate_raw", "locate_volumes",
+        "notify_delete", "notify_delete_batch", "notify_put_batch",
+    }
 
 
-def test_only_a_key_selector_is_consulted_by_the_controller():
-    """A selector over a subject the store cannot read may not answer for it.
+def test_a_selector_is_a_utility_a_plane_holds_and_not_a_plane():
+    """Which is why a run refuses one: there is nothing to hand it and nothing to ask.
 
-    The installed plane is consulted on every ``get``; one whose subject is an
-    application payload is refused at assembly instead, so there is no run in which
-    the directory hands it keys.
+    A selector has no ``cluster`` for a run to front and no questions of its own to
+    declare -- ``select`` is what the plane holding it consults. So the thing a run
+    takes is the plane, and the plane passes the ports down.
     """
-    control = _Fixed()
-    sim = Simulation(_topology(), control=control)
+    for kind in (KeySelector, AnySelector, Selector):
+        assert not issubclass(kind, ControlPlane)
+    with pytest.raises(TypeError, match="must be a ControlPlane"):
+        Simulation(_topology(), control=_Fixed())
 
-    async def scenario():
-        with sim.mesh.installed():
-            sim.mesh.bind_source("a")
-            await sim.mesh.client("a").put("W", _payload())
-            sim.mesh.bind_source("c")
-            await sim.mesh.client("c").get("W")
-
-    _drive(sim, scenario())
-    assert control.asked == ["c"]
-    with pytest.raises(TypeError, match="must be a KeySelector"):
-        Simulation(_topology(), control=_FixedPlacement())
+    inner = _Fixed(Selection.of(["a"]))
+    sim = Simulation(_topology(), control=_Ranks(inner))
+    answer = _drive(sim, sim.control_plane_handle.sources.call_one(["W"], "c"))
+    assert answer.sources == ("a",)
+    assert inner.asked == ["c"]      # the requester reached the utility unchanged
 
 
-def test_an_installed_selector_is_attached_to_the_run_s_view():
-    """The sensor a selector is consulted with is the one it was brought up with.
+def test_a_plane_passes_the_run_s_view_down_to_what_it_ranks_with():
+    """Fronting a plane and attaching it are one act of assembly.
 
-    A ``KeySelector`` is a ``ControlPlane``, so installing one in the directory and
-    attaching it are the same act of assembly -- which is what lets ``select`` take
-    a subject and a requester and no view. A selector installed but never attached
-    would sense through ``None``.
+    Which is what lets ``select`` take a subject and a requester and no view: the
+    selector was handed the sensor when the plane was, by the plane. One never
+    attached would sense through ``None``.
     """
     selector = _Fixed()
-    sim = Simulation(_topology(), control=selector)
+    sim = Simulation(_topology(), control=_Ranks(selector))
     assert selector.view is sim.view
     assert isinstance(selector.view, View)
 
 
 # --------------------------------------------------------------------------
-# 2c. Two planes, two arguments: which side reaches a plane is what it was passed as.
+# 2c. One plane per run, fronted as a service, asked by the members it declares.
 # --------------------------------------------------------------------------
 
 
 class _Decides(ControlPlane):
-    """An application's own plane: answers what it was built with, remembers who asked.
+    """A plane that answers what it was built with, and remembers who asked.
 
-    A plain :class:`~proposed.plane.ControlPlane`, because what it answers with is
-    between it and the hosts that ask -- ``kvcache_sim``'s scheduler answers with the
-    winners of two selections, which is not a ``Selection`` at all.
+    What it answers with is between it and the hosts that ask -- ``kvcache_sim``'s
+    scheduler answers with the winners of two selections, which is not a ``Selection``
+    at all.
     """
 
     def __init__(self, answer: Any = "decided") -> None:
@@ -372,15 +377,14 @@ class _Decides(ControlPlane):
         return self.answer
 
 
-def test_a_placement_plane_is_fronted_as_the_application_s_own_service():
+def test_the_run_s_plane_is_fronted_as_a_service():
     """Reached over the hop, by the member it declares.
 
-    Nothing looks up its type: it is the ``placement`` argument, so it is the plane
-    an application's hosts ask, and the handle offers ``decide`` for one that answers
-    with its own value.
+    Nothing looks up its type or names its members: the handle offers ``decide``
+    because this plane declares ``decide``.
     """
     plane = _Decides()
-    sim = Simulation(_topology(), placement=plane)
+    sim = Simulation(_topology(), control=plane)
     assert sim.control_plane_handle is not None
     assert sim.control_plane_handle.control is plane
     answer = _drive(sim, sim.control_plane_handle.decide.call_one("subject", "a"))
@@ -410,7 +414,7 @@ def test_a_handle_offers_the_members_the_plane_declares_and_no_others():
         def ready(self):                     # not awaited, so not a question
             return True
 
-    sim = Simulation(_topology(), placement=_Two())
+    sim = Simulation(_topology(), control=_Two())
     handle = sim.control_plane_handle
     assert handle.asked == ("decide", "price")
     assert _drive(sim, handle.price.call_one("subject", "a")) == "priced"
@@ -418,18 +422,15 @@ def test_a_handle_offers_the_members_the_plane_declares_and_no_others():
         assert not isinstance(getattr(handle, hidden, None), LocalEndpoint)
 
 
-def test_only_a_key_selector_may_be_installed_in_the_directory():
-    """``control`` runs inside ``locate_volumes``, so its subject has to be keys.
+def test_a_run_with_no_plane_fronts_nothing():
+    """No plane, no service, and a directory that answers for itself.
 
-    A plane that decides an application's own question is passed as ``placement``;
-    handing it to the directory instead would answer a question the store never
-    asked, so the claim is checked rather than assumed.
+    The baseline path: nobody asks anything, so nobody hands the store a preference
+    and every read is the ordinary one (``putget_sim``).
     """
-    with pytest.raises(TypeError, match="must be a KeySelector"):
-        Simulation(_topology(), control=_Decides())
-    # ...and the store-side plane is not fronted as a service of its own.
-    sim = Simulation(_topology(), control=_Fixed())
+    sim = Simulation(_topology())
     assert sim.control_plane_handle is None
+    assert sim.cluster_handle is None
 
 
 # --------------------------------------------------------------------------
@@ -437,16 +438,43 @@ def test_only_a_key_selector_may_be_installed_in_the_directory():
 # --------------------------------------------------------------------------
 
 
-def test_selection_narrows_to_its_ranked_sources():
+def test_a_preference_reorders_a_directory_answer_to_its_ranked_sources():
     located = {"K": {"v0": "i0", "v1": "i1", "v2": "i2"}}
-    narrowed = Selection.of(["v2", "v0"]).narrow(located)
-    assert list(narrowed["K"]) == ["v2", "v0"]  # rank order, v1 dropped
+    preferred = prefer(located, Selection.of(["v2", "v0"]).sources)
+    assert list(preferred["K"]) == ["v2", "v0"]  # rank order, v1 dropped
 
 
-def test_selection_keeps_a_key_no_selected_source_holds():
+def test_a_preference_keeps_a_key_none_of_its_sources_holds():
     """A preference must not make data disappear."""
     located = {"K": {"v0": "i0"}}
-    assert Selection.of(["v9"]).narrow(located) == located
+    assert prefer(located, ("v9",)) == located
+
+
+def test_a_settled_selection_has_waited_and_carries_no_gate():
+    """What a plane reached as a service answers with: the ranking, no closure.
+
+    Two properties in one call, because they are the same requirement seen twice --
+    a caller in another process could not receive a gate, and would have nothing to
+    wait on if it could.
+    """
+    opened = asyncio.Event()
+
+    async def gate() -> None:
+        await opened.wait()
+
+    async def scenario():
+        answer = asyncio.get_running_loop().create_task(
+            Selection.of(["v0"], ready=gate, payload={"v0": 7}).settled()
+        )
+        await asyncio.sleep(0)
+        assert not answer.done(), "answered before the source was usable"
+        opened.set()
+        return await answer
+
+    settled, _ = run_sim(scenario())
+    assert settled.sources == ("v0",)
+    assert settled.ready is None
+    assert settled.winner == 7        # the price rides along; the gate does not
 
 
 def test_selection_withholds_until_its_gate_opens():
@@ -534,8 +562,8 @@ def test_first_match_keeps_the_winner_s_readiness_gate():
 def test_first_match_attaches_every_selector_even_unconsulted_ones():
     """A link behind an earlier answer still has to be brought up.
 
-    That is what lets it subscribe: a selector parks requesters on gates nothing
-    but its own registration opens, and it never gets the chance if the chain
+    That is what lets it gate: a selector parks requesters on facts only its own
+    bookkeeping will settle, and it never gets the chance to sense them if the chain
     only attaches what it consults.
     """
     front, behind = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
@@ -546,12 +574,11 @@ def test_first_match_attaches_every_selector_even_unconsulted_ones():
 
 
 def test_a_combinator_holds_either_kind_and_is_neither():
-    """Mixing kinds is allowed because the mixture cannot reach the controller.
+    """Mixing kinds is allowed because a combinator claims neither.
 
-    A combinator is a plain ``Selector`` whatever it wraps, so a chain of two
-    key selectors is no more installable than a chain mixing in an application's
-    -- which
-    is what makes the mixture harmless rather than something to reject.
+    A combinator is a plain ``Selector`` whatever it wraps, so a chain of two key
+    selectors says no more about its subject than one mixing in an application's --
+    which is what makes the mixture harmless rather than something to reject.
     """
     mixed = FirstMatch([_Fixed(Selection.of([])), _FixedPlacement(Selection.of(["v1"]))])
     assert _select(mixed).sources == ("v1",)
@@ -644,8 +671,8 @@ def test_refine_brings_up_the_source_and_every_step():
 
 def test_refine_is_a_plain_selector_whatever_it_narrows():
     """Same bar as ``FirstMatch``: narrowing a selector's ranking with an
-    application's test asks something the store cannot read, so the result is
-    barred from the controller by being neither subtype."""
+    application's test asks something the store cannot read, so the funnel claims
+    neither subject."""
     funnel = Refine(_Fixed(Selection.of(["v0"])), TakeHead())
     assert isinstance(funnel, Selector)
     assert not isinstance(funnel, (KeySelector, AnySelector))
@@ -787,7 +814,7 @@ def test_the_controller_hop_is_charged_to_every_capability():
     This boundary used to be the one seam charging nothing: the transport charged
     bytes and the coordinator handle charged its round trip, while every
     ``locate_volumes`` / ``notify_put_batch`` in the repo was free. A burst that
-    routes nothing and installs no selector still crosses it.
+    routes nothing and asks no control plane still crosses it.
     """
     from sim_common import config
 

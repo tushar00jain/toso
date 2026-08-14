@@ -47,7 +47,7 @@ mesh -- a run's ledger, which needs the mesh to exist first -- can claim it.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import make_controller_adapter
@@ -112,12 +112,9 @@ class Mesh:
         # endpoint through :attr:`controller_handle`, which is the name the
         # ``Deployment`` port uses, rather than a second alias here.
         self.directory = make_controller_adapter(real_directory)
-        # No selector yet: a mesh answers for itself -- every holder, directory
-        # order -- until whoever assembled it installs one through
-        # ``controller_handle.install_selector``, which is where a control plane
-        # runs (inside the endpoint's locate_volumes, see
-        # LocalControllerHandle._route). An unrouted mesh pays nothing for the
-        # hook.
+        # A mesh answers for itself -- every holder, directory order -- unless the
+        # caller of a read named the sources it prefers (``client_for(prefer=...)``).
+        # Nothing decides in here: who to prefer is settled before the read.
         #
         # Each volume's byte capacity comes from the run's profile
         # (``storage_capacity_bytes``, default unbounded); the seam enforces it
@@ -164,10 +161,10 @@ class Mesh:
         what a :class:`Mesh` is.
 
         Senses through the directory *service*, not the handle in front of it:
-        ``locate_raw`` is the unrouted read, so a selector consulted inside
-        ``locate_volumes`` cannot re-enter the hook it is being called from. Note
-        what that also means -- a control plane's directory reads do not cross the
-        handle, so they are neither routed nor charged the hop a real one would pay.
+        ``locate_raw`` is the read with no caller's preference folded into it, so a
+        control plane ranks the directory rather than an answer somebody has already
+        ranked. Note what that also means -- a control plane's directory reads do not
+        cross the handle, so they are not charged the hop a real one would pay.
         """
         return View(self.directory.service, self.topology)
 
@@ -175,15 +172,24 @@ class Mesh:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""
         return self.adapters[node_id]
 
-    def client_for(self, node_id: str) -> Any:
+    def client_for(
+        self, node_id: str, *, prefer: Optional[Sequence[str]] = None
+    ) -> Any:
         """:class:`proposed.deployment.Deployment` -- the client for ``node_id``.
 
         Binds the calling coroutine to ``node_id`` first, so a capability's data
         plane never has to know that many clients share this process. A real
         deployment has one client and no binding to do.
 
+        ``prefer`` is bound the same way and for a different reason: the real client
+        has no source-preference parameter, so a caller that has one to give says so
+        here and the directory read applies it
+        (:func:`realsim.seams.factory.bind_prefer`). Bound on every call, ``None``
+        included, so a client vended without one reads as an unrouted client does
+        rather than inheriting the last preference this coroutine expressed.
         """
         self.bind_source(node_id)
+        factory.bind_prefer(prefer)
         return self.client(node_id)
 
     def volume_handle(self, node_id: str) -> Any:
@@ -194,8 +200,8 @@ class Mesh:
     def controller_handle(self) -> Any:
         """:class:`proposed.deployment.Deployment` -- the directory endpoints.
 
-        The one way to reach the directory service: a client is built with it, a
-        ``View`` reads through it, and an installed selector is consulted inside it.
+        The one way a *caller* reaches the directory service: every client is built
+        with it. A ``View`` goes to the service behind it instead (see :attr:`view`).
         """
         return self.directory.handle
 
@@ -214,13 +220,8 @@ class Mesh:
         Must be called before driving a client under :meth:`installed`, in the
         coroutine that will run the operation: the shared factory has no other way
         to tell which of the mesh's clients it is building a transport for.
-
-        Binds two identities for the same client: the locality endpoint the cost
-        model prices against, and the directory volume id a routing selector is
-        asked about (see :func:`realsim.seams.factory.bind_requester`).
         """
         factory.bind_source(self.topology[node_id])
-        factory.bind_requester(node_id)
 
     def _dispatch_transfer(
         self, kind: str, src_id: str, dst_id: str, nbytes: int, cost: float

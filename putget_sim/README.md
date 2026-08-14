@@ -5,7 +5,7 @@ the **real** `LocalClient` planning core, the **real** `Controller` directory an
 the **real** in-memory transport/store (via [`realsim`](../realsim/)), on
 `realsim`'s deterministic virtual-clock async engine.
 
-It installs **no selector and no data plane**. Every reader locates the origin
+It has **no control plane and no data plane**. Every reader locates the origin
 before anyone finishes, so each pulls from it and fabric is **`m x`** the
 payload. That is deliberately the uninteresting outcome: this is the baseline
 [`dedup_sim`](../dedup_sim/) measures its **1x** against, and the smallest thing
@@ -110,8 +110,8 @@ engine, meta/metadata carriers — is imported from `realsim` / `sim_common`.
 
 | role | `putget_sim` | `dedup_sim` | `kvcache_sim` |
 |---|---|---|---|
-| `control/` — what is decided | **absent** — the naive default (all holders, directory order) | `routing.py`: one `KeySelector.select` — a ranked source plus a readiness gate | `scheduler.py` + `selector.py` + `cache.py` + `view.py` |
-| `data/` — what executes | **absent** — a `get` and nothing after it | `read_through.py`: one member — the get, then a local put | `serving.py` + `decode.py` + `_store.py` |
-| `workload/` — what is simulated | `put_get.py`: one synchronized burst, parameterized by reader count | the same `put_get.py`, with the selector installed | `request.py` + `generator.py` + `scenarios.py` |
+| `control/` — what is decided | **absent** — no preference is passed, so the directory's own order stands | `routing.py`: one `KeySelector.select` — a ranked source, once it is usable | `scheduler.py` + `_source.py` + `_cluster.py` + `_view.py` |
+| `data/` — what executes | **absent** — a `get` and nothing around it | `read_through.py`: one member — ask, get, local put, report | `serving.py` + `_decode.py` + `_store.py` |
+| `workload/` — what is simulated | `put_get.py`: one synchronized burst, parameterized by reader count | the same `put_get.py`, with the two planes added | `request.py` + `generator.py` + `scenarios.py` |
 | `report/` — outcome metrics | `summary.py`: rendering only, over a shared `Ledger` | `summary.py`: rendering only, over the same `Ledger` | `metrics.py`: its **own** per-request outcome row |
 | outcome | `m x` fabric | **1x** fabric, same workload | TTFT/TBT under an arrival stream |

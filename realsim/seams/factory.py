@@ -32,7 +32,7 @@ from __future__ import annotations
 import contextvars
 import sys
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, Sequence, Tuple
 
 import torchstore.client  # noqa: F401  (ensure the submodule is in sys.modules)
 
@@ -40,8 +40,8 @@ from sim_common.topology import Endpoint
 
 __all__ = [
     "bind_source",
-    "bind_requester",
-    "current_requester",
+    "bind_prefer",
+    "current_prefer",
     "current_source",
     "current_owner",
     "installed",
@@ -59,11 +59,18 @@ _current_src: "contextvars.ContextVar[Endpoint]" = contextvars.ContextVar(
     "realsim_current_src_endpoint"
 )
 
-# The *directory* identity (volume id) of that same client, for the controller's
-# routing hook: a selector is asked "which source for this requester". Defaults to
-# ``None`` so an unrouted drive simply gets the directory's own answer.
-_current_requester: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
-    "realsim_current_requester", default=None
+# Which volumes the calling client would rather be served by, best first --
+# the source preference ``locate_volumes`` applies to the answer it is about to
+# give (:func:`proposed.selector.prefer`). ``None`` is no preference, hence the
+# directory's own order.
+#
+# A binding rather than an argument because the real ``LocalClient.get`` has no
+# such parameter: upstream this is one optional argument on the read path, applied
+# to the located map before ``_build_volume_requests`` picks a volume per key. The
+# simulator carries it here so an *unmodified* client can be handed a preference
+# at all -- see :func:`bind_prefer`.
+_current_prefer: "contextvars.ContextVar[Optional[Tuple[str, ...]]]" = (
+    contextvars.ContextVar("realsim_current_prefer", default=None)
 )
 
 # The object currently holding the process-wide patch (``None`` == nobody).
@@ -75,28 +82,29 @@ def bind_source(endpoint: Endpoint) -> None:
     _current_src.set(endpoint)
 
 
-def bind_requester(volume_id: Optional[str]) -> None:
-    """Bind the *directory* identity of the client whose operation is running.
+def bind_prefer(sources: Optional[Sequence[str]]) -> None:
+    """Prefer ``sources``, best first, for the reads the calling coroutine makes.
 
-    The endpoint bound by :func:`bind_source` is the locality the cost model
-    prices against; this is the same client's volume id in the real directory,
-    which is what a routing selector needs to know who is asking. They are
-    separate ids (a topology may name a node ``"r0"`` and its endpoint
-    ``"volr0"``), so both are bound together by
-    :meth:`realsim.mesh.Mesh.bind_source`.
+    A *value* the caller was handed by whoever decides -- a data plane asks its
+    control plane who should serve a key and binds the answer here before driving the
+    client (:meth:`realsim.mesh.Mesh.client_for`). Nothing in the store consults
+    anybody as a result: ``locate_volumes`` applies what it finds bound and no more.
+
+    ``None`` clears it, so a client vended without a preference reads exactly as
+    an unrouted one does.
     """
-    _current_requester.set(volume_id)
+    _current_prefer.set(tuple(sources) if sources is not None else None)
 
 
-def current_requester() -> Optional[str]:
-    """The directory identity of the calling client, or ``None`` if unbound.
+def current_prefer() -> Optional[Tuple[str, ...]]:
+    """The sources the calling coroutine prefers, or ``None`` if it named none.
 
     Unlike :func:`current_source` this returns ``None`` rather than raising: a
-    routing selector that cannot tell who is asking must fall back to the
-    directory's own answer, which is always correct, whereas an unbound *source*
-    would silently misprice a transfer.
+    read with no preference is the ordinary read, and the directory's own order is
+    always a correct answer -- whereas an unbound *source* would silently misprice
+    a transfer.
     """
-    return _current_requester.get()
+    return _current_prefer.get()
 
 
 def current_source() -> Endpoint:

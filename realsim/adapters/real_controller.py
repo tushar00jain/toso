@@ -60,7 +60,7 @@ class RealControllerAdapter:
     Attributes:
         controller: the real ``Controller`` instance.
         service: the :class:`ControllerService` around it -- the server side, which
-            holds the selector and the endpoint bodies.
+            holds the endpoint bodies.
         handle: a :class:`LocalControllerHandle` referring to that service -- the
             client side, which is what a caller holds.
     """

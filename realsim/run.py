@@ -11,19 +11,17 @@ A scenario is almost never a single run -- it is a comparison. Dedup runs the
 same burst unrouted and then once per fan-out cap; kvcache runs the same request
 stream under two schedulers. What differs between those runs is not the workload,
 it is the *control plane* and the *data plane*. A :class:`Run` names both, so
-neither is buried inside the other's factory -- kvcache used to build its
-scheduler inside the thing that built its serving plane, which hid that the two
-halves run in different places.
+neither is buried inside the other's factory.
 
-:class:`Run` is that difference: a label, the workload, and the pieces the
-capability installs around it. :meth:`Run.execute` is the only code that turns
+:class:`Run` is that difference: a label, the workload, and the two halves the
+capability adds around it. :meth:`Run.execute` is the only code that turns
 one into a :class:`Result`, so three capabilities cannot drift in how they wire a
 stack -- which is what a per-capability ``harness.py`` used to allow, each with
 its own signature (``run_burst(num_readers, ...)`` vs ``run(topology, requests,
 kind, ...)``).
 
     runs = [Run("baseline", burst),
-            Run("cap=1", burst, control=DedupKeySelector(1, trace=t), data=make_plane)]
+            Run("cap=1", burst, control=Dedup(1, trace=t), data=make_plane)]
     results = [r.execute() for r in runs]
 
 :class:`Simulation` deliberately does *not* take a ``Run``. It is constructible
@@ -40,7 +38,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Sequence
 
-from proposed import Endpoint, KeySelector
+from proposed import Endpoint
 from sim_common.cost_model import MachineProfile
 from sim_common.report import Ledger
 from sim_common.trace import Trace
@@ -105,34 +103,27 @@ class Run:
         label: how this run is named in a comparison ("baseline", "cap=1").
         workload: the work to perform. Shared across the runs of a comparison,
             which is what makes the comparison mean something.
-        control: the plane that decides **in the directory service** -- a
-            :class:`~proposed.selector.KeySelector`, installed in the real
-            controller's ``locate_volumes`` and reached through the seam already
-            standing there
-            (:class:`~realsim.seams.controller_handle.LocalControllerHandle`), so a
-            caller just calls ``client.get`` and is routed. This is dedupe, whose
-            whole control plane is the selector. ``None`` leaves the directory
-            answering for itself.
-        placement: the plane the application's **own hosts ask**, fronted by a
-            :class:`~realsim.seams.control_plane_handle.LocalControlPlaneHandle` as
-            ``sim.control_plane_handle``. This is kvcache's scheduler, which holds every
-            instance's queue, cache and decode occupancy.
+        control: this configuration's one :class:`~proposed.plane.ControlPlane`,
+            fronted as ``sim.control_plane_handle``. Whatever members it declares are
+            what the data plane may ask: dedup's is asked which peer serves a key and
+            told when a put lands; kvcache's is asked where a request should run *and*
+            which peer serves a fetch, and holds every instance's queue, cache and
+            decode occupancy to answer both. ``None`` leaves the directory answering
+            for itself, because nothing hands it a preference.
 
-            A capability deciding in both places passes both, which is what kvcache
-            does: the scheduler decides where to prefill, and a
-            :class:`~kvcache_sim.control._source.LongestPrefixKeySelector` in the
-            directory narrows the pull to the peer the scheduler already priced --
-            without it the client reads from whichever holder the directory lists
-            first, and a pull predicted over NVLink can be charged over RDMA.
+            kvcache is where one plane pays off: the same object prices a pull and
+            later answers the fetch with the peer it priced, so a pull predicted over
+            NVLink is not charged over RDMA -- which is what happens if the client
+            takes whichever holder the directory lists first.
 
-            (Neither seam charges its hop by default: ``--coordinator-rtt`` gives
-            the coordinator one a cost, and the client-to-controller hop is free
-            for every capability, including the baseline.)
+            (No seam charges its hop by default: ``--control-rtt`` gives the control
+            services one, and the client-to-controller hop is free for every
+            capability, including the baseline.)
         data: builds this run's :class:`~realsim.runner.ItemDispatch` onto the
             assembled stack -- how the executing half is driven, and where a
             capability's :class:`~proposed.plane.DataPlane` is plugged in.
             ``None`` -> the plain path: run each item, nothing around it. It
-            reaches that control plane through ``sim.control_plane_handle``, never by
+            reaches the control plane through ``sim.control_plane_handle``, never by
             being handed the object.
         profile / trace / ledger: the run's target machine, event trace and
             outcome ledger. A capability with a richer outcome row passes its own
@@ -143,7 +134,6 @@ class Run:
     label: str
     workload: Workload
     control: Optional[Any] = None
-    placement: Optional[Any] = None
     data: Optional[MakePlane] = None
     profile: Optional[MachineProfile] = None
     trace: Optional[Trace] = None
@@ -165,7 +155,6 @@ class Run:
         sim = Simulation(
             self.workload.topology,
             control=self.control,
-            placement=self.placement,
             profile=self.profile,
             trace=self.trace,
             ledger=self.ledger,

@@ -63,7 +63,7 @@ def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
     so the trace format and the metrics ledger a run reports into are chosen once
     and cannot drift between them.
     """
-    # The pools are a deployment fact and go to both planes: the data plane gives
+    # The pools are a deployment fact and go to both halves: the data plane gives
     # a host the engines its pools put on it, and control routes to the
     # same pools. ``coupled`` is a separate, fidelity question -- does this run
     # model a prefill and a decode step on one host as colliding? -- so it goes to
@@ -80,15 +80,12 @@ def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
     # where the blocks are; a store in general is unbounded, which is why this
     # belongs to the capability and not to the profile every sim shares.
     profile = knobs.pop("profile", _KV_INSTANCE_PROFILE)
-    routing, sched = scheduler(kind, topology, **knobs)
     return Run(
         label,
         KVWorkload(topology, conversations),
-        # Two control planes, one per service: the chain answers the store's
-        # routing question in the directory, and the scheduler decides compute
-        # placement through the placement seam.
-        control=routing,
-        placement=sched,
+        # One control plane, asked twice per request that pulls: where to run it, and
+        # then which peer serves the fetch that plan implies.
+        control=scheduler(kind, topology, **knobs),
         data=serving_plane(
             coupled=coupled,
             simulate_decode=knobs.get("simulate_decode", False),
