@@ -9,8 +9,8 @@ has a question::
 
 The second exists because the first already answered it: routing prices a pull
 against recomputing and records the peer it priced, and the fetch that follows asks
-which peer to read from. Two objects would have to keep that record in step across a
-boundary; one plane just reads its own (:class:`RoutedPull`).
+which peer to read from. Two objects would have to keep that note in step across a
+boundary; one plane just reads its own sensor (:class:`RoutedPull`).
 
 Not a selector, because the decision is made of **two** selections and a selection
 holds one: the prefill hosts this scheduler priced, and the decode hosts it ranked
@@ -22,7 +22,7 @@ One ask settles both halves, before anything runs -- which is what makes a refus
 cost nothing.
 
 What a host *reports* is not asked and is not answered, so it does not come here:
-a fact goes to the model it corrects (:mod:`kvcache_sim.control._cluster`), which
+a fact goes to the sensor it corrects (:mod:`kvcache_sim.control._sensor`), which
 this scheduler reads and the run gives a service of its own.
 
 The question is about *compute*; data placement is not asked here -- the serving
@@ -50,22 +50,22 @@ What a decision senses
 ----------------------
 Nothing here executes, and nothing here is a live read. Every host this scheduler
 ranks, prices or gates, it judges against one
-:class:`~kvcache_sim.control._cluster.KVClusterModel` -- the predicted prefill
-queues and the observed decode batches, and what keeps each of them true. That model
-is one sense of the view this plane and everything it consults senses through
+:class:`~kvcache_sim.control._sensor.ClusterSensor` -- the predicted prefill
+queues and the observed decode batches, and what keeps each of them true. That sensor
+is read through the view this plane and everything it consults senses through
 (:class:`~kvcache_sim.control._view.KVView`), beside the prefix runs, the prefills this
 plane has promised and not seen land, and the pulls it has already priced
-(:class:`RoutedPull`). Sensed rather than held because the hosts are what keep the model
+(:class:`RoutedPull`). Sensed rather than held because the hosts are what keep it
 true: every other fact in it comes from them, over the service the run fronts it with
-(:attr:`_Scheduler.cluster`).
+(:attr:`_Scheduler.sensor`).
 
-An accepted decision is reported back the same way, into each sense it moves
-(:meth:`_Scheduler._admit`): the model holds the prefill instance the plan spoke for
-(:class:`~kvcache_sim.control._cluster.Committed`), the reservation record stands in for
-a request no host can report yet, and the routed record remembers the peer the pull was
-priced against. A run that judges the TBT SLO against the occupancy observed now
-promises nothing and senses no reservation record at all, so the two halves of the
-prediction cannot come apart.
+An accepted decision is reported back the same way, into each sensor it moves
+(:meth:`_Scheduler._admit`): the cluster sensor holds the prefill instance the plan
+spoke for (:class:`~kvcache_sim.control._sensor.Committed`), the reservation sensor
+stands in for a request no host can report yet, and the routed one remembers the peer
+the pull was priced against. A run that judges the TBT SLO against the occupancy
+observed now promises nothing and composes no reservation sensor at all, so the two
+halves of the prediction cannot come apart.
 
 The TTFT the metrics record is therefore the prediction, not a measurement (the
 README says why). Prefill cost is deterministic, so on the default path the two
@@ -88,10 +88,10 @@ from domain import (
     prefill_time,
 )
 
-from ._cluster import (
-    Committed, ComputeBusy, DecodeState, KVClusterModel, PrefillFinished,
+from ._sensor import (
+    ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
+    ReservationSensor, RoutedPullSensor,
 )
-from ._pending import Reservations, RoutedPulls
 from ._source import LongestPrefixKeySelector
 from ._view import KVView
 from .request import Request
@@ -124,8 +124,8 @@ def _predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
 
 
 # -- what this application's control plane answers with ---------------------- #
-# The answer is here; the facts a host reports are with the model they write
-# (:mod:`kvcache_sim.control._cluster`).
+# The answer is here; the facts a host reports are with the sensor they write
+# (:mod:`kvcache_sim.control._sensor`).
 
 
 @dataclass
@@ -291,7 +291,7 @@ class _ByLoad(AnySelector[Sequence[_Priced], Plan]):
     This scheduler's claim is that it picks by load and nothing else.
 
     The queue is sensed through the attached view
-    (:class:`~kvcache_sim.control._view.ClusterSense`) and read once for the whole
+    (:class:`~kvcache_sim.control._view.ClusterView`) and read once for the whole
     ranking, so every candidate is ranked against one state of the cluster.
     """
 
@@ -328,17 +328,18 @@ class RoutedPull(KeySelector[_P]):
     pull falls through to the ranking behind this link.
 
     A selector like any other, sensing through the view it is attached to
-    (:meth:`~proposed.selector.Selector.attach`) -- the record is one of that view's
-    senses (:class:`~kvcache_sim.control._view.RoutedSense`), so it arrives the way
-    every other read does and nothing hands this one the record.
+    (:meth:`~proposed.selector.Selector.attach`) -- the sensor is one that view carries
+    (:class:`~kvcache_sim.control._view.RoutedView`), so it arrives the way
+    every other read does and nothing hands this one the sensor.
 
-    Reading it **consumes** it (:meth:`~kvcache_sim.control._pending.RoutedPulls.claim`
-    expires the record on a match), so this belongs at the head of a
+    Reading it **consumes** it
+    (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim` expires the entry on
+    a match), so this belongs at the head of a
     :class:`~proposed.selector.FirstMatch` chain and under no combinator that can drop
     the answer or rank it down (:class:`~proposed.selector.Discount`). In that one
     position spending and using coincide: a link that answers wins the chain, an
     abstention matched nothing and spends nothing. Under one that could reject the
-    peer, the record would be gone and the fetch would fall through to a ranking that
+    peer, the entry would be gone and the fetch would fall through to a ranking that
     never saw it.
     """
 
@@ -386,10 +387,10 @@ class _Scheduler(ControlPlane):
         early_rejection: ``"early"`` | ``"predict"`` -- whether the decode occupancy
             the TBT SLO is judged against is the one observed now or the one predicted
             at prefill completion.
-        cluster: the run's one :class:`~kvcache_sim.control._cluster.KVClusterModel`,
+        cluster: the run's one :class:`~kvcache_sim.control._sensor.ClusterSensor`,
             when a caller has to make it first. ``None`` -- the default -- builds it
             in :meth:`attach`, where the instances become known. Either way
-            :meth:`attach` folds it into the sensor and this plane holds it no other
+            :meth:`attach` composes it into the view and this plane holds it no other
             way.
     """
 
@@ -409,7 +410,7 @@ class _Scheduler(ControlPlane):
         slo_tbt: float = float("inf"),
         simulate_decode: bool = False,
         early_rejection: str = "early",
-        cluster: Optional[KVClusterModel] = None,
+        cluster: Optional[ClusterSensor] = None,
     ) -> None:
         self.B = block_tokens
         self.profile = profile
@@ -436,7 +437,7 @@ class _Scheduler(ControlPlane):
             )
         # The admission mode is spent here and never read again: both modes hold a
         # decision to the same two SLOs and differ only in what feeds them. This one
-        # answer governs the reservation record end to end -- composed in attach(),
+        # answer governs the reservation sensor end to end -- composed in attach(),
         # written on admission, read by the prediction -- so no two of the three can
         # disagree about whether this run predicts.
         self._lookahead = _predicts_decode(simulate_decode, early_rejection)
@@ -445,10 +446,10 @@ class _Scheduler(ControlPlane):
         self.ids: List[str] = []
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
-        # The caller's argument, not this plane's model: attach() spends it building
-        # the sensor and clears it, so the model has one reference here either way.
-        self._supplied_cluster: Optional[KVClusterModel] = cluster
-        # Both built in attach(), where the model they read exists.
+        # The caller's argument, not this plane's sensor: attach() spends it composing
+        # the view and clears it, so the sensor has one reference here either way.
+        self._supplied_cluster: Optional[ClusterSensor] = cluster
+        # Both built in attach(), where the sensors they read exist.
         self.view: Optional[KVView] = None
         self._fetch: Optional[FirstMatch[int]] = None
 
@@ -460,39 +461,39 @@ class _Scheduler(ControlPlane):
         (``MyControl(knobs)``) and let the run hand it the stack afterwards.
 
         The view is composed into a :class:`~kvcache_sim.control._view.KVView` here,
-        with the senses this capability's decisions read: prefix runs, the cluster
-        model, the prefills this plane promised, and the pulls it priced. None of the
+        with the reads this capability's decisions make: prefix runs, the cluster
+        sensor, the prefills this plane promised, and the pulls it priced. None of the
         four is the store's notion, so the run supplies none of them. Everything
         downstream then senses one view -- both axes, the fetch chain -- and nothing is
-        handed a record to read.
+        handed a sensor to read.
 
-        The run's one :class:`~kvcache_sim.control._cluster.KVClusterModel` is built
+        The run's one :class:`~kvcache_sim.control._sensor.ClusterSensor` is built
         here unless a caller made it first (``cluster``): this is where the
         instances become known, and this runs once per run, so nothing else is
         placed to build a second (empty) one -- and an empty one would report every
         host idle, which is a run that looks healthy and is wrong. It goes into the
-        view and nowhere else; :attr:`cluster`, which the run harvests to put a
+        view and nowhere else; :attr:`sensor`, which the run harvests to put a
         service in front of, reads it back from there.
 
-        This plane's own two records are built here and never supplied, because a
-        record handed to two planes would have each answering for the other's
-        decisions: a second routed-pull record would answer every fetch "I decided
-        nothing about this", and a second reservation record would leave every
-        predicted batch short. The reservation record is composed in only for a run
+        This plane's own two sensors are built here and never supplied, because one
+        handed to two planes would have each answering for the other's
+        decisions: a second routed-pull sensor would answer every fetch "I decided
+        nothing about this", and a second reservation sensor would leave every
+        predicted batch short. The reservation sensor is composed in only for a run
         that rolls occupancy forward, so a run that does not predict has no empty
-        record to read (:class:`~kvcache_sim.control._view.ReservedSense`).
+        one to read (:class:`~kvcache_sim.control._view.ReservedView`).
         """
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
         cluster, self._supplied_cluster = self._supplied_cluster, None
         if cluster is None:
             # Over ALL instances: the prefill and decode pools may each be a subset.
-            cluster = KVClusterModel(self.ids)
+            cluster = ClusterSensor(self.ids)
         self.view = view.derived(
             KVView,
             cluster=cluster,
-            reserved=Reservations() if self._lookahead else None,
-            routed=RoutedPulls(),
+            reserved=ReservationSensor() if self._lookahead else None,
+            routed=RoutedPullSensor(),
         )
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
@@ -501,9 +502,9 @@ class _Scheduler(ControlPlane):
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
         # What a fetch is answered with. Both this and the reuse axis sense through
-        # the KVView above -- the fetch because its head link reads the model
-        # (:class:`RoutedPull`), the reuse axis because one routing decision pins that
-        # view's snapshot for the whole of itself
+        # the KVView above -- the fetch because its head link reads the routed-pull
+        # sensor (:class:`RoutedPull`), the reuse axis because one routing decision
+        # pins that view's snapshot for the whole of itself
         # (:meth:`~kvcache_sim.control._view.KVView.pinned`) and a ranking consulted
         # inside the pin must not read past it into the live directory. The source
         # ranking is a link of both and gets attached twice, to the same view either
@@ -514,13 +515,14 @@ class _Scheduler(ControlPlane):
         self._rank.attach(self.view)
 
     @property
-    def cluster(self) -> Optional[KVClusterModel]:
-        """:attr:`~proposed.plane.ControlPlane.cluster` -- the model the run fronts
-        with a service so hosts can report into it.
+    def sensor(self) -> Optional[ClusterSensor]:
+        """:attr:`~proposed.plane.ControlPlane.sensor` -- the one sensor here a host
+        writes, which the run fronts with a service.
 
-        Read out of the sensor rather than stored beside it, so this plane has one
-        path to the model. ``None`` until :meth:`attach` builds it; the run harvests
-        after.
+        Read out of the view rather than stored beside it, so this plane has one path
+        to it. ``None`` until :meth:`attach` builds it; the run harvests after. The
+        other two sensors this plane holds are not offered: nothing outside this
+        process writes them.
         """
         return None if self.view is None else self.view.cluster
 
@@ -641,7 +643,7 @@ class _Scheduler(ControlPlane):
         """Price prefilling ``request`` on ``inst`` reusing ``match`` blocks.
 
         Reserves nothing and mutates nothing, so a losing candidate leaves no trace
-        (:class:`~kvcache_sim.control._cluster.Committed` records a decision actually
+        (:class:`~kvcache_sim.control._sensor.Committed` records a decision actually
         taken). Which candidate wins is the rank axis's business
         (:class:`_ByLoad` / :class:`_ByTTFT`).
         """
@@ -670,8 +672,8 @@ class _Scheduler(ControlPlane):
         ``done_time`` (its prefill completion). Drives TBT prediction.
 
         The flag that picks between the two readings is the one that decided whether
-        the reservation record was composed at all (:func:`_predicts_decode`), so the
-        second reading finds a record to read exactly when it takes it.
+        the reservation sensor was composed at all (:func:`_predicts_decode`), so the
+        second reading finds one to read exactly when it takes it.
         """
         if not self.tbt_enabled:
             return 0
@@ -735,16 +737,16 @@ class _Scheduler(ControlPlane):
         # A run that does not model decode has no batch to hold to a TBT SLO.
         if self.tbt_enabled and response.pred_tbt > self.slo_tbt:
             return None
-        # Accepted, so each sense this decision moves is told: the model holds the
+        # Accepted, so each sensor this decision moves is told: the cluster holds the
         # instance the plan spoke for, the reservation stands in for a request the
         # observed decode state cannot show until its prefill lands, and the routed
-        # record remembers the peer its pull was priced against for when the fetch asks
+        # pull remembers the peer it was priced against for when the fetch asks
         # (:class:`RoutedPull`).
         #
         # Local writes, not the endpoint a host reports over: control is in the same
         # process, and plain calls are what keep this decision atomic. All three land in
         # one non-suspending window -- this method has no ``await`` -- and they touch
-        # disjoint records, so nothing can read a half-committed decision and their
+        # disjoint sensors, so nothing can read a half-committed decision and their
         # order here is unobservable.
         self.view.cluster.notify_sync(Committed(response))
         plan = response.plan

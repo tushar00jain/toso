@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
-    "ClusterModel", "Controller", "Deployment", "Key",
+    "Controller", "Deployment", "Key", "NotifiedSensor", "Sensor",
     "StorageFull", "StorageVolume", "VolumeId",
 ]
 
@@ -155,21 +155,34 @@ class Controller(Protocol):
         """Every registered key, or those under ``prefix``."""
 
 
-class ClusterModel(Protocol):
-    """An application's picture of its own cluster, as a caller reaches it.
+class Sensor(Protocol):
+    """Facts a capability holds between calls, and its decisions read.
 
     The peer of :class:`Controller` on the application's side. That one holds
     residency -- which volume holds which key -- and is written as volumes publish
-    and evict; this one holds what no directory can see: how deep an instance's
+    and evict; a sensor holds what no directory can see: how deep an instance's
     queue is, who is working and until when, what has been promised and not yet
-    done. It is written as the hosts report what they did.
+    done.
 
-    One member, because being told is the only thing a *caller* does to a model.
-    What decides against it is the application's own control plane, and what it
-    may show is read off the model itself: the reads are the application's, since a
-    queue tail and a decode occupancy are one application's vocabulary, and
-    :class:`~proposed.view.View` is the *store's* sensor, which cannot see load at
-    all.
+    No members, because what may be read off one is the application's own
+    vocabulary: a queue tail and a decode occupancy belong to whoever decides
+    against them, and :class:`~proposed.view.View` -- which carries the store's
+    reads -- cannot see load at all. A capability declares those reads on its own
+    sensor and exposes it through a view (:meth:`proposed.view.View.derived`).
+
+    ``notify`` follows the seam. A sensor its owning plane writes in-process takes
+    plain typed methods and derives this; one a host reports into over a service
+    derives :class:`NotifiedSensor`, so which sensors a deployment has to front is
+    read off the types.
+    """
+
+
+class NotifiedSensor(Sensor, Protocol):
+    """A sensor a host reports into, as a caller reaches it.
+
+    One member, because being told is the only thing a *remote* reporter does to a
+    sensor: what decides against it is co-located with it and reads it off the
+    object.
 
     The fact is ``Any`` for the reason given at the top of this module: this
     package cannot import an application, so what a host reports is the
@@ -339,11 +352,12 @@ class Deployment(Protocol):
         ...
 
     @property
-    def cluster_handle(self) -> Any:
-        """A reference to the model this application's hosts report into.
+    def sensor_handle(self) -> Any:
+        """A reference to the sensor this application's hosts report into.
 
         The other half of what a host says to control -- a question goes to
         :attr:`control_plane_handle`, a fact goes here
-        (:class:`ClusterModel`). ``None`` when the control plane keeps no model.
+        (:class:`NotifiedSensor`). ``None`` when the control plane's sensors are all
+        written in its own process.
         """
         ...

@@ -9,7 +9,7 @@ out of the harness.
 So the run supplies it. :data:`TransferCost` is the whole surface: given two volume
 ids and a byte count, how long. ``sim_common`` builds one from a ``MachineProfile``
 and a topology; a deployment would build one from measured fabric numbers. A control
-plane reaches it off the sensor it was attached to
+plane reaches it off the view it was attached to
 (:meth:`proposed.view.View.transfer_cost`), which is where every other run-supplied
 read lives.
 

@@ -12,7 +12,7 @@ What differs is the **subject**, and every selector names its own in its header:
 A selector is a **utility**, not a plane. Nothing outside a capability reaches one:
 a run knows about the capability's :class:`~proposed.plane.ControlPlane`, that plane
 declares the questions its callers may ask, and a selector is one of the things it
-may work the answer out with. So a selector needs no lifecycle beyond the sensor it
+may work the answer out with. So a selector needs no lifecycle beyond the view it
 ranks against (:meth:`Selector.attach`), and a ranking that never leaves the plane
 that built it may hold whatever it likes -- including a readiness gate. What crosses
 a service boundary is the plane's business (:meth:`Selection.settled`).
@@ -273,8 +273,8 @@ class Selector(ABC, Generic[_S, _P]):
 
     A utility a control plane consults, and deliberately **not** a
     :class:`~proposed.plane.ControlPlane`: a run never holds one, so it needs no
-    ``cluster`` to harvest and no service in front of it. Everything shared by every
-    kind lives here -- ``select``, ``subject_type``, the sensor -- so
+    sensor to harvest and no service in front of it. Everything shared by every
+    kind lives here -- ``select``, ``subject_type``, the view -- so
     :class:`KeySelector` and :class:`AnySelector` cannot drift apart. Implement one
     of those, or this base directly.
     """
@@ -320,11 +320,11 @@ class Selector(ABC, Generic[_S, _P]):
     view: Optional[View] = None
 
     def attach(self, view: Any) -> None:
-        """Keep the sensor this selector senses and prices through.
+        """Keep the view this selector senses and prices through.
 
         The one the plane holding it was handed
         (:meth:`proposed.plane.ControlPlane.attach`), passed straight down: a
-        selector runs beside the directory it senses, so the sensor is the run's and
+        selector runs beside the directory it senses, so the view is the run's and
         not a per-call argument -- one selector, one view, whoever asks.
         """
         self.view = view

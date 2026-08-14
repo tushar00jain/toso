@@ -186,7 +186,7 @@ The only calls a "serving engine" makes are:
 answer = await control.decide(request, me)             # route; None => rejected
 ...                                                    # pull remote prefix + prefill
 await store.publish(me, fresh, kv)                     # cache fill + decode handoff
-await cluster.notify(PrefillFinished(me, now))
+await sensor.notify(PrefillFinished(me, now))
 ```
 
 One question, asked once: the answer names the prefill host *and* the decode host, so
@@ -197,7 +197,7 @@ winner of each plus the price of the one that won (a `Response`). `None` is the
 refusal.
 
 Two ports, one member each, split between asking and telling: the scheduler's `decide`
-for the question (a `Request`) and `ClusterModel.notify` for the facts
+for the question (a `Request`) and `NotifiedSensor.notify` for the facts
 (`PrefillFinished`, `ComputeBusy`, `DecodeState`), every one of them a value. They
 are deliberately all a serving host may touch: control holds every instance's
 queue, cache and decode occupancy, so it runs as a service, not here. Everything crossing is a value, which is what lets the in-process call
@@ -227,37 +227,40 @@ kvcache_sim/
     scheduler.py          #   ONE scheduler behind proposed.ControlPlane, the
                           #   port the data plane calls: prefill placement,
                           #   pull-vs-recompute, SLO gates, decode placement,
-                          #   every one of them priced against the cluster model
-                          #   below. LoadBalance (baseline) and CacheAware are
-                          #   presets of it -- two selectors, one naming a peer
-                          #   to pull from and one ranking the priced
-                          #   candidates, and admission as two SLO comparisons
-    _cluster.py           #   KVClusterModel behind proposed.ClusterModel: the
-                          #   PREDICTED prefill queue and the observed decode
-                          #   batches -- what a host keeps true, and nothing
-                          #   else. One per run, built in attach() and written
-                          #   only by notify(fact) -- the facts a host reports
-                          #   live here with the fold that applies them, and so
-                          #   do the reads everything that ranks hosts by load
-                          #   makes
-    _pending.py           #   Reservations / RoutedPulls: what this plane decided
-                          #   and has not yet seen carried out, each a sense of
-                          #   its own and neither corrected by a host. Each
-                          #   expires on its own terms, when read -- so no
-                          #   decision method carries a sweep
+                          #   every one of them priced against the cluster
+                          #   sensor below. LoadBalance (baseline) and
+                          #   CacheAware are presets of it -- two selectors, one
+                          #   naming a peer to pull from and one ranking the
+                          #   priced candidates, and admission as two SLO
+                          #   comparisons
+    _sensor/              #   one sensor per kind of fact this plane holds
+      _cluster.py         #     ClusterSensor behind proposed.NotifiedSensor:
+                          #     the PREDICTED prefill queue and the observed
+                          #     decode batches -- what a host keeps true, and
+                          #     nothing else. One per run, built in attach() and
+                          #     written only by notify(fact) -- the facts a host
+                          #     reports live here with the fold that applies
+                          #     them, and so do the reads everything that ranks
+                          #     hosts by load makes
+      _pending.py         #     ReservationSensor / RoutedPullSensor: what this
+                          #     plane decided and has not yet seen carried out.
+                          #     No host reports into either, so neither declares
+                          #     notify and no service fronts them. Each expires
+                          #     on its own terms, when read -- so no decision
+                          #     method carries a sweep
     _source.py            #   LongestPrefixKeySelector: the one store question
                           #   ("which peer serves this gap"), a
                           #   proposed.KeySelector, priced in blocks of prefix
                           #   run so the opt-in proposed.selector.Discount can
                           #   spread reads over equally good replicas
-    _view.py              #   KVView: what a decision senses, one class per
-                          #   sense and each a proposed.View -- prefix runs
-                          #   (with the pinned snapshot one routing decision
-                          #   reads them through), the cluster model above, the
+    _view.py              #   KVView: what a decision senses, one class per read
+                          #   and each a proposed.View -- prefix runs (with the
+                          #   pinned snapshot one routing decision reads them
+                          #   through) and each sensor above: the cluster, the
                           #   prefills promised (composed in only by a run that
                           #   predicts decode occupancy forward) and the routed
-                          #   pulls, so what ranks or gates reads the sense it
-                          #   needs and is handed no record of its own
+                          #   pulls, so what ranks or gates reads the view it
+                          #   needs and is handed no sensor of its own
                           #   (underscored: the coordinator builds its own, so
                           #   nothing outside control/ names this)
     request.py            #   inference Request, carrying its prompt (a
@@ -439,8 +442,8 @@ plus the prefix-run read that express KV caching on a mesh.
   workload, mean TTFT goes 2.56 → 4.90 and the hit rate 0.734 → 0.704, because routing
   reads a directory snapshot one hop old and a just-published prefix is not there to
   reuse yet. Both schedulers pay the same hop, so the comparison holds either way.
-  Reports pay it too, over the seam in front of the model they correct
-  (`realsim/seams/cluster_model_handle.py`, same distance): a decode batch change is
+  Reports pay it too, over the seam in front of the sensor they correct
+  (`realsim/seams/sensor_handle.py`, same distance): a decode batch change is
   a round trip inside the step loop, so on a coupled instance every step pays one.
   What the seam still does not model is that the recorded TTFT is control's own
   prediction, so it moves with queueing rather than by exactly one RTT.

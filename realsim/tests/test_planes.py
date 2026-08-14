@@ -96,7 +96,7 @@ def test_view_reads_the_real_directory_topology_and_clock():
 
     (located, now) = _drive(sim, scenario())
     assert list(located["W"]) == ["a"]
-    # Absent keys are simply missing -- a sensor reports, it does not raise.
+    # Absent keys are simply missing -- a view reports, it does not raise.
     assert "absent" not in located
     assert now >= 2.0
     # Distance is arithmetic on the topology the view carries, not a read of it:
@@ -108,7 +108,7 @@ def test_view_reads_the_real_directory_topology_and_clock():
 
 
 def test_view_locate_reports_the_directory_and_not_a_preferred_answer():
-    """A sensor reads what is there, whatever the caller of a read prefers.
+    """A view reads what is there, whatever the caller of a read prefers.
 
     A control plane ranks the directory; handed an answer already put in somebody's
     order, it would be ranking its own output back.
@@ -321,7 +321,7 @@ def test_the_directory_holds_nothing_that_decides():
 def test_a_selector_is_a_utility_a_plane_holds_and_not_a_plane():
     """Which is why a run refuses one: there is nothing to hand it and nothing to ask.
 
-    A selector has no ``cluster`` for a run to front and no questions of its own to
+    A selector has no sensor for a run to front and no questions of its own to
     declare -- ``select`` is what the plane holding it consults. So the thing a run
     takes is the plane, and the plane passes the ports down.
     """
@@ -341,7 +341,7 @@ def test_a_plane_passes_the_run_s_view_down_to_what_it_ranks_with():
     """Fronting a plane and attaching it are one act of assembly.
 
     Which is what lets ``select`` take a subject and a requester and no view: the
-    selector was handed the sensor when the plane was, by the plane. One never
+    selector was handed the view when the plane was, by the plane. One never
     attached would sense through ``None``.
     """
     selector = _Fixed()
@@ -413,7 +413,7 @@ def test_a_handle_offers_the_members_the_plane_declares_and_no_others():
     handle = sim.control_plane_handle
     assert handle.asked == ("decide", "price")
     assert _drive(sim, handle.price.call_one("subject", "a")) == "priced"
-    for hidden in ("_internal", "ready", "attach", "cluster"):
+    for hidden in ("_internal", "ready", "attach", "sensor"):
         assert not isinstance(getattr(handle, hidden, None), LocalEndpoint)
 
 
@@ -425,7 +425,7 @@ def test_a_run_with_no_plane_fronts_nothing():
     """
     sim = Simulation(_topology())
     assert sim.control_plane_handle is None
-    assert sim.cluster_handle is None
+    assert sim.sensor_handle is None
 
 
 # --------------------------------------------------------------------------

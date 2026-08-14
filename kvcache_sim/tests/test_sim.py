@@ -21,8 +21,8 @@ from kvcache_sim.control._view import KVView, _longest_prefix_run
 from kvcache_sim.workload._accelerator import (
     BLOCK_TOKENS, SimulatedAccelerator, TOKEN_DTYPE, token_tensor,
 )
-from realsim.seams.cluster_model_handle import LocalClusterModelHandle
-from realsim.seams.cluster_model_service import ClusterModelService
+from realsim.seams.sensor_handle import LocalSensorHandle
+from realsim.seams.sensor_service import SensorService
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
@@ -1755,23 +1755,23 @@ def test_a_refusal_is_a_decision_not_taken():
 
 
 def test_notify_dispatches_each_fact_and_answers_nothing():
-    """The learning half: each fact lands in the cluster model and answers None.
+    """The learning half: each fact lands in the cluster sensor and answers None.
 
     Told over the handle a host holds, not to the object, so what is exercised is
     the surface a report really crosses.
     """
     sim, sched = _scheduler()
-    cluster = LocalClusterModelHandle(ClusterModelService(sched.cluster))
-    assert cluster.model is sched.cluster, "the handle refers to the run's one model"
+    cluster = LocalSensorHandle(SensorService(sched.sensor))
+    assert cluster.sensor is sched.sensor, "the handle refers to the run's one sensor"
 
     async def scenario():
         assert await cluster.notify.call_one(ComputeBusy("s0", 7.0)) is None
-        assert sched.cluster.busy_until["s0"] == 7.0
+        assert sched.sensor.busy_until["s0"] == 7.0
         assert await cluster.notify.call_one(DecodeState("s1", (1.0, 2.0))) is None
-        assert sched.cluster.occupancy("s1") == 2
+        assert sched.sensor.occupancy("s1") == 2
         # A completion raises the tail and never lowers it.
         await cluster.notify.call_one(PrefillFinished("s0", 3.0))
-        assert sched.cluster.busy_until["s0"] == 7.0
+        assert sched.sensor.busy_until["s0"] == 7.0
 
     try:
         sim.loop.run_until_complete(scenario())
@@ -1785,7 +1785,7 @@ def test_an_unknown_fact_is_refused_not_guessed():
     try:
         with pytest.raises(TypeError, match="is not told"):
             sim.loop.run_until_complete(
-                sched.cluster.notify("not a fact")
+                sched.sensor.notify("not a fact")
             )
     finally:
         sim.loop.close()
@@ -1810,22 +1810,22 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
 def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     """Why one plane: neither the memo nor the ranking crosses a boundary.
 
-    The peer a pull was priced against is recorded in this plane's own model and read
+    The peer a pull was priced against is recorded in this plane's own sensor and read
     back by the member a fetch asks, and the ranking behind that memo is the *same
     object* the pricing ranked with. Two planes had to keep both in step; one holds
     them.
     """
     sched = scheduler("cache_aware", _make_topology(2))
-    assert sched.cluster is None, "no sensor to read the model out of before attach"
+    assert sched.sensor is None, "no view to read the sensor out of before attach"
     sim = Simulation(_make_topology(2), control=sched)   # attach builds the chain
     try:
-        # The memo link reads the plane's own model, through the one sensor everything
-        # here senses through -- it is handed no model of its own.
+        # The memo link reads the plane's own sensor, through the one view everything
+        # here senses through -- it is handed no sensor of its own.
         assert sched._fetch.selectors[0].view is sched.view
         assert sched._fetch.selectors[-1] is sched._reuse
-        # And what the run fronted for the hosts is that same sensor's model: the
-        # plane keeps no second reference to reach it by.
-        assert sim.cluster_handle.model is sched.view.cluster
+        # And what the run fronted for the hosts is that same view's cluster sensor:
+        # the plane keeps no second reference to reach it by.
+        assert sim.sensor_handle.sensor is sched.view.cluster
     finally:
         sim.loop.close()
 

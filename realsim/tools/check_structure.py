@@ -42,7 +42,7 @@ Six rules, none of which a type system can express:
    is not a dataclass -- the values that legitimately cross are dataclasses, and
    reading *their* fields is the point of sending them. Today that leaves two
    members on the whole control side of a serving host: ``decide`` on the
-   control plane it asks and ``notify`` on the model it reports into.
+   control plane it asks and ``notify`` on the sensor it reports into.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -54,8 +54,8 @@ above passed. Rule 5 is the answer, narrowed until it was worth enforcing:
 * over *all* public names it is unenforceable -- 78 hits, mostly correct as they
   stand: type aliases used only in this module's annotations (``MakePlane``,
   ``Edge``), rule tables that exist to be read (``BANNED_ALWAYS``), types a
-  caller receives without importing (``ControlPlane.cluster`` -> a capability's
-  own model, which the run fronts with a service),
+  caller receives without importing (``ControlPlane.sensor`` -> a capability's
+  own sensor, which the run fronts with a service),
   exceptions a caller catches (``StorageCapacityExceeded``). A rule whose
   exception list is longer than its findings enforces nothing;
 * over public **functions** it is 12, because every category above is a class or
@@ -447,8 +447,10 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     * it is declared in :mod:`proposed.deployment` and **every member it declares
       is a coroutine** -- what a reference to another process offers, and what a
       surface with a local read never is. That is how
-      :class:`proposed.deployment.ClusterModel` is caught: a host reports into it
-      and asks a selector, and the two are the same kind of reach.
+      :class:`proposed.deployment.NotifiedSensor` is caught, and why the bare
+      :class:`proposed.deployment.Sensor` beside it is not: a host reports into the
+      first over a wire and asks a selector, and the two are the same kind of reach,
+      while the second is read in the process that holds it.
 
     So a ``View``, a ``Selection`` or a ``Deployment`` is not a port -- each has a
     member a caller invokes here and now, and reading a field off a value the other

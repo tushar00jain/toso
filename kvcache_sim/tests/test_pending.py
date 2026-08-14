@@ -1,8 +1,8 @@
 """What the coordinator decided and the cluster has not done yet.
 
-Both records in :mod:`kvcache_sim.control._pending` are self-expiring, and both
-expire on the *read* -- which is the whole reason they are objects rather than two
-lists swept by whichever decision method happens to touch them. These assert the
+Both sensors in :mod:`kvcache_sim.control._sensor._pending` are self-expiring, and
+both expire on the *read* -- which is the whole reason they are objects rather than
+two lists swept by whichever decision method happens to touch them. These assert the
 expiry directly, because the scenarios that would exercise it do so rarely: a
 measured run of the early-rejection comparison reads the reservations 800 times and
 only 3 of those reads see an entry that has come true. The rule has to hold on all
@@ -15,11 +15,11 @@ Run from the repo root::
 
 from __future__ import annotations
 
-from kvcache_sim.control._pending import Reservations, RoutedPulls
+from kvcache_sim.control._sensor import ReservationSensor, RoutedPullSensor
 
 
 # --------------------------------------------------------------------------
-# Reservations: prefills promised, until they land.
+# ReservationSensor: prefills promised, until they land.
 # --------------------------------------------------------------------------
 
 
@@ -30,7 +30,7 @@ def test_a_reservation_that_has_come_true_is_not_pending():
     the request is in the observed decode state. A reservation still standing for
     it would be added on top of that -- the same request predicted as two.
     """
-    reserved = Reservations()
+    reserved = ReservationSensor()
     reserved.reserve(prefill_done=10.0, decode_id="d0", output_tokens=4)
     assert [r.decode_id for r in reserved.pending(now=9.0)] == ["d0"]
     assert list(reserved.pending(now=10.5)) == []
@@ -38,7 +38,7 @@ def test_a_reservation_that_has_come_true_is_not_pending():
 
 def test_a_reservation_is_pending_up_to_the_instant_it_lands():
     """The boundary is inclusive: at exactly its completion it still counts."""
-    reserved = Reservations()
+    reserved = ReservationSensor()
     reserved.reserve(prefill_done=10.0, decode_id="d0", output_tokens=4)
     assert len(reserved.pending(now=10.0)) == 1
 
@@ -46,12 +46,12 @@ def test_a_reservation_is_pending_up_to_the_instant_it_lands():
 def test_expiry_runs_on_the_read_not_on_the_write():
     """The property the extraction exists for.
 
-    A routing decision reads this record before it writes to it, so expiry driven
+    A routing decision reads this sensor before it writes to it, so expiry driven
     by the write is always one decision late -- every read would see entries whose
     prefill has since completed. Here the read is what cleans, so a read is never
     stale however long it has been since the last reservation.
     """
-    reserved = Reservations()
+    reserved = ReservationSensor()
     reserved.reserve(prefill_done=1.0, decode_id="d0", output_tokens=4)
     reserved.reserve(prefill_done=2.0, decode_id="d1", output_tokens=4)
     # No further writes -- and the read is still correct at every instant.
@@ -61,7 +61,7 @@ def test_expiry_runs_on_the_read_not_on_the_write():
 
 
 # --------------------------------------------------------------------------
-# RoutedPulls: a peer priced at routing, until the store asks about it.
+# RoutedPullSensor: a peer priced at routing, until the store asks about it.
 # --------------------------------------------------------------------------
 
 
@@ -72,7 +72,7 @@ def test_a_routed_pull_is_answered_once():
     instance, which would be handed a peer chosen for a different request -- and
     charged a locality tier nobody priced.
     """
-    routed = RoutedPulls()
+    routed = RoutedPullSensor()
     routed.route("s0", ["a", "b"], "s1")
     assert routed.claim("s0", ["a", "b"]) == "s1"
     assert routed.claim("s0", ["a", "b"]) is None
@@ -80,7 +80,7 @@ def test_a_routed_pull_is_answered_once():
 
 def test_pulls_to_one_instance_are_claimed_oldest_first():
     """Two requests in flight to one instance resolve in a fixed order."""
-    routed = RoutedPulls()
+    routed = RoutedPullSensor()
     routed.route("s0", ["a"], "s1")
     routed.route("s0", ["a"], "s2")
     assert routed.claim("s0", ["a"]) == "s1"
@@ -94,7 +94,7 @@ def test_a_claim_is_for_exactly_what_was_planned():
     is a different pull, and answering it with this peer would charge it a
     locality tier chosen for another request.
     """
-    routed = RoutedPulls()
+    routed = RoutedPullSensor()
     routed.route("s0", ["a", "b", "c"], "s1")
     assert routed.claim("s0", ["a", "b"]) is None
     assert routed.claim("s0", ["c", "b", "a"]) == "s1"  # order is not identity
@@ -102,7 +102,7 @@ def test_a_claim_is_for_exactly_what_was_planned():
 
 def test_nobody_elses_pull_is_claimable():
     """A peer priced for one requester says nothing about another's fetch."""
-    routed = RoutedPulls()
+    routed = RoutedPullSensor()
     routed.route("s0", ["a"], "s1")
     assert routed.claim("s2", ["a"]) is None       # different requester
     assert routed.claim("s0", ["a", "z"]) is None  # more than was planned

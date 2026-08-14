@@ -28,14 +28,17 @@ simulator, ``proposed`` is the design being argued for.
   takes it unannotated). The difference between it and torchstore's class is the
   ask: an optional **source preference** on ``locate_volumes``, which the store
   applies to its own answer without consulting anybody, and ``locate_raw`` -- the
-  same read with nothing applied, which is what a sensor reads. Beside it,
-  :class:`~proposed.deployment.ClusterModel`: the directory's peer on the
-  application's side, holding the load a store cannot see and written by one
-  ``notify(fact)``, the way the directory is written by ``notify_put_batch``;
+  same read with nothing applied, which is what a view reads. Beside it,
+  :class:`~proposed.deployment.Sensor`: the directory's peer on the application's
+  side, holding the load a store cannot see, and
+  :class:`~proposed.deployment.NotifiedSensor` -- one of those that a host writes
+  from another process, by one ``notify(fact)``, the way the directory is written by
+  ``notify_put_batch``. A capability declares the reads on its own sensor and exposes
+  it through a view;
 * :mod:`proposed.view` -- :class:`~proposed.view.View`, the read-only observation a
-  control plane senses through: who holds a key, where volumes are, what time it is.
-  It reads a :class:`~proposed.deployment.Controller` through ``locate_raw``,
-  synchronously.
+  control plane senses through: who holds a key, where volumes are, what time it is,
+  and whatever sensors a capability composes onto it. It reads a
+  :class:`~proposed.deployment.Controller` through ``locate_raw``, synchronously.
 
 Import rule, enforced by ``realsim/tools/check_contract.py``: **this package may
 not import anything at all** -- not ``realsim``, not a capability, not even
@@ -51,8 +54,8 @@ missing" section.
 # Re-export the contract surface so callers import from the package directly.
 from .cost import TransferCost
 from .deployment import (
-    ClusterModel, Controller, Deployment, Key, StorageFull, StorageVolume,
-    VolumeId,
+    Controller, Deployment, Key, NotifiedSensor, Sensor, StorageFull,
+    StorageVolume, VolumeId,
 )
 from .plane import ControlPlane, DataPlane
 from .selector import DecisionLog, AnySelector, KeySelector, Selection
@@ -69,7 +72,8 @@ __all__ = [
     "DecisionLog",
     "View",
     "Controller",
-    "ClusterModel",
+    "Sensor",
+    "NotifiedSensor",
     "StorageVolume",
     "StorageFull",
     "Endpoint",

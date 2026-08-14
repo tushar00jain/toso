@@ -20,7 +20,7 @@ What it builds, top to bottom (compare the stack in the design doc):
   client per node, the shared resource registry, and the one shared
   ``create_transport_buffer``;
 * the **control services**: the one ``control`` plane, fronted by a handle a
-  caller reaches it through, and the model it decides against, fronted beside it;
+  caller reaches it through, and the sensor its hosts write, fronted beside it;
 * the **view** the control plane senses through, over that same directory;
 * the **transfer-cost estimate**, from the *same* topology and profile the mesh
   charges against, so a scheduler cannot predict against one model while the
@@ -47,11 +47,11 @@ from sim_common.report import Ledger
 from sim_common.trace import Trace
 
 from realsim.mesh import Mesh
-from realsim.seams.cluster_model_handle import LocalClusterModelHandle
-from realsim.seams.cluster_model_service import ClusterModelService
-from realsim.seams.link import ServiceHop
 from realsim.seams.control_plane_handle import LocalControlPlaneHandle
 from realsim.seams.control_plane_service import ControlPlaneService
+from realsim.seams.link import ServiceHop
+from realsim.seams.sensor_handle import LocalSensorHandle
+from realsim.seams.sensor_service import SensorService
 from realsim.runner import ItemDispatch, Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -81,8 +81,8 @@ class Simulation:
             the peer that serves the read, with nothing threaded through the data
             plane and nothing to keep in step between two objects.
 
-            A model of the cluster (:attr:`~proposed.plane.ControlPlane.cluster`) is
-            fronted too, as :attr:`cluster_handle`, so the hosts report into it
+            The sensor its hosts write (:attr:`~proposed.plane.ControlPlane.sensor`)
+            is fronted too, as :attr:`sensor_handle`, so they report into it
             directly.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`;
             supplies every cost constant and each volume's byte capacity.
@@ -142,7 +142,7 @@ class Simulation:
         # the transfer-cost estimate that everything below is derived from, and it
         # passes them down to whatever it ranks with.
         self.control_plane_handle: Optional[Any] = None
-        self.cluster_handle: Optional[Any] = None
+        self.sensor_handle: Optional[Any] = None
         if control is not None:
             if not isinstance(control, ControlPlane):
                 raise TypeError(
@@ -155,7 +155,7 @@ class Simulation:
         # What reaching a control plane costs. Resolved once, here, because this is
         # the one place a run's control services are built -- the same reason
         # ``make_controller_adapter`` resolves the directory's. One distance for both
-        # of them: the model is held by the control plane that reads it, so a caller
+        # of them: the sensor is held by the control plane that reads it, so a caller
         # reaching either crosses the same boundary.
         hop = ServiceHop(config.current().control_rtt)
         if control is not None:
@@ -165,12 +165,12 @@ class Simulation:
                 ControlPlaneService(control), hop=hop
             )
             # The other half of what a host says to control: a question goes to the
-            # plane, a fact goes to the model it corrects. Only a plane that keeps one
-            # has it (``ControlPlane.cluster``), and it is read after ``attach``
-            # because that is when a model learns which cluster it is of.
-            if control.cluster is not None:
-                self.cluster_handle = LocalClusterModelHandle(
-                    ClusterModelService(control.cluster), hop=hop
+            # plane, a fact goes to the sensor it corrects. Only the one sensor a host
+            # writes is fronted (``ControlPlane.sensor``), and it is read after
+            # ``attach`` because that is when a sensor learns which cluster it is of.
+            if control.sensor is not None:
+                self.sensor_handle = LocalSensorHandle(
+                    SensorService(control.sensor), hop=hop
                 )
 
     @property
@@ -187,7 +187,7 @@ class Simulation:
     # :class:`~proposed.deployment.Deployment`: a capability's data plane is handed
     # this one object (:meth:`~proposed.plane.DataPlane.attach`) and finds on it the
     # store to call, the control plane to ask (:attr:`control_plane_handle`, whatever
-    # that plane declares) and the model to report into (:attr:`cluster_handle`).
+    # that plane declares) and the sensor to report into (:attr:`sensor_handle`).
     def client_for(
         self, node_id: str, *, prefer: Optional[Sequence[str]] = None
     ) -> Any:

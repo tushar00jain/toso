@@ -1,40 +1,40 @@
-"""The senses one KV-cache decision reads, composed: :class:`KVView`.
+"""What one KV-cache decision senses, composed: :class:`KVView`.
 
-A sense is one read, as a class, and a :class:`~proposed.view.View` in its own right:
-a view is assembled by naming the senses a decision makes, and a capability needing
-one of them composes that one alone (``view.derived(ClusterSense, cluster=m)``). A
-selector reads the one it needs:
+Each class here is one read, and a :class:`~proposed.view.View` in its own right: a
+view is assembled by naming the reads a decision makes, and a capability needing one
+of them composes that one alone (``view.derived(ClusterView, cluster=s)``). A selector
+takes the one it needs:
 
-* :class:`PrefixSense`: how many leading blocks of a prompt an instance holds
+* :class:`PrefixView`: how many leading blocks of a prompt an instance holds
   contiguously. The base view stops at "who holds this key", and a cache is only
   useful as a contiguous prefix -- a KV-cache notion, not a store notion;
-* :class:`ClusterSense`: the predicted prefill queues and observed decode batches
-  (:class:`~kvcache_sim.control._cluster.KVClusterModel`), which is what ranks, prices
+* :class:`ClusterView`: the predicted prefill queues and observed decode batches
+  (:class:`~kvcache_sim.control._sensor.ClusterSensor`), which is what ranks, prices
   and gates a candidate host;
-* :class:`ReservedSense`: the prefills this plane promised and has not seen land
-  (:class:`~kvcache_sim.control._pending.Reservations`), read by the decode-side
+* :class:`ReservedView`: the prefills this plane promised and has not seen land
+  (:class:`~kvcache_sim.control._sensor.ReservationSensor`), read by the decode-side
   prediction of a run that rolls occupancy forward, and composed in only by such a run;
-* :class:`RoutedSense`: the pulls a decision priced against a peer
-  (:class:`~kvcache_sim.control._pending.RoutedPulls`), read by the fetch chain's head
-  link alone (:class:`~kvcache_sim.control.scheduler.RoutedPull`).
+* :class:`RoutedView`: the pulls a decision priced against a peer
+  (:class:`~kvcache_sim.control._sensor.RoutedPullSensor`), read by the fetch chain's
+  head link alone (:class:`~kvcache_sim.control.scheduler.RoutedPull`).
 
-Each sense claims its own keyword through :meth:`~proposed.view.View.derived`, holds
-its own state and raises its own "this run supplied none", so composing one in is a
-name in a class statement and nothing else moves. The senses are disjoint: different
-selectors read different ones and none of them touches another's, which is what makes
-sensing any of them ambiently safe.
+Each claims its own keyword through :meth:`~proposed.view.View.derived`, carries its
+own sensor and raises its own "this run supplied none", so composing one in is a name
+in a class statement and nothing else moves. They are disjoint: different selectors
+read different ones and none of them touches another's, which is what makes sensing
+any of them ambiently safe.
 
-They are all *observed state* -- this plane's own records as much as the directory --
-so whatever ranks, prices or gates senses it here instead of being handed the object,
+All four are *observed state* -- this plane's own sensors as much as the directory --
+so whatever ranks, prices or gates senses it here instead of being handed the sensor,
 and the plane reports its own decision into them the same way. What does not come this
-way is a host's fact: the run puts a service in front of the model for those.
+way is a host's fact: the run puts a service in front of the cluster sensor for those.
 
-:meth:`PrefixSense.pinned` is the second half of the prefix idea. A routing decision
+:meth:`PrefixView.pinned` is the second half of the prefix idea. A routing decision
 reads the prefix runs several times -- once for the candidate loop's local matches,
 once per candidate when it asks the source :class:`~proposed.selector.KeySelector` which
 peer would serve the gap -- and all of them must see the *same* directory state or the
 decision is incoherent. Pinning also means the directory is walked once per request,
-not once per read. The other senses are live: they move only when a fact is folded or a
+not once per read. The other three are live: they move only when a fact is folded or a
 decision commits, and neither happens inside a pin.
 """
 
@@ -48,15 +48,14 @@ from typing import (
 from proposed import View
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from ._cluster import KVClusterModel
-    from ._pending import Reservations, RoutedPulls
+    from ._sensor import ClusterSensor, ReservationSensor, RoutedPullSensor
 
 __all__ = [
     "prefix_lengths_of",
-    "PrefixSense",
-    "ClusterSense",
-    "ReservedSense",
-    "RoutedSense",
+    "PrefixView",
+    "ClusterView",
+    "ReservedView",
+    "RoutedView",
     "KVView",
 ]
 
@@ -81,7 +80,7 @@ def prefix_lengths_of(
 ) -> Dict[str, int]:
     """``instance -> leading blocks of ``block_keys`` it holds contiguously``.
 
-    Split from the read that feeds it: :meth:`PrefixSense.prefix_lengths` reads the
+    Split from the read that feeds it: :meth:`PrefixView.prefix_lengths` reads the
     directory (or serves a pinned snapshot), while
     :class:`~kvcache_sim.control._source.LongestPrefixKeySelector` may be attached to a
     plain :class:`~proposed.view.View` and reads it itself. One definition either
@@ -97,7 +96,7 @@ def prefix_lengths_of(
     return counts
 
 
-class PrefixSense(View):
+class PrefixView(View):
     """Prefix runs, off this view's own directory.
 
     Derived rather than held: it reads :meth:`~proposed.view.View.locate`, so it takes
@@ -151,108 +150,108 @@ class PrefixSense(View):
             self._snapshot = None
 
 
-class ClusterSense(View):
+class ClusterView(View):
     """The cluster this capability decides against: :attr:`cluster`.
 
-    Its reads are the model's own members (``busy_until``, ``occupancy``,
-    ``predict_occupancy``), stated once where the model is.
+    Its reads are the sensor's own members (``busy_until``, ``occupancy``,
+    ``predict_occupancy``), stated once where the sensor is.
     """
 
     def __init__(
         self,
         *ports: Any,
-        cluster: Optional["KVClusterModel"] = None,
-        **senses: Any,
+        cluster: Optional["ClusterSensor"] = None,
+        **sensors: Any,
     ) -> None:
-        super().__init__(*ports, **senses)
+        super().__init__(*ports, **sensors)
         self._cluster = cluster
 
     @property
-    def cluster(self) -> "KVClusterModel":
-        """The run's model of the cluster, as a sense beside the directory.
+    def cluster(self) -> "ClusterSensor":
+        """The run's cluster sensor, read beside the directory.
 
         Raises like :meth:`~proposed.view.View.transfer_cost` does and for its reason:
-        a view composed without the model cannot answer for the cluster, and "idle" is
-        not a number to invent.
+        a view composed without that sensor cannot answer for the cluster, and "idle"
+        is not a number to invent.
         """
         if self._cluster is None:
             raise RuntimeError(
-                "this view was composed without a cluster model, so nothing here can "
+                "this view was composed without a cluster sensor, so nothing here can "
                 "be ranked, priced or gated against the cluster"
             )
         return self._cluster
 
 
-class ReservedSense(View):
+class ReservedView(View):
     """The prefills this plane promised and has not seen land: :attr:`reserved`.
 
     Written when a decision commits, read when the next one predicts the decode batch
     it will meet, and self-expiring on that read
-    (:meth:`~kvcache_sim.control._pending.Reservations.pending`).
+    (:meth:`~kvcache_sim.control._sensor.ReservationSensor.pending`).
     """
 
     def __init__(
         self,
         *ports: Any,
-        reserved: Optional["Reservations"] = None,
-        **senses: Any,
+        reserved: Optional["ReservationSensor"] = None,
+        **sensors: Any,
     ) -> None:
-        super().__init__(*ports, **senses)
+        super().__init__(*ports, **sensors)
         self._reserved = reserved
 
     @property
-    def reserved(self) -> "Reservations":
+    def reserved(self) -> "ReservationSensor":
         """The prefills promised and not yet landed.
 
-        Raises like :attr:`ClusterSense.cluster` does, and for its reason: a run that
-        promises nothing composes no record, and reading one that was never written
-        would under-count every predicted batch and report no error.
+        Raises like :attr:`ClusterView.cluster` does, and for its reason: a run that
+        promises nothing composes no such sensor, and reading one that was never
+        written would under-count every predicted batch and report no error.
         """
         if self._reserved is None:
             raise RuntimeError(
-                "this view was composed without a reservation record, so this run "
+                "this view was composed without a reservation sensor, so this run "
                 "does not roll decode occupancy forward and nothing here can read "
                 "the prefills it promised"
             )
         return self._reserved
 
 
-class RoutedSense(View):
+class RoutedView(View):
     """The pulls this plane has priced against a peer: :attr:`routed`.
 
     Written by the plane that priced them, read by the one link that answers a fetch
     from them (:class:`~kvcache_sim.control.scheduler.RoutedPull`) -- and reading one
-    consumes it (:meth:`~kvcache_sim.control._pending.RoutedPulls.claim`).
+    consumes it (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim`).
     """
 
     def __init__(
         self,
         *ports: Any,
-        routed: Optional["RoutedPulls"] = None,
-        **senses: Any,
+        routed: Optional["RoutedPullSensor"] = None,
+        **sensors: Any,
     ) -> None:
-        super().__init__(*ports, **senses)
+        super().__init__(*ports, **sensors)
         self._routed = routed
 
     @property
-    def routed(self) -> "RoutedPulls":
+    def routed(self) -> "RoutedPullSensor":
         """The pulls priced and not yet claimed.
 
-        Raises like :attr:`ClusterSense.cluster` does, and for its reason.
+        Raises like :attr:`ClusterView.cluster` does, and for its reason.
         """
         if self._routed is None:
             raise RuntimeError(
-                "this view was composed without a routed-pull record, so nothing "
+                "this view was composed without a routed-pull sensor, so nothing "
                 "here can claim the peer a pull was priced against"
             )
         return self._routed
 
 
-class KVView(PrefixSense, ClusterSense, ReservedSense, RoutedSense):
-    """The senses a KV-cache decision reads, over the run's ports.
+class KVView(PrefixView, ClusterView, ReservedView, RoutedView):
+    """Every read a KV-cache decision makes, over the run's ports.
 
-    Every sense is optional and independent, so a caller wanting the prefix runs alone
-    composes :class:`PrefixSense` and never names the rest. C3 puts
+    Each is optional and independent, so a caller wanting the prefix runs alone
+    composes :class:`PrefixView` and never names the rest. C3 puts
     :class:`~proposed.view.View` once at the tail of this MRO, so the run's ports are
-    taken up once however many senses are named.
+    taken up once however many are named.
     """

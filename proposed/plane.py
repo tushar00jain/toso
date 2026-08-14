@@ -8,8 +8,8 @@ implementing these and nothing else.
 
 * :class:`ControlPlane` -- the deciding half's lifecycle: knobs at construction,
   the stack's ports at :meth:`ControlPlane.attach`, and the one thing a run
-  harvests off it once attached -- the model it decides against
-  (:attr:`ControlPlane.cluster`), to put a service in front of. **One per
+  harvests off it once attached -- the sensor its hosts report into
+  (:attr:`ControlPlane.sensor`), to put a service in front of. **One per
   capability**, whatever it is asked: which volumes should serve this read, where
   this request should run, both. A capability that answered two questions from two
   objects would have to keep them agreeing, and they already share the state the
@@ -57,7 +57,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from proposed.deployment import ClusterModel
+from proposed.deployment import NotifiedSensor
 
 __all__ = ["ControlPlane", "DataPlane"]
 
@@ -81,7 +81,7 @@ class DataPlane:
 
         The sibling of :meth:`ControlPlane.attach`, and two-phase for the same
         reason: a plane is constructed with its knobs, and the store, the control
-        plane it asks and the model it reports into do not exist until the
+        plane it asks and the sensor it reports into do not exist until the
         deployment does. One argument, because they all hang off it
         (:class:`~proposed.deployment.Deployment`) -- a plane that had to be handed
         each port separately would make every caller responsible for knowing which
@@ -115,15 +115,18 @@ class ControlPlane:
     ports of its own and inherits this no-op.
     """
 
-    #: The picture this control plane decides against, if it keeps one. Read after
-    #: :meth:`attach` by whoever assembles the run, and given a service of its own
-    #: so the application's hosts can report into it without a question being asked.
-    #: ``None`` -- the default -- is a control plane that models nothing between
-    #: calls, so there is nothing for a host to correct and no service to stand up.
-    cluster: Optional[ClusterModel] = None
+    #: The one sensor of this plane's that a host writes. Read after :meth:`attach`
+    #: by whoever assembles the run, and given a service of its own so the
+    #: application's hosts can report into it without a question being asked.
+    #: Singular because the seam is: a plane may hold several sensors -- its own
+    #: bookkeeping among them -- and only one that a *host* corrects needs fronting,
+    #: which is what :class:`~proposed.deployment.NotifiedSensor` says. ``None`` --
+    #: the default -- is a plane whose facts are all its own, so there is nothing for
+    #: a host to correct and no service to stand up.
+    sensor: Optional[NotifiedSensor] = None
 
     def attach(self, view: Any) -> None:
-        """Receive the sensor this control plane senses and prices through.
+        """Receive the view this control plane senses and prices through.
 
         One argument, the sibling of :meth:`DataPlane.attach`'s: a
         :class:`~proposed.view.View` carries every run-supplied read there is.

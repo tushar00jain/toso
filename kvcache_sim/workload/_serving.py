@@ -52,9 +52,9 @@ had to keep the loop alive for the tail, and nothing was left holding the reques
 to measure it.
 
 They are two functions because they are the two halves. The plane factory does not
-build the scheduler; it takes ``sim.control_plane_handle`` and ``sim.cluster_handle``,
+build the scheduler; it takes ``sim.control_plane_handle`` and ``sim.sensor_handle``,
 the handles :meth:`realsim.run.Run.execute` put in front of whatever
-:func:`scheduler` returned and of the model it decides against. A scenario names
+:func:`scheduler` returned and of the sensor its hosts report into. A scenario names
 both functions on a :class:`~realsim.run.Run`: same workload, different wiring,
 which is exactly what "cache-aware vs load-balance" means.
 """
@@ -74,7 +74,7 @@ from realsim.simulation import Simulation
 from realsim.run import Workload
 from sim_common import config
 
-from ..control._cluster import KVClusterModel
+from ..control._sensor import ClusterSensor
 from ..control._source import LongestPrefixKeySelector
 from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
@@ -163,8 +163,8 @@ def scheduler(
     rather than a factory the harness must call at the right moment.
 
     One plane, asked where a request should run and, later, which peer serves the
-    fetch that plan implies. Its cluster model is built here rather than in
-    ``attach`` for one reason: a scenario may want to hand the same model to a test,
+    fetch that plan implies. Its cluster sensor is built here rather than in
+    ``attach`` for one reason: a scenario may want to hand the same sensor to a test,
     and the plane accepts one so that stays possible.
 
     ``source_selector`` is the one knob that is an object rather than a value: which
@@ -179,7 +179,7 @@ def scheduler(
         raise ValueError(f"unknown scheduler kind {kind!r}")
     source = source_selector if source_selector is not None else LongestPrefixKeySelector()
     # Over ALL instances: the prefill and decode pools may each be a subset.
-    cluster = KVClusterModel(sorted(topology))
+    cluster = ClusterSensor(sorted(topology))
     knobs = dict(
         block_tokens=BLOCK_TOKENS,
         profile=DEFAULT_PROFILE,

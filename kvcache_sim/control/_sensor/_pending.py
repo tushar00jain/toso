@@ -1,21 +1,27 @@
-"""Decisions taken but not yet carried out: :class:`Reservations`, :class:`RoutedPulls`.
+"""Decisions taken but not yet carried out: :class:`ReservationSensor`,
+:class:`RoutedPullSensor`.
 
 A control plane that predicts has to remember what it has already promised, because
 the next decision is made against a cluster that has not finished doing the last
-one. Both records here are *self-expiring*, and expiry runs on the **read** rather
+one. Both sensors here are *self-expiring*, and expiry runs on the **read** rather
 than on the write: a routing decision reads before it writes, so sweeping on write
 would serve entries whose event had since occurred -- and prediction would count a
 request twice, once as a reservation and once through the observed decode state
 that had superseded it.
 
-Folder-private: one control plane's own bookkeeping, not a surface.
+Grouped in one module because that expiry rule is the one idea behind both, and because
+nothing outside this process writes either: both take plain typed methods and neither
+declares ``notify`` -- one control plane's own bookkeeping, with no service in front of
+it.
 """
 
 from __future__ import annotations
 
 from typing import List, NamedTuple, Optional, Sequence, Tuple
 
-__all__ = ["Reservation", "Reservations", "RoutedPulls"]
+from proposed import Sensor
+
+__all__ = ["Reservation", "ReservationSensor", "RoutedPullSensor"]
 
 
 class Reservation(NamedTuple):
@@ -26,15 +32,15 @@ class Reservation(NamedTuple):
     output_tokens: int
 
 
-class Reservations:
+class ReservationSensor(Sensor):
     """Prefills promised and not yet finished, oldest first.
 
     Held because a request routed now shares its decode instance with requests
     whose prefill has not completed yet: they are invisible to the observed decode
     state and would otherwise be predicted as absent.
 
-    One sense of the scheduler's view
-    (:class:`~kvcache_sim.control._view.ReservedSense`): the plane that promises a
+    Read through the scheduler's view
+    (:class:`~kvcache_sim.control._view.ReservedView`): the plane that promises a
     prefill writes it, and the decode-side prediction reads it.
     """
 
@@ -56,7 +62,7 @@ class Reservations:
         return self._held
 
 
-class RoutedPulls:
+class RoutedPullSensor(Sensor):
     """Pulls priced against a chosen peer, waiting for the store to ask about them.
 
     A pull is routed when the request is planned and fetched later, and in between
@@ -64,7 +70,7 @@ class RoutedPulls:
     the answer be the decision already made rather than a second,
     differently-derived one.
 
-    One sense of the scheduler's view (:class:`~kvcache_sim.control._view.RoutedSense`):
+    Read through the scheduler's view (:class:`~kvcache_sim.control._view.RoutedView`):
     the plane that prices a pull writes it, and the one link that answers a fetch from
     it reads it.
     """

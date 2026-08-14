@@ -1,10 +1,10 @@
-"""Control's model of the cluster: :class:`KVClusterModel`, and the facts it folds.
+"""The cluster as control sees it: :class:`ClusterSensor`, and the facts it folds.
 
 Nothing here executes. What control knows about what the cluster is *doing* is a
-*model* corrected by what the hosts report, never a live read -- two records, and a
-host's fact is what keeps each of them true:
+*model* corrected by what the hosts report, never a live read -- two things it keeps,
+and a host's report is what keeps each of them true:
 
-* the **prefill queue** (:attr:`KVClusterModel.busy_until`) is predicted -- a
+* the **prefill queue** (:attr:`ClusterSensor.busy_until`) is predicted -- a
   :class:`Committed` plan holds its instance until the TTFT it was priced at --
   and corrected by :class:`PrefillFinished`. It diverges from the wait the data
   plane measures by construction: a candidate is priced for
@@ -17,15 +17,14 @@ host's fact is what keeps each of them true:
   wholesale by :class:`DecodeState`.
 
 A prefill this plane has *promised* is neither: the control plane both writes and reads
-that, and no host corrects it, so it is a record and a sense of its own
-(:class:`kvcache_sim.control._pending.Reservations`,
-:class:`kvcache_sim.control._view.ReservedSense`).
+that, and no host corrects it, so it is a sensor of its own
+(:class:`kvcache_sim.control._sensor.ReservationSensor`).
 
-Folder-private: the port this answers (:class:`proposed.ClusterModel`) is the
-surface, and a host reaches it through the seam in front of it
-(:class:`realsim.seams.cluster_model_handle.LocalClusterModelHandle`). The control
-plane reads and writes it here, in this process, through the sense it is composed into
-(:class:`kvcache_sim.control._view.ClusterSense`).
+The one sensor here that a host writes, which is what
+:class:`~proposed.deployment.NotifiedSensor` says: a report reaches ``notify`` over the
+seam in front of it (:class:`realsim.seams.sensor_handle.LocalSensorHandle`), while the
+control plane reads and writes it in this process, through the view it is composed into
+(:class:`kvcache_sim.control._view.ClusterView`).
 """
 
 from __future__ import annotations
@@ -36,17 +35,17 @@ from typing import (
     Any, Callable, Dict, List, Mapping, Sequence, Tuple, TYPE_CHECKING,
 )
 
-from proposed import ClusterModel
+from proposed import NotifiedSensor
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .scheduler import Response
+    from ..scheduler import Response
 
 __all__ = [
     "ComputeBusy",
     "DecodeState",
     "PrefillFinished",
     "Committed",
-    "KVClusterModel",
+    "ClusterSensor",
 ]
 
 
@@ -59,13 +58,13 @@ __all__ = [
 class PrefillFinished:
     """*Prefill really finished at this clock -- what is the queue tail now?*
 
-    The only thing that tells this control plane its model of an instance's
+    The only thing that tells this control plane its picture of an instance's
     prefill queue was wrong: ``now`` is measured independently (the host's
     accelerator serialises its own passes).
 
     Reported over a call the host waits for, and not for the reply, which carries
-    nothing: the decode admission it asks next must be decided against a model that
-    has already folded this completion.
+    nothing: the decode admission it asks next must be decided against a sensor
+    that has already folded this completion.
     """
 
     inst: str
@@ -104,15 +103,15 @@ class Committed:
     response: "Response"
 
 
-class KVClusterModel(ClusterModel):
+class ClusterSensor(NotifiedSensor):
     """Every instance's predicted prefill queue and observed decode batch.
 
     One per run, and that is load-bearing: a second one starts empty, and an empty
-    model would report every host idle -- a run that looks healthy and is wrong.
+    sensor would report every host idle -- a run that looks healthy and is wrong.
     Two things keep it to one. It is built in a single place, the control plane's
     :meth:`~kvcache_sim.control.scheduler._Scheduler.attach`, which the run calls
     once when the stack exists; and it is keyed by the instances handed to it
-    there, so a model built for the wrong cluster (or for none) raises on the
+    there, so one built for the wrong cluster (or for none) raises on the
     first read instead of answering "idle".
 
     Args:
@@ -135,7 +134,7 @@ class KVClusterModel(ClusterModel):
 
     # -- the two ways in, one fold ------------------------------------------ #
     async def notify(self, fact: Any) -> None:
-        """:class:`~proposed.deployment.ClusterModel` -- fold ``fact`` into state.
+        """:class:`~proposed.deployment.NotifiedSensor` -- fold ``fact`` into state.
 
         The endpoint a host reports over, and the whole of what crosses the seam.
         """
@@ -145,8 +144,8 @@ class KVClusterModel(ClusterModel):
         """Fold ``fact`` in, here and now: what co-located control code calls.
 
         The same fold as :meth:`notify` over a shorter reach, so what a caller
-        chooses between is the transport. Only a caller holding the model itself can
-        reach this one -- :class:`~proposed.deployment.ClusterModel` declares
+        chooses between is the transport. Only a caller holding this sensor itself can
+        reach this one -- :class:`~proposed.deployment.NotifiedSensor` declares
         ``notify`` alone and the service in front of it forwards only that -- so a
         host reports over the seam whatever it is co-located with.
 

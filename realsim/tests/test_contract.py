@@ -350,7 +350,7 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
     """Vacuous unless it finds both real ports and the plane that holds them.
 
     A serving host reaches control twice -- it asks a ``ControlPlane`` and reports
-    to a ``ClusterModel`` -- and each is found on its own mark: the first *is* the
+    to a ``NotifiedSensor`` -- and each is found on its own mark: the first *is* the
     base every port derives (followed transitively, so a capability declaring a
     narrower plane in ``proposed`` is caught too); the second is one of the
     all-coroutine services ``proposed.deployment`` declares. Both are imported from
@@ -374,7 +374,7 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
         )
     }
     ports = check_structure._control_ports(rel, tree, mods, trees)
-    assert ports == {"ControlPlane", "ClusterModel"}, ports
+    assert ports == {"ControlPlane", "NotifiedSensor"}, ports
     # ...and that the plane's fields are recognised as holding them.
     _local, attrs = check_structure._port_names(tree, ports)
     assert {"control", "cluster"} <= attrs, attrs

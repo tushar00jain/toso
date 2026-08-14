@@ -110,7 +110,7 @@ engine, meta/metadata carriers — is imported from `realsim` / `sim_common`.
 
 | role | `putget_sim` | `dedup_sim` | `kvcache_sim` |
 |---|---|---|---|
-| `control/` — what is decided | **absent** — no preference is passed, so the directory's own order stands | `routing.py` + `_source.py`: one `KeySelector.select` behind one plane — a ranked source, once it is usable | `scheduler.py` + `_source.py` + `_cluster.py` + `_view.py` |
+| `control/` — what is decided | **absent** — no preference is passed, so the directory's own order stands | `routing.py` + `_source.py`: one `KeySelector.select` behind one plane — a ranked source, once it is usable | `scheduler.py` + `_source.py` + `_sensor/` + `_view.py` |
 | `data/` — what executes | **absent** — a `get` and nothing around it | `read_through.py`: one member — ask, get, local put, report | `serving.py` + `_decode.py` + `_store.py` |
 | `workload/` — what is simulated | `put_get.py`: one synchronized burst, parameterized by reader count | the same `put_get.py`, with the two planes added | `request.py` + `generator.py` + `scenarios.py` |
 | `report/` — outcome metrics | `summary.py`: rendering only, over a shared `Ledger` | `summary.py`: rendering only, over the same `Ledger` | `metrics.py`: its **own** per-request outcome row |

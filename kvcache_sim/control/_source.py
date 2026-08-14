@@ -28,7 +28,7 @@ from typing import Dict, Sequence
 
 from proposed import Key, KeySelector, Selection
 
-from ._view import prefix_lengths_of, PrefixSense
+from ._view import prefix_lengths_of, PrefixView
 
 __all__ = ["LongestPrefixKeySelector"]
 
@@ -69,9 +69,9 @@ class LongestPrefixKeySelector(KeySelector[int]):
         snapshot a routing decision pins, so the whole decision reads one directory.
         A run that stands this selector up on its own can only attach the plain
         :class:`~proposed.view.View`, since a prefix run is a KV-cache notion the
-        store has no reason to know. Read the sense when the view composes it, derive
-        it otherwise, off one shared definition.
+        store has no reason to know. Read it off the view that carries it, derive it
+        otherwise, off one shared definition.
         """
-        if isinstance(self.view, PrefixSense):
+        if isinstance(self.view, PrefixView):
             return self.view.prefix_lengths(keys)
         return prefix_lengths_of(self.view.locate(keys), keys)

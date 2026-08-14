@@ -28,7 +28,7 @@ not. So a capability written next needs no change here, however many questions i
 answers.
 
 What a host reports is not a question and reaches its own service
-(:mod:`realsim.seams.cluster_model_handle`).
+(:mod:`realsim.seams.sensor_handle`).
 
 Calls and sends
 ---------------

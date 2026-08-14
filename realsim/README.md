@@ -184,10 +184,11 @@ proposed/       every contract that outlives the simulator; imports nothing
   deployment.py   Deployment -- how data-plane code reaches its store and the one
                   control plane it asks (control_plane_handle, whatever that plane
                   declares); and each service as a caller reaches it -- Controller,
-                  StorageVolume, ClusterModel (notify(fact): the load a store
-                  cannot see, written by the hosts that make it)
-  plane.py        ControlPlane -- attach(view, cost) + cluster, the model a run
-                  puts a service in front of; DataPlane -- attach(deployment),
+                  StorageVolume, and Sensor / NotifiedSensor (facts a decision
+                  reads; notify(fact) when a host is what writes them, which is
+                  the load a store cannot see)
+  plane.py        ControlPlane -- attach(view) + sensor, the one a run puts a
+                  service in front of; DataPlane -- attach(deployment),
                   and no verbs: what a capability does is its own to name
   cost.py         TransferCost -- what a fetch is predicted to cost
   topology.py     Endpoint / Tier / locality -- where a volume is
