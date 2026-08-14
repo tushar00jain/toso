@@ -27,6 +27,7 @@ surface declares the methods, which is where the signatures are.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
@@ -165,8 +166,14 @@ class Controller(Protocol):
         """Every registered key, or those under ``prefix``."""
 
 
-class Sensor(Protocol):
+class Sensor(ABC):
     """Facts a capability holds between calls, and its decisions read.
+
+    A base a sensor derives, where the services in this module are
+    :class:`Protocol`s: a protocol is for a surface reached across a boundary, of which
+    a caller has the shape and not the object, while this is what a capability's own
+    object declares itself to be -- and a member-less protocol would declare nothing,
+    every object satisfying it structurally.
 
     The peer of :class:`Controller` on the application's side. That one holds
     residency -- which volume holds which key -- and is written as volumes publish
@@ -187,7 +194,7 @@ class Sensor(Protocol):
     """
 
 
-class NotifiedSensor(Sensor, Protocol):
+class NotifiedSensor(Sensor):
     """A sensor a host reports into, as a caller reaches it.
 
     One member, because being told is the only thing a *remote* reporter does to a
@@ -199,6 +206,7 @@ class NotifiedSensor(Sensor, Protocol):
     application's own type.
     """
 
+    @abstractmethod
     async def notify(self, fact: Any) -> None:
         """Fold ``fact`` in. The reply carries nothing.
 
