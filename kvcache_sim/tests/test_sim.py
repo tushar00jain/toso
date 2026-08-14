@@ -1816,14 +1816,16 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     them.
     """
     sched = scheduler("cache_aware", _make_topology(2))
+    assert sched.cluster is None, "no sensor to read the model out of before attach"
     sim = Simulation(_make_topology(2), control=sched)   # attach builds the chain
     try:
-        assert sched.cluster is not None
         # The memo link reads the plane's own model, through the one sensor everything
         # here senses through -- it is handed no model of its own.
         assert sched._fetch.selectors[0].view is sched.view
-        assert sched.view.cluster is sched.cluster
         assert sched._fetch.selectors[-1] is sched._reuse
+        # And what the run fronted for the hosts is that same sensor's model: the
+        # plane keeps no second reference to reach it by.
+        assert sim.cluster_handle.model is sched.view.cluster
     finally:
         sim.loop.close()
 

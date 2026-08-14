@@ -12,9 +12,9 @@ The other read is the cluster the scheduler decides against
 prefill queues, observed decode batches, and the pull a decision priced. That model
 is the capability's own, so the run cannot supply it and the base view does not carry
 it -- but it is *observed state* like the directory is, so whatever ranks, prices or
-gates against it senses it here instead of being handed the model. Writing it is
-still the owner's: a fact is folded by the service the run puts in front of the model
-and a decision is committed by the plane that took it, neither of them through here.
+gates against it senses it here instead of being handed the model, and the plane
+commits its own decision through here as well. What does not come this way is a
+host's fact: the run puts a service in front of the model for those.
 
 :meth:`KVView.pinned` is the second half of the prefix idea. A routing decision reads
 the prefix runs several times -- once for the candidate loop's local matches, once

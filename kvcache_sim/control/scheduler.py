@@ -50,11 +50,12 @@ Control's model of the cluster
 Nothing here executes, and nothing here is a live read. Every host this scheduler
 ranks, prices or gates, it judges against one
 :class:`~kvcache_sim.control._cluster.KVClusterModel` -- the predicted prefill
-queues and the observed decode batches, and what keeps each of them true. Its
-*reads* arrive the way the directory's do, through the one sensor this plane and
-everything it consults senses through (:class:`~kvcache_sim.control._view.KVView`);
-the plane keeps the model itself for the one thing that is not a read, recording a
-decision it accepted.
+queues and the observed decode batches, and what keeps each of them true. It reaches
+that model one way, the sensor this plane and everything it consults senses through
+(:class:`~kvcache_sim.control._view.KVView`) -- the reads, and the one write, the
+decision it accepted (:class:`~kvcache_sim.control._cluster.Committed`). Sensor
+content because the hosts are what keep the model true: every other fact in it comes
+from them, over the service the run fronts it with (:attr:`_Scheduler.cluster`).
 
 The TTFT the metrics record is therefore the prediction, not a measurement (the
 README says why). Prefill cost is deterministic, so on the default path the two
@@ -381,7 +382,9 @@ class _Scheduler(ControlPlane):
             prefill completion.
         cluster: the run's one :class:`~kvcache_sim.control._cluster.KVClusterModel`,
             when a caller has to make it first. ``None`` -- the default -- builds it
-            in :meth:`attach`, where the instances become known.
+            in :meth:`attach`, where the instances become known. Either way
+            :meth:`attach` folds it into the sensor and this plane holds it no other
+            way.
     """
 
     def __init__(
@@ -438,8 +441,11 @@ class _Scheduler(ControlPlane):
         self.ids: List[str] = []
         self.prefill_ids: List[str] = []
         self.decode_ids: List[str] = []
-        self.cluster: Optional[KVClusterModel] = cluster
-        # Built in attach(), where the model it reads exists.
+        # The caller's argument, not this plane's model: attach() spends it building
+        # the sensor and clears it, so the model has one reference here either way.
+        self._supplied_cluster: Optional[KVClusterModel] = cluster
+        # Both built in attach(), where the model they read exists.
+        self.view: Optional[KVView] = None
         self._fetch: Optional[FirstMatch[int]] = None
 
     # -- the stack hands over its ports ----------------------------------- #
@@ -459,17 +465,17 @@ class _Scheduler(ControlPlane):
         here unless a caller made it first (``cluster``): this is where the
         instances become known, and this runs once per run, so nothing else is
         placed to build a second (empty) one -- and an empty one would report every
-        host idle, which is a run that looks healthy and is wrong. The plane keeps it
-        because a plane owns what it wrote (:class:`Committed`) and the run harvests
-        it (:attr:`~proposed.plane.ControlPlane.cluster`) to put a service in front
-        of; reading it is the view's.
+        host idle, which is a run that looks healthy and is wrong. It goes into the
+        sensor and nowhere else; :attr:`cluster`, which the run harvests to put a
+        service in front of, reads it back from there.
         """
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
-        if self.cluster is None:
+        cluster, self._supplied_cluster = self._supplied_cluster, None
+        if cluster is None:
             # Over ALL instances: the prefill and decode pools may each be a subset.
-            self.cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
-        self.view = view.derived(KVView, cluster=self.cluster)
+            cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
+        self.view = view.derived(KVView, cluster=cluster)
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
         )
@@ -487,6 +493,17 @@ class _Scheduler(ControlPlane):
         self._fetch = FirstMatch([RoutedPull(), self._source])
         self._fetch.attach(self.view)
         self._reuse.attach(self.view)
+
+    @property
+    def cluster(self) -> Optional[KVClusterModel]:
+        """:attr:`~proposed.plane.ControlPlane.cluster` -- the model the run fronts
+        with a service so hosts can report into it.
+
+        Read out of the sensor rather than stored beside it, so this plane has one
+        path to the model. ``None`` until :meth:`attach` builds it; the run harvests
+        after.
+        """
+        return None if self.view is None else self.view.cluster
 
     # -- what a serving host asks, at the two moments it has a question ------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection[int]:
@@ -695,7 +712,7 @@ class _Scheduler(ControlPlane):
         #
         # The local write, not the endpoint a host reports over: control is in the
         # model's process, and a plain call is what keeps this decision atomic.
-        self.cluster._notify_impl(Committed(response, request.output_tokens))
+        self.view.cluster._notify_impl(Committed(response, request.output_tokens))
         return response
 
 

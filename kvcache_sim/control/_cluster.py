@@ -21,7 +21,8 @@ corrected by what the hosts report, never a live read:
 Folder-private: the port this answers (:class:`proposed.ClusterModel`) is the
 surface, and a host reaches it through the seam in front of it
 (:class:`realsim.seams.cluster_model_handle.LocalClusterModelHandle`). The control
-plane holding the model reads and writes it here, in this process.
+plane reads and writes it here, in this process, through the one sensor it senses
+everything through (:class:`kvcache_sim.control._view.KVView`).
 """
 
 from __future__ import annotations

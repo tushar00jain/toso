@@ -18,8 +18,8 @@ shape (endpoints) for a different reason (it stands in for the process boundary)
 
 What crosses here and what does not
 -----------------------------------
-This endpoint carries what a *host* reports. The control plane holding the model
-reads it, and writes its own decisions into it, by plain local call -- the same
+This endpoint carries what a *host* reports. The control plane deciding against the
+model reads it, and writes its own decisions into it, by plain local call -- the same
 co-location a :class:`~proposed.selector.KeySelector` has with the directory it
 senses through ``locate_raw``, and for the same reason: a decision formed against a
 read that could suspend is a decision formed against a picture that changed halfway
