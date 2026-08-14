@@ -113,7 +113,7 @@ class Dedup(ControlPlane):
     #: What this plane senses through: ``None`` until :meth:`attach`.
     view: Optional[View] = None
 
-    def attach(self, view: Any, transfer_cost: Any) -> None:
+    def attach(self, view: Any) -> None:
         """Keep the view this plane reads the directory through.
 
         It ranks nothing but holders, so the transfer-cost half of the port goes

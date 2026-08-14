@@ -301,7 +301,7 @@ def compute_time(
 
 
 class ProfileTransferCost:
-    """:class:`proposed.cost.TransferCost` backed by a profile + topology.
+    """A :data:`proposed.cost.TransferCost` backed by a profile + topology.
 
     The simulator's implementation: prices a transfer with :func:`_get_time`,
     the sum of the same three terms the transport seam charges one at a time, so

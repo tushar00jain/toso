@@ -56,7 +56,11 @@ from realsim.seams.transport import Endpoint, InMemoryTransport
 from realsim.seams.volume_handle import LocalVolumeHandle
 from realsim.seams.volume_service import VolumeService
 from proposed import View
-from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
+from sim_common.cost_model import (
+    DEFAULT_PROFILE,
+    MachineProfile,
+    ProfileTransferCost,
+)
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 
@@ -166,7 +170,11 @@ class Mesh:
         ranked. Note what that also means -- a control plane's directory reads do not
         cross the handle, so they are not charged the hop a real one would pay.
         """
-        return View(self.directory.service, self.topology)
+        return View(
+            self.directory.service,
+            self.topology,
+            ProfileTransferCost(self.topology, self.profile).get_time,
+        )
 
     def adapter(self, node_id: str) -> RealClientAdapter:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""

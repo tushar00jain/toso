@@ -210,8 +210,8 @@ returns a plan, and is told the outcome. Remote-prefix pulls
 ## Layout
 
 Split by plane: `control/` decides, `data/` executes, and neither imports the
-simulator — `control/` takes a `View`, a `TransferCost` and machine facts from
-`domain`; `data/` calls torchstore APIs against a `Deployment`. Both are enforced
+simulator — `control/` takes a `View` (which carries the run's `TransferCost`) and
+machine facts from `domain`; `data/` calls torchstore APIs against a `Deployment`. Both are enforced
 by `realsim/tools/check_contract.py`, which also forbids either of them from
 importing `workload/` -- that is the run's scaffolding and has no counterpart in
 production, so a type all three planes pass (`Request`) belongs in `control/`.

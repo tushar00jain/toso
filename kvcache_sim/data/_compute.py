@@ -9,7 +9,7 @@ long. Under simulation that is a roofline and an ``asyncio.sleep``
 the run's wiring because it is the simulation); in a deployment it is the model's
 forward pass, with measured durations.
 
-The compute counterpart of :class:`proposed.cost.TransferCost`, and it does one
+The compute counterpart of :data:`proposed.cost.TransferCost`, and it does one
 thing that port does not: fabric cost is *incurred* by the real client call the data
 plane already makes, so predicting it is enough, whereas nothing else makes a GPU
 busy -- so this both predicts and incurs.

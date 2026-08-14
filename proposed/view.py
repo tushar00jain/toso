@@ -44,8 +44,9 @@ builds one via ``Mesh.view``; a real controller would build one over itself.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
+from proposed.cost import TransferCost
 from proposed.deployment import Controller
 from proposed.topology import Endpoint
 
@@ -53,7 +54,18 @@ __all__ = ["View"]
 
 
 class View:
-    """Read-only observation of the real directory and topology.
+    """Everything a control plane senses and prices with, and nothing else.
+
+    A container of run-supplied reads: who holds a key, where the volumes are, what
+    time it is, what a transfer would cost. The capability's *own* state is not here
+    -- a plane holds what it made (its model of the cluster) and is handed what it
+    could not otherwise reach.
+
+    It is also a subtraction. The directory behind it answers five members; one of
+    them is safe for a decision to read, and that one is what :meth:`locate` calls.
+    The object itself does not come back out (:meth:`derived` is how a capability
+    builds a richer sensor), so a control plane cannot notify the directory, route
+    through it, or delete from it.
 
     Args:
         directory: the directory to read -- anything satisfying
@@ -61,19 +73,29 @@ class View:
             controller service, in a deployment the controller itself.
         topology: ``volume_id -> Endpoint``; the volume id is the directory
             identity, the endpoint is what locality is priced against.
+        cost: a :data:`~proposed.cost.TransferCost`. ``None`` for a run whose
+            decisions price nothing, which is every capability but ``kvcache_sim``.
     """
 
     def __init__(
-        self, directory: Controller, topology: Dict[str, Endpoint]
+        self,
+        directory: Controller,
+        topology: Dict[str, Endpoint],
+        cost: Optional[TransferCost] = None,
     ) -> None:
         self._directory = directory
         self._topology = dict(topology)
+        self._cost = cost
 
-    # -- directory ---------------------------------------------------------- #
-    @property
-    def directory(self) -> Controller:
-        """The directory this view reads, so a derived view can rebuild over it."""
-        return self._directory
+    def derived(self, cls: type) -> "View":
+        """A richer sensor of type ``cls`` over these same ports.
+
+        The one sanctioned way to reach the directory a view reads:
+        ``kvcache_sim`` needs prefix runs, which the store has no reason to know, so
+        it builds a subclass here rather than being handed the controller and left to
+        do as it likes with it.
+        """
+        return cls(self._directory, self._topology, self._cost)
 
     def locate(self, keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """``key -> {volume_id -> StorageInfo}`` from the REAL directory.
@@ -93,6 +115,21 @@ class View:
     def topology(self) -> Dict[str, Endpoint]:
         """``volume_id -> Endpoint`` for the whole run."""
         return self._topology
+
+    # -- price -------------------------------------------------------------- #
+    def transfer_cost(self, src_id: str, dst_id: str, nbytes: int) -> float:
+        """Seconds to move ``nbytes`` from ``src_id`` to ``dst_id``.
+
+        The run's estimate, not this capability's, so a prediction and the charge the
+        transport makes cannot diverge. Raises for a run that supplied none: pricing
+        a transfer a run cannot price is a scheduler in the wrong harness, not a
+        number to invent.
+        """
+        if self._cost is None:
+            raise RuntimeError(
+                "this run supplied no transfer cost, so nothing here can be priced"
+            )
+        return self._cost(src_id, dst_id, nbytes)
 
     # -- clock -------------------------------------------------------------- #
     def now(self) -> float:

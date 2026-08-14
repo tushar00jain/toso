@@ -6,10 +6,12 @@ should hard-code, and it is not something the simulator should hand it directly 
 otherwise every scheduler is written against one cost model and cannot be lifted
 out of the harness.
 
-So it is a protocol. :class:`TransferCost` is the whole surface: given two volume
-ids and a byte count, how long. ``sim_common`` implements it from a
-``MachineProfile`` and a topology; a deployment would implement it from measured
-fabric numbers.
+So the run supplies it. :data:`TransferCost` is the whole surface: given two volume
+ids and a byte count, how long. ``sim_common`` builds one from a ``MachineProfile``
+and a topology; a deployment would build one from measured fabric numbers. A control
+plane reaches it off the sensor it was attached to
+(:meth:`proposed.view.View.transfer_cost`), which is where every other run-supplied
+read lives.
 
 It pairs with :mod:`proposed.topology` — knowing *where* a volume is (gap 4) is
 what makes an estimate possible at all.
@@ -17,19 +19,16 @@ what makes an estimate possible at all.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Callable
+
+from proposed.deployment import VolumeId
 
 __all__ = ["TransferCost"]
 
-
-class TransferCost(Protocol):
-    """Predicts the time to move ``nbytes`` between two volumes."""
-
-    def get_time(self, src_id: str, dst_id: str, nbytes: int) -> float:
-        """Seconds to move ``nbytes`` from ``src_id`` to ``dst_id``.
-
-        Must agree with what the data plane is actually charged, or a scheduler
-        will route against a fiction. ``kvcache_sim/tests/test_cost_parity.py``
-        pins that agreement for the simulator's implementation.
-        """
-        ...
+#: Seconds to move ``nbytes`` from one volume to another.
+#:
+#: One function, so it is one: a class around a single call would be a place for a
+#: second one to accrete. Whatever answers it must agree with what the data plane is
+#: actually charged, or a scheduler routes against a fiction --
+#: ``kvcache_sim/tests/test_cost_parity.py`` pins that agreement for the simulator's.
+TransferCost = Callable[[VolumeId, VolumeId, int], float]

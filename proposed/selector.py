@@ -276,10 +276,10 @@ class Selector(ABC, Generic[_S, _P]):
     #: read by one that ranks only what it is handed.
     view: Optional[View] = None
 
-    def attach(self, view: Any, transfer_cost: Any) -> None:
-        """Keep the ports this selector senses and prices through.
+    def attach(self, view: Any) -> None:
+        """Keep the sensor this selector senses and prices through.
 
-        The same two the plane holding it was handed
+        The one the plane holding it was handed
         (:meth:`proposed.plane.ControlPlane.attach`), passed straight down: a
         selector runs beside the directory it senses, so the sensor is the run's and
         not a per-call argument -- one selector, one view, whoever asks.
@@ -360,7 +360,7 @@ class FirstMatch(Selector[_S, _P]):
     def __init__(self, selectors: Sequence[Selector[_S, _P]]) -> None:
         self.selectors: Tuple[Selector[_S, _P], ...] = tuple(selectors)
 
-    def attach(self, view: Any, transfer_cost: Any) -> None:
+    def attach(self, view: Any) -> None:
         """Hand the stack's ports to every wrapped selector, answering or not.
 
         One that senses through a view of its own must be brought up even if it
@@ -368,7 +368,7 @@ class FirstMatch(Selector[_S, _P]):
         turn comes.
         """
         for selector in self.selectors:
-            selector.attach(view, transfer_cost)
+            selector.attach(view)
 
     async def select(self, subject: _S, requester: str) -> Selection[_P]:
         """The first non-abstaining answer, or an abstention if there is none."""
@@ -421,7 +421,7 @@ class Refinement(ABC, Generic[_S, _P]):
     #: What this refinement reads to decide: ``None`` until :meth:`attach`.
     view: Optional[View] = None
 
-    def attach(self, view: Any, transfer_cost: Any) -> None:
+    def attach(self, view: Any) -> None:
         self.view = view
 
     @abstractmethod
@@ -468,12 +468,12 @@ class Refine(Selector[_S, _P]):
         """Its source's: a funnel narrows an answer, it does not reinterpret one."""
         return self.source.subject_type
 
-    def attach(self, view: Any, transfer_cost: Any) -> None:
+    def attach(self, view: Any) -> None:
         """Hand the stack's ports to the source and every step."""
-        super().attach(view, transfer_cost)
-        self.source.attach(view, transfer_cost)
+        super().attach(view)
+        self.source.attach(view)
         for step in self.steps:
-            step.attach(view, transfer_cost)
+            step.attach(view)
 
     async def select(self, subject: _S, requester: str) -> Selection[_P]:
         """The source's ranking narrowed by every step, or the first abstention."""

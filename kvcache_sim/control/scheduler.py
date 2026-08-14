@@ -72,7 +72,6 @@ from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
     prefill_time,
 )
-from proposed import TransferCost
 
 from ._cluster import (
     Committed, ComputeBusy, DecodeState, KVClusterModel, PrefillFinished,
@@ -451,7 +450,6 @@ class _Scheduler(ControlPlane):
         # the same gates (above) and differ only in what the model feeds them.
         self._lookahead = predicts_decode(simulate_decode, early_rejection)
         # Filled by attach(): the run knows its servers only once its stack exists.
-        self.transfer_cost: Optional[TransferCost] = None
         self.topo: Dict[str, Endpoint] = {}
         self.ids: List[str] = []
         self.prefill_ids: List[str] = []
@@ -461,7 +459,7 @@ class _Scheduler(ControlPlane):
         self._fetch: Optional[FetchRouting] = None
 
     # -- the stack hands over its ports ----------------------------------- #
-    def attach(self, view, transfer_cost: TransferCost) -> None:
+    def attach(self, view) -> None:
         """Receive the ports this control plane senses and prices through.
 
         Two-phase so a scenario can declare a control plane as an object
@@ -477,10 +475,7 @@ class _Scheduler(ControlPlane):
         host idle, which is a run that looks healthy and is wrong. Everything that
         ranks, prices or gates is handed that one model.
         """
-        self.view = KVView(view.directory, view.topology)
-        # A protocol rather than a simulator function: a deployment supplies its own
-        # measured numbers.
-        self.transfer_cost = transfer_cost
+        self.view = view.derived(KVView)
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
         if self.cluster is None:
@@ -494,7 +489,7 @@ class _Scheduler(ControlPlane):
         )
         # What a fetch is answered with, over the model just settled above.
         self._fetch = FetchRouting(self.cluster, self._source)
-        self._fetch.attach(view, transfer_cost)
+        self._fetch.attach(view)
         # The reuse axis senses through the same view this one does, which is what
         # lets one routing decision pin one directory snapshot for both
         # (:meth:`~kvcache_sim.control._view.KVView.pinned`). The rank keys need no
@@ -506,7 +501,7 @@ class _Scheduler(ControlPlane):
         # view. This is the attach that leaves it sensing through the pinned view: a
         # ranking a decision consults inside its pin must not read past the snapshot
         # into the live directory.
-        self._reuse.attach(self.view, transfer_cost)
+        self._reuse.attach(self.view)
 
     # -- what a serving host asks, at the two moments it has a question ------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection[None]:
@@ -619,7 +614,7 @@ class _Scheduler(ControlPlane):
             xbytes = self.model.block_bytes(len(pull_keys), self.B)
             # The cost model the transport charges, so this prediction is what the
             # real pull will cost.
-            transfer_t = self.transfer_cost.get_time(source, inst, xbytes)
+            transfer_t = self.view.transfer_cost(source, inst, xbytes)
         else:
             source, xbytes, transfer_t = None, 0, 0.0
         queue_wait, ttft, done = self._predict(inst, now, transfer_t, prefill_t)

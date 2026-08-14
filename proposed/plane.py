@@ -101,7 +101,7 @@ class ControlPlane:
     Construct it with its knobs, and it is handed the stack's ports once those exist
     -- :meth:`attach` -- because a control plane senses through a
     :class:`~proposed.view.View` and prices through a
-    :class:`~proposed.cost.TransferCost`, neither of which a caller has before the
+    :data:`~proposed.cost.TransferCost`, neither of which a caller has before the
     store is assembled. It passes those ports on to whatever it ranks with
     (:class:`~proposed.selector.Selector`), which is a utility it holds rather than a
     plane of its own.
@@ -122,5 +122,9 @@ class ControlPlane:
     #: calls, so there is nothing for a host to correct and no service to stand up.
     cluster: Optional[ClusterModel] = None
 
-    def attach(self, view: Any, transfer_cost: Any) -> None:
-        """Receive the ports this control plane senses and prices through."""
+    def attach(self, view: Any) -> None:
+        """Receive the sensor this control plane senses and prices through.
+
+        One argument, the sibling of :meth:`DataPlane.attach`'s: a
+        :class:`~proposed.view.View` carries every run-supplied read there is.
+        """

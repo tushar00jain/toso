@@ -146,8 +146,8 @@ class _Ranks(ControlPlane):
     def __init__(self, selector: Selector) -> None:
         self.selector = selector
 
-    def attach(self, view, transfer_cost) -> None:
-        self.selector.attach(view, transfer_cost)
+    def attach(self, view) -> None:
+        self.selector.attach(view)
 
     async def sources(self, keys, requester) -> Selection:
         return await (await self.selector.select(list(keys), requester)).settled()
@@ -569,7 +569,7 @@ def test_first_match_attaches_every_selector_even_unconsulted_ones():
     """
     front, behind = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
     chained = FirstMatch([front, behind])
-    chained.attach("a-view", "a-cost")
+    chained.attach("a-view")
     _select(chained)                      # behind is never asked ...
     assert front.view is behind.view == "a-view"   # ... but is brought up
 
@@ -665,7 +665,7 @@ def test_refine_brings_up_the_source_and_every_step():
     """One view for the whole funnel: a step senses through what the source did."""
     source, step = _Fixed(), _Step()
     funnel = Refine(source, step)
-    funnel.attach("a-view", "a-cost")
+    funnel.attach("a-view")
 
     assert funnel.view is source.view is step.view == "a-view"
 

@@ -133,6 +133,9 @@ class Simulation:
         # What the control plane may look at, and what it may price against --
         # both derived from the objects above rather than rebuilt beside them.
         self.view: View = self.mesh.view
+        # What a control plane prices with reaches it through the view (Mesh.view
+        # builds one over this same topology and profile). Kept here for the tests
+        # that pin prediction against what the transports charge.
         self.transfer_cost = ProfileTransferCost(self.mesh.topology, self.profile)
 
         # The plane, attached before any wiring below: attach hands over the view and
@@ -148,7 +151,7 @@ class Simulation:
                     f"hands it the stack's ports, which a selector or a bare "
                     f"callable has nowhere to receive"
                 )
-            control.attach(self.view, self.transfer_cost)
+            control.attach(self.view)
         # What reaching a control plane costs. Resolved once, here, because this is
         # the one place a run's control services are built -- the same reason
         # ``make_controller_adapter`` resolves the directory's. One distance for both

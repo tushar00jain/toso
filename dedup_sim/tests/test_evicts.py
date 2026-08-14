@@ -274,7 +274,7 @@ def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
     Nothing here is priced, so the transfer-cost half of the port is ``None``.
     """
     selector = Dedup(fanout_cap=fanout_cap)
-    selector.attach(directory, None)
+    selector.attach(directory)
     return selector
 
 

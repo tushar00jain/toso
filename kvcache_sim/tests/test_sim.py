@@ -268,7 +268,7 @@ def test_real_directory_prefix_presence_and_eviction():
 
     sim = Simulation(topo)
     store = KVStore(sim)
-    view = KVView(sim.view.directory, sim.topology)
+    view = sim.view.derived(KVView)
 
     async def scenario():
         # The data plane publishes/evicts; the control-plane view reads back.
@@ -300,7 +300,7 @@ def test_a_pinned_view_serves_one_snapshot_and_releases_it():
 
     sim = Simulation(topo)
     store = KVStore(sim)
-    view = KVView(sim.view.directory, sim.topology)
+    view = sim.view.derived(KVView)
 
     async def scenario():
         with sim.mesh.installed():
@@ -788,7 +788,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
                 request, _answer(request, prefill=prefill, decode="s1")
             )
             if probe is not None:
-                view = KVView(sim.view.directory, sim.topology)
+                view = sim.view.derived(KVView)
                 probe["chain"] = view.prefix_lengths(keys)
                 probe["generated"] = view.prefix_lengths(
                     list(request.continuation_keys(1))
@@ -1492,7 +1492,7 @@ def test_the_source_selector_accepts_a_plain_view():
     sim = Simulation(topo)
     keys = _block_keys_for("m0", [0, 1])
     selector = LongestPrefixKeySelector()
-    selector.attach(sim.view, sim.transfer_cost)
+    selector.attach(sim.view)
 
     async def scenario():
         with sim.mesh.installed():
@@ -1539,7 +1539,7 @@ def _replicated(holders, blocks, *, num=4):
 
 def _select_heads(sim, selector, keys, *, count, gap=0.0):
     """The head of ``count`` successive rankings, ``gap`` virtual seconds apart."""
-    selector.attach(sim.view, sim.transfer_cost)
+    selector.attach(sim.view)
 
     async def scenario():
         heads = []
@@ -1617,7 +1617,7 @@ def test_spread_reads_ranks_deterministically():
     """
     async def rankings(sim, keys):
         selector = SpreadReadsKeySelector()
-        selector.attach(sim.view, sim.transfer_cost)
+        selector.attach(sim.view)
         out = []
         with sim.mesh.installed():
             for _ in range(5):
@@ -1682,7 +1682,7 @@ def _scheduler(n: int = 2):
     """A scheduler attached to a real mesh view, ready to be asked things."""
     sim = Simulation(_make_topology(n))
     sched = LoadBalanceScheduler(block_tokens=512)
-    sched.attach(sim.view, sim.transfer_cost)
+    sched.attach(sim.view)
     return sim, sched
 
 
@@ -1730,7 +1730,7 @@ def test_a_refusal_is_a_decision_not_taken():
     """
     sim = Simulation(_make_topology(2))
     sched = LoadBalanceScheduler(block_tokens=512, slo_ttft=0.0)
-    sched.attach(sim.view, sim.transfer_cost)
+    sched.attach(sim.view)
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
         block_keys=tuple(_block_keys_for("m0", [0, 1])),
