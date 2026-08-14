@@ -301,8 +301,7 @@ class _Scheduler(ControlPlane):
         # consulted inside the pin must not read past it into the live directory. The
         # source ranking is a link of both and gets attached twice, to the same view
         # either way, so no order here is load-bearing.
-        self._fetch = FirstMatch([RoutedPull(), self._source])
-        self._fetch.attach(self.view)
+        self._fetch = FirstMatch([RoutedPull(), self._source]).attach(self.view)
         self._reuse.attach(self.view)
         self._rank.attach(self.view)
         # Senses nothing, but attached like every other ranking here, so wrapping it in

@@ -69,8 +69,7 @@ class Dedup(ControlPlane):
             PlannedPeer(trace=self._trace),
             HolderRanking(trace=self._trace),
             NaiveKeySelector(),
-        ])
-        self._chain.attach(self.view)
+        ]).attach(self.view)
 
     # -- what a reader asks -------------------------------------------------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection[int]:

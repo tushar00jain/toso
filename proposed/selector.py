@@ -84,6 +84,10 @@ _P = TypeVar("_P")
 #: whichever argument lines up with this variable.
 _S = TypeVar("_S")
 
+#: The selector :meth:`Selector.attach` hands back: whatever it was called on, so a
+#: wired chain is still a chain and a wired discount still a discount.
+_Sel = TypeVar("_Sel", bound="Selector[Any, Any]")
+
 
 @dataclass(frozen=True)
 class Selection(Generic[_P]):
@@ -321,15 +325,20 @@ class Selector(ABC, Generic[_S, _P]):
     #: read by one that ranks only what it is handed.
     view: Optional[View] = None
 
-    def attach(self, view: Any) -> None:
-        """Keep the view this selector senses and prices through.
+    def attach(self: _Sel, view: Any) -> _Sel:
+        """Keep the view this selector senses and prices through, and return it.
 
         The one the plane holding it was handed
         (:meth:`proposed.plane.ControlPlane.attach`), passed straight down: a
         selector runs beside the directory it senses, so the view is the run's and
         not a per-call argument -- one selector, one view, whoever asks.
+
+        Returned so building one and wiring it is a single expression::
+
+            source = Discount(LongestPrefixKeySelector()).attach(view)
         """
         self.view = view
+        return self
 
     @abstractmethod
     async def select(self, subject: _S, requester: str) -> Selection[_P]:
@@ -420,7 +429,7 @@ class FirstMatch(KeySelector[_P]):
                 f"{'is' if len(wrong) == 1 else 'are'} not"
             )
 
-    def attach(self, view: Any) -> None:
+    def attach(self, view: Any) -> "FirstMatch[_P]":
         """Hand the stack's ports to every wrapped selector, answering or not.
 
         One that senses through a view of its own must be brought up even if it
@@ -429,6 +438,7 @@ class FirstMatch(KeySelector[_P]):
         """
         for selector in self.selectors:
             selector.attach(view)
+        return self
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
         """The first non-abstaining answer, or an abstention if there is none."""
@@ -576,10 +586,11 @@ class Discount(Selector[_S, int]):
         self.trace = trace
         self._grants = _Grants(window)
 
-    def attach(self, view: Any) -> None:
+    def attach(self, view: Any) -> "Discount[_S]":
         """Sense through ``view``, and hand it down to the ranking as well."""
         super().attach(view)
         self.ranking.attach(view)
+        return self
 
     async def select(self, subject: _S, requester: str) -> Selection[int]:
         """``ranking``'s answer re-ordered, its head recorded as a grant.

@@ -588,9 +588,21 @@ def test_first_match_attaches_every_selector_even_unconsulted_ones():
     """
     front, behind = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
     chained = FirstMatch([front, behind])
-    chained.attach("a-view")
+    assert chained.attach("a-view") is chained     # wiring is one expression
     _select(chained)                      # behind is never asked ...
     assert front.view is behind.view == "a-view"   # ... but is brought up
+
+
+def test_attaching_a_selector_hands_it_back_however_it_is_wrapped():
+    """So a selector can be built and wired in one expression.
+
+    Every override returns too, or the shape would work for a bare ranking and not
+    for the two combinators -- which is where a run does most of its wiring.
+    """
+    ranking = _Fixed(Selection.priced([("v0", 1)]))
+    assert ranking.attach("a-view") is ranking
+    discounted = Discount(ranking)
+    assert discounted.attach("a-view") is discounted
 
 
 def test_a_chain_is_a_key_selector_and_refuses_a_link_that_is_not():
