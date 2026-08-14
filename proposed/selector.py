@@ -33,17 +33,16 @@ does not belong in a :class:`Selection` at all. A gate rides *with* one instead 
 a selector that refuses abstains (``Selection.of([])``), and what it would have
 answered is simply not in the ranking.
 
-Selectors compose two ways, and neither one is a selector holding another:
+Selectors compose one way, and it is not a selector holding another:
+:class:`FirstMatch` picks between alternatives -- ask each in order, take the first
+answer. It wraps either kind and *is* a plain :class:`Selector` whatever it wraps, so
+a chain mixing the two kinds is possible and harmless. A chain whose links all take
+keys is a :class:`KeySelectorChain`, which says so in its type and checks it at
+construction.
 
-* :class:`FirstMatch` picks between alternatives -- ask each in order, take the
-  first answer. It wraps either kind and *is* a plain :class:`Selector` whatever it
-  wraps, so a chain mixing the two kinds is possible and harmless. A chain whose
-  links all take keys is a :class:`KeySelectorChain`, which says so in its type and
-  checks it at construction.
-* :class:`Refine` funnels a single answer -- one selector's ranking, narrowed by
-  each :class:`Refinement` behind it. That is how a test an application owns is
-  applied to a ranking over the store's own subject, with the composition in the
-  object that holds both rather than inside either.
+Narrowing an answer is not a composition of selectors at all: a test an application
+owns is applied to the ranking it was given, by the caller that has both
+(:meth:`Selection.require`, :meth:`Selection.take`).
 """
 
 from __future__ import annotations
@@ -61,7 +60,6 @@ from proposed.view import View
 __all__ = [
     "Ready", "Selection", "prefer", "DecisionLog", "Selector", "KeySelector",
     "AnySelector", "NaiveKeySelector", "FirstMatch", "KeySelectorChain",
-    "Refinement", "Refine", "AbstainOnSelf", "TakeHead",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -170,6 +168,18 @@ class Selection(Generic[_P]):
             return self
         return Selection(sources=self.sources, payload=self.payload)
 
+    @property
+    def head(self) -> Optional[VolumeId]:
+        """The best-ranked source, or ``None`` if this names none in particular.
+
+        The id, where :attr:`winner` is the price under it. ``None`` for both empties,
+        which a caller reading the head cannot tell apart and does not need to: neither
+        one names a source to act on.
+        """
+        if not self.sources:
+            return None
+        return self.sources[0]
+
     def only(self, sources: Sequence[VolumeId]) -> "Selection[_P]":
         """This selection cut down to ``sources``, in the order given.
 
@@ -182,6 +192,36 @@ class Selection(Generic[_P]):
             ready=self.ready,
             payload={s: self.payload[s] for s in kept if s in self.payload},
         )
+
+    def take(self, n: int) -> "Selection[_P]":
+        """The best ``n`` sources, price and gate intact."""
+        return self.only((self.sources or ())[:n])
+
+    def require(self, ok: Callable[[VolumeId], bool]) -> "Selection[_P]":
+        """This selection if its head satisfies ``ok``, else the abstention.
+
+        The narrowing a caller does *to* a ranking, as a method on the ranking, so a
+        test an application owns needs no object to live in and composes by being
+        called again.
+
+        All or nothing: filtering the head out would **promote** the source behind it,
+        and a ranking need not be in the order ``ok`` measures -- the sources behind the
+        head are the ones the ranking preferred *less*, so promoting one on a raw
+        measurement would overrule it from outside. An abstention is returned unchanged,
+        since there is no head to judge.
+
+        Raises:
+            ValueError: on the default selection (every holder in directory order),
+                which names no head and so cannot be narrowed.
+        """
+        if self.sources is None:
+            raise ValueError(
+                "a selection naming every holder in directory order has no head to "
+                "require anything of: narrow one that ranks"
+            )
+        if not self.sources or ok(self.sources[0]):
+            return self
+        return Selection.of([])
 
 
 def prefer(
@@ -253,8 +293,8 @@ class Selector(ABC, Generic[_S, _P]):
         one lining up with :data:`_S` in that base's own ``__parameters__``. A class
         no base of which binds :data:`_S` inherits its parent's subject, which is how
         both a narrowing subclass (``SpreadReadsKeySelector``) and a priced-only
-        header resolve. One that declares ``subject_type`` itself is left alone --
-        :class:`Refine` computes it from its source and would lose the property.
+        header resolve. One that declares ``subject_type`` itself is left alone, since
+        a computed subject would be overwritten here.
 
         Reads ``cls.__dict__`` rather than :func:`getattr`, which would find the
         base's ``__orig_bases__`` and give every unparameterized subclass the bare
@@ -403,120 +443,3 @@ class KeySelectorChain(FirstMatch[Sequence[Key], _P], KeySelector[_P]):
                 f"a KeySelectorChain selects over keys, so every link must be a KeySelector; "
                 f"{', '.join(wrong)} {'is' if len(wrong) == 1 else 'are'} not"
             )
-
-
-class Refinement(ABC, Generic[_S, _P]):
-    """Narrow a ranking some selector already produced.
-
-    Not a :class:`Selector`: it has no subject of its own, and ``select`` has
-    nowhere to put an incoming ranking. :class:`Refine` is what holds the selector,
-    which is what keeps one selector from holding another. Its parameters are that
-    selector's, borrowed -- the subject it is handed and the price it must not lose.
-
-    Senses through the run's view like anything else in a chain (:meth:`attach`).
-    """
-
-    name = "refinement"
-
-    #: What this refinement reads to decide: ``None`` until :meth:`attach`.
-    view: Optional[View] = None
-
-    def attach(self, view: Any) -> None:
-        self.view = view
-
-    @abstractmethod
-    async def refine(
-        self, selection: Selection[_P], subject: _S, requester: str
-    ) -> Selection[_P]:
-        """``selection``, narrowed. Handed the subject too, since a test may read it.
-
-        Called only with a selection that names at least one source, so an
-        implementation may index the head without checking.
-        """
-
-
-class Refine(Selector[_S, _P]):
-    """One selector's ranking, put through each :class:`Refinement` in turn.
-
-    A plain :class:`Selector` whatever it wraps, for :class:`FirstMatch`'s reason:
-    narrowing a ranking over one subject with a test that reads another leaves a
-    funnel that answers its source's question, so it claims neither subtype.
-
-    A step that abstains (``Selection.of([])``) ends the funnel -- the steps behind
-    it are not consulted and the abstention is the answer. ``Selection()``, every
-    holder in directory order, is the one thing a step cannot narrow, so a source
-    that answers with one in front of a step raises rather than silently handing
-    back an unfiltered ranking.
-
-    Args:
-        source: produces the ranking. Either kind of selector, and what both
-            parameters are read off: a funnel answers its source's question with
-            its source's prices.
-        steps: applied left to right, each narrowing that same ranking.
-    """
-
-    name = "refine"
-
-    def __init__(
-        self, source: Selector[_S, _P], *steps: Refinement[_S, _P]
-    ) -> None:
-        self.source = source
-        self.steps: Tuple[Refinement[_S, _P], ...] = tuple(steps)
-
-    @property
-    def subject_type(self) -> Any:
-        """Its source's: a funnel narrows an answer, it does not reinterpret one."""
-        return self.source.subject_type
-
-    def attach(self, view: Any) -> None:
-        """Hand the stack's ports to the source and every step."""
-        super().attach(view)
-        self.source.attach(view)
-        for step in self.steps:
-            step.attach(view)
-
-    async def select(self, subject: _S, requester: str) -> Selection[_P]:
-        """The source's ranking narrowed by every step, or the first abstention."""
-        selection = await self.source.select(subject, requester)
-        for step in self.steps:
-            if selection.sources is None:
-                raise ValueError(
-                    f"{self.source.name} named every holder in directory order, "
-                    f"which {step.name} cannot narrow: refine a source that ranks"
-                )
-            if not selection.sources:
-                return selection
-            selection = await step.refine(selection, subject, requester)
-        return selection
-
-
-class AbstainOnSelf(Refinement[Any, _P]):
-    """Abstain when the ranking's head is the requester itself.
-
-    A source is a peer, and a requester does not fetch what it already holds. The
-    whole selection goes rather than just the head: the ranking preferred the
-    requester, so nothing behind it is preferred to what the requester has.
-
-    ``Refinement[Any, _P]``, as :class:`TakeHead` is: a step that reads the ranking
-    and the requester and not the subject fits behind a source of any kind.
-    """
-
-    name = "abstain-on-self"
-
-    async def refine(
-        self, selection: Selection[_P], subject: Any, requester: str
-    ) -> Selection[_P]:
-        if selection.sources[0] == requester:
-            return Selection.of([])
-        return selection
-
-
-class TakeHead(Refinement[Any, _P]):
-    """Keep the best-ranked source and drop the rest, price and gate intact."""
-
-    name = "take-head"
-
-    async def refine(
-        self, selection: Selection[_P], subject: Any, requester: str
-    ) -> Selection[_P]:
-        return selection.only(selection.sources[:1])

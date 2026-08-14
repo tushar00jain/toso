@@ -31,9 +31,9 @@ drops its own coldest keys and tells the directory afterwards
 (:mod:`realsim.seams._retention`). Every argument and return is a value.
 
 Both names are *presets* of one scheduler, parameterized on two axes, neither of
-them reachable from outside it: **reuse**, a selector consulted per candidate for
-"name a peer to pull a prefix from, or nobody", and **the rank key**, which sorts
-the candidates this scheduler priced.
+them reachable from outside it: **reuse**, a selector asked once per decision to
+"rank the peers holding this prefix, or name nobody", and **the rank key**, which
+sorts the candidates this scheduler priced.
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
@@ -68,9 +68,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from proposed import ControlPlane, Endpoint, Key, KeySelector, Selection, VolumeId
-from proposed.selector import (
-    AbstainOnSelf, KeySelectorChain, Refine, Refinement, Selector, TakeHead,
-)
+from proposed.selector import KeySelectorChain, Selector
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -176,16 +174,21 @@ class Response:
 # What differs is the two axes and which admission gates are installed.
 #
 # Only this first axis is a selector at all, and it answers the store-shaped half
-# -- name a peer to pull from, or nobody. So it is the source ranking
-# (:mod:`kvcache_sim.control._source`, a real KeySelector) under the one test that is
-# not the store's: is pulling worth more than recomputing here. That composition is a
-# :class:`~proposed.selector.Refine`, so the composition lives in the object holding
-# both rather than inside either. Its ``select`` is awaited inside the pinned snapshot
-# (:meth:`_Scheduler._select_prefill`), so it runs to completion without suspending.
+# -- rank the peers holding this prefix, best first (:mod:`kvcache_sim.control._source`,
+# a real KeySelector), or name nobody. Awaited once per decision inside the pinned
+# snapshot (:meth:`_Scheduler._select_prefill`), so it runs to completion without
+# suspending, and once because the ranking is over the prefix: which peers hold it does
+# not depend on who would prefill.
 #
-# The second axis is below, and is a sort key rather than a selector: it ranks what
-# this scheduler already priced, reads no directory and answers nobody. What is not
-# a selection at all is the rest of what a scheduler decides -- admission and the
+# The tests that *do* depend on the candidate are applied to that one ranking, per
+# candidate, through :meth:`~proposed.selector.Selection.require` -- a method on the
+# ranking, so a test needs no object to live in and composes by being called again.
+# That is what makes the hoist above visible rather than hidden inside a funnel that
+# would have to be asked afresh for every candidate.
+#
+# The second axis is further below, and is a sort key rather than a selector: it ranks
+# what this scheduler already priced, reads no directory and answers nobody. What is
+# not a selection at all is the rest of what a scheduler decides -- admission and the
 # SLO gates answer yes or no, and a ranked set of sources cannot say that.
 
 
@@ -207,37 +210,20 @@ class _LocalOnly(Selector[Sequence[Key], None]):
         return Selection.of([])
 
 
-class _LongerThanLocal(Refinement[Sequence[Key], None]):
-    """Abstain unless the head's prefix beats recomputing the gap locally.
+def _worth_pulling(
+    counts: Dict[str, int], inst: str, threshold: float
+) -> Callable[[str], bool]:
+    """Does pulling the head's prefix beat recomputing the gap on ``inst``?
 
-    Its run must be more than ``threshold`` times the requester's own -- the
-    balancing threshold. A pull is charged to the prefill instance's queue, so one
-    that saves little compute still costs the whole wait, and without the threshold
-    every request would chase the longest match onto one instance.
+    Its run must be more than ``threshold`` times ``inst``'s own -- the balancing
+    threshold. A pull is charged to the prefill instance's queue, so one that saves
+    little compute still costs the whole wait, and without the threshold every request
+    would chase the longest match onto one instance.
 
-    Judges the head and abstains for the whole ranking rather than filtering peer
-    by peer. A ranking is not obliged to be in raw-run order
-    (:class:`~kvcache_sim.control._source.SpreadReadsKeySelector` discounts a busy
-    source), so the sources behind the head are the ones it preferred *less*, and
-    promoting one on a longer raw run would overrule the ranking from outside it.
-
-    Reads the runs off the view rather than being told them: the decision pinned
-    it, so this is the same snapshot and costs no directory read.
+    A test for :meth:`~proposed.selector.Selection.require`, which is what makes it a
+    test of the *head* and not a filter: see there for why the whole ranking goes.
     """
-
-    name = "longer-than-local"
-
-    def __init__(self, threshold: float) -> None:
-        self.threshold = threshold
-
-    async def refine(
-        self, selection: Selection[None], keys: Sequence[Key], requester: str
-    ) -> Selection[None]:
-        counts = self.view.prefix_lengths(list(keys))
-        head = selection.sources[0]
-        if counts.get(head, 0) <= counts.get(requester, 0) * self.threshold:
-            return Selection.of([])  # not worth the transfer: recompute it
-        return selection
+    return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
 
 
 # -- the second axis: which priced candidate wins ---------------------------- #
@@ -362,9 +348,12 @@ class _Scheduler(ControlPlane):
         reuse / rank: the two axes a preset picks (see above), both used while
             forming the one answer :meth:`decide` gives. ``reuse`` is a selector
             and ``rank`` a sort key (:data:`_RankKey`), which is why only the first
-            is attached. It names a peer for a candidate's block keys and prices
-            nothing (``Selector[Sequence[Key], None]``): what a peer is worth is
-            this scheduler's to work out (:meth:`_priced_reuse`).
+            is attached. It ranks the peers holding a prefix and prices nothing
+            (``Selector[Sequence[Key], None]``): what a peer is worth to one candidate
+            is this scheduler's to work out (:meth:`_priced_reuse`).
+        balance_threshold: how much longer the head's prefix run must be than a
+            candidate's own before pulling beats recomputing
+            (:func:`_longer_than_local`). Unread when ``reuse`` names nobody.
         source_selector: ranks the holders of a prefix, and what :meth:`sources`
             answers a fetch with behind the pull it already priced
             (:class:`RoutedPull`). ``None`` builds a
@@ -389,6 +378,7 @@ class _Scheduler(ControlPlane):
         *,
         reuse: Selector[Sequence[Key], None],
         rank: _RankKey,
+        balance_threshold: float = 1.5,
         source_selector: Optional[KeySelector[None]] = None,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
@@ -406,6 +396,7 @@ class _Scheduler(ControlPlane):
         self.model = model
         self._reuse = reuse
         self._rank = rank
+        self._threshold = balance_threshold
         self._source = (
             source_selector if source_selector is not None
             else LongestPrefixKeySelector()
@@ -514,15 +505,17 @@ class _Scheduler(ControlPlane):
         ``None`` is an SLO miss. There is no host this request may run on, and the
         refusal costs nothing because nothing has run.
 
-        ``requester`` is the host the request landed on, which no part of this
-        decision reads: where a request *should* run is a fact about the cluster,
-        not about who was asked.
+        ``requester`` is the host the request landed on. Nothing that ranks, prices or
+        gates a *candidate host* reads it -- where a request should run is a fact about
+        the cluster, not about who was asked. It reaches the reuse ranking only as the
+        answer to that ranking's own question, "who wants these bytes"; the candidate
+        under test is what the tests behind it are handed.
         """
-        prefill = await self._select_prefill(request)
+        prefill = await self._select_prefill(request, requester)
         decode = await self._select_decode(prefill.winner)
         return self._admit(request, prefill, decode)
 
-    async def _select_prefill(self, request: Request) -> Selection[Plan]:
+    async def _select_prefill(self, request: Request, requester: str) -> Selection[Plan]:
         """Every prefill instance, priced and ranked best first.
 
         Each one's :class:`Plan` rides under its id in
@@ -534,15 +527,27 @@ class _Scheduler(ControlPlane):
         prices are comparable, and the bookkeeping it writes needs nothing locked.
         Pricing a candidate reserves nothing (:meth:`_candidate`), so the losers leave
         no trace and the winner is chosen after the whole field is known.
+
+        The reuse ranking is asked once and tested per candidate: which peers hold this
+        prefix is the same question whoever would prefill it, and only the tests behind
+        it -- is that peer me, is its run worth the transfer -- read the candidate.
         """
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
             counts = self.view.prefix_lengths(keys)
+            ranked = await self._reuse.select(keys, requester)
             candidates: List[_Priced] = []
             for inst in self.prefill_ids:
-                chosen = await self._reuse.select(keys, inst)
-                match, src, pull = self._priced_reuse(counts, keys, inst, chosen)
+                # A host is not its own peer, and a peer is only worth the transfer if
+                # it holds materially more than this candidate already does.
+                peer = (
+                    ranked
+                    .require(lambda head, me=inst: head != me)
+                    .require(_worth_pulling(counts, inst, self._threshold))
+                    .take(1)
+                )
+                match, src, pull = self._priced_reuse(counts, keys, inst, peer)
                 candidates.append((inst, self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
                 )))
@@ -553,18 +558,18 @@ class _Scheduler(ControlPlane):
     @staticmethod
     def _priced_reuse(
         counts: Dict[str, int], keys: Sequence[Key], inst: str,
-        chosen: Selection[None],
+        peer: Selection[None],
     ) -> Tuple[int, Optional[str], Sequence[str]]:
-        """What a reuse selection buys ``inst``: ``(match, source, pull_keys)``.
+        """What one peer buys ``inst``: ``(match, source, pull_keys)``.
 
-        Derived here and not in the selector, because naming a peer is where a
+        Derived here and not in the selector, because ranking peers is where a
         selector's job ends: how much of this prompt that peer's prefix covers is
-        arithmetic over the snapshot this scheduler already read. An abstention --
-        and a selection naming ``inst`` itself, which is not a pull -- leaves the
-        local match to recompute from.
+        arithmetic over the snapshot this scheduler already read. A selection naming
+        nobody -- a test having dropped the ranking -- leaves the local match to
+        recompute from.
         """
         local = counts.get(inst, 0)
-        src = chosen.sources[0] if chosen.sources else None
+        src = peer.head
         if src is None or src == inst:
             return local, None, ()
         return counts[src], src, keys[local:counts[src]]
@@ -704,8 +709,8 @@ class CacheAwareScheduler(_Scheduler):
     the candidate loop tests.
 
     Args:
-        source_selector: ranks peers for a prefix pull. Handed to the reuse axis
-            *and* on to :meth:`~_Scheduler.sources`, which is the point: one object,
+        source_selector: ranks peers for a prefix pull. Used *as* the reuse axis and
+            handed on to :meth:`~_Scheduler.sources`, which is the point: one object,
             so the peer named while pricing is the peer that serves the read.
             ``replicate=False`` never asks it anything while pricing, and a fetch
             still is.
@@ -720,16 +725,8 @@ class CacheAwareScheduler(_Scheduler):
     def __init__(self, *, source_selector: KeySelector, balance_threshold: float = 1.5,
                  replicate: bool = True, **knobs: Any) -> None:
         super().__init__(
-            reuse=(
-                Refine(
-                    source_selector,
-                    AbstainOnSelf(),
-                    _LongerThanLocal(balance_threshold),
-                    TakeHead(),
-                )
-                if replicate
-                else _LocalOnly()
-            ),
+            reuse=source_selector if replicate else _LocalOnly(),
+            balance_threshold=balance_threshold,
             rank=_by_ttft,
             source_selector=source_selector,
             **knobs,

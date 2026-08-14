@@ -1705,7 +1705,7 @@ def test_one_answer_names_both_of_a_request_s_hosts():
             # The ranking first: committing the decision moves the load the ranking
             # is read off, so asking afterwards would price a different field.
             return (
-                await sched._select_prefill(request),
+                await sched._select_prefill(request, "s0"),
                 await sched.decide(request, "s0"),
             )
 
@@ -1816,7 +1816,7 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
         # here senses through -- it is handed no model of its own.
         assert sched._fetch.selectors[0].view is sched.view
         assert sched.view.cluster is sched.cluster
-        assert sched._fetch.selectors[-1] is sched._reuse.source
+        assert sched._fetch.selectors[-1] is sched._reuse
     finally:
         sim.loop.close()
 
