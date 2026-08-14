@@ -10,7 +10,7 @@ has a question::
 The second exists because the first already answered it: routing prices a pull
 against recomputing and records the peer it priced, and the fetch that follows asks
 which peer to read from. Two objects would have to keep that record in step across a
-boundary; one plane just reads its own model (:class:`RoutedPull`).
+boundary; one plane just reads its own (:class:`RoutedPull`).
 
 Not a selector, because the decision is made of **two** selections and a selection
 holds one: the prefill hosts this scheduler priced, and the decode hosts it ranked
@@ -45,17 +45,22 @@ Admission is a setting rather than an axis: ``early_rejection`` names what the T
 gate is fed -- the decode occupancy of the moment (``early``) or the occupancy
 predicted at prefill completion (``predict``).
 
-Control's model of the cluster
-------------------------------
+What a decision senses
+----------------------
 Nothing here executes, and nothing here is a live read. Every host this scheduler
 ranks, prices or gates, it judges against one
 :class:`~kvcache_sim.control._cluster.KVClusterModel` -- the predicted prefill
-queues and the observed decode batches, and what keeps each of them true. It reaches
-that model one way, the sensor this plane and everything it consults senses through
-(:class:`~kvcache_sim.control._view.KVView`) -- the reads, and the one write, the
-decision it accepted (:class:`~kvcache_sim.control._cluster.Committed`). Sensor
-content because the hosts are what keep the model true: every other fact in it comes
-from them, over the service the run fronts it with (:attr:`_Scheduler.cluster`).
+queues and the observed decode batches, and what keeps each of them true. That model
+is one sense of the view this plane and everything it consults senses through
+(:class:`~kvcache_sim.control._view.KVView`), beside the prefix runs and the pulls this
+plane has already priced (:class:`RoutedPull`). Sensed rather than held because the
+hosts are what keep the model true: every other fact in it comes from them, over the
+service the run fronts it with (:attr:`_Scheduler.cluster`).
+
+An accepted decision is reported back the same way, into each sense it moves
+(:meth:`_Scheduler._admit`): the model holds the prefill instance the plan spoke for
+(:class:`~kvcache_sim.control._cluster.Committed`), and the routed record remembers the
+peer the pull was priced against.
 
 The TTFT the metrics record is therefore the prediction, not a measurement (the
 README says why). Prefill cost is deterministic, so on the default path the two
@@ -79,6 +84,7 @@ from domain import (
 from ._cluster import (
     Committed, ComputeBusy, DecodeState, KVClusterModel, PrefillFinished,
 )
+from ._pending import RoutedPulls
 from ._source import LongestPrefixKeySelector
 from ._view import KVView
 from .request import Request
@@ -323,11 +329,11 @@ class RoutedPull(KeySelector[_P]):
     pull falls through to the ranking behind this link.
 
     A selector like any other, sensing through the view it is attached to
-    (:meth:`~proposed.selector.Selector.attach`) -- the record is a read of the
-    cluster, so it arrives the way every other read does and nothing hands this one
-    the model.
+    (:meth:`~proposed.selector.Selector.attach`) -- the record is one of that view's
+    senses (:class:`~kvcache_sim.control._view.RoutedSense`), so it arrives the way
+    every other read does and nothing hands this one the record.
 
-    Reading it **consumes** it (:meth:`~kvcache_sim.control._cluster.KVClusterModel.claim`
+    Reading it **consumes** it (:meth:`~kvcache_sim.control._pending.RoutedPulls.claim`
     expires the record on a match), so this belongs at the head of a
     :class:`~proposed.selector.FirstMatch` chain and under no combinator that can drop
     the answer or rank it down (:class:`~proposed.selector.Discount`). In that one
@@ -340,7 +346,7 @@ class RoutedPull(KeySelector[_P]):
     name = "routed-pull"
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
-        peer = self.view.cluster.claim(requester, keys)
+        peer = self.view.routed.claim(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
 
@@ -455,19 +461,22 @@ class _Scheduler(ControlPlane):
         Two-phase so a scenario can declare a control plane as an object
         (``MyControl(knobs)``) and let the run hand it the stack afterwards.
 
-        The view is upgraded to a :class:`~kvcache_sim.control._view.KVView` here:
-        prefix runs are this capability's notion, not the store's, and so is the
-        cluster model, which goes *into* that sensor. Everything downstream then
-        senses one object -- the rank keys, the reuse axis, the fetch chain -- and
-        nothing is handed the model to read.
+        The view is composed into a :class:`~kvcache_sim.control._view.KVView` here,
+        with the senses this capability's decisions read: prefix runs, the cluster
+        model, and the pulls this plane prices. None of the three is the store's
+        notion, so the run supplies none of them. Everything downstream then senses
+        one view -- the rank keys, the reuse axis, the fetch chain -- and nothing is
+        handed a record to read.
 
         The run's one :class:`~kvcache_sim.control._cluster.KVClusterModel` is built
         here unless a caller made it first (``cluster``): this is where the
         instances become known, and this runs once per run, so nothing else is
         placed to build a second (empty) one -- and an empty one would report every
         host idle, which is a run that looks healthy and is wrong. It goes into the
-        sensor and nowhere else; :attr:`cluster`, which the run harvests to put a
-        service in front of, reads it back from there.
+        view and nowhere else; :attr:`cluster`, which the run harvests to put a
+        service in front of, reads it back from there. The routed-pull record is built
+        here for the same reason and never supplied: a second one would answer every
+        fetch "I decided nothing about this".
         """
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
@@ -475,7 +484,7 @@ class _Scheduler(ControlPlane):
         if cluster is None:
             # Over ALL instances: the prefill and decode pools may each be a subset.
             cluster = KVClusterModel(self.ids, lookahead=self._lookahead)
-        self.view = view.derived(KVView, cluster=cluster)
+        self.view = view.derived(KVView, cluster=cluster, routed=RoutedPulls())
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
         )
@@ -706,13 +715,19 @@ class _Scheduler(ControlPlane):
         )
         if not all(gate(response, self) for gate in self._gates):
             return None
-        # Accepted: the model holds the instances this plan spoke for, and remembers
-        # the peer its pull was priced against for when the fetch asks
-        # (:class:`RoutedPull`).
+        # Accepted, so each sense this decision moves is told: the model holds the
+        # instance the plan spoke for, and the routed record remembers the peer its
+        # pull was priced against for when the fetch asks (:class:`RoutedPull`).
         #
-        # The local write, not the endpoint a host reports over: control is in the
-        # model's process, and a plain call is what keeps this decision atomic.
+        # Local writes, not the endpoint a host reports over: control is in the same
+        # process, and plain calls are what keep this decision atomic. Both land in
+        # one non-suspending window -- this method has no ``await`` -- and they touch
+        # disjoint records, so nothing can read a half-committed decision and their
+        # order here is unobservable.
         self.view.cluster._notify_impl(Committed(response, request.output_tokens))
+        plan = response.plan
+        if plan.reuse_source is not None and plan.pull_keys:
+            self.view.routed.route(response.prefill, plan.pull_keys, plan.reuse_source)
         return response
 
 

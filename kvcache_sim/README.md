@@ -234,24 +234,27 @@ kvcache_sim/
                           #   candidates, and admission as a list of gates
     _cluster.py           #   KVClusterModel behind proposed.ClusterModel: the
                           #   PREDICTED prefill queue, the observed decode
-                          #   batches, and what was promised against them. One
-                          #   per run, built in attach() and written only by
+                          #   batches, and the prefills promised against them.
+                          #   One per run, built in attach() and written only by
                           #   notify(fact) -- the facts a host reports live here
                           #   with the fold that applies them, and so do the
                           #   reads everything that ranks hosts by load makes
     _pending.py           #   Reservations / RoutedPulls: what was decided and
-                          #   not yet done. Each expires on its own terms, when
-                          #   read -- so no decision method carries a sweep
+                          #   not yet done -- the first read through the model
+                          #   above, the second a sense of its own. Each expires
+                          #   on its own terms, when read -- so no decision
+                          #   method carries a sweep
     _source.py            #   LongestPrefixKeySelector: the one store question
                           #   ("which peer serves this gap"), a
                           #   proposed.KeySelector, priced in blocks of prefix
                           #   run so the opt-in proposed.selector.Discount can
                           #   spread reads over equally good replicas
-    _view.py              #   KVView: everything a decision senses, as one
-                          #   object -- per-instance prefix-run lengths, the
-                          #   pinned snapshot one routing decision reads them
-                          #   through, and the cluster model above, so nothing
-                          #   that ranks or gates is handed a model of its own
+    _view.py              #   KVView: what a decision senses, one class per
+                          #   sense composed onto proposed.View -- prefix runs
+                          #   (with the pinned snapshot one routing decision
+                          #   reads them through), the cluster model above, and
+                          #   the routed pulls, so what ranks or gates reads the
+                          #   sense it needs and is handed no record of its own
                           #   (underscored: the coordinator builds its own, so
                           #   nothing outside control/ names this)
     request.py            #   inference Request, carrying its prompt (a

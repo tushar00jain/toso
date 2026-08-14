@@ -59,6 +59,10 @@ class RoutedPulls:
     the host that fetches will ask who should serve it. This is the note that lets
     the answer be the decision already made rather than a second,
     differently-derived one.
+
+    One sense of the scheduler's view (:class:`~kvcache_sim.control._view.RoutedSense`):
+    the plane that prices a pull writes it, and the one link that answers a fetch from
+    it reads it.
     """
 
     def __init__(self) -> None:
@@ -77,6 +81,11 @@ class RoutedPulls:
 
         Matched oldest first, so two pulls in flight to one instance resolve in a
         fixed order, and consumed on match, so a later fetch cannot claim it.
+
+        A read that *writes*, and one call, which it has to stay: split into a read
+        and a following write, two fetches could both read before either claimed, and
+        the second would pull from a peer nothing priced -- an unplanned transfer,
+        with the predicted cost drifting from the actual one and nothing failing.
 
         The keys must match *exactly*. A pull is all-or-nothing, so a fetch asks for
         precisely what it was told to; a smaller set is a different pull, and

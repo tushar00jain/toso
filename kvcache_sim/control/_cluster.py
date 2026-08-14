@@ -14,15 +14,15 @@ corrected by what the hosts report, never a live read:
   accelerator, so each decode step is mirrored back as :class:`ComputeBusy`;
 * **decode occupancy** is a per-instance list of estimated finish times, replaced
   wholesale by :class:`DecodeState`;
-* what was decided and not yet carried out -- prefills promised, pulls priced
-  against a peer -- is :mod:`kvcache_sim.control._pending`, written by
-  :class:`Committed` and read back as it expires.
+* the **prefills promised** and not yet landed
+  (:class:`kvcache_sim.control._pending.Reservations`) are written by
+  :class:`Committed` and dropped as they are read.
 
 Folder-private: the port this answers (:class:`proposed.ClusterModel`) is the
 surface, and a host reaches it through the seam in front of it
 (:class:`realsim.seams.cluster_model_handle.LocalClusterModelHandle`). The control
-plane reads and writes it here, in this process, through the one sensor it senses
-everything through (:class:`kvcache_sim.control._view.KVView`).
+plane reads and writes it here, in this process, through the sense it is composed into
+(:class:`kvcache_sim.control._view.ClusterSense`).
 """
 
 from __future__ import annotations
@@ -30,12 +30,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import (
-    Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING,
+    Any, Callable, Dict, List, Mapping, Sequence, Tuple, TYPE_CHECKING,
 )
 
 from proposed import ClusterModel
 
-from ._pending import Reservation, Reservations, RoutedPulls
+from ._pending import Reservation, Reservations
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .scheduler import Response
@@ -130,10 +130,9 @@ class KVClusterModel(ClusterModel):
         # there. Empty until the data plane reports.
         self._decode_finishes: Dict[str, List[float]] = {i: [] for i in ids}
         self._lookahead = lookahead
-        # Decided but not yet carried out: prefills promised, and pulls priced
-        # against a peer. Both self-expire (:mod:`kvcache_sim.control._pending`).
+        # Promised and not yet carried out, self-expiring as it is read
+        # (:mod:`kvcache_sim.control._pending`).
         self._reserved = Reservations()
-        self._routed = RoutedPulls()
         # fact type -> the bound method that folds it.
         self._folds: Dict[type, Callable[[Any], None]] = {
             ComputeBusy: self._compute_busy,
@@ -200,14 +199,8 @@ class KVClusterModel(ClusterModel):
             self._busy_until[fact.inst] = fact.now
 
     def _committed(self, fact: Committed) -> None:
-        """Hold the prefill instance for an accepted decision, and note its pull."""
+        """Hold the prefill instance an accepted decision spoke for."""
         plan = fact.response.plan
-        # The peer this pull was priced against, for when the fetch asks
-        # (:meth:`claim`).
-        if plan.reuse_source is not None and plan.pull_keys:
-            self._routed.route(
-                fact.response.prefill, plan.pull_keys, plan.reuse_source
-            )
         self._busy_until[fact.response.prefill] = plan.done_time
         if self._lookahead:
             self._reserved.reserve(
@@ -239,16 +232,3 @@ class KVClusterModel(ClusterModel):
         (:class:`~kvcache_sim.control._pending.Reservations`).
         """
         return self._reserved.pending(now)
-
-    def claim(self, requester: str, keys: Sequence[str]) -> Optional[str]:
-        """The peer ``requester``'s pull of ``keys`` was priced against, consumed.
-
-        A read that *writes*: taking a routed pull expires it
-        (:meth:`~kvcache_sim.control._pending.RoutedPulls.claim`), which is what
-        stops two fetches claiming the same record. And one call, which it has to
-        stay: split into a read and a following write, both could read before either
-        claimed, and the second would pull from a peer nothing priced -- an
-        unplanned transfer, with the predicted cost drifting from the actual one and
-        nothing failing.
-        """
-        return self._routed.claim(requester, keys)

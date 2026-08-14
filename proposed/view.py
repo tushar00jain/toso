@@ -5,8 +5,8 @@ mesh -- it is given a ``View`` and returns a decision. The ``View`` is the senso
 half of that contract: *reads* of state that already exists, and no mutation of any
 kind.
 
-What the base view offers, and why that is all it offers
---------------------------------------------------------
+What the base view offers, and how a capability adds to it
+----------------------------------------------------------
 * :meth:`locate` -- the real directory answer for a set of keys, read straight
   from the real ``Controller`` body, with no caller's source preference applied to
   it (see :mod:`proposed.selector`): a sensor must report the directory as it *is*,
@@ -20,19 +20,19 @@ What the base view offers, and why that is all it offers
   over a non-zero hop the sender's stamp is already stale and comparing it against
   every instance's queue would read the cluster in the past.
 
-Anything more specific stays out. ``kvcache_sim`` wants leading-prefix-run
-lengths, which are a KV-cache notion (a block key chain), so that derived read is
-a subclass in ``kvcache_sim/control/``; ``dedup_sim`` wants a fan-out tally,
-which is the selector's own bookkeeping, not observed state. Folding either into
-the base type would make it a union serving neither caller -- and per-node
-*load* is the same trap twice over: the KV-cache scheduler's load signal is its
-own predicted prefill queue (a control-plane model, not an observation) and the
-dedup selector's is its planned tree, so a base ``load()`` would be a stub with two
-incompatible meanings. It is left out until a caller can observe one: an
-application ranking by load reads its own
-:class:`~proposed.deployment.ClusterModel`, which it may put behind the derived
-sensor it builds here (:meth:`View.derived`) so one object answers everything a
-decision senses.
+Anything more specific stays out, and is *composed* on instead: a capability adds
+one class per read it senses and builds a view out of them and this base
+(:meth:`View.derived`), so a selector reads the one sense it needs and the class
+statement is the list of what that capability's decisions sense. ``kvcache_sim``
+composes leading-prefix-run lengths, which are a KV-cache notion (a block key
+chain); ``dedup_sim`` wants a fan-out tally, which is the selector's own
+bookkeeping, not observed state. Folding either into the base type would make it a
+union serving neither caller -- and per-node *load* is the same trap twice over: the
+KV-cache scheduler's load signal is its own predicted prefill queue (a control-plane
+model, not an observation) and the dedup selector's is its planned tree, so a base
+``load()`` would be a stub with two incompatible meanings. It is left out until a
+caller can observe one: an application ranking by load reads its own
+:class:`~proposed.deployment.ClusterModel` as a sense of its own.
 
 Construction
 ------------
@@ -61,8 +61,8 @@ class View:
     A container of run-supplied reads: who holds a key, where the volumes are, what
     time it is, what a transfer would cost. This base holds what a plane could not
     otherwise reach and nothing a capability made itself; a capability whose decisions
-    also read its own state (its model of the cluster) puts that behind a sensor of its
-    own, over these same ports (:meth:`derived`).
+    also read its own state (its model of the cluster) composes that in as a sense of
+    its own, over these same ports (:meth:`derived`).
 
     The sensors it holds are the members: :attr:`directory`, :attr:`topology`. Of the
     five the directory answers, one is safe for a decision to read, and that one is
@@ -91,16 +91,19 @@ class View:
         self._cost = cost
 
     def derived(self, cls: type, **senses: Any) -> "View":
-        """A richer sensor of type ``cls`` over these same ports, plus ``senses``.
+        """A view of type ``cls`` over these same ports, carrying ``senses``.
 
-        How a capability gets a derived read: ``kvcache_sim`` needs prefix runs, which
-        the store has no reason to know, so it builds a subclass here rather than
-        assembling its own sensor out of ports it would have to be handed one by one.
+        How a capability composes its own reads in: ``cls`` is this base plus one class
+        per sense the capability adds -- ``kvcache_sim`` adds prefix runs, its model of
+        the cluster, and the pulls it has priced -- rather than a sensor it assembles
+        out of ports it would have to be handed one by one.
 
         ``senses`` is what the capability *already holds* and wants read through the
-        same sensor as the run's ports -- its model of the cluster, which nothing here
-        supplies (see the load discussion above). Passed to ``cls`` as keywords, so a
-        subclass names what it takes and this base names nothing it cannot supply.
+        same view as the run's ports, and nothing here supplies any of it (see the load
+        discussion above). Passed as keywords, each claimed by the sense that named it,
+        so this base names none of them -- and one no sense claimed reaches this base's
+        own ``__init__``, which takes none, and fails there rather than being silently
+        absent.
         """
         return cls(self._directory, self._topology, self._cost, **senses)
 

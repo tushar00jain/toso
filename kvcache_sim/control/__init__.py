@@ -20,11 +20,11 @@
   sits behind the plane a fetch asks, so the read is *served* by the peer that was
   priced. Spreading reads over the replicas of a hot prefix is that ranking under
   :class:`proposed.selector.Discount`, which is a composition and so lives there;
-* :mod:`~kvcache_sim.control._view` -- everything a decision senses, as one object:
-  the single derived directory read the scheduler needs (per-instance prefix-run
-  lengths, and the private prefix walk behind them), the pinned snapshot one decision
-  reads it through, and the cluster model above -- so what ranks, prices or gates
-  senses it rather than being handed it.
+* :mod:`~kvcache_sim.control._view` -- what a decision senses, as one class per sense
+  composed onto :class:`proposed.View`: per-instance prefix-run lengths (with the
+  private prefix walk behind them and the pinned snapshot one decision reads them
+  through), the cluster model above, and the routed pulls from ``_pending`` -- so what
+  ranks, prices or gates reads the sense it needs rather than being handed a record.
 
 Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and nothing
 reaches into the simulator -- all checked by the repo's contract lint. Control
