@@ -721,7 +721,7 @@ class _Scheduler(ControlPlane):
         # one non-suspending window -- this method has no ``await`` -- and they touch
         # disjoint records, so nothing can read a half-committed decision and their
         # order here is unobservable.
-        self.view.cluster._notify_impl(Committed(response, request.output_tokens))
+        self.view.cluster.notify_sync(Committed(response, request.output_tokens))
         plan = response.plan
         if plan.reuse_source is not None and plan.pull_keys:
             self.view.routed.route(response.prefill, plan.pull_keys, plan.reuse_source)

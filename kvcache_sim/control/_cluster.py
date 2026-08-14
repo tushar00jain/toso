@@ -141,23 +141,29 @@ class KVClusterModel(ClusterModel):
             Committed: self._committed,
         }
 
-    # -- proposed.ClusterModel: the one way in ----------------------------- #
+    # -- the two ways in, one fold ------------------------------------------ #
     async def notify(self, fact: Any) -> None:
         """:class:`~proposed.deployment.ClusterModel` -- fold ``fact`` into state.
 
         The endpoint a host reports over, and the whole of what crosses the seam.
         """
-        self._notify_impl(fact)
+        self.notify_sync(fact)
 
-    def _notify_impl(self, fact: Any) -> None:
+    def notify_sync(self, fact: Any) -> None:
         """Fold ``fact`` in, here and now: what co-located control code calls.
+
+        The same fold as :meth:`notify` over a shorter reach, so what a caller
+        chooses between is the transport. Only a caller holding the model itself can
+        reach this one -- :class:`~proposed.deployment.ClusterModel` declares
+        ``notify`` alone and the service in front of it forwards only that -- so a
+        host reports over the seam whatever it is co-located with.
 
         **Not a coroutine, and that is load-bearing**, the same way
         :meth:`proposed.deployment.Controller.locate_raw` is not one: the scheduler
         writes :class:`Committed` in the middle of a routing decision, and a plain
         call cannot let a second decision interleave with the first -- whereas an
         ``await`` would rest that atomicity on the coroutine happening not to
-        suspend.
+        suspend. That is the reason to call it, not that it is cheaper.
 
         Dispatch is on the fact's type, through the table bound in ``__init__``
         and not ``functools.singledispatchmethod``, which captures the function
