@@ -360,17 +360,20 @@ class AnySelector(Selector[_S, _P]):
     """
 
 
-class NaiveKeySelector(KeySelector[None]):
+class NaiveKeySelector(KeySelector[_P]):
     """Every holder, in directory order, usable now.
 
     Precisely the real directory's own answer, so this returns the empty
     :class:`Selection` rather than re-deriving it: a read preferring what it names is
     byte-identical to a read that names nothing (:func:`prefer`).
+
+    Generic in the price because it quotes none: an empty payload is a payload in
+    whatever terms the chain it tails prices in.
     """
 
     name = "naive"
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[None]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
         return Selection()
 
 

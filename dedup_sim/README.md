@@ -117,13 +117,20 @@ dedup_sim/
   control/                # DECIDES
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
                           #   with a source once it is usable, published() hears the
-                          #   put that makes it so; both off the selector it holds
-    _source.py            #   PeerKeySelector: the routing itself -- a peer per
-                          #   requester under a fan-out cap, gated on the put that
-                          #   peer owes; from a read-only View
-    _readiness.py         #   Readiness: a gate per fact not true yet, opened
-                          #   against the directory (nothing remembered, because
-                          #   volumes evict) -- the waiting, out of the routing
+                          #   put that makes it so; both off the chain it builds
+    _selector.py          #   PlannedPeer / HolderRanking: the routing itself -- the
+                          #   next peer under a fan-out cap, else the holders that
+                          #   could open a tree, nearest first and priced by tier;
+                          #   both gated on the put the head owes
+    _sensor/              #   the one kind of fact this plane holds
+      _fanout.py          #     FanoutSensor: who is folded in behind whom, which
+                          #     puts are owed, who waits on them -- a
+                          #     proposed.Sensor, and the links' one record
+      _readiness.py       #     Readiness: a gate per fact not true yet, opened
+                          #     against the directory (nothing remembered, because
+                          #     volumes evict) -- the waiting, out of the routing
+    _view.py              #   FanoutView: that sensor as a read of the plane's
+                          #   View, which is how a link reaches it
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- ask, read,
                           #   put, report, over the Deployment's client and ports
@@ -147,7 +154,7 @@ visible from which folders exist and how thick they are:
 
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
-| `control/` — what is decided | `routing.py`: one plane, `sources` + `published` + `_source.py` (the ranking behind both) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_source.py` (the ranking it uses) + `_cluster.py` (the model) + `_view.py` (prefix runs) |
+| `control/` — what is decided | `routing.py`: one plane, `sources` + `published` + `_selector.py` (the chain behind both) + `_sensor/`/`_view.py` (the fan-out it senses) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_source.py` (the ranking it uses) + `_sensor/` (the model) + `_view.py` (prefix runs) |
 | `data/` — what executes | `read_through.py`: one member — ask, get, local put, report | `serving.py` (the per-request lifecycle) + `_decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |
@@ -157,7 +164,7 @@ The short version: dedup is a *source decision*, so its control plane is two mem
 and its data plane one. KV-cache serving is a *continuous arrival stream with
 per-instance compute state*, so its plane also answers where a request runs, and it
 keeps its own serving loop and outcome model — while the "which peer" half of it is the
-same `KeySelector` ranking dedup's is built on.
+same kind of `KeySelector` chain dedup's is built on.
 
 ## Honesty note
 

@@ -23,7 +23,7 @@ from collections import Counter
 import pytest
 import torch
 
-from dedup_sim.control._readiness import Readiness
+from dedup_sim.control._sensor._readiness import Readiness
 from dedup_sim.tests._run import run
 from putget_sim.workload.put_get import DEFAULT_N, MODE_META, MODE_METADATA
 from realsim.seams.transport import TensorDescriptor

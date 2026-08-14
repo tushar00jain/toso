@@ -16,7 +16,7 @@ So this run reads the same key twice with an eviction in between:
    (:meth:`realsim.seams.volume_service.VolumeService._ask_for_room`);
 3. every reader gets ``W`` again.
 
-Round 3 is the whole test. The selector's routes are unchanged from round 1 -- each
+Round 3 is the whole test. The sensor's routes are unchanged from round 1 -- each
 reader is still pointed at the peer ahead of it -- but none of those peers holds
 ``W`` any more, so each answer has to be withheld again until the peer's
 read-through brings it back. Reading the directory is what makes that happen; a
@@ -45,6 +45,7 @@ from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
 
+from dedup_sim.control._view import FanoutView
 from dedup_sim.control.routing import Dedup
 from proposed import Endpoint
 from dedup_sim.data.read_through import ReadThroughPlane
@@ -207,7 +208,7 @@ def test_the_fabric_is_1x_per_read_for_any_fanout_cap():
 
 
 # --------------------------------------------------------------------------
-# And the selector is no bigger at the end of the run than at the start.
+# And the sensor is no bigger at the end of the run than at the start.
 # --------------------------------------------------------------------------
 
 
@@ -218,24 +219,36 @@ class _OwnNode(dict):
         return Endpoint(id=volume_id, host=volume_id, node=volume_id)
 
 
-class Directory:
-    """The reads a selector makes, over a ``key -> volumes`` map a test controls.
+class Directory(FanoutView):
+    """The reads a chain makes, over a ``key -> volumes`` map a test controls.
 
     Waiting is the part of routing that fails by *not* happening, and the two
     ways it can go wrong -- one registration owed to several requesters, and a
     source with no registration owed at all -- both need the directory to change
     between two ``select`` calls at an exact moment. Staging that state directly
-    says what the selector is being asked; arranging for a burst to produce it says
+    says what the chain is being asked; arranging for a burst to produce it says
     considerably less.
+
+    A view itself, so what the plane composes its sensor onto is this object
+    (:meth:`derived`) and the links sense the real one.
     """
 
     def __init__(self, **holders: str) -> None:
+        # No ports: every read below is staged here rather than sensed off a run.
+        super().__init__(None, {}, None)
         self.by_key = {key: set(vols.split()) for key, vols in holders.items()}
 
     # -- the View surface Dedup uses -------------------------------------- #
-    @property
-    def directory(self):
-        """A view exposes the directory it reads; here they are one object."""
+    def derived(self, cls: type, **sensors: Any) -> "Directory":
+        """Compose ``sensors`` onto this view, where the real one builds a fresh view.
+
+        A fresh instance of ``cls`` would sense a run's ports, and the reads here are
+        staged rather than sensed -- so the sensor goes onto this object, which is
+        already a view.
+        """
+        assert isinstance(self, cls), f"{type(self).__name__} is not a {cls.__name__}"
+        for name, value in sensors.items():
+            setattr(self, f"_{name}", value)
         return self
 
     def locate(self, keys):
@@ -269,7 +282,7 @@ class Directory:
 
 
 def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
-    """A plane whose selector senses ``directory``, as a run's ``attach`` leaves it.
+    """A plane whose chain senses ``directory``, as a run's ``attach`` leaves it.
 
     Nothing here is priced, so the transfer-cost half of the port is ``None``.
     """
@@ -345,8 +358,8 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
 
         # r1 is a live source though -- it is fetching now -- so r2 attaches to it
         # rather than to the peer that was retired. Its decision therefore gates,
-        # which is why this asks the selector rather than awaiting the plane's answer.
-        return await plane.selector.select([KEY], "r2")
+        # which is why this asks the chain rather than awaiting the plane's answer.
+        return await plane._chain.select([KEY], "r2")
 
     selection, _trace = run_sim(_after_the_eviction())
     assert selection.sources == ("r1",)
@@ -365,7 +378,7 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
     feed ``2 x cap``, and the cap the run was configured with would not be the
     one it got.
 
-    Asks the selector rather than the plane, because most of these requesters are
+    Asks the chain rather than the plane, because most of these requesters are
     routed to a peer that never publishes here: what is under test is who was
     assigned to whom, and ``sources`` would rightly still be waiting.
     """
@@ -380,15 +393,15 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
         await plane.published("r0", [KEY])
         served = 0
         for i in range(cap):  # ...and every one of those slots is taken
-            if (await plane.selector.select([KEY], f"r{i + 1}")).sources == ("r0",):
+            if (await plane._chain.select([KEY], f"r{i + 1}")).sources == ("r0",):
                 served += 1
         # The origin drops the key, so r0's source holds nothing and owes nothing:
         # it is retired, and r0 is assigned afresh on the ask after that.
         directory.evict("p", KEY)
-        await plane.selector.select([KEY], "r0")
-        await plane.selector.select([KEY], "r0")
+        await plane._chain.select([KEY], "r0")
+        await plane._chain.select([KEY], "r0")
         for i in range(2 * cap):
-            if (await plane.selector.select([KEY], f"x{i}")).sources == ("r0",):
+            if (await plane._chain.select([KEY], f"x{i}")).sources == ("r0",):
                 served += 1
         return served
 
@@ -396,7 +409,7 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
     assert served == cap
 
 
-def test_the_selector_remembers_no_registrations():
+def test_the_sensor_remembers_no_registrations():
     """What it keeps is per requester, not per (volume, key) ever registered.
 
     The readiness object is the one that would have grown with every version the
@@ -404,5 +417,6 @@ def test_the_selector_remembers_no_registrations():
     so a finished run leaves it empty.
     """
     result, plane = _run()
-    assert plane.selector._ready._gates == {}
-    assert set(plane.selector._route) == set(result.workload.reader_ids)
+    fanout = plane.view.fanout
+    assert fanout._ready._gates == {}
+    assert set(fanout._route) == set(result.workload.reader_ids)

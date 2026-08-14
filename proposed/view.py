@@ -26,11 +26,11 @@ one subclass of this base per read it senses, and builds a view by naming them
 any one of them alone is already a view, and the class statement is the list of what
 that capability's decisions sense. ``kvcache_sim``
 composes leading-prefix-run lengths, which are a KV-cache notion (a block key
-chain); ``dedup_sim`` wants a fan-out tally, which is the selector's own
-bookkeeping, not observed state. Folding either into the base type would make it a
+chain); ``dedup_sim`` composes the fan-out tree it has planned, which is one plane's
+own bookkeeping and no directory's. Folding either into the base type would make it a
 union serving neither caller -- and per-node *load* is the same trap twice over: the
 KV-cache scheduler's load signal is its own predicted prefill queue (a control-plane
-model, not an observation) and the dedup selector's is its planned tree, so a base
+model, not an observation) and dedup's is its planned tree, so a base
 ``load()`` would be a stub with two incompatible meanings. It is left out until a
 caller can observe one: an application ranking by load exposes its own
 :class:`~proposed.deployment.Sensor` through a view of its own.
