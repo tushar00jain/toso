@@ -21,7 +21,8 @@ What the base view offers, and how a capability adds to it
   every instance's queue would read the cluster in the past.
 
 Anything more specific stays out, and is *composed* on instead: a capability adds
-one subclass of this base per read it senses, and builds a view by naming them
+one subclass of this base per read it senses -- a sensor it holds is one line,
+``cluster = Sensed()`` on a :class:`SensorView` -- and builds a view by naming them
 (:meth:`View.derived`), so a selector takes the one view carrying the read it needs,
 any one of them alone is already a view, and the class statement is the list of what
 that capability's decisions sense. ``kvcache_sim``
@@ -53,7 +54,7 @@ from proposed.cost import TransferCost
 from proposed.deployment import Controller
 from proposed.topology import Endpoint
 
-__all__ = ["View"]
+__all__ = ["Sensed", "SensorView", "View"]
 
 
 class View:
@@ -103,10 +104,10 @@ class View:
 
         ``sensors`` is what the capability *already holds* and wants read through the
         same view as the run's ports, and nothing here supplies any of it (see the load
-        discussion above). Passed as keywords, each claimed by the view that named it,
-        so this base names none of them -- and one no view claimed reaches this base's
-        own ``__init__``, which takes none, and fails there rather than being silently
-        absent.
+        discussion above). Passed as keywords, each claimed by the :class:`Sensed`
+        attribute of that name, so this base names none of them -- and one no attribute
+        claimed reaches this base's own ``__init__``, which takes none, and fails there
+        rather than being silently absent.
         """
         return cls(self._directory, self._topology, self._cost, **sensors)
 
@@ -160,3 +161,69 @@ class View:
         whose value no loop controls and no run can reproduce.
         """
         return asyncio.get_running_loop().time()
+
+
+class Sensed:
+    """One sensor a view carries, declared as the attribute it is read through::
+
+        class ClusterView(SensorView):
+            cluster = Sensed()
+
+    The attribute name *is* the keyword :meth:`View.derived` takes, so the two cannot
+    drift apart.
+
+    Args:
+        noun: what the raise calls the sensor, for a view whose attribute is not its
+            name (``reserved`` reads a reservation sensor).
+    """
+
+    def __init__(self, noun: Optional[str] = None) -> None:
+        self._noun = noun
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+        self.noun = self._noun or name
+
+    def __get__(
+        self, view: Optional["SensorView"], owner: Optional[type] = None
+    ) -> Any:
+        """The sensor, or raise: an absent sensor is not an empty one.
+
+        A run that composed none would otherwise read every host as idle, nothing as
+        promised and no tree as planned -- answers that look healthy and are wrong.
+        """
+        if view is None:
+            return self
+        sensor = view._sensors.get(self.name)
+        if sensor is None:
+            raise RuntimeError(
+                f"this view was composed without a {self.noun} sensor: an absent "
+                f"sensor answers nothing, so compose it in ({self.name}=...)"
+            )
+        return sensor
+
+
+def _sensed(cls: type) -> Sequence[str]:
+    """Every :class:`Sensed` attribute reachable from ``cls``, each named once."""
+    return tuple(dict.fromkeys(
+        name
+        for klass in cls.__mro__
+        for name, attr in vars(klass).items()
+        if isinstance(attr, Sensed)
+    ))
+
+
+class SensorView(View):
+    """A view whose :class:`Sensed` attributes name the sensors it is composed with.
+
+    Cooperative: it takes the keywords its own descriptors claim and hands the rest
+    up, so several compose (``class KVView(PrefixView, ClusterView, ...)``) with this
+    base and :class:`View` each entering the MRO once, and a keyword no descriptor
+    claims arrives at :meth:`View.__init__`, which takes none.
+    """
+
+    def __init__(self, *ports: Any, **sensors: Any) -> None:
+        self._sensors = {
+            name: sensors.pop(name, None) for name in _sensed(type(self))
+        }
+        super().__init__(*ports, **sensors)

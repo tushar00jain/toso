@@ -247,8 +247,7 @@ class Directory(FanoutView):
         already a view.
         """
         assert isinstance(self, cls), f"{type(self).__name__} is not a {cls.__name__}"
-        for name, value in sensors.items():
-            setattr(self, f"_{name}", value)
+        self._sensors.update(sensors)
         return self
 
     def locate(self, keys):

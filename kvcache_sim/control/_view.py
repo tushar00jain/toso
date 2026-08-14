@@ -18,11 +18,10 @@ takes the one it needs:
   (:class:`~kvcache_sim.control._sensor.RoutedPullSensor`), read by the fetch chain's
   head link alone (:class:`~kvcache_sim.control._selector.RoutedPull`).
 
-Each claims its own keyword through :meth:`~proposed.view.View.derived`, carries its
-own sensor and raises its own "this run supplied none", so composing one in is a name
-in a class statement and nothing else moves. They are disjoint: different selectors
-read different ones and none of them touches another's, which is what makes sensing
-any of them ambiently safe.
+Each names its sensor with a :class:`~proposed.view.Sensed` attribute, so composing one
+in is a name in a class statement and nothing else moves. They are disjoint: different
+selectors read different ones and none of them touches another's, which is what makes
+sensing any of them ambiently safe.
 
 All four are *observed state* -- this plane's own sensors as much as the directory --
 so whatever ranks, prices or gates senses it here instead of being handed the sensor,
@@ -41,14 +40,9 @@ decision commits, and neither happens inside a pin.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import (
-    AbstractSet, Any, Dict, Iterator, List, Optional, Sequence, Tuple, TYPE_CHECKING,
-)
+from typing import AbstractSet, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from proposed import View
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from ._sensor import ClusterSensor, ReservationSensor, RoutedPullSensor
+from proposed import Sensed, SensorView, View
 
 __all__ = [
     "prefix_lengths_of",
@@ -150,39 +144,18 @@ class PrefixView(View):
             self._snapshot = None
 
 
-class ClusterView(View):
+class ClusterView(SensorView):
     """The cluster this capability decides against: :attr:`cluster`.
 
     Its reads are the sensor's own members (``busy_until``, ``occupancy``,
-    ``predict_occupancy``), stated once where the sensor is.
+    ``predict_occupancy``), stated once where the sensor is
+    (:class:`~kvcache_sim.control._sensor.ClusterSensor`).
     """
 
-    def __init__(
-        self,
-        *ports: Any,
-        cluster: Optional["ClusterSensor"] = None,
-        **sensors: Any,
-    ) -> None:
-        super().__init__(*ports, **sensors)
-        self._cluster = cluster
-
-    @property
-    def cluster(self) -> "ClusterSensor":
-        """The run's cluster sensor, read beside the directory.
-
-        Raises like :meth:`~proposed.view.View.transfer_cost` does and for its reason:
-        a view composed without that sensor cannot answer for the cluster, and "idle"
-        is not a number to invent.
-        """
-        if self._cluster is None:
-            raise RuntimeError(
-                "this view was composed without a cluster sensor, so nothing here can "
-                "be ranked, priced or gated against the cluster"
-            )
-        return self._cluster
+    cluster = Sensed()
 
 
-class ReservedView(View):
+class ReservedView(SensorView):
     """The prefills this plane promised and has not seen land: :attr:`reserved`.
 
     Written when a decision commits, read when the next one predicts the decode batch
@@ -190,33 +163,10 @@ class ReservedView(View):
     (:meth:`~kvcache_sim.control._sensor.ReservationSensor.pending`).
     """
 
-    def __init__(
-        self,
-        *ports: Any,
-        reserved: Optional["ReservationSensor"] = None,
-        **sensors: Any,
-    ) -> None:
-        super().__init__(*ports, **sensors)
-        self._reserved = reserved
-
-    @property
-    def reserved(self) -> "ReservationSensor":
-        """The prefills promised and not yet landed.
-
-        Raises like :attr:`ClusterView.cluster` does, and for its reason: a run that
-        promises nothing composes no such sensor, and reading one that was never
-        written would under-count every predicted batch and report no error.
-        """
-        if self._reserved is None:
-            raise RuntimeError(
-                "this view was composed without a reservation sensor, so this run "
-                "does not roll decode occupancy forward and nothing here can read "
-                "the prefills it promised"
-            )
-        return self._reserved
+    reserved = Sensed("reservation")
 
 
-class RoutedView(View):
+class RoutedView(SensorView):
     """The pulls this plane has priced against a peer: :attr:`routed`.
 
     Written by the plane that priced them, read by the one link that answers a fetch
@@ -224,27 +174,7 @@ class RoutedView(View):
     consumes it (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim`).
     """
 
-    def __init__(
-        self,
-        *ports: Any,
-        routed: Optional["RoutedPullSensor"] = None,
-        **sensors: Any,
-    ) -> None:
-        super().__init__(*ports, **sensors)
-        self._routed = routed
-
-    @property
-    def routed(self) -> "RoutedPullSensor":
-        """The pulls priced and not yet claimed.
-
-        Raises like :attr:`ClusterView.cluster` does, and for its reason.
-        """
-        if self._routed is None:
-            raise RuntimeError(
-                "this view was composed without a routed-pull sensor, so nothing "
-                "here can claim the peer a pull was priced against"
-            )
-        return self._routed
+    routed = Sensed("routed-pull")
 
 
 class KVView(PrefixView, ClusterView, ReservedView, RoutedView):

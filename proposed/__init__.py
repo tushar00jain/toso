@@ -37,7 +37,9 @@ simulator, ``proposed`` is the design being argued for.
   it through a view;
 * :mod:`proposed.view` -- :class:`~proposed.view.View`, the read-only observation a
   control plane senses through: who holds a key, where volumes are, what time it is,
-  and whatever sensors a capability composes onto it. It reads a
+  and whatever sensors a capability composes onto it -- one
+  :class:`~proposed.view.Sensed` attribute per sensor, on a
+  :class:`~proposed.view.SensorView`. It reads a
   :class:`~proposed.deployment.Controller` through ``locate_raw``, synchronously.
 
 Import rule, enforced by ``realsim/tools/check_contract.py``: **this package may
@@ -60,7 +62,7 @@ from .deployment import (
 from .plane import ControlPlane, DataPlane
 from .selector import DecisionLog, AnySelector, KeySelector, Selection
 from .topology import Endpoint, locality, nearest, Tier, TIER_LABEL
-from .view import View
+from .view import Sensed, SensorView, View
 
 __all__ = [
     # the torchstore ask
@@ -71,6 +73,8 @@ __all__ = [
     "VolumeId",
     "DecisionLog",
     "View",
+    "SensorView",
+    "Sensed",
     "Controller",
     "Sensor",
     "NotifiedSensor",
