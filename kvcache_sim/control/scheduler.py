@@ -146,37 +146,31 @@ def _worth_pulling(
     return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
 
 
-#: The source ranking each name builds: which peers may serve a prefix. ``"spread"``
-#: is the same ranking under a :class:`~proposed.selector.Balance`, carrying the fold
-#: that weighs a busy holder against a long match -- so every caller of that ranking
-#: folds it the same way and none of them names a fold.
-_SOURCES: Dict[str, Callable[[], Selector[Sequence[Key], int]]] = {
-    "prefix": LongestPrefixKeySelector,
-    "spread": lambda: Balance(
-        LongestPrefixKeySelector(), by_prefix_and_load()
-    ),
-}
+def _source_ranking(name: str) -> Selector[Sequence[Key], int]:
+    """Which peers may serve a prefix, by name -- a fresh one every call.
 
-#: The winner ranking each name builds: what orders the candidates this plane priced.
-_RANKS: Dict[str, Callable[[], AnySelector[Sequence[Priced], Plan]]] = {
-    "ttft": ByTTFT,
-    "load": ByLoad,
-}
-
-
-def _built(table: Dict[str, Callable[[], Any]], name: str, axis: str) -> Any:
-    """The axis ``name`` names, built here, or a refusal listing the names there are.
-
-    A preset picks an axis by name and this plane builds it, so no caller holds a
-    ranking's lifetime: one attached to two runs senses only the view it was attached
-    to last, and neither run would then reproduce alone.
+    ``"spread"`` is the same ranking under a :class:`~proposed.selector.Balance`,
+    carrying the fold that weighs a busy holder against a long match, so every caller
+    of it folds the same way and none of them names a fold.
     """
-    if name not in table:
-        raise ValueError(
-            f"unknown {axis} {name!r}: the choice is "
-            f"{', '.join(repr(known) for known in sorted(table))}"
-        )
-    return table[name]()
+    if name == "prefix":
+        return LongestPrefixKeySelector()
+    if name == "spread":
+        return Balance(LongestPrefixKeySelector(), by_prefix_and_load())
+    raise ValueError(
+        f"unknown source ranking {name!r}: the choice is 'prefix' or 'spread'"
+    )
+
+
+def _winner_ranking(name: str) -> AnySelector[Sequence[Priced], Plan]:
+    """What orders the candidates this plane priced, by name."""
+    if name == "ttft":
+        return ByTTFT()
+    if name == "load":
+        return ByLoad()
+    raise ValueError(
+        f"unknown winner ranking {name!r}: the choice is 'ttft' or 'load'"
+    )
 
 
 class _Scheduler(ControlPlane):
@@ -189,9 +183,10 @@ class _Scheduler(ControlPlane):
     cannot disagree, and nothing is threaded through the data plane to keep them
     together.
 
-    Every ranking is named rather than handed in, and built here (:func:`_built`):
-    which ones a preset picks is the preset's business, and a name cannot be shared
-    between two runs the way an object can.
+    Every ranking is named rather than handed in, and built here
+    (:func:`_source_ranking`, :func:`_winner_ranking`): which ones a preset picks is the
+    preset's business, and a name cannot be shared between two runs the way an object
+    can.
 
     Args:
         reuse / rank: the two axes a preset picks, both attached in :meth:`attach`, and
@@ -211,7 +206,7 @@ class _Scheduler(ControlPlane):
             (:class:`~kvcache_sim.control._selector.RoutedPull`) -- ``"prefix"``,
             longest match first, or ``"spread"``, the same ranking
             under a :class:`~proposed.selector.Balance` so a host holding a hot prefix
-            does not serve every read of it (:data:`_SOURCES`). The fold that reads
+            does not serve every read of it (:func:`_source_ranking`). The fold that reads
             its dimensions rides on its answers, since the two have to agree on how
             many there are, so neither place this ranking is folded names one
             (:meth:`sources`, :meth:`_select_prefill`).
@@ -255,14 +250,15 @@ class _Scheduler(ControlPlane):
         # remembers nothing on itself (``check_structure`` rule 7), so two of them
         # answer alike off the sensors they share and neither side has to be handed the
         # other's. A preset that never pulls prices against nobody instead.
-        self._reuse = (
-            _built(_SOURCES, source, "source ranking") if reuse == "peers"
-            else _built({"none": LocalOnly}, reuse, "reuse axis")
-        )
-        self._fetch = FirstMatch(
-            [RoutedPull(), _built(_SOURCES, source, "source ranking")]
-        )
-        self._rank = _built(_RANKS, rank, "winner ranking")
+        if reuse not in ("peers", "none"):
+            raise ValueError(
+                f"unknown reuse axis {reuse!r}: a candidate pulls from the peers the "
+                f"source ranking names or from nobody, so the choice is 'peers' or "
+                f"'none'"
+            )
+        self._reuse = _source_ranking(source) if reuse == "peers" else LocalOnly()
+        self._fetch = FirstMatch([RoutedPull(), _source_ranking(source)])
+        self._rank = _winner_ranking(rank)
         # Built rather than named: not an axis (see the module it comes from).
         self._decode = ByBatch()
         self._threshold = balance_threshold

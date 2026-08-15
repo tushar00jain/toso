@@ -75,7 +75,7 @@ class LongestPrefixKeySelector(KeySelector[int]):
     of it. Opt-in and off by default: ``python -m kvcache_sim hotspot --spread-reads``
     is that scenario's cache-aware runs asking for the ``"spread"`` source ranking,
     which the scheduler builds with :func:`by_prefix_and_load` as its fold
-    (:data:`~kvcache_sim.control.scheduler._SOURCES`).
+    (:func:`~kvcache_sim.control.scheduler._source_ranking`).
     """
 
     name = "longest-prefix"
