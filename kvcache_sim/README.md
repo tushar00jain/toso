@@ -241,29 +241,31 @@ kvcache_sim/
                           #   pull-vs-recompute, SLO gates, decode placement,
                           #   every one of them priced against the cluster
                           #   sensor below. LoadBalance (baseline) and
-                          #   CacheAware are presets of it -- one choice each on
-                          #   two of the rankings below, and admission as two
+                          #   CacheAware are presets of it -- one choice each
+                          #   on the reuse ranking below and on the fold that
+                          #   orders the prefill pool, and admission as two
                           #   SLO comparisons
     _answer.py            #   Plan / Response: what a decision IS, as values --
-                          #   what one candidate was priced at, and the two
+                          #   what one candidate was priced at (carrying no order
+                          #   of its own: which of its numbers ranks a pool of
+                          #   them is the scheduler's fold to name), and the two
                           #   hosts a request runs on. Under both of the modules
-                          #   above and below it, so a ranking may be typed on a
-                          #   plan and nothing cycles
+                          #   above and below it, so nothing cycles
     _selector.py          #   every ranking a decision here makes, each a
                           #   proposed selector, and each one keying its
                           #   candidates rather than ordering them:
                           #   LongestPrefixKeySelector (the
                           #   one store question, "which peer serves this gap",
-                          #   priced in blocks of prefix run so the opt-in
+                          #   keyed at blocks of prefix run so the opt-in
                           #   proposed.selector.Balance can spread reads over
                           #   equally good replicas, by_prefix_and_load being
                           #   the fold that reads the two dimensions that
-                          #   leaves), LocalOnly,
-                          #   ByTTFT/ByLoad
-                          #   over the priced prefill candidates, ByBatch over
-                          #   the decode ones, and RoutedPull answering a fetch
+                          #   leaves), LocalOnly, ByBatch over the decode
+                          #   candidates, and RoutedPull answering a fetch
                           #   with the pull already priced for it. A ranking is
-                          #   a selector; an SLO gate and a cost are not
+                          #   a selector; an SLO gate and a cost are not --
+                          #   nor is the prefill order, which is the
+                          #   scheduler's own fold over the pool it keyed
     _sensor/              #   one sensor per kind of fact this plane holds
       _action.py          #     the four actions that move them, each a
                           #     proposed.dispatch.Action: PrefillFinished,

@@ -5,7 +5,7 @@ what this capability decides. Two members, asked at the two moments a serving ho
 has a question::
 
     await decide(request, me)   -> Optional[Response]   # where should this run
-    await sources(keys, me)     -> Selection[int]       # who serves this fetch
+    await sources(keys, me)     -> Selection            # who serves this fetch
 
 The second exists because the first already answered it: routing prices a pull
 against recomputing and records the peer it priced, and the fetch that follows asks
@@ -32,8 +32,9 @@ drops its own coldest keys and tells the directory afterwards
 (:mod:`realsim.seams._retention`). Every argument and return is a value.
 
 Both names are *presets* of one scheduler, each one choice on each of its two axes --
-reuse and the winner, both selectors (:mod:`kvcache_sim.control._selector`, where every
-ranking a decision here makes lives) and neither reachable from outside this plane:
+reuse, a selector (:mod:`kvcache_sim.control._selector`, where every ranking a decision
+here makes lives), and the winner, the fold that orders the pool this plane keyed
+itself; neither reachable from outside this plane:
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
@@ -80,19 +81,18 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from proposed import (
-    AnySelector, ControlPlane, Dispatcher, Endpoint, Key, KeySelector, Selection,
+    ControlPlane, Dispatcher, Endpoint, Key, KeySelector, Selection,
 )
-from proposed.selector import Balance, FirstMatch, Fold, Selector
+from proposed.selector import Balance, Dims, FirstMatch, Selector
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
     prefill_time,
 )
 
-from ._answer import Batched, Plan, Priced, Response
+from ._answer import Batched, Plan, Response
 from ._selector import (
-    by_prefix_and_load, ByBatch, ByLoad, ByTTFT, LocalOnly,
-    LongestPrefixKeySelector, RoutedPull,
+    by_prefix_and_load, ByBatch, LocalOnly, LongestPrefixKeySelector, RoutedPull,
 )
 from ._sensor import (
     ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
@@ -146,7 +146,7 @@ def _worth_pulling(
     return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
 
 
-def _source_ranking(name: str) -> Selector[Sequence[Key], int]:
+def _source_ranking(name: str) -> Selector[Sequence[Key]]:
     """Which peers may serve a prefix, by name -- a fresh one every call.
 
     ``"spread"`` is the same ranking under a :class:`~proposed.selector.Balance`,
@@ -162,15 +162,32 @@ def _source_ranking(name: str) -> Selector[Sequence[Key], int]:
     )
 
 
-def _winner_ranking(name: str) -> AnySelector[Sequence[Priced], Plan]:
-    """What orders the candidates this plane priced, by name."""
-    if name == "ttft":
-        return ByTTFT()
-    if name == "load":
-        return ByLoad()
-    raise ValueError(
-        f"unknown winner ranking {name!r}: the choice is 'ttft' or 'load'"
-    )
+# -- the two winner folds: what each preset compares of a priced pool ------- #
+# Both read the pool :meth:`_Scheduler._select_prefill` keys, and each names the number
+# it orders by, so a plan carries no order of its own and neither preset can pick up the
+# other's (:class:`Plan`).
+
+
+def _by_ttft(dims: Dims) -> float:
+    """The cache-aware fold: the whole predicted queue + transfer + prefill.
+
+    Why reuse is *priced* rather than preferred: a longer match on a busier instance
+    can still lose. Read off the plan in the leading dimension, which is the plan the
+    caller of this fold priced.
+    """
+    return dims[0].ttft
+
+
+def _by_queue(dims: Dims) -> float:
+    """The baseline's fold: the queue a candidate would join, and nothing else.
+
+    Reads the dimension appended behind the plan, so what reuse bought cannot move this
+    choice. That dimension is ``busy_until`` and not the plan's own ``queue_wait``,
+    which is the same tail clamped at the clock: two instances idle since different
+    moments both wait zero, and the pick would fall to the id tie-break instead of to
+    the longer-idle host.
+    """
+    return dims[1]
 
 
 class _Scheduler(ControlPlane):
@@ -183,21 +200,21 @@ class _Scheduler(ControlPlane):
     cannot disagree, and nothing is threaded through the data plane to keep them
     together.
 
-    Every ranking is named rather than handed in, and built here
-    (:func:`_source_ranking`, :func:`_winner_ranking`): which ones a preset picks is the
-    preset's business, and a name cannot be shared between two runs the way an object
-    can.
+    Both axes are named rather than handed in, and the ranking of the two is built here
+    (:func:`_source_ranking`): which ones a preset picks is the preset's business, and a
+    name cannot be shared between two runs the way an object can.
 
     Args:
-        reuse / rank: the two axes a preset picks, both attached in :meth:`attach`, and
-            both used while forming the one answer :meth:`decide` gives. ``reuse`` is
-            the peers a candidate may pull from -- ``"peers"``, which is the ``source``
-            ranking itself, or ``"none"``, which names nobody; what a peer is *worth*
-            to one candidate is this scheduler's to work out, off the snapshot it read
-            itself (:meth:`_priced_reuse`), so a stage annotating the axis cannot move
-            a price this scheduler compares. ``rank`` orders the candidates this
-            scheduler priced -- ``"ttft"`` by predicted time to first token,
-            ``"load"`` by what each host is already serving.
+        reuse / rank: the two axes a preset picks, both used while forming the one
+            answer :meth:`decide` gives. ``reuse`` is a ranking, attached in
+            :meth:`attach`: the peers a candidate may pull from -- ``"peers"``, which
+            is the ``source`` ranking itself, or ``"none"``, which names nobody; what a
+            peer is *worth* to one candidate is this scheduler's to work out, off the
+            snapshot it read itself (:meth:`_priced_reuse`), so a stage annotating the
+            axis cannot move a price this scheduler compares. ``rank`` is a fold and
+            not a ranking, over the pool this scheduler keyed itself -- ``"ttft"`` by
+            predicted time to first token (:func:`_by_ttft`), ``"load"`` by what each
+            host is already serving (:func:`_by_queue`).
         balance_threshold: how much longer the head's prefix run must be than a
             candidate's own before pulling beats recomputing (:func:`_worth_pulling`).
             Unread when ``reuse`` names nobody.
@@ -206,9 +223,9 @@ class _Scheduler(ControlPlane):
             (:class:`~kvcache_sim.control._selector.RoutedPull`) -- ``"prefix"``,
             longest match first, or ``"spread"``, the same ranking
             under a :class:`~proposed.selector.Balance` so a host holding a hot prefix
-            does not serve every read of it (:func:`_source_ranking`). The fold that reads
-            its dimensions rides on its answers, since the two have to agree on how
-            many there are, so neither place this ranking is folded names one
+            does not serve every read of it (:func:`_source_ranking`). The fold that
+            reads its dimensions rides on its answers, since the two have to agree on
+            how many there are, so neither place this ranking is folded names one
             (:meth:`sources`, :meth:`_select_prefill`).
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
@@ -258,7 +275,16 @@ class _Scheduler(ControlPlane):
             )
         self._reuse = _source_ranking(source) if reuse == "peers" else LocalOnly()
         self._fetch = FirstMatch([RoutedPull(), _source_ranking(source)])
-        self._rank = _winner_ranking(rank)
+        if rank not in ("ttft", "load"):
+            raise ValueError(
+                f"unknown winner ranking {rank!r}: what orders the candidates this "
+                f"plane priced is their predicted TTFT or the queue each would join, "
+                f"so the choice is 'ttft' or 'load'"
+            )
+        #: Which of the two folds orders the prefill pool, and with it whether a queue
+        #: dimension is appended for that fold to read -- one name, read in the one
+        #: place both happen (:meth:`_select_prefill`).
+        self._rank = rank
         # Built rather than named: not an axis (see the module it comes from).
         self._decode = ByBatch()
         self._threshold = balance_threshold
@@ -372,11 +398,11 @@ class _Scheduler(ControlPlane):
         # (:meth:`~proposed.view.View.subset`), so a ranking consulted inside a routing
         # decision reads the snapshot the decision pinned rather than past it into the
         # live directory.
-        for ranking in (self._fetch, self._reuse, self._rank, self._decode):
+        for ranking in (self._fetch, self._reuse, self._decode):
             ranking.attach(self.view.subset(*ranking.sensors))
 
     # -- what a serving host asks, at the two moments it has a question ------- #
-    async def sources(self, keys: Sequence[Key], requester: str) -> Selection[int]:
+    async def sources(self, keys: Sequence[Key], requester: str) -> Selection:
         """Which peers should serve ``requester``'s fetch of ``keys``, best first.
 
         The pull :meth:`decide` already priced for this caller
@@ -430,15 +456,17 @@ class _Scheduler(ControlPlane):
         if placed is not None:
             return placed
         prefill = await self._select_prefill(request, requester)
-        decode = await self._select_decode(prefill.winner, requester)
-        return self._admit(request, requester, prefill, decode)
+        # The winning plan, read once off the dimension it rides in: both halves of the
+        # answer are formed against the same one.
+        plan: Plan = prefill.key[prefill.head][0]
+        decode = await self._select_decode(plan, requester)
+        return self._admit(request, requester, prefill, plan, decode)
 
-    async def _select_prefill(self, request: Request, requester: str) -> Selection[Plan]:
+    async def _select_prefill(self, request: Request, requester: str) -> Selection:
         """Every prefill instance, priced and folded into an order, best first.
 
-        Each one's :class:`Plan` rides under its id in
-        :attr:`~proposed.selector.Selection.payload`, so the answer says what was
-        compared as well as what won -- which is why the fold here is
+        Each one's :class:`Plan` is the leading dimension of its key, so the answer says
+        what was compared as well as what won -- which is why the fold here is
         :meth:`~proposed.selector.Selection.sort` and not
         :meth:`~proposed.selector.Selection.max`.
 
@@ -458,16 +486,23 @@ class _Scheduler(ControlPlane):
         is all-or-nothing on the head (:meth:`~proposed.selector.Selection.require`) and
         the head of an unfolded answer is whatever order the axis built it in.
 
-        The candidates are folded on their own key, which is one dimension deep -- the
-        TTFT or the queue the rank axis measured (:class:`ByTTFT`,
-        :class:`ByLoad`) -- so nothing here has to blend anything.
+        The two winner axes are one dimension apart. Both key the pool at the plan and
+        both name what they compare of it -- the predicted TTFT (:func:`_by_ttft`), or
+        the queue each candidate would join, which the baseline appends first
+        (:func:`_by_queue`). The queue dimension goes on only where that fold reads it:
+        compared as they stand ``(plan, busy)`` would break a TTFT tie by load rather
+        than by id, and two idle instances holding no prefix do price identically.
+
+        Annotated once per dimension rather than once per candidate: annotating rebuilds
+        the whole key mapping (:meth:`~proposed.selector.Selection.annotated`), so the
+        loop fills a mapping and the appending happens after it.
         """
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
             counts = self.view.prefix_lengths(keys)
             best = (await self._reuse.select(keys, requester)).max()
-            candidates: List[Priced] = []
+            plans: Dict[str, Plan] = {}
             for inst in self.prefill_ids:
                 # A host is not its own peer, and a peer is only worth the transfer if
                 # it holds materially more than this candidate already does.
@@ -477,15 +512,20 @@ class _Scheduler(ControlPlane):
                     .require(_worth_pulling(counts, inst, self._threshold))
                 )
                 match, src, pull = self._priced_reuse(counts, keys, inst, peer)
-                candidates.append((inst, self._candidate(
+                plans[inst] = self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
-                )))
-            return (await self._rank.select(candidates, requester)).sort()
+                )
+            pool = Selection.of(self.prefill_ids).annotated(plans)
+            if self._rank == "load":
+                busy = self.view.cluster.busy_until
+                queued = pool.annotated({i: busy[i] for i in self.prefill_ids})
+                return queued.sort(_by_queue)
+            return pool.sort(_by_ttft)
 
     @staticmethod
     def _priced_reuse(
         counts: Dict[str, int], keys: Sequence[Key], inst: str,
-        peer: Selection[int],
+        peer: Selection,
     ) -> Tuple[int, Optional[str], Sequence[str]]:
         """What one peer buys ``inst``: ``(match, source, pull_keys)``.
 
@@ -523,9 +563,8 @@ class _Scheduler(ControlPlane):
 
         Reserves nothing and mutates nothing, so a losing candidate leaves no trace
         (:class:`~kvcache_sim.control._sensor.Committed` records a decision actually
-        taken). Which candidate wins is the rank axis's business
-        (:class:`~kvcache_sim.control._selector.ByLoad` /
-        :class:`~kvcache_sim.control._selector.ByTTFT`).
+        taken). Which candidate wins is the winner axis's business
+        (:meth:`_select_prefill`).
         """
         cached = min(match * self.B, request.prompt_tokens)
         uncached = request.prompt_tokens - cached
@@ -574,7 +613,7 @@ class _Scheduler(ControlPlane):
                 n += 1
         return n
 
-    async def _select_decode(self, plan: Plan, requester: str) -> Selection[int]:
+    async def _select_decode(self, plan: Plan, requester: str) -> Selection:
         """Decode instances, each with the batch a request admitted at ``plan``'s
         completion is predicted to meet there.
 
@@ -591,8 +630,9 @@ class _Scheduler(ControlPlane):
         self,
         request: Request,
         requester: str,
-        prefill: Selection[Plan],
-        decode: Selection[int],
+        prefill: Selection,
+        plan: Plan,
+        decode: Selection,
     ) -> Optional[Response]:
         """The two winners as one :class:`Response`, held to the SLOs and committed.
 
@@ -600,15 +640,18 @@ class _Scheduler(ControlPlane):
         judge is the value the answer carries. ``None`` == rejected, and rejected here
         costs nothing: this runs before the prefill does, which is the whole of why
         admission is decided at routing.
+
+        ``plan`` is the winning prefill candidate's, read off its key by :meth:`decide`
+        -- the same value the decode side was chosen against.
         """
         instance = decode.sources[0]
-        # The decode ranking prices headroom, and what the TBT SLO is judged on is the
-        # occupancy behind it (:class:`~kvcache_sim.control._selector.ByBatch`).
-        batch = -decode.payload[instance]
+        # The decode ranking keys the occupancy, which is what the TBT SLO is judged on
+        # (:class:`~kvcache_sim.control._selector.ByBatch`).
+        batch = decode.key[instance][0]
         response = Response(
             prefill=prefill.sources[0],
             decode=instance,
-            plan=prefill.winner,
+            plan=plan,
             pred_batch=batch,
             pred_tbt=(
                 decode_step_time(batch + 1, self.profile, self.model)

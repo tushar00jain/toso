@@ -3,9 +3,8 @@
 Over **keys**, the store's own question and the only part of this routing that is one:
 :class:`LongestPrefixKeySelector` ranks the peers holding a prefix,
 :class:`LocalOnly` names nobody, and :class:`RoutedPull` answers a fetch with the pull
-that was already priced for it. Over the scheduler's **own priced candidates**:
-:class:`ByTTFT` and :class:`ByLoad` rank the hosts that could prefill,
-:class:`ByBatch` the hosts that could decode.
+that was already priced for it. Over the scheduler's **own candidates**:
+:class:`ByBatch` ranks the hosts that could decode.
 
 What is a selector and what is not: a **ranking over candidates** is one; a comparison
 or a cost function is not. Holding a plan to an SLO answers yes or no, and a ranked set
@@ -13,16 +12,17 @@ of sources cannot say that; whether a peer's prefix run beats recomputing is a t
 one ranking's head (:func:`~kvcache_sim.control.scheduler._worth_pulling`); and what a
 prefill costs is arithmetic (:func:`domain.prefill_time`).
 
-Two are the **axes** a preset picks. **Reuse** ranks the peers holding this prefix or
-names nobody, and is asked once per decision, because which peers hold a prefix does not
-depend on who would prefill it; the tests that *do* depend on the candidate are applied
-to that one ranking per candidate
-(:meth:`~kvcache_sim.control.scheduler._Scheduler._select_prefill`). **The winner**
-ranks the candidates the scheduler priced. Which host decodes is *not* an axis -- both
-presets rank decode the same way, so the scheduler builds :class:`ByBatch` itself -- and
-it is a selector anyway, so it can be re-keyed from outside
-(:class:`~proposed.selector.Balance`), which a sort written into the scheduler never
-could.
+One of the **axes** a preset picks is here. **Reuse** ranks the peers holding this
+prefix or names nobody, and is asked once per decision, because which peers hold a
+prefix does not depend on who would prefill it; the tests that *do* depend on the
+candidate are applied to that one ranking per candidate
+(:meth:`~kvcache_sim.control.scheduler._Scheduler._select_prefill`). The other axis,
+**the winner**, is not a ranking at all: the scheduler keys the prefill pool with the
+plans it priced and its own fold orders them, so there is nothing here to name. Which
+host decodes is not an axis either -- both presets rank decode the same way, so the
+scheduler builds :class:`ByBatch` itself -- and it is a selector, so it can be re-keyed
+from outside (:class:`~proposed.selector.Balance`), which a sort written into the
+scheduler never could.
 
 Every ranking here **keys** its candidates and orders none of them
 (:attr:`~proposed.selector.Selection.key`); the scheduler folds once when it wants a
@@ -33,33 +33,24 @@ fold compares, so a rank is total and a run reproduces.
 
 from __future__ import annotations
 
-from typing import Dict, Sequence, Tuple, TypeVar
+from typing import Dict, Sequence, Tuple
 
 from proposed import AnySelector, Key, KeySelector, Selection
 from proposed.selector import Dims, Fold, Selector
 
-from ._answer import Batched, Plan, Priced
-from ._view import ClusterView, prefix_lengths_of, PrefixView, RoutedView
+from ._answer import Batched
+from ._view import prefix_lengths_of, PrefixView, RoutedView
 
 __all__ = [
     "LongestPrefixKeySelector",
     "by_prefix_and_load",
     "LocalOnly",
-    "ByTTFT",
-    "ByLoad",
     "ByBatch",
     "RoutedPull",
 ]
 
-#: The price a selector here answers in, left open on the two that answer without
-#: quoting one: :class:`LocalOnly` names nobody, and :class:`RoutedPull` names the peer
-#: the scheduler already priced itself. Their payload is empty, and an empty payload is
-#: a payload in whatever terms the holder prices in -- so neither claims a unit it never
-#: quotes, and both fit a chain pricing in blocks of prefix run.
-_P = TypeVar("_P")
 
-
-class LongestPrefixKeySelector(KeySelector[int]):
+class LongestPrefixKeySelector(KeySelector):
     """Rank instances by how much of the requested block prefix they hold.
 
     Longest contiguous run first once folded, the instance id breaking that tie there,
@@ -81,26 +72,19 @@ class LongestPrefixKeySelector(KeySelector[int]):
     name = "longest-prefix"
     sensors = (PrefixView,)
 
-    async def select(
-        self, keys: Sequence[Key], requester: str
-    ) -> Selection[int]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
         """Instances holding a leading run of ``keys``, keyed at the **negated** run.
 
-        ``KeySelector[int]``: the price is the run itself, in blocks -- a measurement,
-        not a valuation, and what a source is *worth* remains the scheduler's to
-        weigh. Published because the number this ranking already turns on is the only
-        honest price for it, and because a stage appended behind this one has to have
-        something to be behind (:class:`~proposed.selector.Balance`).
-
-        Negated in the key and not in the price, since a fold takes the lowest and a
-        longer run is the better source.
+        Blocks of prefix run: a measurement and not a valuation -- what a source is
+        *worth* remains the scheduler's to weigh. Keyed at all because a stage appended
+        behind this one has to have something to be behind
+        (:class:`~proposed.selector.Balance`), and negated because a fold takes the
+        lowest while a longer run is the better source.
         """
         counts = self._prefix_runs(list(keys))
         if not counts:
             return Selection.of([])
-        return Selection.keyed(
-            [(inst, (-run,), run) for inst, run in counts.items()]
-        )
+        return Selection.keyed([(inst, (-run,)) for inst, run in counts.items()])
 
     def _prefix_runs(self, keys: Sequence[Key]) -> Dict[str, int]:
         """Per-instance prefix runs, off whichever view this selector was attached to.
@@ -137,7 +121,7 @@ def by_prefix_and_load(bound: int = 1) -> Fold:
     return fold
 
 
-class LocalOnly(Selector[Sequence[Key], _P]):
+class LocalOnly(Selector[Sequence[Key]]):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
     A plain :class:`~proposed.selector.Selector`: its subject is keys, but the
@@ -152,68 +136,19 @@ class LocalOnly(Selector[Sequence[Key], _P]):
     name = "local-only"
     sensors = ()
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
         return Selection.of([])
 
 
-class ByTTFT(AnySelector[Sequence[Priced], Plan]):
-    """The lowest predicted queue + transfer + prefill.
-
-    Why reuse is *priced* rather than preferred: a longer match on a busier instance
-    can still lose. The price it ranks by is one the scheduler already worked out per
-    candidate.
-    """
-
-    name = "by-ttft"
-    sensors = ()
-
-    async def select(
-        self, candidates: Sequence[Priced], requester: str
-    ) -> Selection[Plan]:
-        """Every candidate, keyed at its predicted TTFT and holding its whole plan."""
-        return Selection.keyed(
-            [(inst, (plan.ttft,), plan) for inst, plan in candidates]
-        )
-
-
-class ByLoad(AnySelector[Sequence[Priced], Plan]):
-    """The shortest predicted prefill queue, whatever reuse bought (the baseline).
-
-    Keys on ``busy_until`` rather than the candidate's ``queue_wait``, which is that
-    tail clamped at the clock: two instances idle since different moments both wait
-    zero, so the choice would fall to the id tie-break and a different one would win.
-    This ranking's claim is that it picks by load and nothing else.
-
-    The queue is read once for the whole ranking, so every candidate is keyed against
-    one state of the cluster.
-    """
-
-    name = "by-load"
-    sensors = (ClusterView,)
-
-    async def select(
-        self, candidates: Sequence[Priced], requester: str
-    ) -> Selection[Plan]:
-        """Every candidate, keyed at the queue it would join and holding its plan."""
-        busy = self.view.cluster.busy_until
-        return Selection.keyed(
-            [(inst, (busy[inst],), plan) for inst, plan in candidates]
-        )
-
-
-class ByBatch(AnySelector[Sequence[Batched], int]):
+class ByBatch(AnySelector[Sequence[Batched]]):
     """The smallest predicted decode batch, instance id breaking the tie.
 
     The other host pick of a routing decision, over a predicted batch rather than a
     plan; the scheduler predicted every batch before asking.
 
-    Priced at the **negated batch** -- headroom, which is the figure a fold would read
-    load against (:class:`~proposed.selector.Balance`), so it is what this
-    publishes. Negated rather than counted down from a capacity, because only
-    differences are compared and no batch cap is known here -- it is the accelerator's.
-    The occupancy itself is what the TBT SLO is judged on, so the one caller that needs
-    the number back negates it again
-    (:meth:`~kvcache_sim.control.scheduler._Scheduler._admit`).
+    Keyed at the batch itself, which is also the occupancy the TBT SLO is judged on, so
+    the caller admitting the request reads that dimension back rather than predicting it
+    twice (:meth:`~kvcache_sim.control.scheduler._Scheduler._admit`).
     """
 
     name = "by-batch"
@@ -221,14 +156,12 @@ class ByBatch(AnySelector[Sequence[Batched], int]):
 
     async def select(
         self, candidates: Sequence[Batched], requester: str
-    ) -> Selection[int]:
-        """Every candidate, keyed at the batch itself and priced at the headroom."""
-        return Selection.keyed(
-            [(instance, (batch,), -batch) for instance, batch in candidates]
-        )
+    ) -> Selection:
+        """Every candidate, keyed at the batch predicted for it: smallest is best."""
+        return Selection.priced(candidates)
 
 
-class RoutedPull(KeySelector[_P]):
+class RoutedPull(KeySelector):
     """The peer a fetch's pull was already priced against, or an abstention.
 
     Answering the fetch from what routing decided, rather than deciding twice:
@@ -254,6 +187,6 @@ class RoutedPull(KeySelector[_P]):
     name = "routed-pull"
     sensors = (RoutedView,)
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
         peer = self.view.routed.claim(requester, keys)
         return Selection.of([peer] if peer is not None else [])

@@ -9,14 +9,17 @@
   These are *compute* decisions the store knows nothing about, which is why what they
   rank is this application's own candidates and not keys;
 * :mod:`~kvcache_sim.control._answer` -- what those decisions *are*, as values: the
-  ``Plan`` one candidate was priced at and the ``Response`` naming both of a request's
-  hosts. The layer under everything else here, which is what lets a ranking be typed on
-  a plan without a cycle back into the plane that builds one;
+  ``Plan`` one candidate was priced at -- carrying no order of its own, since which of
+  its numbers ranks a pool of them is the fold's to name -- and the ``Response`` naming
+  both of a request's hosts. The layer under everything else here, which is what lets a
+  ranking be typed on this plane's own values without a cycle back into the plane that
+  builds one;
 * :mod:`~kvcache_sim.control._selector` -- every ranking those decisions make, each a
   :class:`proposed.selector.Selector`: which peer serves a prefix gap (the one part that
-  *is* a store question, so the only ranking here over keys), which priced candidate
-  prefills, which host decodes, and the pull a fetch was already answered with. What is
-  not a ranking is not here -- an SLO gate answers yes or no, and a cost is arithmetic;
+  *is* a store question, so the only ranking here over keys), which host decodes, and
+  the pull a fetch was already answered with. What is not a ranking is not here -- an
+  SLO gate answers yes or no, a cost is arithmetic, and which candidate prefills is the
+  scheduler's own fold over the pool it keyed;
 * :mod:`~kvcache_sim.control._sensor` -- what those decisions are made against: one
   sensor per kind of fact this plane holds -- the cluster's load, and what this plane
   decided and has not yet seen carried out (the prefills it promised, the pulls it

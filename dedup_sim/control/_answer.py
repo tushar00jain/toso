@@ -42,9 +42,9 @@ def committed(
     commits: Dispatcher,
     keys: Sequence[Key],
     requester: str,
-    ranking: Selection[Any],
+    ranking: Selection,
     trace: Optional[DecisionLog] = None,
-) -> Selection[Any]:
+) -> Selection:
     """``ranking``, routed to its head and gated until that head is usable.
 
     Which of three shapes an answer takes is the whole of when waiting is safe, because
@@ -56,8 +56,9 @@ def committed(
 
     The head is what the route is recorded against, what the gate is opened on, and what
     a caller preferring this ranking reads from; whatever is ranked behind it rides
-    through with its prices. A ranking naming no head in particular -- an abstention, or
-    the directory's own answer -- comes back untouched: there is nothing to route to.
+    through as it was ranked. A ranking naming no head in particular -- an abstention,
+    or the directory's own answer -- comes back untouched: there is nothing to route
+    to.
     """
     source = ranking.head
     if source is None:

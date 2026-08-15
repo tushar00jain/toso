@@ -78,7 +78,7 @@ class Dedup(ControlPlane):
         # All built in attach(), where the ports the chain senses through arrive.
         self.view: Optional[DedupView] = None
         self.dispatcher: Optional[Dispatcher] = None
-        self._chain: Optional[FirstMatch[float]] = None
+        self._chain: Optional[FirstMatch] = None
 
     def attach(self, view: Any) -> None:
         """Compose this plane's one sensor, and attach the chain that senses it.
@@ -115,7 +115,7 @@ class Dedup(ControlPlane):
         ]).attach(self.view)
 
     # -- what a reader asks -------------------------------------------------- #
-    async def sources(self, keys: Sequence[Key], requester: str) -> Selection[float]:
+    async def sources(self, keys: Sequence[Key], requester: str) -> Selection:
         """Which volumes serve ``keys`` for ``requester``, once they are usable.
 
         Three things, because a caller reaches this plane as a service: the ranking, the
@@ -129,7 +129,7 @@ class Dedup(ControlPlane):
         """
         return await (await self._decide(keys, requester)).settled()
 
-    async def _decide(self, keys: Sequence[Key], requester: str) -> Selection[float]:
+    async def _decide(self, keys: Sequence[Key], requester: str) -> Selection:
         """The whole decision, gate unspent: the chain's scores folded into an order,
         then what is committed out of it.
 

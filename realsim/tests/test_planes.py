@@ -242,21 +242,21 @@ def test_the_subtypes_add_a_subject_and_nothing_else():
 
 
 def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
-    """``Selector[X, ...]`` is the only place a subject is written; the value follows.
+    """``Selector[X]`` is the only place a subject is written; the value follows.
 
     Two annotations for one fact would drift. The parameter is what a reader sees
     and mypy checks; ``subject_type`` is the same type as something a gate can
     compare, since :pep:`484` erases the parameter at runtime.
     """
 
-    class _Parameterised(Selector[Sequence[Key], None]):
+    class _Parameterised(Selector[Sequence[Key]]):
         async def select(self, keys, requester):
             return Selection()
 
     class _Inherits(_Parameterised):        # narrows behaviour, not the subject
         pass
 
-    class _PricesOnly(KeySelector[int]):    # binds the price, not the subject
+    class _Bare(KeySelector):               # binds nothing, so it inherits the subject
         async def select(self, keys, requester):
             return Selection()
 
@@ -270,9 +270,9 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
 
     assert _Parameterised.subject_type == Sequence[Key]
     assert _Inherits.subject_type == Sequence[Key]
-    assert _PricesOnly.subject_type == Sequence[Key]
+    assert _Bare.subject_type == Sequence[Key]
     assert _DeclaresItsOwn().subject_type == "computed"
-    # An unbound parameter is not a subject: AnySelector is Selector[_S, _P].
+    # An unbound parameter is not a subject: AnySelector is Selector[_S].
     assert AnySelector.subject_type is Any
 
 
@@ -284,7 +284,7 @@ def test_taking_keys_is_not_the_same_claim_as_answering_for_the_store():
     different question. Reading ``subject_type`` alone could not tell them apart.
     """
 
-    class _KeysButNotTheStore(Selector[Sequence[Key], None]):
+    class _KeysButNotTheStore(Selector[Sequence[Key]]):
         async def select(self, subject, requester):
             return Selection.of([])
 
@@ -452,7 +452,7 @@ def test_a_fold_is_the_only_thing_that_puts_a_selection_in_an_order():
     stages costs when nothing has to be blended -- and a selection no stage keyed keeps
     the order it was built with, since there is nothing to beat it.
     """
-    keyed = Selection.keyed([("v0", (9,), "p0"), ("v1", (2,), "p1")])
+    keyed = Selection.keyed([("v0", (9,)), ("v1", (2,))])
     assert keyed.sources == ("v0", "v1")            # built, not ranked
     assert keyed.sort().sources == ("v1", "v0")
     assert keyed.max().sources == ("v1",)
@@ -470,7 +470,7 @@ def test_a_fold_blends_the_dimensions_the_stages_left():
     is not there, so a fold reaching for it raises instead of comparing whatever landed
     in that position.
     """
-    two = Selection.keyed([("v0", (4, 3), "p0"), ("v1", (5, 0), "p1")])
+    two = Selection.keyed([("v0", (4, 3)), ("v1", (5, 0))])
     assert two.sort().sources == ("v0", "v1")                     # 4 < 5
     assert two.sort(lambda d: d[0] * (1 + d[1])).sources == ("v1", "v0")   # 16 > 5
     with pytest.raises(IndexError):
@@ -483,7 +483,7 @@ def test_the_id_breaks_every_tie_in_one_place():
     In one place, so a run reproduces however many stages annotated the selection and
     whatever the fold made of them.
     """
-    tied = Selection.keyed([("v1", (5, 1), "p"), ("v0", (5, 1), "p")])
+    tied = Selection.keyed([("v1", (5, 1)), ("v0", (5, 1))])
     assert tied.sort().sources == ("v0", "v1")
     assert tied.sort(lambda d: 0).sources == ("v0", "v1")
 
@@ -495,17 +495,17 @@ def test_both_empties_survive_a_fold():
         assert empty.max() is empty
 
 
-def test_max_keeps_the_gate_and_the_winner_s_key_and_price():
+def test_max_keeps_the_gate_and_the_winner_s_key():
     """A plane folds and *then* spends the gate, so the pick has to carry it."""
 
     async def gate() -> None:
         return None
 
-    best = Selection.keyed([("v0", (9,), "p0"), ("v1", (2,), "p1")], ready=gate).max()
-    assert (best.head, best.winner) == ("v1", "p1")
+    best = Selection.keyed([("v0", (9,)), ("v1", (2,))], ready=gate).max()
+    assert best.head == "v1"
     assert best.ready is gate
-    assert best.key == {"v1": (2,)}
-    assert "v0" not in best.payload      # dropped with the source it spoke for
+    assert best.key == {"v1": (2,)}      # what the stages measured about the pick
+    assert "v0" not in best.key          # dropped with the source it spoke for
 
 
 def test_a_preference_reorders_a_directory_answer_to_its_ranked_sources():
@@ -544,7 +544,7 @@ def test_a_settled_selection_has_waited_and_carries_no_gate():
     settled, _ = run_sim(scenario())
     assert settled.sources == ("v0",)
     assert settled.ready is None
-    assert settled.winner == 7        # the price rides along; the gate does not
+    assert settled.key == {"v0": (7,)}   # the key rides along; the gate does not
 
 
 def test_selection_withholds_until_its_gate_opens():
@@ -789,15 +789,14 @@ def test_a_chain_is_a_key_selector_and_refuses_a_link_that_is_not():
 def test_balance_appends_a_dimension_and_computes_nothing():
     """What it adds is a reading, behind what the ranking under it said.
 
-    So the fold sees both numbers and decides between them -- and the payload arrives
-    as the base wrote it, which is what lets a caller price the winner against
-    something of its own without ever reading a weighed figure.
+    So the fold sees both numbers and decides between them -- and the base's own
+    dimension arrives as the base wrote it, which is what lets a caller price the winner
+    against something of its own without ever reading a weighed figure.
     """
-    base = _FixedPlacement(Selection.keyed([("h0", (5,), "plan0"), ("h1", (9,), "p1")]))
+    base = _FixedPlacement(Selection.keyed([("h0", (5,)), ("h1", (9,))]))
     balanced = Balance(base).attach(_Senses(_Load(h0=2)))
     annotated = _select(balanced)
     assert annotated.key == {"h0": (5, 2), "h1": (9, 0)}
-    assert annotated.payload == {"h0": "plan0", "h1": "p1"}
     assert annotated.sources == ("h0", "h1")          # ordered nothing
 
 
@@ -910,7 +909,7 @@ def test_balance_spreads_an_application_ranking_too():
 def test_balance_attaches_the_ranking_under_it_and_keeps_what_it_answered():
     """The wrapped selector is sensing, and the answer is annotated and nothing else.
 
-    The gate rides through and every source keeps the *base's* price, so a caller
+    The gate rides through and every source keeps the *base's* dimension, so a caller
     pricing the winner against something of its own never reads a weighed figure.
     """
 
@@ -927,8 +926,8 @@ def test_balance_attaches_the_ranking_under_it_and_keeps_what_it_answered():
     second = _select(balanced).sort()                   # ... so v1 leads now
     assert second.sources == ("v1", "v0")
     assert second.ready is gate
-    assert (second.head, second.winner) == ("v1", 5)
-    assert second.payload == {"v0": 5, "v1": 5}
+    assert second.head == "v1"
+    assert second.key == {"v0": (5, 1), "v1": (5, 0)}   # the base's 5, then the load
 
 
 # --------------------------------------------------------------------------
@@ -965,7 +964,7 @@ def test_require_leaves_an_abstention_alone_and_refuses_the_naive_answer():
         Selection().require(lambda head: True)
 
 
-def test_a_narrowed_selection_keeps_its_gate_and_the_prices_it_kept():
+def test_a_narrowed_selection_keeps_its_gate_and_the_keys_it_kept():
     """What narrowing drops is sources, not what the selector said about them."""
 
     async def gate() -> None:
@@ -975,14 +974,14 @@ def test_a_narrowed_selection_keeps_its_gate_and_the_prices_it_kept():
 
     assert narrowed.sources == ("v0",)
     assert narrowed.ready is gate
-    assert narrowed.winner == 7
-    assert "v1" not in narrowed.payload  # dropped with the source it priced
+    assert narrowed.key == {"v0": (7,)}
+    assert "v1" not in narrowed.key      # dropped with the source it priced
 
 
-def test_head_is_the_id_where_winner_is_the_price_under_it():
+def test_head_is_the_leading_source_and_what_was_measured_is_under_it():
     """Both empties read as ``None``: neither names a source to act on."""
     ranked = Selection.priced([("v0", 7), ("v1", 9)])
-    assert (ranked.head, ranked.winner) == ("v0", 7)
+    assert (ranked.head, ranked.key[ranked.head]) == ("v0", (7,))
     assert Selection.of([]).head is None
     assert Selection().head is None
 

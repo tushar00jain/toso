@@ -68,7 +68,7 @@ CHAIN = 10.0
 SPREAD = 0.0
 
 
-class Candidates(KeySelector[float]):
+class Candidates(KeySelector):
     """Holders and planned peers as one pool, each priced in seconds.
 
     Args:
@@ -93,10 +93,10 @@ class Candidates(KeySelector[float]):
         self.fabric = fabric
         self.payload_bytes = payload_bytes
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
         """Everything that could serve every one of ``keys``, scored; else abstain.
 
-        The score is both the price and the one dimension of the key
+        The score is the whole of the key
         (:meth:`~proposed.selector.Selection.priced`): what a source costs *is* what
         orders it here. Ordering is the plane's, one fold at the end
         (:meth:`~dedup_sim.control.routing.Dedup._decide`).

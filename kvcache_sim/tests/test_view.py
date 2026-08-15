@@ -20,8 +20,12 @@ import asyncio
 
 import pytest
 
-from kvcache_sim.control._selector import ByBatch, ByLoad, LongestPrefixKeySelector
-from kvcache_sim.control._sensor import ClusterSensor, ReservationSensor
+from kvcache_sim.control._selector import (
+    ByBatch, LongestPrefixKeySelector, RoutedPull,
+)
+from kvcache_sim.control._sensor import (
+    ClusterSensor, ReservationSensor, RoutedPullSensor,
+)
 from kvcache_sim.control._view import ClusterView, KVView, PrefixView, RoutedView
 from proposed.view import View
 
@@ -90,12 +94,14 @@ def test_a_selector_senses_the_views_it_declared_and_nothing_else():
     A ranking cannot read past what it declared by accident: the attribute is not on
     the view it was attached to at all.
     """
-    view = _view(cluster=ClusterSensor(["s0"]), reserved=None, routed=None)
-    assert ByLoad.sensors == (ClusterView,)
-    sensed = view.subset(*ByLoad.sensors)
-    assert sensed.cluster is view.cluster            # the run's one sensor
+    view = _view(
+        cluster=ClusterSensor(["s0"]), reserved=None, routed=RoutedPullSensor(),
+    )
+    assert RoutedPull.sensors == (RoutedView,)
+    sensed = view.subset(*RoutedPull.sensors)
+    assert sensed.routed is view.routed              # the run's one sensor
     with pytest.raises(AttributeError):
-        sensed.routed                                # not declared, so not there
+        sensed.cluster                               # not declared, so not there
     assert not hasattr(sensed, "prefix_lengths")
 
 

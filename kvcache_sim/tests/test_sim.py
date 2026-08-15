@@ -32,7 +32,7 @@ from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data._store import KVStore
 from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
-from proposed import ControlPlane, Dispatcher, KeySelector, LoadView
+from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
 from proposed.selector import Balance, FirstMatch
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector,
@@ -40,7 +40,7 @@ from kvcache_sim.control._selector import (
 from kvcache_sim.control._sensor import Committed, SourceLoad
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, Plan, PrefillFinished, Response,
-    _Scheduler,
+    _by_queue, _by_ttft, _Scheduler,
 )
 from kvcache_sim.workload._serving import scheduler
 from kvcache_sim.workload._generator import _block_keys_for, make_workload
@@ -1863,6 +1863,41 @@ def test_one_answer_names_both_of_a_request_s_hosts():
     # every instance in the pool.
     assert sorted(ranked.sources) == sorted(sched.prefill_ids)
     assert response.prefill == ranked.sources[0]
+    # ...and what it was priced at is the dimension that pool was keyed with.
+    assert ranked.key[ranked.head][0].ttft == response.plan.ttft
+
+
+def _plan(*, ttft: float, match_blocks: int = 0) -> Plan:
+    """One priced candidate, as the scheduler keys one into the prefill pool."""
+    return Plan(
+        match_blocks=match_blocks, cached_tokens=0, uncached_tokens=0,
+        reuse_source=None, transfer_bytes=0, queue_wait=0.0, ttft=ttft,
+        done_time=0.0,
+    )
+
+
+def test_a_plan_in_a_key_is_ordered_only_by_a_fold_that_names_what_it_compares():
+    """What makes carrying a priced plan as a dimension safe.
+
+    A plan has no order of its own, so the fold that ranks a pool of them says which
+    figure it compares -- and one that named none raises instead of ordering by
+    something meaningless. Two plans that fold alike are left to the instance id, in the
+    one place every tie is settled (:meth:`proposed.selector.Selection.sort`).
+    """
+    with pytest.raises(TypeError):
+        _plan(ttft=1.0) < _plan(ttft=2.0)
+    pool = Selection.keyed([("s1", (_plan(ttft=2.0),)), ("s0", (_plan(ttft=1.0),))])
+    assert pool.sort(_by_ttft).sources == ("s0", "s1")
+    with pytest.raises(TypeError):
+        pool.sort()
+
+    tied = Selection.keyed(
+        [("s1", (_plan(ttft=1.0),)), ("s0", (_plan(ttft=1.0, match_blocks=9),))]
+    )
+    assert tied.sort(_by_ttft).sources == ("s0", "s1")
+    # ...and the baseline's fold reads the dimension appended behind the plan instead.
+    queued = tied.annotated({"s0": 9.0, "s1": 1.0})
+    assert queued.sort(_by_queue).sources == ("s1", "s0")
 
 
 def test_a_refusal_is_a_decision_not_taken():

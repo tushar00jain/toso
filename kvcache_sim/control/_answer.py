@@ -1,12 +1,13 @@
-"""What this plane answers with: :class:`Plan`, :class:`Response`, and the candidate
-pair a ranking over either is built out of.
+"""What this plane answers with: :class:`Plan`, :class:`Response`, and the pair a
+ranking over decode hosts is built out of.
 
 Values only, so each crosses a service boundary unchanged, and the layer under both
-the rankings that sort them (:mod:`kvcache_sim.control._selector`) and the plane that
-prices and answers with them (:mod:`kvcache_sim.control.scheduler`) -- which is what
-lets a selector be typed on a plan without a cycle back into the plane that builds
-one. What is decided *about* is :mod:`kvcache_sim.control.request`; the facts a host
-reports are with the sensor they write (:mod:`kvcache_sim.control._sensor`).
+the ranking that sorts those hosts (:mod:`kvcache_sim.control._selector`) and the plane
+that prices and answers with them (:mod:`kvcache_sim.control.scheduler`) -- which is
+what lets a selector be typed on this plane's own values without a cycle back into the
+plane that builds one. What is decided *about* is :mod:`kvcache_sim.control.request`;
+the facts a host reports are with the sensor they write
+(:mod:`kvcache_sim.control._sensor`).
 """
 
 from __future__ import annotations
@@ -16,12 +17,17 @@ from typing import List, Optional, Tuple
 
 from proposed import VolumeId
 
-__all__ = ["Plan", "Response", "Priced", "Batched"]
+__all__ = ["Plan", "Response", "Batched"]
 
 
 @dataclass
 class Plan:
     """What prefilling one request on one instance was priced at.
+
+    No order of its own: a plan rides in the key of the pool it was priced into, and
+    which of its numbers orders that pool is the fold's to name
+    (:meth:`~kvcache_sim.control.scheduler._Scheduler._select_prefill`). So nothing can
+    compare two of these by accident.
 
     One candidate's price and nothing else: which instance this is, and which one
     decodes, are the two selections' winners and live on the :class:`Response`. Every
@@ -75,8 +81,6 @@ class Response:
     pred_tbt: float = 0.0
 
 
-#: One candidate as the pair a :class:`~proposed.selector.Selection` is built out of:
-#: the instance, and what the scheduler priced it at. A :class:`Plan` when the choice
-#: is which host prefills, a predicted batch size when it is which host decodes.
-Priced = Tuple[VolumeId, Plan]
+#: One decode candidate as the pair a :class:`~proposed.selector.Selection` is built out
+#: of: the instance, and the batch the scheduler predicted it would meet there.
 Batched = Tuple[VolumeId, int]
