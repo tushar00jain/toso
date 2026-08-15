@@ -42,7 +42,9 @@ Six rules, none of which a type system can express:
    is not a dataclass -- the values that legitimately cross are dataclasses, and
    reading *their* fields is the point of sending them. Today that leaves two
    members on the whole control side of a serving host: ``decide`` on the
-   control plane it asks and ``notify`` on the sensor it reports into.
+   control plane it asks and ``dispatch`` on the dispatcher it reports into. **Only
+   the first is policed** -- see :func:`_proposed_ports` for why the second is not
+   found.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -54,8 +56,8 @@ above passed. Rule 5 is the answer, narrowed until it was worth enforcing:
 * over *all* public names it is unenforceable -- 78 hits, mostly correct as they
   stand: type aliases used only in this module's annotations (``MakePlane``,
   ``Edge``), rule tables that exist to be read (``BANNED_ALWAYS``), types a
-  caller receives without importing (``ControlPlane.sensor`` -> a capability's
-  own sensor, which the run fronts with a service),
+  caller receives without importing (``ControlPlane.dispatcher`` -> where a
+  capability's facts arrive, which the run fronts with a service),
   exceptions a caller catches (``StorageCapacityExceeded``). A rule whose
   exception list is longer than its findings enforces nothing;
 * over public **functions** it is 12, because every category above is a class or
@@ -447,10 +449,10 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     * it is declared in :mod:`proposed.deployment` and **every member it declares
       is a coroutine** -- what a reference to another process offers, and what a
       surface with a local read never is. That is how
-      :class:`proposed.deployment.NotifiedSensor` is caught, and why the bare
-      :class:`proposed.deployment.Sensor` beside it is not: a host reports into the
-      first over a wire and asks a selector, and the two are the same kind of reach,
-      while the second is read in the process that holds it.
+      :class:`proposed.deployment.StorageVolume` is caught, and why the bare
+      :class:`proposed.deployment.Sensor` beside it is not: the second is read in the
+      process that holds it. Followed transitively for this mark too, so a surface
+      declared one level down is still caught.
 
     So a ``View``, a ``Selection`` or a ``Deployment`` is not a port -- each has a
     member a caller invokes here and now, and reading a field off a value the other
@@ -459,6 +461,16 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     is the data plane's to take. Nor is ``Controller`` a port, whose ``locate_raw``
     is exactly such a member; nothing in a ``data/`` module holds one anyway, since
     reaching the store is what a ``Deployment`` is for.
+
+    **What is missing:** :class:`proposed.dispatch.Dispatcher` is not found, and a
+    ``data/`` module does hold one -- the handle a host reports its facts over. It has
+    ``Controller``'s exact shape, an ``async dispatch`` beside a local
+    ``dispatch_sync``, so the second mark rejects it for the reason it rejects
+    ``Controller``, and it derives nothing that would reach it through the first. Rule 6
+    therefore polices only the plane a host *asks*. Closing this means either seeding
+    the closure with ``Dispatcher`` by name, as ``ControlPlane`` already is, or a mark
+    that can tell a mixed surface a seam fronts from one only this process reaches --
+    which nothing in ``proposed`` says today.
 
     Bases are pooled per *name*, so the closure holds whichever module in the
     package declares a link in the chain, and a base that names its type parameters

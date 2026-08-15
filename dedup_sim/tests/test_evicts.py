@@ -47,7 +47,7 @@ from sim_common.cost_model import DEFAULT_PROFILE
 
 from dedup_sim.control._view import FanoutView
 from dedup_sim.control.routing import Dedup
-from proposed import Endpoint
+from proposed import Endpoint, Stored
 from dedup_sim.data.read_through import ReadThroughPlane
 
 #: The version that displaces ``W`` in a one-deep reader volume.
@@ -230,7 +230,9 @@ class Directory(FanoutView):
     considerably less.
 
     A view itself, so what the plane composes its sensor onto is this object
-    (:meth:`derived`) and the links sense the real one.
+    (:meth:`derived`) and the links sense the real one. What writes it is
+    :meth:`publish`, called where a run's put would have registered: before the action
+    announcing it is dispatched.
     """
 
     def __init__(self, **holders: str) -> None:
@@ -270,9 +272,9 @@ class Directory(FanoutView):
     def publish(self, volume: str, key: str) -> None:
         """``volume``'s read-through lands: the directory gains it.
 
-        Only the directory. Telling the plane is the *reader's* to do, after its
-        put -- ``await plane.published(volume, [key])`` -- and in that order,
-        which is what a released waiter depends on: it re-reads this map.
+        What a real ``client.put`` does before it returns, which is why every caller
+        below does this and *then* dispatches: a waiter woken by the commit re-reads
+        this map and has to find the volume in it.
         """
         self.by_key.setdefault(key, set()).add(volume)
 
@@ -282,7 +284,10 @@ class Directory(FanoutView):
 
 
 def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
-    """A plane whose chain senses ``directory``, as a run's ``attach`` leaves it.
+    """A plane whose chain senses ``directory``, as a run's wiring leaves it.
+
+    ``attach`` is the whole of it, as it is in a run: it composes the plane's own state
+    onto the dispatcher it builds, and that state is the only thing a landed put folds.
 
     Nothing here is priced, so the transfer-cost half of the port is ``None``.
     """
@@ -320,8 +325,10 @@ def test_one_registration_releases_every_requester_waiting_on_it():
         tasks = [loop.create_task(ask(name)) for name in ("r1", "r2")]
         await asyncio.sleep(0)
         assert answered == [], "answered before the peer published"
+        # r0's put: the directory gains it, and then the one action settles the debt
+        # r0 owed -- whose commit is what wakes r1 and r2 to re-read the directory.
         directory.publish("r0", KEY)
-        await plane.published("r0", [KEY])  # the one registration
+        plane.dispatcher.dispatch_sync(Stored("r0", KEY))
         waiters = await asyncio.gather(*tasks)
         assert all(w.sources == ("r0",) for w in waiters)
         # Nothing that crossed the boundary carries a closure with it.
@@ -347,8 +354,8 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
         directory = Directory(W="p")
         plane = _sensing(directory, fanout_cap=3)
         await plane.sources([KEY], "r0")  # r0 <- p
-        directory.publish("r0", KEY)  # r0's read-through lands
-        await plane.published("r0", [KEY])
+        directory.publish("r0", KEY)                       # r0's read-through lands
+        plane.dispatcher.dispatch_sync(Stored("r0", KEY))
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
         # It answers at all, which is the hang that would not: nothing to wait for,
@@ -390,7 +397,7 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
         # r0 pulls from the origin and publishes: a source for cap peers now.
         await plane.sources([KEY], "r0")
         directory.publish("r0", KEY)
-        await plane.published("r0", [KEY])
+        plane.dispatcher.dispatch_sync(Stored("r0", KEY))
         served = 0
         for i in range(cap):  # ...and every one of those slots is taken
             if (await plane._chain.select([KEY], f"r{i + 1}")).sources == ("r0",):
@@ -412,11 +419,15 @@ def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
 def test_the_sensor_remembers_no_registrations():
     """What it keeps is per requester, not per (volume, key) ever registered.
 
-    The readiness object is the one that would have grown with every version the
-    run touched; it holds gates for facts still being waited on and nothing else,
-    so a finished run leaves it empty.
+    Two rounds of ``W`` and a round of ``W2`` went through this sensor, and what is
+    left names neither: the debts are settled, so nothing is outstanding, and the
+    routes are one per reader whatever the run read. Nothing accumulates per
+    ``(volume, key)`` -- not a registration, and not a waiter either, since who is
+    waiting is not recorded anywhere at all
+    (:meth:`proposed.dispatch.Dispatcher.gate`).
     """
     result, plane = _run()
     fanout = plane.view.fanout
-    assert fanout._ready._gates == {}
+    assert fanout._promised == set(), "a put owed by a run that finished"
     assert set(fanout._route) == set(result.workload.reader_ids)
+    assert not hasattr(fanout, "_ready"), "the waiting is the commit, and is nobody's"

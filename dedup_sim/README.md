@@ -4,10 +4,9 @@
 types** (via [`realsim`](../realsim/)): a synchronized read burst is routed so
 that each unique byte crosses the fabric **exactly once (1x)**, versus **`m x`**
 for the unrouted baseline. The routing is one `proposed.plane.ControlPlane`
-(`dedup_sim.control.routing.Dedup`), asked by the data plane before each read and told
-when its put lands, over the real `LocalClient` planning core, the real `Controller`
-directory and the real in-memory transport, all on `realsim`'s deterministic
-virtual-clock async engine.
+(`dedup_sim.control.routing.Dedup`), asked by the data plane before each read, over the
+real `LocalClient` planning core, the real `Controller` directory and the real in-memory
+transport, all on `realsim`'s deterministic virtual-clock async engine.
 
 Everything is single-threaded, deterministic (byte-identical trace across runs),
 and **allocation-free**: the payload is carried by a `device="meta"` tensor (real
@@ -38,10 +37,11 @@ capability's whole control plane, reached as a service of its own:
    lied to.
 4. The read-through is the data plane's one job
    (`dedup_sim.data.read_through`): after a reader's `get` returns, it `put`s the
-   key into its own co-located volume -- a zero-fabric local write that, through
-   the real `client.put` path, both stores the payload there and calls the real
-   `notify_put_batch` -- and then **reports that put** to the plane it asked. That
-   report opens the next reader's gate.
+   key into its own co-located volume -- a zero-fabric local write through the real
+   `client.put` path, which registers the key before it returns -- and then **commits
+   one action**, `Stored`, which the plane's own fan-out folds. That commit wakes every
+   parked reader, each of which re-reads the directory: one of them now finds its peer
+   there, and the gate is open.
 
 Because exactly one reader ever pulls from a pre-existing holder, the only
 origin-sourced transfer is that first hop: `origin_bytes == 1x` the payload, for
@@ -116,8 +116,9 @@ against a `Deployment` (enforced by `realsim/tools/check_contract.py`).
 dedup_sim/
   control/                # DECIDES
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
-                          #   with a source once it is usable, published() hears the
-                          #   put that makes it so; both off the chain it builds
+                          #   with a source once it is usable, off the chain it
+                          #   builds; a landed put is an action it folds, not a
+                          #   question it is asked
     _selector.py          #   PlannedPeer / HolderRanking: the routing itself -- the
                           #   next peer under a fan-out cap, else the holders that
                           #   could open a tree, nearest first and priced by tier;
@@ -125,15 +126,14 @@ dedup_sim/
     _sensor/              #   the one kind of fact this plane holds
       _fanout.py          #     FanoutSensor: who is folded in behind whom, which
                           #     puts are owed, who waits on them -- a
-                          #     proposed.Sensor, and the links' one record
-      _readiness.py       #     Readiness: a gate per fact not true yet, opened
-                          #     against the directory (nothing remembered, because
-                          #     volumes evict) -- the waiting, out of the routing
+                          #     proposed.Sensor, the links' one record, and the
+                          #     proposed.dispatch.Reducer that folds a landed put
     _view.py              #   FanoutView: that sensor as a read of the plane's
                           #   View, which is how a link reaches it
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- ask, read,
-                          #   put, report, over the Deployment's client and ports
+                          #   put, commit one Stored action, over the Deployment's
+                          #   client and ports
   workload/               # WHAT IS SIMULATED
     scenarios.py          #   the Dedup Scenario: the Runs to compare (the fixture
                           #   as it is, and with the two planes added) + narration
@@ -154,13 +154,13 @@ visible from which folders exist and how thick they are:
 
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
-| `control/` — what is decided | `routing.py`: one plane, `sources` + `published` + `_selector.py` (the chain behind both) + `_sensor/`/`_view.py` (the fan-out it senses) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_view.py` (prefix runs) |
-| `data/` — what executes | `read_through.py`: one member — ask, get, local put, report | `serving.py` (the per-request lifecycle) + `_decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
+| `control/` — what is decided | `routing.py`: one plane, `sources` + `_selector.py` (the chain behind it) + `_sensor/`/`_view.py` (the fan-out it senses, and folds a landed put into) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_view.py` (prefix runs) |
+| `data/` — what executes | `read_through.py`: one member — ask, get, local put, commit | `serving.py` (the per-request lifecycle) + `_decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |
 | domain model + cost layer | **absent** — no served model to describe; charges realsim's cost model directly through the transport seam | `domain/llm.py` (shared — the LLM's flop terms, KV block byte size, and token→time) |
 
-The short version: dedup is a *source decision*, so its control plane is two members
+The short version: dedup is a *source decision*, so its control plane is one member
 and its data plane one. KV-cache serving is a *continuous arrival stream with
 per-instance compute state*, so its plane also answers where a request runs, and it
 keeps its own serving loop and outcome model — while the "which peer" half of it is the

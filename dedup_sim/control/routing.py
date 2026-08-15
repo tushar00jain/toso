@@ -1,9 +1,10 @@
 """1x-fabric dedup routing: :class:`Dedup`, the capability's whole control plane.
 
-Two members, and between them everything a reader needs: *which volumes serve this
-key for me, and when are they usable* (:meth:`Dedup.sources`), and *my read-through
-has landed* (:meth:`Dedup.published`). A reader asks, reads from what it was told,
-puts, and says so. Nothing else is decided here and nothing else is told.
+One member, and it is everything a reader asks: *which volumes serve this key for me,
+and when are they usable* (:meth:`Dedup.sources`). A reader asks, reads from what it
+was told, and puts. That the put landed is not a second question and not a report to
+this plane: it is one action a reader commits (:class:`proposed.dispatch.Stored`), and
+this plane's own state is what folds it (:attr:`Dedup.dispatcher`).
 
 The deciding is the source chain this plane holds
 (:mod:`dedup_sim.control._selector`); what is left here is the service boundary.
@@ -13,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
-from proposed import ControlPlane, DecisionLog, Key, Selection
+from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
 from proposed.selector import FirstMatch, NaiveKeySelector
 
 from ._selector import HolderRanking, PlannedPeer
@@ -24,7 +25,7 @@ __all__ = ["Dedup"]
 
 
 class Dedup(ControlPlane):
-    """Dedup's whole control plane: two members over one source chain.
+    """Dedup's whole control plane: one member over one source chain.
 
     Args:
         fanout_cap: peers one source may be planned to feed -- 1 a chain, >= 2 a
@@ -42,8 +43,9 @@ class Dedup(ControlPlane):
     ) -> None:
         self._cap = fanout_cap
         self._trace = trace
-        # Both built in attach(), where the ports the chain senses through arrive.
+        # All built in attach(), where the ports the chain senses through arrive.
         self.view: Optional[FanoutView] = None
+        self.dispatcher: Optional[Dispatcher] = None
         self._chain: Optional[FirstMatch[int]] = None
 
     def attach(self, view: Any) -> None:
@@ -57,6 +59,11 @@ class Dedup(ControlPlane):
         :meth:`~proposed.selector.FirstMatch.attach` is the whole of the wiring and no
         link is handed a sensor.
 
+        The dispatcher is built here for the same reason and composed with that sensor
+        as its reducer: what a landed put moves is this plane's own state, so this is
+        what knows to fold it. The links get the dispatcher too, because a withheld
+        answer waits on its commit and on nothing else.
+
         The order is load-bearing: :class:`~dedup_sim.control._selector.PlannedPeer`
         spends a slot when it answers, so it goes at the head, and the
         :class:`~proposed.selector.NaiveKeySelector` tail is what makes an unroutable
@@ -65,9 +72,11 @@ class Dedup(ControlPlane):
         self.view = view.derived(
             FanoutView, fanout=FanoutSensor(fanout_cap=self._cap)
         )
+        self.dispatcher = Dispatcher()
+        self.dispatcher.compose(self.view.fanout)
         self._chain = FirstMatch([
-            PlannedPeer(trace=self._trace),
-            HolderRanking(trace=self._trace),
+            PlannedPeer(self.dispatcher, trace=self._trace),
+            HolderRanking(self.dispatcher, trace=self._trace),
             NaiveKeySelector(),
         ]).attach(self.view)
 
@@ -85,19 +94,3 @@ class Dedup(ControlPlane):
         """
         selection = await self._chain.select(list(keys), requester)
         return await selection.settled()
-
-    async def published(self, requester: str, keys: Sequence[Key]) -> None:
-        """``requester``'s read-through has landed: ``keys`` are on its volume now.
-
-        The other half of this plane's surface, and the reason it can gate at all:
-        the data plane reports its own put (:mod:`dedup_sim.data.read_through`), so
-        this hears a registration without the directory having to know that anything
-        is listening. Folded into the sensor the chain senses, which is where the
-        debt it settles is kept.
-
-        Reported *after* the put, so the directory already lists ``requester`` when a
-        waiter released here re-reads it. Awaited for the ordering rather than an
-        answer: the reporter's next ask must be decided against a plane that has
-        folded this one in.
-        """
-        self.view.fanout.published(requester, keys)

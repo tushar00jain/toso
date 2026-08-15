@@ -189,7 +189,10 @@ class Mesh:
         return self.adapters[node_id]
 
     def client_for(
-        self, node_id: str, *, prefer: Optional[Sequence[str]] = None
+        self,
+        node_id: str,
+        *,
+        prefer: Optional[Sequence[str]] = None,
     ) -> Any:
         """:class:`proposed.deployment.Deployment` -- the client for ``node_id``.
 
@@ -197,12 +200,12 @@ class Mesh:
         plane never has to know that many clients share this process. A real
         deployment has one client and no binding to do.
 
-        ``prefer`` is bound the same way and for a different reason: the real client
-        has no source-preference parameter, so a caller that has one to give says so
-        here and the directory read applies it
-        (:func:`realsim.seams.factory.bind_prefer`). Bound on every call, ``None``
-        included, so a client vended without one reads as an unrouted client does
-        rather than inheriting the last preference this coroutine expressed.
+        ``prefer`` is bound the same way, because the real client has no
+        source-preference parameter for a caller to pass it through: the directory read
+        applies what it finds bound (:func:`realsim.seams.factory.bind_prefer`). It is
+        bound on every call, ``None`` included, so a client vended without one reads as
+        an unrouted client's does rather than inheriting whatever this coroutine last
+        asked for.
         """
         self.bind_source(node_id)
         factory.bind_prefer(prefer)

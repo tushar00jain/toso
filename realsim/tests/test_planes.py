@@ -430,7 +430,7 @@ def test_a_run_with_no_plane_fronts_nothing():
     """
     sim = Simulation(_topology())
     assert sim.control_plane_handle is None
-    assert sim.sensor_handle is None
+    assert sim.dispatcher_handle is None
 
 
 # --------------------------------------------------------------------------

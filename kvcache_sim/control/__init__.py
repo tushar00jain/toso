@@ -18,11 +18,11 @@
   prefills, which host decodes, and the pull a fetch was already answered with. What is
   not a ranking is not here -- an SLO gate answers yes or no, and a cost is arithmetic;
 * :mod:`~kvcache_sim.control._sensor` -- what those decisions are made against: one
-  sensor per kind of fact this plane holds. The cluster's load, behind
-  :class:`proposed.NotifiedSensor`'s single write verb, with the facts a host reports
-  and the fold that applies them; and what this plane decided and has not yet seen
-  carried out (the prefills it promised, the pulls it priced), each expiring on its own
-  terms as it is read;
+  sensor per kind of fact this plane holds -- the cluster's load, and what this plane
+  decided and has not yet seen carried out (the prefills it promised, the pulls it
+  priced), each expiring on its own terms as it is read. Beside them, the actions that
+  move them and the fold each sensor publishes, since every write here is one action
+  dispatched into this plane's :class:`proposed.Dispatcher`;
 * :mod:`~kvcache_sim.control._view` -- what a decision senses, as one class per read
   composed onto :class:`proposed.View`: per-instance prefix-run lengths (with the
   private prefix walk behind them and the pinned snapshot one decision reads them
@@ -31,6 +31,6 @@
 
 Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and nothing
 reaches into the simulator -- all checked by the repo's contract lint. Control
-senses through a view and answers questions; what actually happened arrives as a
-fact its hosts report into the cluster sensor.
+senses through a view and answers questions; what actually happened arrives as an
+action its hosts dispatch.
 """

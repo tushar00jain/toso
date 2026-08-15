@@ -50,8 +50,8 @@ from realsim.mesh import Mesh
 from realsim.seams.control_plane_handle import LocalControlPlaneHandle
 from realsim.seams.control_plane_service import ControlPlaneService
 from realsim.seams.link import ServiceHop
-from realsim.seams.sensor_handle import LocalSensorHandle
-from realsim.seams.sensor_service import SensorService
+from realsim.seams.dispatcher_handle import LocalDispatcherHandle
+from realsim.seams.dispatcher_service import DispatcherService
 from realsim.runner import ItemDispatch, Runner
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -81,9 +81,9 @@ class Simulation:
             the peer that serves the read, with nothing threaded through the data
             plane and nothing to keep in step between two objects.
 
-            The sensor its hosts write (:attr:`~proposed.plane.ControlPlane.sensor`)
-            is fronted too, as :attr:`sensor_handle`, so they report into it
-            directly.
+            Where its hosts report their facts
+            (:attr:`~proposed.plane.ControlPlane.dispatcher`) is fronted too, as
+            :attr:`dispatcher_handle`, so they report into it directly.
         profile: target-machine :class:`~sim_common.cost_model.MachineProfile`;
             supplies every cost constant and each volume's byte capacity.
         trace: shared :class:`~sim_common.trace.Trace` (created if omitted).
@@ -142,7 +142,7 @@ class Simulation:
         # the transfer-cost estimate that everything below is derived from, and it
         # passes them down to whatever it ranks with.
         self.control_plane_handle: Optional[Any] = None
-        self.sensor_handle: Optional[Any] = None
+        self.dispatcher_handle: Optional[Any] = None
         if control is not None:
             if not isinstance(control, ControlPlane):
                 raise TypeError(
@@ -155,8 +155,8 @@ class Simulation:
         # What reaching a control plane costs. Resolved once, here, because this is
         # the one place a run's control services are built -- the same reason
         # ``make_controller_adapter`` resolves the directory's. One distance for both
-        # of them: the sensor is held by the control plane that reads it, so a caller
-        # reaching either crosses the same boundary.
+        # of them: the dispatcher is held by the control plane whose sensors it folds
+        # into, so a caller reaching either crosses the same boundary.
         hop = ServiceHop(config.current().control_rtt)
         if control is not None:
             # Fronted as a service, with an endpoint per member the plane declares --
@@ -165,12 +165,12 @@ class Simulation:
                 ControlPlaneService(control), hop=hop
             )
             # The other half of what a host says to control: a question goes to the
-            # plane, a fact goes to the sensor it corrects. Only the one sensor a host
-            # writes is fronted (``ControlPlane.sensor``), and it is read after
-            # ``attach`` because that is when a sensor learns which cluster it is of.
-            if control.sensor is not None:
-                self.sensor_handle = LocalSensorHandle(
-                    SensorService(control.sensor), hop=hop
+            # plane, a fact goes to the dispatcher the plane declares
+            # (``ControlPlane.dispatcher``, which folds one action into every sensor it
+            # moves). Read after ``attach``, because that is when a plane builds it.
+            if control.dispatcher is not None:
+                self.dispatcher_handle = LocalDispatcherHandle(
+                    DispatcherService(control.dispatcher), hop=hop
                 )
 
     @property
@@ -187,9 +187,13 @@ class Simulation:
     # :class:`~proposed.deployment.Deployment`: a capability's data plane is handed
     # this one object (:meth:`~proposed.plane.DataPlane.attach`) and finds on it the
     # store to call, the control plane to ask (:attr:`control_plane_handle`, whatever
-    # that plane declares) and the sensor to report into (:attr:`sensor_handle`).
+    # that plane declares) and the dispatcher to report into
+    # (:attr:`dispatcher_handle`).
     def client_for(
-        self, node_id: str, *, prefer: Optional[Sequence[str]] = None
+        self,
+        node_id: str,
+        *,
+        prefer: Optional[Sequence[str]] = None,
     ) -> Any:
         """The torchstore client for ``node_id``, ready to be driven.
 

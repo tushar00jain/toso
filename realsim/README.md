@@ -185,10 +185,12 @@ proposed/       every contract that outlives the simulator; imports nothing
   deployment.py   Deployment -- how data-plane code reaches its store and the one
                   control plane it asks (control_plane_handle, whatever that plane
                   declares); and each service as a caller reaches it -- Controller,
-                  StorageVolume, and Sensor / NotifiedSensor (facts a decision
-                  reads; notify(fact) when a host is what writes them, which is
-                  the load a store cannot see)
-  plane.py        ControlPlane -- attach(view) + sensor, the one a run puts a
+                  StorageVolume and Sensor (facts a decision reads, the load a
+                  store cannot see, reached only in the process that holds it)
+  dispatch.py     Dispatcher -- where a host's facts arrive, and one action, every
+                  reducer that folds its type, one commit, and one payload-free
+                  wake at it. Holds no state itself
+  plane.py        ControlPlane -- attach(view) + dispatcher, the one a run puts a
                   service in front of; DataPlane -- attach(deployment),
                   and no verbs: what a capability does is its own to name
   cost.py         TransferCost -- what a fetch is predicted to cost

@@ -103,6 +103,28 @@ def test_multi_client_drive_charges_the_calling_client_locality():
     assert _cost("vola->volc") > _cost("vola->volb") > 0.0
 
 
+def test_a_put_is_in_the_directory_before_it_returns():
+    """The bytes and the registration are both there when the await comes back.
+
+    What a reader announcing its own put rests on
+    (:class:`dedup_sim.data.read_through.ReadThroughPlane`): it awaits the put and then
+    dispatches, and the commit is what wakes a parked reader, so the directory must
+    already name the volume by then. Probed inside the run, between the put and
+    anything else, because after the run every ordering looks the same.
+    """
+    mesh = Mesh(_topology())
+
+    async def scenario():
+        with mesh.installed():
+            await mesh.client_for("a").put("W", torch.arange(64, dtype=torch.float32))
+            located = mesh.directory.service.locate_raw(["W"], missing_ok=True)
+            return "W" in mesh.volumes["a"].service.store.kv, list(located.get("W", {}))
+
+    (stored, holders), _trace = run_sim(scenario())
+    assert stored, "the bytes did not land"
+    assert holders == ["a"], "the put returned before the directory knew"
+
+
 def test_on_transfer_is_read_at_call_time():
     """A hook attached after construction still sees every transfer.
 

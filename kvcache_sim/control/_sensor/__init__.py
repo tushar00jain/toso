@@ -5,20 +5,22 @@ decision reaches one (:mod:`kvcache_sim.control._view`). Three of them, and what
 separates them is who writes each:
 
 * :class:`ClusterSensor` -- the predicted prefill queues and observed decode batches,
-  written by the hosts over a seam, so it is the one
-  :class:`~proposed.deployment.NotifiedSensor` here and the one the run fronts with a
-  service. The facts a host reports live with it, and so does the fold;
+  moved by what the hosts report;
 * :class:`ReservationSensor` and :class:`RoutedPullSensor` -- what this plane decided
-  and has not yet seen carried out. Written and read in this process by the plane that
-  decided, so they declare no ``notify`` and no service reaches them.
+  and has not yet seen carried out, moved by the decision that took it.
+
+None of the three is reached from outside this process. Every write is an action
+(:mod:`kvcache_sim.control._sensor._action`) dispatched into this plane's one
+:class:`proposed.dispatch.Dispatcher`, which folds it into every sensor it moves and
+commits them together -- so an accepted decision moves all three or none, and what the
+run fronts with a service is that dispatcher rather than a sensor.
 
 Folder-private, all three: what a decision may read is the view, not the sensor
 behind it.
 """
 
-from ._cluster import (
-    ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
-)
+from ._action import Committed, ComputeBusy, DecodeState, PrefillFinished
+from ._cluster import ClusterSensor
 from ._pending import Reservation, ReservationSensor, RoutedPullSensor
 
 __all__ = [

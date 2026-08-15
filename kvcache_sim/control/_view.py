@@ -24,9 +24,10 @@ selectors read different ones and none of them touches another's, which is what 
 sensing any of them ambiently safe.
 
 All four are *observed state* -- this plane's own sensors as much as the directory --
-so whatever ranks, prices or gates senses it here instead of being handed the sensor,
-and the plane reports its own decision into them the same way. What does not come this
-way is a host's fact: the run puts a service in front of the cluster sensor for those.
+so whatever ranks, prices or gates senses it here instead of being handed the sensor. A
+*write* does not come this way at all: every one is an action dispatched into the
+plane's :class:`proposed.dispatch.Dispatcher`, whether a host reported it or the plane's
+own decision did.
 
 Pinning (:meth:`~proposed.view.View.pinned`) is the second half of the prefix idea. A
 routing decision reads the prefix runs several times -- once for the candidate loop's

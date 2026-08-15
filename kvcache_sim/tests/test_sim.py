@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 
 import pytest
 
@@ -21,19 +22,21 @@ from kvcache_sim.control._view import KVView, _longest_prefix_run
 from kvcache_sim.workload._accelerator import (
     BLOCK_TOKENS, SimulatedAccelerator, TOKEN_DTYPE, token_tensor,
 )
-from realsim.seams.sensor_handle import LocalSensorHandle
-from realsim.seams.sensor_service import SensorService
+from realsim.seams.dispatcher_handle import LocalDispatcherHandle
+from realsim.seams.dispatcher_service import DispatcherService
 from realsim.simulation import Simulation
 from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data._store import KVStore
 from kvcache_sim.control.request import Request
-from proposed import ControlPlane, KeySelector
+from proposed import ControlPlane, Dispatcher, KeySelector
 from proposed.selector import Discount, FirstMatch
 from kvcache_sim.control._selector import LocalOnly, LongestPrefixKeySelector
+from kvcache_sim.control._sensor import Committed
 from kvcache_sim.control.scheduler import (
-    ComputeBusy, DecodeState, LoadBalanceScheduler, PrefillFinished,
+    ComputeBusy, DecodeState, LoadBalanceScheduler, Plan, PrefillFinished, Response,
+    _Scheduler,
 )
 from kvcache_sim.workload._serving import scheduler
 from kvcache_sim.workload._generator import _block_keys_for, make_workload
@@ -715,8 +718,6 @@ def test_the_decode_host_fetches_its_kv_out_of_the_store():
 #      a scenario.
 def _answer(request: Request, *, prefill: str, decode: str):
     """A minimal accepted decision. Exercises the decode leg, not the router."""
-    from kvcache_sim.control.scheduler import Plan, Response
-
     return Response(
         prefill=prefill,
         decode=decode,
@@ -1759,24 +1760,26 @@ def test_a_refusal_is_a_decision_not_taken():
     assert response is None
 
 
-def test_notify_dispatches_each_fact_and_answers_nothing():
-    """The learning half: each fact lands in the cluster sensor and answers None.
+def test_dispatch_folds_each_action_and_answers_nothing():
+    """The learning half: each action lands in the cluster sensor and answers None.
 
-    Told over the handle a host holds, not to the object, so what is exercised is
+    Dispatched over the handle a host holds, not to the object, so what is exercised is
     the surface a report really crosses.
     """
     sim, sched = _scheduler()
-    cluster = LocalSensorHandle(SensorService(sched.sensor))
-    assert cluster.sensor is sched.sensor, "the handle refers to the run's one sensor"
+    handle = LocalDispatcherHandle(DispatcherService(sched.dispatcher))
+    assert handle.dispatcher is sched.dispatcher, (
+        "the handle refers to the run's one dispatcher"
+    )
 
     async def scenario():
-        assert await cluster.notify.call_one(ComputeBusy("s0", 7.0)) is None
-        assert sched.sensor.busy_until["s0"] == 7.0
-        assert await cluster.notify.call_one(DecodeState("s1", (1.0, 2.0))) is None
-        assert sched.sensor.occupancy("s1") == 2
+        assert await handle.dispatch.call_one(ComputeBusy("s0", 7.0)) is None
+        assert sched.view.cluster.busy_until["s0"] == 7.0
+        assert await handle.dispatch.call_one(DecodeState("s1", (1.0, 2.0))) is None
+        assert sched.view.cluster.occupancy("s1") == 2
         # A completion raises the tail and never lowers it.
-        await cluster.notify.call_one(PrefillFinished("s0", 3.0))
-        assert sched.sensor.busy_until["s0"] == 7.0
+        await handle.dispatch.call_one(PrefillFinished("s0", 3.0))
+        assert sched.view.cluster.busy_until["s0"] == 7.0
 
     try:
         sim.loop.run_until_complete(scenario())
@@ -1784,14 +1787,87 @@ def test_notify_dispatches_each_fact_and_answers_nothing():
         sim.loop.close()
 
 
-def test_an_unknown_fact_is_refused_not_guessed():
-    """A fact this application does not define fails loudly at the surface."""
+def _accepted(*, prefill: str = "s0", decode: str = "s1", done: float = 5.0,
+              source=None, pull=(), output_tokens: int = 4):
+    """The action an accepted decision dispatches, without running one."""
+    plan = Plan(
+        match_blocks=len(pull), cached_tokens=0, uncached_tokens=0,
+        reuse_source=source, transfer_bytes=0, queue_wait=0.0, ttft=1.0,
+        done_time=done,
+    )
+    plan.pull_keys = list(pull)
+    return Committed(
+        Response(prefill=prefill, decode=decode, plan=plan), output_tokens
+    )
+
+
+def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
+    """What a decision's atomicity rests on, both ways it can be checked.
+
+    ``_admit`` moves three sensors with one dispatch and is a plain ``def``; an
+    ``await`` anywhere under it would let a second decision be formed against a
+    half-committed one. Nothing in kvcache parks on a gate, so the commit itself has
+    nobody to wake -- checked here rather than assumed, by asking the loop.
+    """
+    sim = Simulation(_make_topology(2))
+    sched = LoadBalanceScheduler(
+        block_tokens=512, simulate_decode=True, early_rejection="predict",
+    )
+    sched.attach(sim.view)
+    assert not inspect.iscoroutinefunction(Dispatcher.dispatch_sync)
+    assert not inspect.iscoroutinefunction(_Scheduler._admit)
+    for sensor in (sched.view.cluster, sched.view.reserved, sched.view.routed):
+        assert not any(
+            inspect.iscoroutinefunction(fold) for fold in sensor.folds.values()
+        ), f"{type(sensor).__name__} folds with a coroutine"
+
+    async def scenario():
+        # A callback queued now runs the moment this coroutine yields, so it is still
+        # unrun after the dispatch exactly when the dispatch never yielded.
+        ran = []
+        asyncio.get_running_loop().call_soon(ran.append, "yielded")
+        sched.dispatcher.dispatch_sync(_accepted(pull=["a"], source="s1"))
+        assert ran == [], "the commit suspended: the loop ran something else"
+        # ...and all three sensors moved in that one window.
+        assert sched.view.cluster.busy_until["s0"] == 5.0
+        assert len(sched.view.reserved.pending(0.0)) == 1
+        assert sched.view.routed.claim("s0", ["a"]) == "s1"
+
+    try:
+        sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+
+
+def test_a_run_that_does_not_predict_reserves_nothing():
+    """The reservation's condition is the wiring, and this is what it buys.
+
+    A run judging the TBT SLO against the occupancy observed now composes no
+    reservation sensor, so the same action every accepted decision dispatches moves the
+    two sensors it does hold and reserves nothing -- with no flag read at the fold and
+    nothing for the prediction to read either.
+    """
     sim, sched = _scheduler()
     try:
-        with pytest.raises(TypeError, match="is not told"):
-            sim.loop.run_until_complete(
-                sched.sensor.notify("not a fact")
-            )
+        assert sched._lookahead is False
+        with pytest.raises(RuntimeError, match="without a reservation sensor"):
+            sched.view.reserved
+        sched.dispatcher.dispatch_sync(_accepted(pull=["a"], source="s1"))
+        assert sched.view.cluster.busy_until["s0"] == 5.0
+        assert sched.view.routed.claim("s0", ["a"]) == "s1"
+        # And the decode-side prediction is the observed occupancy, untouched by a
+        # promise this run never made.
+        assert sched._predicted_batch("s1", 5.0) == 0
+    finally:
+        sim.loop.close()
+
+
+def test_an_unknown_action_is_refused_not_guessed():
+    """An action nothing here folds fails loudly at the surface."""
+    sim, sched = _scheduler()
+    try:
+        with pytest.raises(TypeError, match="nothing here folds"):
+            sim.loop.run_until_complete(sched.dispatcher.dispatch("not an action"))
     finally:
         sim.loop.close()
 
@@ -1821,16 +1897,16 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     them.
     """
     sched = scheduler("cache_aware", _make_topology(2))
-    assert sched.sensor is None, "no view to read the sensor out of before attach"
+    assert sched.dispatcher is None, "nothing to dispatch into before attach"
     sim = Simulation(_make_topology(2), control=sched)   # attach builds the chain
     try:
         # The memo link reads the plane's own sensor, off the view it declared and out
         # of the plane's -- it is handed no sensor of its own.
         assert sched._fetch.selectors[0].view.routed is sched.view.routed
         assert sched._fetch.selectors[-1] is sched._reuse
-        # And what the run fronted for the hosts is that same view's cluster sensor:
-        # the plane keeps no second reference to reach it by.
-        assert sim.sensor_handle.sensor is sched.view.cluster
+        # And what the run fronted for the hosts is the plane's one dispatcher: the
+        # sensors it folds into are reachable no other way.
+        assert sim.dispatcher_handle.dispatcher is sched.dispatcher
     finally:
         sim.loop.close()
 

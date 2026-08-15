@@ -55,7 +55,7 @@ The lifecycle, once a host is prefilling:
    device is free -- so the queue wait is *waited*, not slept from a number, and
    what the request actually waited is recorded next to what control predicted;
 4. publish what this host now holds and did not before -- a real ``put_batch``;
-5. tell control's sensor the clock the real ops actually reached;
+5. dispatch the clock the real ops actually reached into control's sensors;
 6. answer the client with the first token and, where the run models decode, the
    address of the host the plan named to run the rest.
 
@@ -110,10 +110,11 @@ between asking and telling:
   :class:`~kvcache_sim.control.scheduler.Response` -- a value naming both of the
   request's hosts, and what prefilling on the first was priced at -- which this plane
   carries to each leg beside the request it already holds;
-* :class:`~proposed.deployment.NotifiedSensor` -- the **facts**: this host's decode
-  batch, its busy compute, the clock its prefill really reached. Nothing comes
-  back, and the reply is waited for anyway, because the next question has to be
-  decided against a sensor that has already folded the fact.
+* :class:`~proposed.dispatch.Dispatcher` -- the **facts**, each an
+  :class:`~proposed.dispatch.Action`: this host's decode batch, its busy compute, the
+  clock its prefill really reached. Nothing comes back, and the reply is waited for
+  anyway, because the next question has to be decided against sensors that have
+  already folded the action.
 
 Those two are the *only* things this module may touch on the control side --
 ``check_structure.py`` rule 6 fails the build on a field read, a subscript or a
@@ -142,7 +143,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from proposed import ControlPlane, DataPlane, Deployment, NotifiedSensor
+from proposed import ControlPlane, DataPlane, Deployment, Dispatcher
 
 from ..control.scheduler import (
     ComputeBusy, DecodeState, Plan, PrefillFinished, Response,
@@ -167,7 +168,7 @@ class ServingHost(DataPlane):
     so nothing here needs a way to reach another host.
 
     A :class:`~proposed.plane.DataPlane`, so the three things it reaches -- the
-    store, the control plane it asks, the sensor it reports into -- arrive together
+    store, the control plane it asks, the dispatcher it reports into -- arrive together
     at :meth:`attach` off the one deployment that has them all, rather than being
     plumbed in by whoever builds the hosts.
 
@@ -203,7 +204,7 @@ class ServingHost(DataPlane):
         # Filled by attach(): none of the three exists before the deployment does.
         self.store: Optional[KVStore] = None
         self.control: Optional[ControlPlane] = None
-        self.cluster: Optional[NotifiedSensor] = None
+        self.dispatcher: Optional[Dispatcher] = None
         self.trace = trace
         self.metrics = metrics
         self.prefill_engine = prefill
@@ -227,7 +228,7 @@ class ServingHost(DataPlane):
 
     # -- proposed.DataPlane: the deployment hands over what this host reaches -- #
     def attach(self, deployment: Deployment) -> None:
-        """Take the store, the control plane and the sensor off ``deployment``.
+        """Take the store, the control plane and the dispatcher off ``deployment``.
 
         One object rather than three arguments: a host reaching its control plane is
         reaching *this deployment's* control plane, so whoever builds the hosts has
@@ -240,19 +241,19 @@ class ServingHost(DataPlane):
         """
         self.store = KVStore(deployment)
         self.control = deployment.control_plane_handle
-        self.cluster = deployment.sensor_handle
+        self.dispatcher = deployment.dispatcher_handle
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
 
-    # -- what this host tells control's sensor about its decode side -------- #
+    # -- what this host dispatches about its decode side -------------------- #
     async def _decode_state(self, finishes: List[float]) -> None:
         """Forward a changed decode batch. The engine reports here, not there."""
-        await self.cluster.notify.call_one(DecodeState(self.me, tuple(finishes)))
+        await self.dispatcher.dispatch.call_one(DecodeState(self.me, tuple(finishes)))
 
     async def _compute_busy(self, until: float) -> None:
         """Forward this host's occupied compute timeline (coupled only)."""
-        await self.cluster.notify.call_one(ComputeBusy(self.me, until))
+        await self.dispatcher.dispatch.call_one(ComputeBusy(self.me, until))
 
     # -- leg 1: the router role, which every host plays -------------------- #
     async def route(self, request: Request) -> Optional[Response]:
@@ -368,15 +369,15 @@ class ServingHost(DataPlane):
         # and "had no room" are the two outcomes a capacity sweep exists to tell
         # apart, and a hit rate cannot.
         row.published = await self.store.publish(self.me, fresh, kv)
-        # (4) tell control's sensor the clock the real ops actually reached -- the
-        # only thing that closes the loop between the predicted queue for this host
-        # and the queue, and the first news control gets that it was wrong.
+        # (4) dispatch the clock the real ops actually reached -- the only thing that
+        # closes the loop between the predicted queue for this host and the queue, and
+        # the first news control gets that it was wrong.
         #
         # Awaited for the ordering, not the answer, which carries nothing: the next
         # request routed against this host must be priced against a sensor that has
         # already folded this completion, and a report left in flight leaves control
         # answering off a queue it knows to be wrong.
-        await self.cluster.notify.call_one(PrefillFinished(self.me, self._now()))
+        await self.dispatcher.dispatch.call_one(PrefillFinished(self.me, self._now()))
         return await self._prefill_done(request, response, row), first_token
 
     def _recompute(self, request: Request, plan: Plan, row: RequestResult) -> int:

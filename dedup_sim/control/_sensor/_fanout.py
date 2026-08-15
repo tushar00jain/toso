@@ -3,25 +3,28 @@
 from __future__ import annotations
 
 from collections import deque
+from types import MappingProxyType
 from typing import (
-    Deque, Dict, Hashable, Iterable, Optional, Sequence, Set, Tuple,
+    Deque, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple,
 )
 
 from proposed import Sensor
-from proposed.selector import Ready
-
-from ._readiness import Observed, Readiness
+from proposed.dispatch import Fold, Stored
 
 __all__ = ["FanoutSensor"]
 
 
 class FanoutSensor(Sensor):
-    """Who is folded in behind whom, which puts are owed, and who waits on them.
+    """Who is folded in behind whom and which puts are owed. Nobody's wait is here.
 
     Read through the plane's view (:class:`~dedup_sim.control._view.FanoutView`):
     every link of the source chain senses it and writes its own decision back
-    (:mod:`dedup_sim.control._selector`), and the plane folds in the puts it is told
-    about (:meth:`~dedup_sim.control.routing.Dedup.published`).
+    (:mod:`dedup_sim.control._selector`).
+
+    A :class:`proposed.dispatch.Reducer` on this plane's dispatcher (:attr:`folds`),
+    which is how a landed put reaches it: the action is dispatched once, this writes its
+    own state, and the commit after it is what wakes anybody. Nothing here reads the
+    directory's state, and nothing reads this.
 
     Args:
         fanout_cap: peers one source may be planned to feed -- 1 a chain, >= 2 a
@@ -48,11 +51,30 @@ class FanoutSensor(Sensor):
         # is routed it OWES that registration. The only thing that makes waiting for
         # a source safe (:func:`~dedup_sim.control._selector._once_usable`).
         self._promised: Set[Tuple[str, str]] = set()
-        # Waiting for the (volume, key) pairs the real directory has not registered
-        # yet. The concurrency lives there, as does the rule that the directory --
-        # not a memory of past registrations -- says which are true, since a volume
-        # that evicts makes one false again.
-        self._ready = Readiness()
+        # action type -> the fold that writes this state. One entry, because a landed
+        # put is the only thing it is told (:class:`proposed.dispatch.Reducer`).
+        self._folds: Dict[type, Fold] = {Stored: self._stored}
+
+    # -- what it folds ------------------------------------------------------- #
+    @property
+    def folds(self) -> Mapping[type, Fold]:
+        """:class:`proposed.dispatch.Reducer` -- what it folds, by action type.
+
+        Read-only, so the one way to move this state is to dispatch something that
+        moves it.
+        """
+        return MappingProxyType(self._folds)
+
+    def _stored(self, action: Stored) -> None:
+        """A reader's put has landed: settle the debt it owed.
+
+        The directory is what says whether the volume holds the key -- the put wrote it
+        before the action was dispatched -- so nothing is recorded here: this drops what
+        was owed and stops there. Whoever is parked on that key is woken by the commit
+        and re-reads the directory (:meth:`~proposed.dispatch.Dispatcher.gate`), which is
+        why nothing here knows that anybody is waiting.
+        """
+        self._promised.discard((action.host, action.key))
 
     # -- the tree ------------------------------------------------------------ #
     def planned(self, requester: str) -> Optional[str]:
@@ -107,22 +129,3 @@ class FanoutSensor(Sensor):
     def owes(self, facts: Iterable[Tuple[str, str]]) -> bool:
         """Is every one of these ``(volume, key)`` publications still owed?"""
         return all(fact in self._promised for fact in facts)
-
-    def published(self, requester: str, keys: Sequence[str]) -> None:
-        """``requester``'s put has landed: release its waiters, settle its debt.
-
-        From here on the directory is what says whether the volume holds the key.
-        """
-        for key in keys:
-            self._promised.discard((requester, key))
-            self._ready.record((requester, key))
-
-    async def gate(
-        self, facts: Iterable[Hashable], observed: Observed
-    ) -> Optional[Ready]:
-        """A gate that opens once every one of ``facts`` is true, or ``None``.
-
-        Delegated whole (:mod:`dedup_sim.control._sensor._readiness`); whether these
-        facts are coming at all is the caller's question.
-        """
-        return await self._ready.gate(facts, observed)

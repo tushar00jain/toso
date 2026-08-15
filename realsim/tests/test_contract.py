@@ -347,16 +347,23 @@ def test_structure_lint_accepts_calling_the_port_and_reading_a_value(tmp_path):
 
 
 def test_plane_port_rule_actually_resolves_the_real_ports():
-    """Vacuous unless it finds both real ports and the plane that holds them.
+    """Vacuous unless it finds a real port and the plane that holds it.
 
-    A serving host reaches control twice -- it asks a ``ControlPlane`` and reports
-    to a ``NotifiedSensor`` -- and each is found on its own mark: the first *is* the
-    base every port derives (followed transitively, so a capability declaring a
-    narrower plane in ``proposed`` is caught too); the second is one of the
-    all-coroutine services ``proposed.deployment`` declares. Both are imported from
-    ``proposed`` rather than from a sibling ``control/``, so this also pins the half
-    of :func:`_control_ports` that follows a package import: were it to look only at
-    ``control/``, rule 6 would go quiet on kvcache's data plane instead of failing.
+    A serving host reaches control twice -- it asks a ``ControlPlane`` and dispatches
+    into a ``Dispatcher`` -- and rule 6 finds the first, on the mark that *is* the base
+    every port derives. It is imported from ``proposed`` rather than from a sibling
+    ``control/``, so this also pins the half of :func:`_control_ports` that follows a
+    package import: were it to look only at ``control/``, rule 6 would go quiet on
+    kvcache's data plane instead of failing.
+
+    **The second is not found, and this pins that too.** A ``Dispatcher`` declares an
+    ``async dispatch`` beside a local ``dispatch_sync``, which is exactly
+    ``Controller``'s shape and deliberately so -- and the other mark is "declared in
+    ``proposed.deployment`` and *every* member is a coroutine", which a mixed surface
+    fails. So the mark now catches only ``StorageVolume``, which no ``data/`` module
+    holds, and rule 6 does not police the handle a host reports over. Asserted rather
+    than left implicit: this rule's failure mode is going quiet, so the gap fails here
+    if it is ever closed or widened without being looked at.
     """
     root, pkgs = check_structure.REPO_ROOT, check_structure.GRAPH_PKGS
     mods = check_structure._module_map(root, pkgs)
@@ -374,10 +381,19 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
         )
     }
     ports = check_structure._control_ports(rel, tree, mods, trees)
-    assert ports == {"ControlPlane", "NotifiedSensor"}, ports
-    # ...and that the plane's fields are recognised as holding them.
+    assert ports == {"ControlPlane"}, ports
+    # ...and that the plane's field is recognised as holding it.
     _local, attrs = check_structure._port_names(tree, ports)
-    assert {"control", "cluster"} <= attrs, attrs
+    assert {"control"} <= attrs, attrs
+    every = check_structure._proposed_ports(
+        {d: ast.parse((root / mods[d]).read_text()) for d in mods}
+    )
+    assert every == {"ControlPlane", "StorageVolume"}, every
+    # A sensor is written in the process that holds it, so it is not a port and never
+    # was; the dispatcher in front of it is reached from another process and is not
+    # caught, which is the gap the docstring states.
+    assert "Sensor" not in every, every
+    assert "Dispatcher" not in every, every
 
 
 def test_structure_lint_reads_a_layout_block():

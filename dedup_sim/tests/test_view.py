@@ -20,6 +20,7 @@ import pytest
 from dedup_sim.control._selector import PlannedPeer
 from dedup_sim.control._sensor import FanoutSensor
 from dedup_sim.control._view import FanoutView
+from proposed import Dispatcher
 from proposed.selector import Discount, FirstMatch
 from proposed.view import View
 
@@ -71,7 +72,7 @@ def test_a_link_that_spends_a_slot_cannot_be_re_ranked():
     """
     fanout = FanoutSensor(fanout_cap=1)
     fanout.route("r0", "origin")                      # r0 joins, so it has a slot
-    discounted = Discount(PlannedPeer())
+    discounted = Discount(PlannedPeer(Dispatcher()))
     discounted.attach(_view(_Holds("r0"), fanout=fanout))
 
     with pytest.raises(ValueError, match="prices every source"):
@@ -84,7 +85,7 @@ def test_the_chain_holds_the_spending_link_at_its_head_unwrapped():
     A link behind one that can answer might never be asked; a link under a combinator
     might have its answer dropped. At the head of a FirstMatch, an answer wins.
     """
-    peer = PlannedPeer()
+    peer = PlannedPeer(Dispatcher())
     chain = FirstMatch([peer])
     assert chain.selectors[0] is peer
     assert not isinstance(chain.selectors[0], Discount)

@@ -6,9 +6,9 @@ All are deliberate and all can rot silently:
   ``proposed`` must not import torchstore -- it is what torchstore would gain, so
   depending on it would invert the claim. The signatures are therefore a copy,
   except for the members that *are* the ask (``THE_ASK``), which upstream has yet
-  to have. The half of the ask that is not a member -- a source preference on the
-  read path -- is pinned on the client instead (``CLIENT_READ_PARAMETERS``), since
-  what makes the simulator's stand-in necessary is the argument that is *not* there;
+  to have. The half of the ask that is not a member -- a source preference on the read
+  path -- is pinned on the client instead (``CLIENT_READ_PARAMETERS``), since what
+  makes the simulator's stand-in necessary is the argument that is *not* there;
 * :class:`proposed.deployment.StorageVolume` declares the storage surface the same
   way, and asks for nothing: every member is a copy, and each endpoint left out is
   listed with a reason (``VOLUME_NOT_DECLARED``) so a narrower surface stays a
@@ -67,14 +67,13 @@ COPIED_FROM_UPSTREAM = [
 #: plain **synchronous local method**: a directory read that cannot suspend is what
 #: makes a routing decision atomic without a lock.
 #:
-#: One member, because the rest of the ask is not a member: ``locate_volumes`` takes
-#: a source preference and applies it, which changes a signature rather than adding
-#: one. That half is pinned on the client instead -- see
-#: :data:`CLIENT_READ_PARAMETERS`.
+#: One member, because the rest of the ask is not a member: ``locate_volumes`` takes a
+#: source preference and applies it, which changes a signature rather than adding one.
+#: That half is pinned on the client instead -- see :data:`CLIENT_READ_PARAMETERS`.
 THE_ASK = ["locate_raw"]
 
-#: What ``LocalClient``'s read path takes today, in full. The other half of the ask
-#: is that it takes one thing more: an optional **source preference**, applied to the
+#: What ``LocalClient``'s read path takes today, in full. Part of the ask is that it
+#: takes one thing more: an optional **source preference**, applied to the
 #: located map before ``_build_volume_requests`` takes the first volume listed per
 #: key. Until it does, the simulator carries that preference in a coroutine binding
 #: (:func:`realsim.seams.factory.bind_prefer`), which is the one thing here standing
@@ -149,12 +148,12 @@ def test_the_ask_is_still_an_ask():
         )
 
 
-def test_the_client_read_path_has_no_source_preference():
-    """The one thing the simulator stands in for, pinned where it is missing.
+def test_the_client_read_path_takes_no_preference():
+    """What the simulator stands in for, pinned on the client's read members.
 
     ``realsim.seams.factory.bind_prefer`` exists *because* these signatures have
-    nowhere to put a preference: a coroutine binding is how an unmodified client can
-    be handed one at all. When ``get`` grows the parameter, this fails -- and the
+    nowhere to put it: a coroutine binding is how an unmodified client can be handed a
+    source preference at all. When ``get`` grows the parameter, this fails -- and that
     binding can go, along with ``client_for``'s keyword.
     """
     for name, expected in CLIENT_READ_PARAMETERS.items():

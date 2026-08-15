@@ -1,20 +1,20 @@
-"""What a host holds to reach a sensor: :class:`LocalSensorHandle`.
+"""What a host holds to report a fact: :class:`LocalDispatcherHandle`.
 
 The **client** side, and only that -- the fourth of the pair this package builds for
 each service (see :mod:`realsim.seams.controller_handle`,
 :mod:`realsim.seams.control_plane_handle`, :mod:`realsim.seams.volume_handle`). A
-serving host does not hold the application's sensor; it holds a reference to one, and
+serving host does not hold what it reports into; it holds a reference to it, and
 Monarch's reference is not the same shape as the actor: ``@endpoint`` turns each
 method into an ``EndpointProperty``, so the attribute resolves to an endpoint object
 and the call reads
 
-    await sensor.notify.call_one(DecodeState(me, finishes))
+    await dispatcher.dispatch.call_one(DecodeState(me, finishes))
 
 This class is that reference, for a service living in this process instead of
 another one: an endpoint per member of
-:class:`realsim.seams.sensor_service.SensorService` -- one, because reporting is the
-whole of what a host does to a sensor. In a deployment it is Monarch's own handle and
-nothing on either side changes shape.
+:class:`realsim.seams.dispatcher_service.DispatcherService` -- one, because reporting an
+action is the whole of what a host does over this seam. In a deployment it is Monarch's
+own handle and nothing on either side changes shape.
 
 Facts are called, not broadcast
 -------------------------------
@@ -29,9 +29,9 @@ Cost
 The hop is handed in and defaults to free, as
 :class:`~realsim.seams.control_plane_handle.LocalControlPlaneHandle`'s does. A run
 builds it from the same :attr:`sim_common.config.SimConfig.control_rtt`: the
-sensor is held by the control plane that reads it, so reaching it is that same
-boundary at that same distance. At ``0.0`` -- the default -- awaiting an endpoint
-never suspends, so a run is byte-identical to calling the sensor directly; a
+dispatcher is held by the control plane that reads what it folds, so reaching it is that
+same boundary at that same distance. At ``0.0`` -- the default -- awaiting an endpoint
+never suspends, so a run is byte-identical to calling the dispatcher directly; a
 non-zero one lands in front of every fact a host reports, and therefore inside the
 decode cadence that reports them.
 """
@@ -42,25 +42,25 @@ from typing import Any, Optional
 
 from realsim.seams.link import LocalEndpoint, ServiceHop
 
-__all__ = ["LocalSensorHandle"]
+__all__ = ["LocalDispatcherHandle"]
 
 
-class LocalSensorHandle:
-    """A reference to a :class:`SensorService` living in this process.
+class LocalDispatcherHandle:
+    """A reference to a :class:`DispatcherService` living in this process.
 
     Args:
-        service: the sensor service this refers to.
+        service: the dispatcher service this refers to.
         hop: what reaching it costs. ``None`` is a free hop, which is what a test
-            wanting a sensor and nothing else wants; a run builds one from
+            wanting a dispatcher and nothing else wants; a run builds one from
             :attr:`sim_common.config.SimConfig.control_rtt`.
     """
 
     def __init__(self, service: Any, *, hop: Optional[ServiceHop] = None) -> None:
         self.service = service
         self.hop = hop if hop is not None else ServiceHop()
-        self.notify = LocalEndpoint(service.notify, self.hop)
+        self.dispatch = LocalEndpoint(service.dispatch, self.hop)
 
     @property
-    def sensor(self) -> Any:
-        """The sensor behind the service, for tests asserting on it."""
-        return self.service.sensor
+    def dispatcher(self) -> Any:
+        """What is behind the service, for tests asserting on it."""
+        return self.service.dispatcher

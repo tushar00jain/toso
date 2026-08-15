@@ -55,16 +55,17 @@ is read through the view this plane and everything it consults senses through
 (:class:`~kvcache_sim.control._view.KVView`), beside the prefix runs, the prefills this
 plane has promised and not seen land, and the pulls it has already priced
 (:class:`~kvcache_sim.control._selector.RoutedPull`). Sensed rather than held because
-the hosts are what keep it true: every other fact in it comes from them, over the
-service the run fronts it with (:attr:`_Scheduler.sensor`).
+the hosts are what keep it true: every other fact in it comes from them, as actions
+dispatched into the one dispatcher the run fronts with a service
+(:attr:`_Scheduler.dispatcher`).
 
-An accepted decision is reported back the same way, into each sensor it moves
-(:meth:`_Scheduler._admit`): the cluster sensor holds the prefill instance the plan
-spoke for (:class:`~kvcache_sim.control._sensor.Committed`), the reservation sensor
-stands in for a request no host can report yet, and the routed one remembers the peer
-the pull was priced against. A run that judges the TBT SLO against the occupancy
-observed now promises nothing and composes no reservation sensor at all, so the two
-halves of the prediction cannot come apart.
+An accepted decision goes the same way, as one
+:class:`~kvcache_sim.control._sensor.Committed` (:meth:`_Scheduler._admit`) folded into
+each sensor it moves: the cluster sensor holds the prefill instance the plan spoke for,
+the reservation sensor stands in for a request no host can report yet, and the routed
+one remembers the peer the pull was priced against. A run that judges the TBT SLO
+against the occupancy observed now composes no reservation sensor at all, so that same
+action promises nothing and the two halves of the prediction cannot come apart.
 
 The TTFT the metrics record is therefore the prediction, not a measurement (the
 README says why). Prefill cost is deterministic, so on the default path the two
@@ -76,7 +77,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from proposed import AnySelector, ControlPlane, Endpoint, Key, KeySelector, Selection
+from proposed import (
+    AnySelector, ControlPlane, Dispatcher, Endpoint, Key, KeySelector, Selection,
+)
 from proposed.selector import FirstMatch, Selector
 
 from domain import (
@@ -241,8 +244,12 @@ class _Scheduler(ControlPlane):
         # The caller's argument, not this plane's sensor: attach() spends it composing
         # the view and clears it, so the sensor has one reference here either way.
         self._supplied_cluster: Optional[ClusterSensor] = cluster
-        # Both built in attach(), where the sensors they read exist.
+        # All built in attach(), where the sensors they read exist.
         self.view: Optional[KVView] = None
+        #: :attr:`~proposed.plane.ControlPlane.dispatcher` -- where a host's facts
+        #: arrive, and the only thing that writes any sensor here. The run harvests it
+        #: after :meth:`attach` to put a service in front of.
+        self.dispatcher: Optional[Dispatcher] = None
         self._fetch: Optional[FirstMatch[int]] = None
 
     # -- the stack hands over its ports ----------------------------------- #
@@ -274,6 +281,13 @@ class _Scheduler(ControlPlane):
         predicted batch short. The reservation sensor is composed in only for a run
         that rolls occupancy forward, so a run that does not predict has no empty
         one to read (:class:`~kvcache_sim.control._view.ReservedView`).
+
+        The dispatcher is built here too, with all three sensors as its reducers, and is
+        the only thing that writes any of them (:attr:`dispatcher`). Which is where the
+        reservation's condition lives: a run that does not predict composes no
+        reservation sensor, so the same :class:`~kvcache_sim.control._sensor.Committed`
+        every accepted decision dispatches reserves nothing -- the flag is spent on the
+        wiring, and no fold reads it.
         """
         self.topo = dict(view.topology)
         self.ids = sorted(self.topo)
@@ -281,12 +295,16 @@ class _Scheduler(ControlPlane):
         if cluster is None:
             # Over ALL instances: the prefill and decode pools may each be a subset.
             cluster = ClusterSensor(self.ids)
+        reserved = ReservationSensor() if self._lookahead else None
+        routed = RoutedPullSensor()
         self.view = view.derived(
-            KVView,
-            cluster=cluster,
-            reserved=ReservationSensor() if self._lookahead else None,
-            routed=RoutedPullSensor(),
+            KVView, cluster=cluster, reserved=reserved, routed=routed,
         )
+        self.dispatcher = Dispatcher()
+        for sensor in (cluster, reserved, routed):
+            # ``None`` is a sensor this run does not hold, so nothing folds for it.
+            if sensor is not None:
+                self.dispatcher.compose(sensor)
         self.prefill_ids = (
             sorted(self._prefill_pool) if self._prefill_pool else self.ids
         )
@@ -304,18 +322,6 @@ class _Scheduler(ControlPlane):
         self._fetch = FirstMatch([RoutedPull(), self._source])
         for ranking in (self._fetch, self._reuse, self._rank, self._decode):
             ranking.attach(self.view.subset(*ranking.sensors))
-
-    @property
-    def sensor(self) -> Optional[ClusterSensor]:
-        """:attr:`~proposed.plane.ControlPlane.sensor` -- the one sensor here a host
-        writes, which the run fronts with a service.
-
-        Read out of the view rather than stored beside it, so this plane has one path
-        to it. ``None`` until :meth:`attach` builds it; the run harvests after. The
-        other two sensors this plane holds are not offered: nothing outside this
-        process writes them.
-        """
-        return None if self.view is None else self.view.cluster
 
     # -- what a serving host asks, at the two moments it has a question ------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection[int]:
@@ -533,25 +539,18 @@ class _Scheduler(ControlPlane):
         # A run that does not model decode has no batch to hold to a TBT SLO.
         if self.tbt_enabled and response.pred_tbt > self.slo_tbt:
             return None
-        # Accepted, so each sensor this decision moves is told: the cluster holds the
-        # instance the plan spoke for, the reservation stands in for a request the
-        # observed decode state cannot show until its prefill lands, and the routed
-        # pull remembers the peer it was priced against for when the fetch asks
-        # (:class:`~kvcache_sim.control._selector.RoutedPull`).
+        # Accepted, so it is dispatched: one action, folded into every sensor it
+        # moves -- the cluster holds the instance the plan spoke for, the reservation
+        # stands in for a request the observed decode state cannot show until its
+        # prefill lands, and the routed pull remembers the peer it was priced against
+        # for when the fetch asks
+        # (:class:`~kvcache_sim.control._selector.RoutedPull`). Each fold writes its own
+        # sensor and reads no other, so their order is unobservable.
         #
-        # Local writes, not the endpoint a host reports over: control is in the same
-        # process, and plain calls are what keep this decision atomic. All three land in
-        # one non-suspending window -- this method has no ``await`` -- and they touch
-        # disjoint sensors, so nothing can read a half-committed decision and their
-        # order here is unobservable.
-        self.view.cluster.notify_sync(Committed(response))
-        plan = response.plan
-        if self._lookahead:
-            self.view.reserved.reserve(
-                plan.done_time, response.decode, request.output_tokens
-            )
-        if plan.reuse_source is not None and plan.pull_keys:
-            self.view.routed.route(response.prefill, plan.pull_keys, plan.reuse_source)
+        # The synchronous half, not the endpoint a host reports over: control is in the
+        # same process, and nothing in this method may suspend -- an ``await`` here
+        # would let a second decision interleave with a half-committed one.
+        self.dispatcher.dispatch_sync(Committed(response, request.output_tokens))
         return response
 
 

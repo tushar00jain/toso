@@ -19,7 +19,8 @@ class FanoutView(SensorView):
 
     Observed state as much as the directory is -- this plane's own record of its own
     decisions -- so whatever routes against it senses it here instead of being handed
-    the sensor, and the plane writes a landed put back the same way.
+    the sensor. A landed put reaches the same sensor as a reducer's fold, not through
+    this view: what a view offers is the read.
     """
 
     fanout = Sensed("fan-out")

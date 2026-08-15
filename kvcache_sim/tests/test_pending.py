@@ -15,7 +15,10 @@ Run from the repo root::
 
 from __future__ import annotations
 
-from kvcache_sim.control._sensor import ReservationSensor, RoutedPullSensor
+from kvcache_sim.control._answer import Plan, Response
+from kvcache_sim.control._sensor import (
+    Committed, Reservation, ReservationSensor, RoutedPullSensor,
+)
 
 
 # --------------------------------------------------------------------------
@@ -107,3 +110,51 @@ def test_nobody_elses_pull_is_claimable():
     assert routed.claim("s2", ["a"]) is None       # different requester
     assert routed.claim("s0", ["a", "z"]) is None  # more than was planned
     assert routed.claim("s0", ["a"]) == "s1"       # ...and it is still there
+
+
+# --------------------------------------------------------------------------
+# Both fold the one action a decision dispatches, each into its own state.
+# --------------------------------------------------------------------------
+
+
+def _committed(*, source=None, pull=(), decode="d0", done=10.0, output_tokens=4):
+    """One accepted decision, as the action a commit dispatches."""
+    plan = Plan(
+        match_blocks=len(pull), cached_tokens=0, uncached_tokens=0,
+        reuse_source=source, transfer_bytes=0, queue_wait=0.0, ttft=1.0,
+        done_time=done,
+    )
+    plan.pull_keys = list(pull)
+    return Committed(
+        Response(prefill="s0", decode=decode, plan=plan), output_tokens
+    )
+
+
+def test_a_reservation_is_written_by_the_action_and_nothing_else():
+    """The fold is the whole of the write path, and it reads only the action.
+
+    Which is what lets the scheduler dispatch one ``Committed`` instead of testing a
+    flag: this sensor cannot see the scheduler's, and a run that does not predict
+    composes no sensor for this fold to be registered on.
+    """
+    reserved = ReservationSensor()
+    reserved.folds[Committed](_committed(decode="d1", done=10.0, output_tokens=7))
+    assert list(reserved.pending(now=9.0)) == [
+        Reservation(prefill_done=10.0, decode_id="d1", output_tokens=7)
+    ]
+
+
+def test_a_pull_is_remembered_only_when_the_plan_priced_one():
+    """The condition is on the action's own payload, so the fold applies it.
+
+    Most accepted plans recompute the gap rather than pull it, and a plan with no
+    source (or no keys to fetch) leaves nothing for a later fetch to claim -- so
+    recording one would answer a fetch with a peer nothing was priced against.
+    """
+    routed = RoutedPullSensor()
+    routed.folds[Committed](_committed(source=None, pull=()))
+    routed.folds[Committed](_committed(source="s1", pull=()))     # priced no keys
+    routed.folds[Committed](_committed(source=None, pull=["a"]))  # named no peer
+    assert routed.claim("s0", ["a"]) is None, "nothing was priced, so nothing is owed"
+    routed.folds[Committed](_committed(source="s1", pull=["a"]))
+    assert routed.claim("s0", ["a"]) == "s1"

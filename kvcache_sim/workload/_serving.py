@@ -52,10 +52,11 @@ had to keep the loop alive for the tail, and nothing was left holding the reques
 to measure it.
 
 They are two functions because they are the two halves. The plane factory does not
-build the scheduler; it takes ``sim.control_plane_handle`` and ``sim.sensor_handle``,
-the handles :meth:`realsim.run.Run.execute` put in front of whatever
-:func:`scheduler` returned and of the sensor its hosts report into. A scenario names
-both functions on a :class:`~realsim.run.Run`: same workload, different wiring,
+build the scheduler; it takes ``sim.control_plane_handle`` and
+``sim.dispatcher_handle``, the handles :meth:`realsim.run.Run.execute` put in front of
+whatever :func:`scheduler` returned and of the dispatcher its hosts report into. A
+scenario names both functions on a :class:`~realsim.run.Run`: same workload, different
+wiring,
 which is exactly what "cache-aware vs load-balance" means.
 """
 

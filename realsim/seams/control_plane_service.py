@@ -21,8 +21,8 @@ A capability adding a second question therefore changes nothing here, and nothin
 :mod:`realsim.seams.control_plane_handle` either.
 
 What a host *reports* is not a question and does not come through here -- a fact goes
-to :mod:`realsim.seams.sensor_service`, the service in front of the sensor it
-corrects.
+to :mod:`realsim.seams.dispatcher_service`, the service in front of the dispatcher that
+folds it.
 """
 
 from __future__ import annotations

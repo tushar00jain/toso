@@ -99,9 +99,10 @@ class SimConfig:
 
     # One-way latency of a service boundary, charged by realsim.seams.link's
     # ServiceHop: ``control_rtt`` for a serving host reaching its control plane --
-    # both the plane it asks (LocalControlPlaneHandle) and the sensor it reports
-    # into (LocalSensorHandle), which sit at one distance because the
-    # control plane holding the sensor is what reads it -- and ``controller_rtt``
+    # both the plane it asks (LocalControlPlaneHandle) and the dispatcher it reports
+    # into (LocalDispatcherHandle), which sit at one distance because the
+    # control plane holding the sensors it folds into is what reads them -- and
+    # ``controller_rtt``
     # for anyone reaching the directory
     # (LocalControllerHandle) -- which is every capability, the baseline included.
     # Like ``contention``

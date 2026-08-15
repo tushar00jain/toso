@@ -23,8 +23,8 @@ from collections import Counter
 import pytest
 import torch
 
-from dedup_sim.control._sensor._readiness import Readiness
 from dedup_sim.tests._run import run
+from proposed import Dispatcher, Stored
 from putget_sim.workload.put_get import DEFAULT_N, MODE_META, MODE_METADATA
 from realsim.seams.transport import TensorDescriptor
 from sim_common import config
@@ -253,41 +253,55 @@ def test_the_scenario_holds_no_burst_loop():
 
 
 # --------------------------------------------------------------------------
-# Readiness: the waiting the selector delegates. Its safety properties are the ones
-# a hand-rolled latch gets wrong, so they are asserted directly rather than only
-# through a burst that happens to exercise them.
+# The waiting, which is the commit notification and nothing else. These are the
+# properties a hand-rolled latch gets wrong, so they are asserted directly rather
+# than only through a burst that happens to exercise them.
 #
-# It remembers nothing: a gate is opened against the truth read from wherever the
-# caller says it lives -- the real directory, in the selector -- because a volume
-# that evicts makes a past registration false. ``_holds`` stands in for that read.
+# Nothing is remembered anywhere: a parked waiter is woken by *any* commit and
+# re-reads the truth from wherever the caller said it lives -- the real directory,
+# in the selector -- because a volume that evicts makes a past registration false.
+# ``holds`` stands in for that read, and ``landed`` for the state whoever committed
+# had written.
 # --------------------------------------------------------------------------
 
+#: The action these gates are commits of. Any action type does; what a waiter reads
+#: is state, never the action.
+_FACT = Stored("v0", "K")
 
-def _holds(*facts):
-    """An ``observed`` probe: the directory currently holds exactly ``facts``."""
 
-    async def observed(wanted):
-        return [f for f in wanted if f in facts]
+def _dispatcher(landed: set):
+    """A dispatcher whose one reducer adds what it is told to ``landed``."""
 
-    return observed
+    class _Directory:
+        folds = {Stored: lambda action: landed.add((action.host, action.key))}
+
+    dispatcher = Dispatcher()
+    dispatcher.compose(_Directory())
+    return dispatcher
 
 
 def test_a_fact_the_directory_already_holds_needs_no_gate():
     """The whole point of the read: never wait for what is already true."""
 
     async def _ask():
-        return await Readiness().gate([("v0", "K")], _holds(("v0", "K")))
+        return Dispatcher().gate(lambda: True)
 
     gate, _trace = run_sim(_ask())
     assert gate is None
 
 
-def test_a_gate_opens_when_its_last_fact_is_recorded():
-    """Recorded *after* the waiter parked: it is released, not stranded."""
+def test_a_gate_opens_at_the_commit_that_makes_its_read_true():
+    """Committed *after* the waiter parked: it is released, not stranded.
 
-    async def _wait() -> str:
-        ready = Readiness()
-        gate = await ready.gate([("v0", "K"), ("v1", "K")], _holds())
+    And a commit that does not satisfy the read leaves it parked -- the waiter is
+    woken by every commit, so what releases it is the state it re-reads, not the
+    action that happened to wake it.
+    """
+
+    async def _wait() -> list:
+        landed: set = set()
+        dispatcher = _dispatcher(landed)
+        gate = dispatcher.gate(lambda: {("v0", "K"), ("v1", "K")} <= landed)
         assert gate is not None
         order: list[str] = []
 
@@ -297,77 +311,91 @@ def test_a_gate_opens_when_its_last_fact_is_recorded():
 
         task = asyncio.get_running_loop().create_task(waiter())
         await asyncio.sleep(0)
-        ready.record(("v0", "K"))
+        dispatcher.dispatch_sync(_FACT)
         await asyncio.sleep(0)
         assert order == [], "released before every fact was true"
-        ready.record(("v1", "K"))
+        dispatcher.dispatch_sync(Stored("v1", "K"))
         await task
-        return order[0]
+        return order
 
-    result, _trace = run_sim(_wait())
-    assert result == "released"
+    order, _trace = run_sim(_wait())
+    assert order == ["released"]
 
 
-def test_a_registration_during_the_directory_read_is_not_lost():
-    """The lost-wakeup guard, and the reason interest is registered first.
+def test_a_commit_between_the_read_and_the_wait_is_not_lost():
+    """The lost-wakeup guard, and the reason the commit is captured first.
 
-    The read is awaited, so the fact can land while it is in flight -- and the
-    answer that comes back is then already stale. Because the event existed
-    before the read started, that registration sets it instead of falling into
-    the window between "is it true?" and "wait".
+    A waiter that read "not yet" and *then* looked for something to wait on would
+    miss a commit landing in between and park for the rest of the run. Because the
+    event it waits on is the one it captured before reading, that commit sets an
+    event it already holds.
     """
 
-    async def _ask():
-        ready = Readiness()
+    async def _race() -> str:
+        landed: set = set()
+        dispatcher = _dispatcher(landed)
+        reads = []
 
-        async def observed(wanted):
-            # The put lands while the directory read is in flight; what the read
-            # reports is the state from before it.
-            await asyncio.sleep(0)
-            ready.record(("v0", "K"))
-            return []
+        def holds() -> bool:
+            reads.append(len(landed))
+            # The put lands "during" the read: what this read reports is the state
+            # from before it, so the answer it gives back is already stale.
+            if len(reads) == 1:
+                dispatcher.dispatch_sync(_FACT)
+                return False
+            return ("v0", "K") in landed
 
-        return await ready.gate([("v0", "K")], observed)
+        gate = dispatcher.gate(holds)
+        assert gate is not None, "the first read said not yet, which it did"
+        await asyncio.wait_for(gate(), timeout=None)
+        return "released"
 
-    gate, _trace = run_sim(_ask())
-    assert gate is None, "would have parked on a fact that is already true"
+    result, _trace = run_sim(_race())
+    assert result == "released", "parked on a commit that had already happened"
 
 
-def test_a_released_gate_is_dropped_and_nothing_takes_its_place():
+def test_nothing_is_kept_per_waiter_or_per_fact():
     """Otherwise the object grows for the life of the run.
 
-    Not just with dead events -- the *fact* is what used to be kept forever, one
-    entry per (volume, key), so a run that reads a hundred model versions carried
-    a hundred times the readers' worth of them to the end.
+    A gate per ``(volume, key)`` is what used to be kept -- one entry per fact being
+    waited on, so a run that reads a hundred model versions carried a hundred times
+    the readers' worth of them until each was released. A payload-free notification
+    keeps one event, whatever is waiting and however many versions go by.
     """
 
-    async def _versions():
-        ready = Readiness()
+    async def _versions() -> int:
+        landed: set = set()
+        dispatcher = _dispatcher(landed)
         for version in range(100):
-            fact = ("v0", f"W{version}")
-            assert await ready.gate([fact], _holds()) is not None
-            assert len(ready._gates) == 1, "one entry per fact being waited on"
-            ready.record(fact)
-        return len(ready._gates)
+            key = f"W{version}"
+            assert dispatcher.gate(lambda k=key: ("v0", k) in landed) is not None
+            dispatcher.dispatch_sync(Stored("v0", key))
+        # One commit event and one registration per action type: no waiter's name, no
+        # fact it asked about, nothing that grew with the hundred versions above.
+        return len(vars(dispatcher)) + len(dispatcher._folds)
 
-    outstanding, _trace = run_sim(_versions())
-    assert outstanding == 0, "a released gate is never consulted again"
+    kept, _trace = run_sim(_versions())
+    assert kept == 3, "the dispatcher grew with what went through it"
 
 
 def test_a_registration_that_was_evicted_does_not_open_a_later_gate():
-    """The stale-routing guard: "recorded once" is not "true from now on".
+    """The stale-routing guard: "committed once" is not "true from now on".
 
     A volume that registered a key and later dropped it (a new version displacing
-    the old) does not hold it. Answering the next requester from the memory of
-    that registration would route it to a volume with nothing to serve.
+    the old) does not hold it. Answering the next requester from the memory of that
+    commit would route it to a volume with nothing to serve -- and there is no such
+    memory to answer from, because a gate is only ever the caller's own read.
     """
 
     async def _evict_then_ask():
-        ready = Readiness()
-        assert await ready.gate([("v0", "K")], _holds()) is not None
-        ready.record(("v0", "K"))  # v0's put landed; the waiter goes
-        # ...and later v0 evicts K, so the directory no longer holds it.
-        return await ready.gate([("v0", "K")], _holds())
+        landed: set = set()
+        dispatcher = _dispatcher(landed)
+        holds = lambda: ("v0", "K") in landed          # noqa: E731
+        assert dispatcher.gate(holds) is not None
+        dispatcher.dispatch_sync(_FACT)                     # v0's put landed
+        assert dispatcher.gate(holds) is None          # ...so nobody waits
+        landed.discard(("v0", "K"))                    # a newer version displaces it
+        return dispatcher.gate(holds)
 
     gate, _trace = run_sim(_evict_then_ask())
     assert gate is not None, "answered from memory, not from the directory"

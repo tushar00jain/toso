@@ -27,12 +27,12 @@ surface declares the methods, which is where the signatures are.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 __all__ = [
-    "Controller", "Deployment", "Key", "NotifiedSensor", "Sensor",
-    "StorageFull", "StorageVolume", "VolumeId",
+    "Controller", "Deployment", "Key", "Sensor", "StorageFull",
+    "StorageVolume", "VolumeId",
 ]
 
 #: What the store is asked *for*: the directory's own noun, and the subject a
@@ -79,14 +79,14 @@ class Controller(Protocol):
     the same convention torchstore already uses.
 
     The difference between this protocol and torchstore's class *is* the ask, and
-    it is two things. One is :meth:`locate_raw`, a directory read with nothing
-    applied to it, which is what a control plane senses through. The other cannot
-    be declared as a member: ``locate_volumes`` gains an optional **source
-    preference** -- a list of volume ids its caller hands it -- and applies it to
-    the answer (:func:`proposed.selector.prefer`) before returning. The store
-    consults nobody to do that; it reorders a value it was given, which is why
-    nothing here declares a plane. Every other member already exists upstream,
-    spelled the same way.
+    it is two things. One is a member: :meth:`locate_raw`, a directory read with
+    nothing applied to it, which is what a control plane senses through. The other
+    cannot be declared as a member: ``locate_volumes`` gains an optional **source
+    preference** -- a list of volume ids its caller hands it -- and applies it to the
+    answer (:func:`proposed.selector.prefer`) before returning. The store consults
+    nobody to do that; it reorders a value it was given, which is why nothing here
+    declares a plane. Every other member already exists upstream, spelled the same
+    way.
 
     A caller does not hold one of these -- it holds a reference
     (:attr:`Deployment.controller_handle`). torchstore's ``Controller`` implements
@@ -187,34 +187,13 @@ class Sensor(ABC):
     reads -- cannot see load at all. A capability declares those reads on its own
     sensor and exposes it through a view (:meth:`proposed.view.View.derived`).
 
-    ``notify`` follows the seam. A sensor its owning plane writes in-process takes
-    plain typed methods and derives this; one a host reports into over a service
-    derives :class:`NotifiedSensor`, so which sensors a deployment has to front is
-    read off the types.
+    Nothing reaches one from outside the process that holds it. A fact a host
+    reports is an action, dispatched into the one
+    :class:`proposed.dispatch.Dispatcher` a run fronts, which folds it by calling the
+    reducer a sensor declares (:class:`proposed.dispatch.Reducer`) -- so a sensor is
+    written by the folds it publishes and read by the decisions above it, and neither
+    is a surface.
     """
-
-
-class NotifiedSensor(Sensor):
-    """A sensor a host reports into, as a caller reaches it.
-
-    One member, because being told is the only thing a *remote* reporter does to a
-    sensor: what decides against it is co-located with it and reads it off the
-    object.
-
-    The fact is ``Any`` for the reason given at the top of this module: this
-    package cannot import an application, so what a host reports is the
-    application's own type.
-    """
-
-    @abstractmethod
-    async def notify(self, fact: Any) -> None:
-        """Fold ``fact`` in. The reply carries nothing.
-
-        Awaited, like :meth:`Controller.notify_put_batch` and for the same reason:
-        a reporter whose next question must be decided against this fact gets that
-        ordering from the reply. Sending it one-way would order it only at the
-        sender, and over any distance at all the question would arrive first.
-        """
 
 
 class StorageVolume(Protocol):
@@ -294,7 +273,10 @@ class Deployment(Protocol):
     """
 
     def client_for(
-        self, node_id: str, *, prefer: Optional[Sequence[VolumeId]] = None
+        self,
+        node_id: str,
+        *,
+        prefer: Optional[Sequence[VolumeId]] = None,
     ) -> Any:
         """The torchstore client for ``node_id``, ready to be driven.
 
@@ -305,11 +287,12 @@ class Deployment(Protocol):
         ``prefer`` is the source preference the reads made through this client apply
         (:func:`proposed.selector.prefer`) -- volume ids, best first, typically what
         a data plane just got back from :attr:`control_plane_handle`. ``None`` is no
-        preference: the read is exactly the ordinary one. Upstream this belongs on
-        ``get`` / ``get_batch`` rather than here; it is a keyword on the member that
-        already binds the caller's identity because the real client has no such
-        parameter yet, and threading it through every call site of a client this
-        object vends would be the same edit twice.
+        preference: the read is exactly the ordinary one.
+
+        Upstream it belongs on the client's own read members, ``get`` / ``get_batch``.
+        It is a keyword on the member that already binds the caller's identity because
+        the real client has no such parameter yet, and threading it through every call
+        site of a client this object vends would be the same edit twice.
         """
         ...
 
@@ -370,12 +353,13 @@ class Deployment(Protocol):
         ...
 
     @property
-    def sensor_handle(self) -> Any:
-        """A reference to the sensor this application's hosts report into.
+    def dispatcher_handle(self) -> Any:
+        """A reference to where this application's hosts report their facts.
 
         The other half of what a host says to control -- a question goes to
-        :attr:`control_plane_handle`, a fact goes here
-        (:class:`NotifiedSensor`). ``None`` when the control plane's sensors are all
-        written in its own process.
+        :attr:`control_plane_handle`, a fact goes here as an action
+        (:class:`proposed.dispatch.Dispatcher`, which folds it into every sensor it
+        moves and commits them together). ``None`` when nothing outside the control
+        plane's own process writes anything.
         """
         ...

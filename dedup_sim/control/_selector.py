@@ -11,17 +11,20 @@ Both links call :func:`_once_usable` for the answer's shape rather than inheriti
 what a source is worth waiting for follows from what it owes, not from which link
 picked it.
 
-No link suspends while it decides. The directory read cannot
-(:meth:`~proposed.deployment.Controller.locate_raw`) and neither does building a gate,
-so a decision runs to completion before the next requester's starts -- the serialized
-mailbox a real controller would give it, and what makes the sensor's read-modify-writes
-safe without a lock. A read that could suspend would turn its slot queue into a
-check-then-act race, and the fan-out cap would be exceeded rather than enforced.
+No link suspends while it decides, and :func:`_once_usable` is not a coroutine, which
+is where that stops being a claim: the directory read cannot suspend
+(:meth:`~proposed.deployment.Controller.locate_raw`) and neither does building a gate
+(:meth:`~proposed.dispatch.Dispatcher.gate`), so a decision runs to completion before
+the next requester's starts -- the serialized mailbox a real controller would give it,
+and what makes the sensor's read-modify-writes safe without a lock. A read that could
+suspend would turn its slot queue into a check-then-act race, and the fan-out cap would
+be exceeded rather than enforced.
 
 There is no burst loop, no reader list and no knowledge of how many readers there will
 be. The tree is assigned one requester at a time as they ask, and the chain *executes*
-because each reader's read-through put releases the next reader's withheld answer -- an
-emergent property of the data plane's registration, not a schedule this module runs.
+because each reader's read-through commits an action whose boundary releases the next
+reader's withheld answer -- an emergent property of what the data plane commits, not a
+schedule this module runs.
 """
 
 from __future__ import annotations
@@ -31,7 +34,9 @@ from typing import (
     Any, Dict, Hashable, List, Optional, Sequence, Tuple, TypeVar,
 )
 
-from proposed import DecisionLog, Key, KeySelector, locality, Selection, VolumeId
+from proposed import (
+    DecisionLog, Dispatcher, Key, KeySelector, locality, Selection, VolumeId,
+)
 
 from ._sensor import FanoutSensor
 from ._view import FanoutView
@@ -58,12 +63,17 @@ def _registered(view: FanoutView, facts: Sequence[Hashable]) -> List[Hashable]:
     """Which of these ``(volume, key)`` pairs the directory holds *now*.
 
     The truth a readiness gate is opened against, read rather than remembered, and read
-    afresh every time an answer is formed: volumes evict, so a peer that registered the
-    key and later dropped it for a newer version is a peer the next requester has to
-    wait for again. Hence the live read
+    afresh every time an answer is formed *and* at every commit a parked requester wakes
+    on (:meth:`~proposed.dispatch.Dispatcher.gate`): volumes evict, so a peer that
+    registered the key and later dropped it for a newer version is a peer the next
+    requester has to wait for again. Hence the live read
     (:meth:`~proposed.view.View.locate_live`): a gate is correct only against the
     directory *now*, and one opened against a directory read taken before the
     registration landed would park its requester forever.
+
+    The cross-slice read, and the only one: what the fan-out owes is one reducer's
+    state and what the directory holds is another's, and a decision is where the two are
+    read together (:mod:`proposed.dispatch`).
     """
     located = view.locate_live([key for _volume, key in facts])
     return [
@@ -86,9 +96,10 @@ def _fold(
         trace.record(view.now(), "route", f"{requester} <- {source}")
 
 
-async def _once_usable(
+def _once_usable(
     view: FanoutView,
     fanout: FanoutSensor,
+    commits: Dispatcher,
     keys: Sequence[Key],
     requester: str,
     ranking: Selection[_P],
@@ -109,15 +120,12 @@ async def _once_usable(
     source = ranking.head
     facts = [(source, key) for key in keys]
     if fanout.owes(facts):
-        # It owes every key, so the wait is bounded by its read-through. Still a
-        # directory read, because it may already hold a key it is about to republish --
-        # then there is nothing to wait for.
-        async def registered(wanted: Sequence[Hashable]) -> List[Hashable]:
-            # A readiness probe is awaited because the truth it reads may live
-            # somewhere that travels. This one is the local directory.
-            return _registered(view, wanted)
-
-        return replace(ranking, ready=await fanout.gate(facts, registered))
+        # It owes every key, so the wait is bounded by its read-through. The gate is
+        # still opened on a directory read, because it may already hold a key it is
+        # about to republish -- then there is nothing to wait for.
+        return replace(ranking, ready=commits.gate(
+            lambda: len(_registered(view, facts)) == len(facts)
+        ))
     if len(_registered(view, facts)) == len(facts):
         # Owes nothing, so a gate here could outlive the run -- nothing would ever
         # record it. Usable because it holds every key right now, which is the ordinary
@@ -154,6 +162,9 @@ class PlannedPeer(KeySelector[_P]):
     that peer would feed one reader fewer than the cap allows.
 
     Args:
+        commits: the run's :class:`~proposed.dispatch.Dispatcher`. A withheld answer
+            waits on its commit and re-reads (:func:`_once_usable`), which is the whole
+            of what this link needs from it.
         trace: optional :class:`~proposed.selector.DecisionLog` to record each routing
             decision into. Changes no metric; the link behaves identically with none.
     """
@@ -161,7 +172,10 @@ class PlannedPeer(KeySelector[_P]):
     name = "planned-peer"
     sensors = (FanoutView,)
 
-    def __init__(self, *, trace: Optional[DecisionLog] = None) -> None:
+    def __init__(
+        self, commits: Dispatcher, *, trace: Optional[DecisionLog] = None
+    ) -> None:
+        self.commits = commits
         self.trace = trace
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
@@ -174,8 +188,9 @@ class PlannedPeer(KeySelector[_P]):
             if source is None:
                 return Selection.of([])
             _fold(self.view, fanout, requester, source, self.trace)
-        return await _once_usable(
-            self.view, fanout, keys, requester, Selection.of([source]), self.trace
+        return _once_usable(
+            self.view, fanout, self.commits, keys, requester,
+            Selection.of([source]), self.trace,
         )
 
 
@@ -201,6 +216,8 @@ class HolderRanking(KeySelector[int]):
     behind, and the chain falls through to the directory's own answer.
 
     Args:
+        commits: the run's :class:`~proposed.dispatch.Dispatcher`, for
+            :class:`PlannedPeer`'s reason.
         trace: optional :class:`~proposed.selector.DecisionLog` to record each routing
             decision into. Changes no metric; the link behaves identically with none.
     """
@@ -208,7 +225,10 @@ class HolderRanking(KeySelector[int]):
     name = "holder"
     sensors = (FanoutView,)
 
-    def __init__(self, *, trace: Optional[DecisionLog] = None) -> None:
+    def __init__(
+        self, commits: Dispatcher, *, trace: Optional[DecisionLog] = None
+    ) -> None:
+        self.commits = commits
         self.trace = trace
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[int]:
@@ -224,8 +244,9 @@ class HolderRanking(KeySelector[int]):
             return Selection.of([])
         ranked = self._by_locality(candidates, requester)
         _fold(self.view, fanout, requester, ranked[0][0], self.trace)
-        return await _once_usable(
-            self.view, fanout, keys, requester, Selection.priced(ranked), self.trace
+        return _once_usable(
+            self.view, fanout, self.commits, keys, requester,
+            Selection.priced(ranked), self.trace,
         )
 
     def _by_locality(

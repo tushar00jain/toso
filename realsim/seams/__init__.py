@@ -16,9 +16,9 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
 - ``control_plane_service.ControlPlaneService`` -- the same for the control plane an
   application's own hosts ask: it holds it and forwards whichever members the plane
   itself declares, since what a capability answers is not ``proposed``'s to name
-- ``sensor_service.SensorService`` -- the same for the sensor that control plane
-  decides against: it holds the application's ``proposed.NotifiedSensor`` and folds
-  the facts its hosts report
+- ``dispatcher_service.DispatcherService`` -- the same for where that control plane's
+  facts arrive: it holds the application's ``proposed.Dispatcher`` -- which folds one
+  action into every sensor it moves -- and forwards what its hosts report
 - ``controller_handle.LocalControllerHandle`` -- what a caller holds for that
   service: one endpoint per member (``locate_volumes`` / ``notify_put_batch`` /
   ``keys``), reached through ``call_one`` / ``call`` / ``broadcast``.
@@ -26,15 +26,15 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
   (``put`` / ``get`` / ``handshake`` / ``delete`` / ``delete_batch`` / ``reset``).
 - ``control_plane_handle.LocalControlPlaneHandle`` -- the same for a control-plane
   service, one endpoint per member it forwards, whose hop a run gives a duration.
-- ``sensor_handle.LocalSensorHandle`` -- the same for a sensor (``notify``), at that
-  same distance: the sensor is held by the control plane that reads it.
+- ``dispatcher_handle.LocalDispatcherHandle`` -- the same for a dispatcher
+  (``dispatch``), at that same distance: it is held by the control plane whose sensors
+  it folds into.
 
 Each pair is a server and a reference to it, split because they are different
 shapes: a service has methods, a reference has endpoints, and in a deployment the
 first becomes an actor while the second becomes Monarch's own handle. All four
 services a deployment runs are here, and each one's surface is declared in
-``proposed`` (``Controller``, ``StorageVolume``, ``ControlPlane``,
-``NotifiedSensor``).
+``proposed`` (``Controller``, ``StorageVolume``, ``ControlPlane``, ``Dispatcher``).
 - ``dict_directory.DictDirectory`` -- a plain-``dict`` stand-in for the
   controller's ``Trie`` directory, presenting the same ``Mapping`` +
   ``keys().filter_by_prefix`` surface so the opt-in shim adapter can skip the

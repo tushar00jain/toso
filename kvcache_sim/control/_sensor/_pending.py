@@ -10,16 +10,20 @@ request twice, once as a reservation and once through the observed decode state
 that had superseded it.
 
 Grouped in one module because that expiry rule is the one idea behind both, and because
-nothing outside this process writes either: both take plain typed methods and neither
-declares ``notify`` -- one control plane's own bookkeeping, with no service in front of
-it.
+both are written by the same action: the decision that took them
+(:class:`~kvcache_sim.control._sensor.Committed`, folded here and by the cluster sensor,
+each into its own state).
 """
 
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from proposed import Sensor
+from proposed.dispatch import Fold
+
+from ._action import Committed
 
 __all__ = ["Reservation", "ReservationSensor", "RoutedPullSensor"]
 
@@ -42,10 +46,31 @@ class ReservationSensor(Sensor):
     Read through the scheduler's view
     (:class:`~kvcache_sim.control._view.ReservedView`): the plane that promises a
     prefill writes it, and the decode-side prediction reads it.
+
+    **Only a run that predicts holds one**, and that is the whole of the condition:
+    this sensor is composed exactly when decode occupancy is rolled forward
+    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`), so a run that does not
+    predict has no reservation sensor to compose onto its dispatcher, and the same
+    :class:`~kvcache_sim.control._sensor.Committed` every decision dispatches reserves
+    nothing. Nothing tests a flag, because a sensor cannot see the scheduler's.
     """
 
     def __init__(self) -> None:
         self._held: List[Reservation] = []
+        self._folds: Dict[type, Fold] = {Committed: self._committed}
+
+    @property
+    def folds(self) -> Mapping[type, Fold]:
+        """:class:`proposed.dispatch.Reducer` -- what it folds, by action type."""
+        return MappingProxyType(self._folds)
+
+    def _committed(self, action: Committed) -> None:
+        """Stand in for the accepted decision's decode until its prefill lands."""
+        self.reserve(
+            action.response.plan.done_time,
+            action.response.decode,
+            action.output_tokens,
+        )
 
     def reserve(self, prefill_done: float, decode_id: str, output_tokens: int) -> None:
         """Record a committed prefill and the decode it is bound for."""
@@ -77,6 +102,22 @@ class RoutedPullSensor(Sensor):
 
     def __init__(self) -> None:
         self._pending: List[Tuple[str, Tuple[str, ...], str]] = []
+        self._folds: Dict[type, Fold] = {Committed: self._committed}
+
+    @property
+    def folds(self) -> Mapping[type, Fold]:
+        """:class:`proposed.dispatch.Reducer` -- what it folds, by action type."""
+        return MappingProxyType(self._folds)
+
+    def _committed(self, action: Committed) -> None:
+        """Remember the peer, for a decision that actually priced one.
+
+        The test is on the action's own payload -- most accepted plans recompute the
+        gap instead, and a plan with no source has no pull for a fetch to claim.
+        """
+        plan = action.response.plan
+        if plan.reuse_source is not None and plan.pull_keys:
+            self.route(action.response.prefill, plan.pull_keys, plan.reuse_source)
 
     def route(self, requester: str, keys: Sequence[str], peer: str) -> None:
         """Remember that ``requester``'s pull of ``keys`` was priced against ``peer``."""

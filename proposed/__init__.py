@@ -30,11 +30,14 @@ simulator, ``proposed`` is the design being argued for.
   applies to its own answer without consulting anybody, and ``locate_raw`` -- the
   same read with nothing applied, which is what a view reads. Beside it,
   :class:`~proposed.deployment.Sensor`: the directory's peer on the application's
-  side, holding the load a store cannot see, and
-  :class:`~proposed.deployment.NotifiedSensor` -- one of those that a host writes
-  from another process, by one ``notify(fact)``, the way the directory is written by
-  ``notify_put_batch``. A capability declares the reads on its own sensor and exposes
-  it through a view;
+  side, holding the load a store cannot see. A capability declares the reads on
+  its own sensor and exposes it through a view;
+* :mod:`proposed.dispatch` -- :class:`~proposed.dispatch.Dispatcher`, where a fact a
+  host reports arrives and the one way a fact is announced: an
+  :class:`~proposed.dispatch.Action` folded by every
+  :class:`~proposed.dispatch.Reducer` that folds its type, and one commit, at which
+  whoever is waiting is woken and re-reads. It stores nothing itself, and no reducer
+  can reach another's state;
 * :mod:`proposed.view` -- :class:`~proposed.view.View`, the read-only observation a
   control plane senses through: who holds a key, where volumes are, what time it is,
   and whatever sensors a capability composes onto it -- one
@@ -56,9 +59,9 @@ missing" section.
 # Re-export the contract surface so callers import from the package directly.
 from .cost import TransferCost
 from .deployment import (
-    Controller, Deployment, Key, NotifiedSensor, Sensor, StorageFull,
-    StorageVolume, VolumeId,
+    Controller, Deployment, Key, Sensor, StorageFull, StorageVolume, VolumeId,
 )
+from .dispatch import Action, Dispatcher, Reducer, Stored
 from .plane import ControlPlane, DataPlane
 from .selector import DecisionLog, AnySelector, KeySelector, Selection
 from .topology import Endpoint, locality, nearest, Tier, TIER_LABEL
@@ -75,9 +78,12 @@ __all__ = [
     "View",
     "SensorView",
     "Sensed",
+    "Action",
+    "Dispatcher",
+    "Reducer",
+    "Stored",
     "Controller",
     "Sensor",
-    "NotifiedSensor",
     "StorageVolume",
     "StorageFull",
     "Endpoint",
