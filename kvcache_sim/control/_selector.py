@@ -72,11 +72,10 @@ class LongestPrefixKeySelector(KeySelector[int]):
     with, and the ranking a fetch falls through to. Spreading reads over the replicas
     of a hot prefix is this ranking under :class:`~proposed.selector.Balance`, folded by
     :func:`by_prefix_and_load`, so a host holding a hot prefix does not serve every read
-    of it. Opt-in and off by default:
-    ``python -m kvcache_sim hotspot --spread-reads`` hands a fresh
-    ``Balance(LongestPrefixKeySelector())`` to each of that scenario's cache-aware runs
-    as :func:`~kvcache_sim.workload._serving.scheduler`'s ``source_selector``, with
-    :func:`by_prefix_and_load` as its ``source_fold``.
+    of it. Opt-in and off by default: ``python -m kvcache_sim hotspot --spread-reads``
+    is that scenario's cache-aware runs asking for the ``"spread"`` source ranking,
+    which the scheduler builds with :func:`by_prefix_and_load` as its fold
+    (:data:`~kvcache_sim.control.scheduler._SOURCES`).
     """
 
     name = "longest-prefix"

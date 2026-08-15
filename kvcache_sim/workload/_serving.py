@@ -66,14 +66,12 @@ from typing import Callable, Dict, List, Optional
 from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
-from proposed import ControlPlane, Endpoint, KeySelector, RoutedPlane
-from proposed.selector import Fold
+from proposed import ControlPlane, Endpoint, RoutedPlane
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.simulation import Simulation
 from realsim.run import Workload
 
 from ..control._sensor import ClusterSensor
-from ..control._selector import LongestPrefixKeySelector
 from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
@@ -151,8 +149,7 @@ def scheduler(
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
-    source_selector: Optional[KeySelector[int]] = None,
-    source_fold: Optional[Fold] = None,
+    source: str = "prefix",
 ) -> ControlPlane:
     """This run's **control plane**, as an object a scenario can just declare.
 
@@ -166,19 +163,13 @@ def scheduler(
     ``attach`` for one reason: a scenario may want to hand the same sensor to a test,
     and the plane accepts one so that stays possible.
 
-    ``source_selector`` is the one knob that is an object rather than a value: which
-    peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and one
-    under a :class:`~proposed.selector.Balance` senses through a view of its own.
-    ``None`` -- the default -- is
-    :class:`~kvcache_sim.control._selector.LongestPrefixKeySelector`. Give each run its
-    own: one object attached twice senses only the view it was attached to last, so
-    neither run would reproduce alone. ``source_fold`` travels with it, being how the
-    plane folds that ranking's key, and is safe to share -- a fold is arithmetic over a
-    key and holds nothing.
+    ``source`` names which peers a fetch is answered from -- ``"prefix"`` or
+    ``"spread"`` -- and the plane builds it, so two runs configured alike still get a
+    ranking each: one object attached twice senses only the view it was attached to
+    last, and neither run would reproduce alone.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
-    source = source_selector if source_selector is not None else LongestPrefixKeySelector()
     # Over ALL instances: the prefill and decode pools may each be a subset.
     cluster = ClusterSensor(sorted(topology))
     knobs = dict(
@@ -191,8 +182,7 @@ def scheduler(
         decode_pool=decode_pool,
         early_rejection=early_rejection,
         cluster=cluster,
-        source_selector=source,
-        source_fold=source_fold,
+        source=source,
     )
     if kind == "cache_aware":
         # The same ranking twice over: the reuse axis names a peer while pricing, and

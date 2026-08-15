@@ -18,13 +18,11 @@ from typing import Dict, List, Sequence
 
 from domain import decode_step_time, DEFAULT_MODEL, DEFAULT_PROFILE
 from proposed import Endpoint
-from proposed.selector import Balance
 
 from realsim.demo import Console, Scenario
 from realsim.run import Result, Run
 from sim_common.trace import Trace
 
-from ..control._selector import by_prefix_and_load, LongestPrefixKeySelector
 from ..report.metrics import Metrics
 from ..report.summary import (
     CacheVsBaselineReport,
@@ -296,22 +294,13 @@ class Hotspot(Scenario):
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
         convs = _hotspot_workload(self.seed)
-        spread = getattr(args, "spread_reads", False)
-
-        def source():
-            """A *fresh* selector per run: one object attached twice senses only the
-            view it was attached to last, so two runs would share one load reading."""
-            return Balance(LongestPrefixKeySelector()) if spread else None
-
-        # One fold for both runs: it is arithmetic over a key and holds nothing.
-        fold = by_prefix_and_load() if spread else None
+        source = "spread" if getattr(args, "spread_reads", False) else "prefix"
         return [
             _configure("baseline", topo, convs, "load_balance"),
-            _configure("no_replication", topo, convs, "cache_aware", replicate=False,
-                 source_selector=source(), source_fold=fold),
+            _configure("no_replication", topo, convs, "cache_aware",
+                 replicate=False, source=source),
             _configure("replication", topo, convs, "cache_aware",
-                 balance_threshold=1.2, replicate=True, source_selector=source(),
-                 source_fold=fold),
+                 balance_threshold=1.2, replicate=True, source=source),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:

@@ -82,7 +82,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from proposed import (
     AnySelector, ControlPlane, Dispatcher, Endpoint, Key, KeySelector, Selection,
 )
-from proposed.selector import FirstMatch, Fold, Selector
+from proposed.selector import Balance, FirstMatch, Fold, Selector
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -91,7 +91,8 @@ from domain import (
 
 from ._answer import Batched, Plan, Priced, Response
 from ._selector import (
-    ByBatch, ByLoad, ByTTFT, LocalOnly, LongestPrefixKeySelector, RoutedPull,
+    by_prefix_and_load, ByBatch, ByLoad, ByTTFT, LocalOnly,
+    LongestPrefixKeySelector, RoutedPull,
 )
 from ._sensor import (
     ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
@@ -145,6 +146,39 @@ def _worth_pulling(
     return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
 
 
+#: The source ranking each name builds, with the fold that reads the dimensions it
+#: keys: which peers may serve a prefix, and how a busy one is weighed against a long
+#: match. ``"spread"`` is the same ranking under a
+#: :class:`~proposed.selector.Balance`, so the fold has a load dimension to read.
+_Source = Callable[[], Tuple[Selector[Sequence[Key], int], Optional[Fold]]]
+
+_SOURCES: Dict[str, _Source] = {
+    "prefix": lambda: (LongestPrefixKeySelector(), None),
+    "spread": lambda: (Balance(LongestPrefixKeySelector()), by_prefix_and_load()),
+}
+
+#: The winner ranking each name builds: what orders the candidates this plane priced.
+_RANKS: Dict[str, Callable[[], AnySelector[Sequence[Priced], Plan]]] = {
+    "ttft": ByTTFT,
+    "load": ByLoad,
+}
+
+
+def _built(table: Dict[str, Callable[[], Any]], name: str, axis: str) -> Any:
+    """The axis ``name`` names, built here, or a refusal listing the names there are.
+
+    A preset picks an axis by name and this plane builds it, so no caller holds a
+    ranking's lifetime: one attached to two runs senses only the view it was attached
+    to last, and neither run would then reproduce alone.
+    """
+    if name not in table:
+        raise ValueError(
+            f"unknown {axis} {name!r}: the choice is "
+            f"{', '.join(repr(known) for known in sorted(table))}"
+        )
+    return table[name]()
+
+
 class _Scheduler(ControlPlane):
     """The pricing, ranking and admission both schedulers share.
 
@@ -155,32 +189,32 @@ class _Scheduler(ControlPlane):
     cannot disagree, and nothing is threaded through the data plane to keep them
     together.
 
+    Every ranking is named rather than handed in, and built here (:func:`_built`):
+    which ones a preset picks is the preset's business, and a name cannot be shared
+    between two runs the way an object can.
+
     Args:
-        reuse / rank: the two axes a preset picks, both selectors, both attached in
-            :meth:`attach`, and both used while forming the one answer :meth:`decide`
-            gives. ``reuse`` ranks the peers holding a prefix, priced in blocks of that
-            prefix (``Selector[Sequence[Key], int]``); what a peer is *worth* to one
-            candidate is this scheduler's to work out, off the snapshot it read itself
-            (:meth:`_priced_reuse`), so a stage annotating the axis cannot move a price
-            this scheduler compares. ``rank`` ranks the candidates this scheduler
-            priced, so its subject is those candidates and its price their
-            :class:`~kvcache_sim.control._answer.Plan`.
+        reuse / rank: the two axes a preset picks, both attached in :meth:`attach`, and
+            both used while forming the one answer :meth:`decide` gives. ``reuse`` is
+            the peers a candidate may pull from -- ``"peers"``, which is the ``source``
+            ranking itself, or ``"none"``, which names nobody; what a peer is *worth*
+            to one candidate is this scheduler's to work out, off the snapshot it read
+            itself (:meth:`_priced_reuse`), so a stage annotating the axis cannot move
+            a price this scheduler compares. ``rank`` orders the candidates this
+            scheduler priced -- ``"ttft"`` by predicted time to first token,
+            ``"load"`` by what each host is already serving.
         balance_threshold: how much longer the head's prefix run must be than a
             candidate's own before pulling beats recomputing (:func:`_worth_pulling`).
             Unread when ``reuse`` names nobody.
-        source_selector: ranks the holders of a prefix, and what :meth:`sources`
-            answers a fetch with behind the pull it already priced
-            (:class:`~kvcache_sim.control._selector.RoutedPull`). ``None`` builds a
-            :class:`~kvcache_sim.control._selector.LongestPrefixKeySelector`. A pulling
-            preset hands the *same* object to its reuse axis, so the peer priced is
-            the peer read from.
-        source_fold: :data:`~proposed.selector.Fold` for that ranking's key, which is
-            ``(-prefix_run,)`` from the selector above plus ``(load,)`` where it sits
-            under a :class:`~proposed.selector.Balance`. ``None`` compares those
-            positions as they stand, which is longest run first. Belongs beside
-            ``source_selector`` because the two have to agree on how many dimensions
-            there are, and it is read at both of the places that ranking is folded
-            (:meth:`sources`, :meth:`_select_prefill`).
+        source: which holders of a prefix :meth:`sources` answers a fetch with, behind
+            the pull it already priced
+            (:class:`~kvcache_sim.control._selector.RoutedPull`) -- ``"prefix"``,
+            longest match first, or ``"spread"``, the same ranking
+            under a :class:`~proposed.selector.Balance` so a host holding a hot prefix
+            does not serve every read of it (:data:`_SOURCES`). The fold that reads its
+            dimensions comes with it, since the two have to agree on how many there
+            are, and both places this ranking is folded use it (:meth:`sources`,
+            :meth:`_select_prefill`).
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -199,11 +233,10 @@ class _Scheduler(ControlPlane):
     def __init__(
         self,
         *,
-        reuse: Selector[Sequence[Key], int],
-        rank: AnySelector[Sequence[Priced], Plan],
+        reuse: str,
+        rank: str,
         balance_threshold: float = 1.5,
-        source_selector: Optional[KeySelector[int]] = None,
-        source_fold: Optional[Fold] = None,
+        source: str = "prefix",
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
@@ -218,16 +251,17 @@ class _Scheduler(ControlPlane):
         self.B = block_tokens
         self.profile = profile
         self.model = model
-        self._reuse = reuse
-        self._rank = rank
-        # Built rather than handed in: not an axis (see the module it comes from).
+        self._source, self._fold = _built(_SOURCES, source, "source ranking")
+        # One object on both sides of a pull, which is what makes the peer priced the
+        # peer read from; a preset that never pulls prices against nobody instead.
+        self._reuse = (
+            self._source if reuse == "peers"
+            else _built({"none": LocalOnly}, reuse, "reuse axis")
+        )
+        self._rank = _built(_RANKS, rank, "winner ranking")
+        # Built rather than named: not an axis (see the module it comes from).
         self._decode = ByBatch()
         self._threshold = balance_threshold
-        self._source = (
-            source_selector if source_selector is not None
-            else LongestPrefixKeySelector()
-        )
-        self._fold = source_fold
         self._prefill_pool = prefill_pool
         self._decode_pool = decode_pool
         #: Requests this plane has sent to another host, and the answer it sent them
@@ -356,7 +390,7 @@ class _Scheduler(ControlPlane):
         abstention rule rather than an ``if`` here. ``Selection.of([])`` names nobody,
         which leaves the read to the directory's own order.
 
-        Folded here (``source_fold``), because the links only key what they name: a
+        Folded here (the ``source`` fold), because the links only key what they name: a
         chain answering with the memo names one peer and has nothing to order, while the
         ranking behind it keys every holder of the prefix and the caller reads down what
         this returns (:func:`~proposed.selector.prefer`).
@@ -418,7 +452,7 @@ class _Scheduler(ControlPlane):
         no trace and the winner is chosen after the whole field is known. Both axes are
         awaited inside the pin and neither suspends, so no second decision can enter it.
 
-        The reuse ranking is asked once, folded to its best peer once (``source_fold``,
+        The reuse ranking is asked once, folded to its best peer once (the same fold,
         the same fold :meth:`sources` uses on the same ranking), and tested per
         candidate: which peers hold this prefix is the same question whoever would
         prefill it, and only the tests behind it -- is that peer me, is its run worth
@@ -621,7 +655,7 @@ class LoadBalanceScheduler(_Scheduler):
     """Baseline (~vLLM): least-loaded instance, local-only cache reuse."""
 
     def __init__(self, **knobs: Any) -> None:
-        super().__init__(reuse=LocalOnly(), rank=ByLoad(), **knobs)
+        super().__init__(reuse="none", rank="load", **knobs)
 
 
 class CacheAwareScheduler(_Scheduler):
@@ -632,25 +666,18 @@ class CacheAwareScheduler(_Scheduler):
     the candidate loop tests.
 
     Args:
-        source_selector: ranks peers for a prefix pull. Used *as* the reuse axis and
-            handed on to :meth:`~_Scheduler.sources`, which is the point: one object,
-            so the peer named while pricing is the peer that serves the read.
-            ``replicate=False`` never asks it anything while pricing, and a fetch
-            still is.
-
-            Required here, and deliberately without a default: this ranking may sense
-            state of its own across the decisions it makes (one under a
-            :class:`~proposed.selector.Balance` does), so which one a run uses is the
-            run's to choose (:func:`kvcache_sim.workload._serving.scheduler`).
+        replicate: whether a candidate may pull a prefix from a peer at all. The
+            ``source`` ranking is the reuse axis when it may, which is the point: one
+            object, so the peer named while pricing is the peer that serves the read.
+            ``replicate=False`` prices against nobody, and a fetch is still answered
+            from that ranking.
     """
 
-    def __init__(self, *, source_selector: KeySelector[int],
-                 balance_threshold: float = 1.5, replicate: bool = True,
+    def __init__(self, *, balance_threshold: float = 1.5, replicate: bool = True,
                  **knobs: Any) -> None:
         super().__init__(
-            reuse=source_selector if replicate else LocalOnly(),
+            reuse="peers" if replicate else "none",
             balance_threshold=balance_threshold,
-            rank=ByTTFT(),
-            source_selector=source_selector,
+            rank="ttft",
             **knobs,
         )
