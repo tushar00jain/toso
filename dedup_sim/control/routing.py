@@ -69,7 +69,9 @@ class Dedup(ControlPlane):
     ) -> None:
         self._cap = fanout_cap
         self._fabric = SPREAD if spread else CHAIN
-        #: How :meth:`_decide` folds the chain's key. ``None`` -- the chain preset --
+        #: How the chain's key is read, stamped on its answers by the
+        #: :class:`~proposed.selector.Balance` that appends the last dimension of it,
+        #: so :meth:`_decide` folds without naming one. ``None`` -- the chain preset --
         #: compares the dimensions as they stand.
         self._fold: Optional[Fold] = _soonest if spread else None
         self._trace = trace
@@ -108,7 +110,7 @@ class Dedup(ControlPlane):
         self.dispatcher = Dispatcher()
         self.dispatcher.compose(sensor)
         self._chain = FirstMatch([
-            Balance(Candidates(self._fabric)),
+            Balance(Candidates(self._fabric), self._fold),
             NaiveKeySelector(),
         ]).attach(self.view)
 
@@ -131,7 +133,7 @@ class Dedup(ControlPlane):
         """The whole decision, gate unspent: the chain's scores folded into an order,
         then what is committed out of it.
 
-        The fold is here, once, and it is the only ordering in the decision: the chain
+        The fold is one call, and it is the only ordering in the decision: the chain
         this plane built in :meth:`attach` keys each source ``(score, queued)`` -- the
         seconds :class:`~dedup_sim.control._selector.Candidates` priced it at, then the
         readers :class:`~proposed.selector.Balance` found already routed to it -- and
@@ -152,7 +154,7 @@ class Dedup(ControlPlane):
         not going to read from can await without parking on a peer's read-through.
         """
         keys = list(keys)
-        ranking = (await self._chain.select(keys, requester)).sort(self._fold)
+        ranking = (await self._chain.select(keys, requester)).sort()
         return committed(
             self.view, self.dispatcher, keys, requester, ranking, self._trace
         )

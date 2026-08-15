@@ -139,12 +139,18 @@ class Selection(Generic[_P]):
         ready: optional gate, for a selector that routes a requester to a peer which
             has not registered yet. Spent by :meth:`settled` before the answer
             travels, never handed to whoever asked.
+        fold: how to read :attr:`key`, from the stage that knows both the dimensions
+            there are and what they mean together -- so a caller folds without being
+            told how (:meth:`sort`, :meth:`max`), and two callers of one ranking cannot
+            fold it two different ways. ``None`` compares the dimensions as they stand.
+            A closure, so :meth:`settled` drops it as it drops the gate.
     """
 
     sources: Optional[Tuple[VolumeId, ...]] = None
     key: Optional[Mapping[VolumeId, Dims]] = None
     payload: Mapping[VolumeId, _P] = field(default_factory=dict)
     ready: Optional[Ready] = None
+    fold: Optional[Fold] = None
 
     @classmethod
     def of(
@@ -208,20 +214,23 @@ class Selection(Generic[_P]):
     def _ranked(self, fold: Optional[Fold]) -> Optional[Tuple[VolumeId, ...]]:
         """These sources best-first, or ``None`` if nothing here says what best is.
 
-        ``fold`` blends one source's dimensions into the comparable to order by; with
-        none they are compared as they stand, which is lexicographic over the stages in
-        the order they annotated. Either way the id is the last thing compared, here
-        and nowhere else, so the order is total whatever the stages keyed on and a run
-        reproduces.
+        ``fold`` blends one source's dimensions into the comparable to order by, and
+        defaults to the one the answer carries (:attr:`fold`); with neither they are
+        compared as they stand, which is lexicographic over the stages in the order
+        they annotated. Either way the id is the last thing compared, here and nowhere
+        else, so the order is total whatever the stages keyed on and a run reproduces.
         """
         if not self.sources or self.key is None:
             return None
+        fold = fold if fold is not None else self.fold
         if fold is None:
             return tuple(sorted(self.sources, key=lambda s: (*self.key[s], s)))
         return tuple(sorted(self.sources, key=lambda s: (fold(self.key[s]), s)))
 
     def sort(self, fold: Optional[Fold] = None) -> "Selection[_P]":
         """This selection ordered best-first -- a **new** one, this being frozen.
+
+        Folded by whatever it carries unless a caller says otherwise.
 
         Both empties pass through, as does a selection no stage keyed: the order a
         producer left is the answer when there is nothing to beat it.
@@ -231,6 +240,8 @@ class Selection(Generic[_P]):
 
     def max(self, fold: Optional[Fold] = None) -> "Selection[_P]":
         """The single best source, with its key, its price and the gate.
+
+        Folded by whatever it carries unless a caller says otherwise.
 
         What a plane naming one source folds to, and it is still a selection so
         :meth:`settled` can be spent on it afterwards. Both empties pass through.
@@ -269,9 +280,9 @@ class Selection(Generic[_P]):
         a ranking released early names a volume holding nothing yet.
         """
         await self.wait()
-        if self.ready is None:
+        if self.ready is None and self.fold is None:
             return self
-        return replace(self, ready=None)
+        return replace(self, ready=None, fold=None)
 
     @property
     def head(self) -> Optional[VolumeId]:
@@ -301,6 +312,7 @@ class Selection(Generic[_P]):
             },
             payload={s: self.payload[s] for s in kept if s in self.payload},
             ready=self.ready,
+            fold=self.fold,
         )
 
     def take(self, n: int) -> "Selection[_P]":
@@ -624,6 +636,13 @@ class Balance(Selector[_S, _P]):
     Args:
         ranking: the selector asked, which must key every source it ranks. What it
             senses is declared here too (:func:`declares`).
+        fold: how to read the key this leaves -- the ranking's own dimensions with the
+            load behind them -- stamped on the answer
+            (:attr:`Selection.fold`) rather than applied here, so every caller of one
+            ranking folds it the same way without being handed the arithmetic. This is
+            where it belongs because this is where both halves of the key exist.
+            ``None`` leaves the dimensions compared as they stand, which is the
+            ranking's own order with load breaking its ties.
     """
 
     name = "balance"
@@ -645,8 +664,11 @@ class Balance(Selector[_S, _P]):
             else cls
         )
 
-    def __init__(self, ranking: Selector[_S, _P]) -> None:
+    def __init__(
+        self, ranking: Selector[_S, _P], fold: Optional[Fold] = None
+    ) -> None:
         self.ranking = ranking
+        self.fold = fold
         #: What it annotates, which is what it takes: the subject is not this
         #: combinator's, so it is read off the ranking rather than declared.
         self.subject_type = ranking.subject_type
@@ -665,7 +687,8 @@ class Balance(Selector[_S, _P]):
         Every source is annotated, not just whichever one led, so a caller that folds
         this and rejects the winner has the rest measured too. Nothing is ordered here
         and nothing is written: the load is an observation, and what moves it is the
-        decision this answer is consulted for.
+        decision this answer is consulted for. The fold rides along, so folding is one
+        call whoever makes it.
 
         An answer with no source to measure goes back untouched. Both empties qualify,
         for the same reason and not by accident: an abstention names nobody, and the
@@ -689,9 +712,10 @@ class Balance(Selector[_S, _P]):
                 f"order: a ranking under one keys every source it ranks"
             )
         load = self.view.load.named()
-        return ranked.annotated(
+        annotated = ranked.annotated(
             {source: load.get(source, 0) for source in ranked.sources}
         )
+        return annotated if self.fold is None else replace(annotated, fold=self.fold)
 
 
 class _KeyBalance(Balance[Sequence[Key], _P], KeySelector[_P]):

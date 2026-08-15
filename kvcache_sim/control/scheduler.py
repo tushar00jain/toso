@@ -146,15 +146,15 @@ def _worth_pulling(
     return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
 
 
-#: The source ranking each name builds, with the fold that reads the dimensions it
-#: keys: which peers may serve a prefix, and how a busy one is weighed against a long
-#: match. ``"spread"`` is the same ranking under a
-#: :class:`~proposed.selector.Balance`, so the fold has a load dimension to read.
-_Source = Callable[[], Tuple[Selector[Sequence[Key], int], Optional[Fold]]]
-
-_SOURCES: Dict[str, _Source] = {
-    "prefix": lambda: (LongestPrefixKeySelector(), None),
-    "spread": lambda: (Balance(LongestPrefixKeySelector()), by_prefix_and_load()),
+#: The source ranking each name builds: which peers may serve a prefix. ``"spread"``
+#: is the same ranking under a :class:`~proposed.selector.Balance`, carrying the fold
+#: that weighs a busy holder against a long match -- so every caller of that ranking
+#: folds it the same way and none of them names a fold.
+_SOURCES: Dict[str, Callable[[], Selector[Sequence[Key], int]]] = {
+    "prefix": LongestPrefixKeySelector,
+    "spread": lambda: Balance(
+        LongestPrefixKeySelector(), by_prefix_and_load()
+    ),
 }
 
 #: The winner ranking each name builds: what orders the candidates this plane priced.
@@ -211,10 +211,10 @@ class _Scheduler(ControlPlane):
             (:class:`~kvcache_sim.control._selector.RoutedPull`) -- ``"prefix"``,
             longest match first, or ``"spread"``, the same ranking
             under a :class:`~proposed.selector.Balance` so a host holding a hot prefix
-            does not serve every read of it (:data:`_SOURCES`). The fold that reads its
-            dimensions comes with it, since the two have to agree on how many there
-            are, and both places this ranking is folded use it (:meth:`sources`,
-            :meth:`_select_prefill`).
+            does not serve every read of it (:data:`_SOURCES`). The fold that reads
+            its dimensions rides on its answers, since the two have to agree on how
+            many there are, so neither place this ranking is folded names one
+            (:meth:`sources`, :meth:`_select_prefill`).
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -251,7 +251,7 @@ class _Scheduler(ControlPlane):
         self.B = block_tokens
         self.profile = profile
         self.model = model
-        self._source, self._fold = _built(_SOURCES, source, "source ranking")
+        self._source = _built(_SOURCES, source, "source ranking")
         # One object on both sides of a pull, which is what makes the peer priced the
         # peer read from; a preset that never pulls prices against nobody instead.
         self._reuse = (
@@ -372,9 +372,11 @@ class _Scheduler(ControlPlane):
         # above. Each such subset shares that view's pin
         # (:meth:`~proposed.view.View.subset`), so a ranking consulted inside a routing
         # decision reads the snapshot the decision pinned rather than past it into the
-        # live directory. The source ranking is a link of the fetch chain and the reuse
-        # axis both, and is attached twice to the same subset either way, so no order
-        # here is load-bearing.
+        # live directory.
+        # The source ranking is a link of the fetch chain and the reuse axis both, so
+        # it is brought up twice -- with the same view each time, one declaration being
+        # one subset, so the second is the first over again and no order here is
+        # load-bearing.
         self._fetch = FirstMatch([RoutedPull(), self._source])
         for ranking in (self._fetch, self._reuse, self._rank, self._decode):
             ranking.attach(self.view.subset(*ranking.sensors))
@@ -390,7 +392,8 @@ class _Scheduler(ControlPlane):
         abstention rule rather than an ``if`` here. ``Selection.of([])`` names nobody,
         which leaves the read to the directory's own order.
 
-        Folded here (the ``source`` fold), because the links only key what they name: a
+        Folded here, by whatever the answer carries, because the links only key what
+        they name: a
         chain answering with the memo names one peer and has nothing to order, while the
         ranking behind it keys every holder of the prefix and the caller reads down what
         this returns (:func:`~proposed.selector.prefer`).
@@ -399,7 +402,7 @@ class _Scheduler(ControlPlane):
         gates, so there is nothing to wait for, and saying so here is what keeps that
         a property of the ranking rather than of the caller.
         """
-        ranked = (await self._fetch.select(list(keys), requester)).sort(self._fold)
+        ranked = (await self._fetch.select(list(keys), requester)).sort()
         return await ranked.settled()
 
     async def decide(self, request: Request, requester: str) -> Optional[Response]:
@@ -452,8 +455,9 @@ class _Scheduler(ControlPlane):
         no trace and the winner is chosen after the whole field is known. Both axes are
         awaited inside the pin and neither suspends, so no second decision can enter it.
 
-        The reuse ranking is asked once, folded to its best peer once (the same fold,
-        the same fold :meth:`sources` uses on the same ranking), and tested per
+        The reuse ranking is asked once, folded to its best peer once (by the fold its
+        own answer carries, which is why this and :meth:`sources` cannot read one
+        ranking two ways), and tested per
         candidate: which peers hold this prefix is the same question whoever would
         prefill it, and only the tests behind it -- is that peer me, is its run worth
         the transfer -- read the candidate. Folded *before* the loop, because each test
@@ -468,7 +472,7 @@ class _Scheduler(ControlPlane):
         keys = list(request.block_keys)
         with self.view.pinned(keys):
             counts = self.view.prefix_lengths(keys)
-            best = (await self._reuse.select(keys, requester)).max(self._fold)
+            best = (await self._reuse.select(keys, requester)).max()
             candidates: List[Priced] = []
             for inst in self.prefill_ids:
                 # A host is not its own peer, and a peer is only worth the transfer if

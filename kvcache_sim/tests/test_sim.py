@@ -1795,8 +1795,8 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     selectors = [run.control._source for run in aware]
     assert all(isinstance(p, Balance) for p in selectors)
     assert selectors[0] is not selectors[1], "a shared tally would count both runs"
-    # Both halves reach the plane, or the load would be a dimension nothing reads.
-    assert all(run.control._fold is not None for run in aware)
+    # The fold rides with the ranking, or the load would be a dimension nothing reads.
+    assert all(p.fold is not None for p in selectors)
 
     def pull_sources(result):
         return sorted(
