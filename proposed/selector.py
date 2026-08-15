@@ -48,10 +48,9 @@ candidates alike, taking the kind of whichever it wraps. ``FirstMatch`` is over 
 only, and checks its links are at construction: a chain hands *one* subject to every
 link.
 
-Annotating is why a ranking says what orders it rather than leaving that to a sort of
-its own: a stage appended behind one that said nothing would be the whole of the order,
-so :class:`Balance` refuses such a ranking. The dimensions already there ride through
-untouched, so a fold still reads what each earlier stage measured.
+A stage appends behind whatever the stages before it left and orders nothing itself, so
+a fold still reads what each earlier one measured. Behind a ranking that keyed nothing
+it is the whole of the order, which is how a bare pool is ranked by one reading alone.
 
 Narrowing an answer is not a composition of selectors in this package: a test an
 application owns is applied to the ranking it was given, by whoever has both
@@ -603,8 +602,9 @@ class Balance(Selector[_S]):
     all (:meth:`Selection.sort`).
 
     Args:
-        ranking: the selector asked, which must key every source it ranks. What it
-            senses is declared here too (:func:`declares`).
+        ranking: the selector asked. Behind one that keyed nothing, the load is the
+            whole of the order -- which is how a bare pool is ranked by load alone.
+            What it senses is declared here too (:func:`declares`).
         fold: how to read the key this leaves -- the ranking's own dimensions with the
             load behind them -- stamped on the answer
             (:attr:`Selection.fold`) rather than applied here, so every caller of one
@@ -663,23 +663,10 @@ class Balance(Selector[_S]):
         for the same reason and not by accident: an abstention names nobody, and the
         default selection names every holder in directory order rather than any source
         in particular.
-
-        Raises:
-            ValueError: if ``ranking`` left a source it ranked with no key. The load
-                would then be the *whole* of the order rather than a dimension behind
-                the ranking's own, which is overruling it.
         """
         ranked = await self.ranking.select(subject, requester)
         if not ranked.sources:
             return ranked
-        keyed = ranked.key or {}
-        unkeyed = [s for s in ranked.sources if s not in keyed]
-        if unkeyed:
-            raise ValueError(
-                f"{type(self.ranking).__name__} ranked {', '.join(unkeyed)} without "
-                f"keying them, so a load appended here would be the whole of the "
-                f"order: a ranking under one keys every source it ranks"
-            )
         load = self.view.load.named()
         annotated = ranked.annotated(
             {source: load.get(source, 0) for source in ranked.sources}

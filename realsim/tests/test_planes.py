@@ -861,16 +861,16 @@ def test_balance_passes_an_answer_with_no_source_to_rank_straight_through():
         assert _select(balanced) is empty
 
 
-def test_balance_refuses_a_ranking_that_keys_nothing():
-    """A dimension appended behind nothing would be the whole of the order.
+def test_balance_over_a_ranking_that_keys_nothing_is_ordered_by_load_alone():
+    """A pool and nothing more, ranked by the one dimension appended behind it.
 
-    Which is why a ranking under one has to say what orders it: the load would
-    otherwise decide a ranking that had already made up its mind, from outside it.
+    Least-loaded routing, and the only shape it can take: a stage appends behind what
+    the stages before it left, so behind a ranking that named a pool and keyed none of
+    it, load is the whole of the order.
     """
     balanced = Balance(_Fixed(Selection.of(["v0", "v1"])))
-    balanced.attach(_Senses())
-    with pytest.raises(ValueError, match="keys every source"):
-        _select(balanced)
+    balanced.attach(_Senses(_Load(v0=2, v1=1)))
+    assert _select(balanced).sort().sources == ("v1", "v0")
 
 
 def test_balance_takes_the_kind_of_the_ranking_it_wraps():
