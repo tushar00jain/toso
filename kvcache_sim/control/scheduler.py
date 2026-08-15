@@ -90,9 +90,9 @@ from domain import (
     prefill_time,
 )
 
-from ._answer import Batched, Plan, Response
+from ._answer import Plan, Response
 from ._selector import (
-    by_prefix_and_load, ByBatch, LocalOnly, LongestPrefixKeySelector, RoutedPull,
+    by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, RoutedPull,
 )
 from ._sensor import (
     ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
@@ -286,7 +286,6 @@ class _Scheduler(ControlPlane):
         #: place both happen (:meth:`_select_prefill`).
         self._rank = rank
         # Built rather than named: not an axis (see the module it comes from).
-        self._decode = ByBatch()
         self._threshold = balance_threshold
         self._prefill_pool = prefill_pool
         self._decode_pool = decode_pool
@@ -398,7 +397,7 @@ class _Scheduler(ControlPlane):
         # (:meth:`~proposed.view.View.subset`), so a ranking consulted inside a routing
         # decision reads the snapshot the decision pinned rather than past it into the
         # live directory.
-        for ranking in (self._fetch, self._reuse, self._decode):
+        for ranking in (self._fetch, self._reuse):
             ranking.attach(self.view.subset(*ranking.sensors))
 
     # -- what a serving host asks, at the two moments it has a question ------- #
@@ -459,7 +458,7 @@ class _Scheduler(ControlPlane):
         # The winning plan, read once off the dimension it rides in: both halves of the
         # answer are formed against the same one.
         plan: Plan = prefill.key[prefill.head][0]
-        decode = await self._select_decode(plan, requester)
+        decode = self._select_decode(plan)
         return self._admit(request, requester, prefill, plan, decode)
 
     async def _select_prefill(self, request: Request, requester: str) -> Selection:
@@ -613,18 +612,19 @@ class _Scheduler(ControlPlane):
                 n += 1
         return n
 
-    async def _select_decode(self, plan: Plan, requester: str) -> Selection:
-        """Decode instances, each with the batch a request admitted at ``plan``'s
-        completion is predicted to meet there.
+    def _select_decode(self, plan: Plan) -> Selection:
+        """Decode instances, each keyed at the batch a request admitted at ``plan``'s
+        completion is predicted to meet there -- smallest first, the id breaking a tie.
 
-        Keyed by :class:`~kvcache_sim.control._selector.ByBatch` and folded here, as
-        this plane's other answer is. With decode unmodelled every candidate keys at
-        zero, so the id tie-break is the whole of the choice.
+        Every batch is predicted here, so keying them is the whole of what a ranking
+        would do and this is one expression instead. Nothing suspends in it, which is
+        why it is not a coroutine: the prefill side is, because it asks the reuse axis.
+        With decode unmodelled every candidate keys at zero and the tie-break is the
+        whole of the choice.
         """
-        batches: List[Batched] = [
-            (d, self._predicted_batch(d, plan.done_time)) for d in self.decode_ids
-        ]
-        return (await self._decode.select(batches, requester)).sort()
+        return Selection.of(self.decode_ids).annotated({
+            d: self._predicted_batch(d, plan.done_time) for d in self.decode_ids
+        }).sort()
 
     def _admit(
         self,
@@ -645,8 +645,8 @@ class _Scheduler(ControlPlane):
         -- the same value the decode side was chosen against.
         """
         instance = decode.sources[0]
-        # The decode ranking keys the occupancy, which is what the TBT SLO is judged on
-        # (:class:`~kvcache_sim.control._selector.ByBatch`).
+        # The decode answer keys the occupancy, which is what the TBT SLO is judged
+        # on (:meth:`_select_decode`).
         batch = decode.key[instance][0]
         response = Response(
             prefill=prefill.sources[0],

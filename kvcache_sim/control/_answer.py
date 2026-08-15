@@ -13,11 +13,11 @@ the facts a host reports are with the sensor they write
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from proposed import VolumeId
 
-__all__ = ["Plan", "Response", "Batched"]
+__all__ = ["Plan", "Response"]
 
 
 @dataclass
@@ -81,6 +81,3 @@ class Response:
     pred_tbt: float = 0.0
 
 
-#: One decode candidate as the pair a :class:`~proposed.selector.Selection` is built out
-#: of: the instance, and the batch the scheduler predicted it would meet there.
-Batched = Tuple[VolumeId, int]

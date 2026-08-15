@@ -260,10 +260,10 @@ kvcache_sim/
                           #   proposed.selector.Balance can spread reads over
                           #   equally good replicas, by_prefix_and_load being
                           #   the fold that reads the two dimensions that
-                          #   leaves), LocalOnly, ByBatch over the decode
-                          #   candidates, and RoutedPull answering a fetch
-                          #   with the pull already priced for it. A ranking is
-                          #   a selector; an SLO gate and a cost are not --
+                          #   leaves), LocalOnly, and RoutedPull answering a
+                          #   fetch with the pull already priced for it. A
+                          #   ranking is a selector; an SLO gate and a cost are
+                          #   not --
                           #   nor is the prefill order, which is the
                           #   scheduler's own fold over the pool it keyed
     _sensor/              #   one sensor per kind of fact this plane holds

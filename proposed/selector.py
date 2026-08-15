@@ -459,6 +459,11 @@ class AnySelector(Selector[_S]):
     a subclass narrows it: this package cannot name a type an application invented.
     Being this type instead of :class:`KeySelector` says the subject is not the store's,
     which is worth saying where the ranking looks otherwise identical.
+
+    Part of the proposal that no capability here exercises: a plane ranking a pool it
+    built itself keys that pool and folds it, which needs no selector at all
+    (``kvcache_sim``'s prefill and decode picks). What this is for is a ranking over an
+    application's own subject that something *else* consults.
     """
 
 

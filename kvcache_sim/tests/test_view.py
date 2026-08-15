@@ -21,7 +21,7 @@ import asyncio
 import pytest
 
 from kvcache_sim.control._selector import (
-    ByBatch, LongestPrefixKeySelector, RoutedPull,
+    LocalOnly, LongestPrefixKeySelector, RoutedPull,
 )
 from kvcache_sim.control._sensor import (
     ClusterSensor, ReservationSensor, RoutedPullSensor,
@@ -112,12 +112,13 @@ def test_a_ranking_that_declares_nothing_senses_nothing():
     this ranking still answers -- which is what makes "reads nothing" a fact.
     """
     bare = View(None, {})
-    assert ByBatch.sensors == ()
-    assert ByBatch().attach(bare.subset(*ByBatch.sensors)).view is bare
+    assert LocalOnly.sensors == ()
+    assert LocalOnly().attach(bare.subset(*LocalOnly.sensors)).view is bare
     with pytest.raises(AttributeError):
         bare.cluster
-    keyed = asyncio.run(ByBatch().attach(bare).select([("s0", 3), ("s1", 1)], "r"))
-    assert keyed.sort().sources == ("s1", "s0")      # the ranking keys, the fold orders
+    # ...and it answers, which is what makes "reads nothing" a fact rather than a
+    # ranking that happens never to have been asked.
+    assert asyncio.run(LocalOnly().attach(bare).select(["k"], "r")).sources == ()
 
 
 def test_a_subset_composing_a_sensor_this_view_never_carried_raises():

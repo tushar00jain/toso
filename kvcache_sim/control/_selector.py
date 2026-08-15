@@ -1,10 +1,9 @@
-"""Every ranking KV-cache routing decides with, over two subjects.
+"""Every ranking KV-cache routing decides with, all over one subject.
 
-Over **keys**, the store's own question and the only part of this routing that is one:
+Keys, the store's own question and the only part of this routing that is one:
 :class:`LongestPrefixKeySelector` ranks the peers holding a prefix,
 :class:`LocalOnly` names nobody, and :class:`RoutedPull` answers a fetch with the pull
-that was already priced for it. Over the scheduler's **own candidates**:
-:class:`ByBatch` ranks the hosts that could decode.
+that was already priced for it.
 
 What is a selector and what is not: a **ranking over candidates** is one; a comparison
 or a cost function is not. Holding a plan to an SLO answers yes or no, and a ranked set
@@ -19,10 +18,9 @@ candidate are applied to that one ranking per candidate
 (:meth:`~kvcache_sim.control.scheduler._Scheduler._select_prefill`). The other axis,
 **the winner**, is not a ranking at all: the scheduler keys the prefill pool with the
 plans it priced and its own fold orders them, so there is nothing here to name. Which
-host decodes is not an axis either -- both presets rank decode the same way, so the
-scheduler builds :class:`ByBatch` itself -- and it is a selector, so it can be re-keyed
-from outside (:class:`~proposed.selector.Balance`), which a sort written into the
-scheduler never could.
+host decodes is not an axis either -- both presets rank decode the same way, and the
+scheduler predicts every batch itself, so keying them is the whole of what a ranking
+would do there (:meth:`~kvcache_sim.control.scheduler._Scheduler._select_decode`).
 
 Every ranking here **keys** its candidates and orders none of them
 (:attr:`~proposed.selector.Selection.key`); the scheduler folds once when it wants a
@@ -35,17 +33,15 @@ from __future__ import annotations
 
 from typing import Dict, Sequence, Tuple
 
-from proposed import AnySelector, Key, KeySelector, Selection
+from proposed import Key, KeySelector, Selection
 from proposed.selector import Dims, Fold, Selector
 
-from ._answer import Batched
 from ._view import prefix_lengths_of, PrefixView, RoutedView
 
 __all__ = [
     "LongestPrefixKeySelector",
     "by_prefix_and_load",
     "LocalOnly",
-    "ByBatch",
     "RoutedPull",
 ]
 
@@ -138,27 +134,6 @@ class LocalOnly(Selector[Sequence[Key]]):
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection:
         return Selection.of([])
-
-
-class ByBatch(AnySelector[Sequence[Batched]]):
-    """The smallest predicted decode batch, instance id breaking the tie.
-
-    The other host pick of a routing decision, over a predicted batch rather than a
-    plan; the scheduler predicted every batch before asking.
-
-    Keyed at the batch itself, which is also the occupancy the TBT SLO is judged on, so
-    the caller admitting the request reads that dimension back rather than predicting it
-    twice (:meth:`~kvcache_sim.control.scheduler._Scheduler._admit`).
-    """
-
-    name = "by-batch"
-    sensors = ()
-
-    async def select(
-        self, candidates: Sequence[Batched], requester: str
-    ) -> Selection:
-        """Every candidate, keyed at the batch predicted for it: smallest is best."""
-        return Selection.priced(candidates)
 
 
 class RoutedPull(KeySelector):
