@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter
 import inspect
 
 import pytest
@@ -29,11 +30,12 @@ from sim_common.cost_model import DEFAULT_PROFILE
 from domain import decode_step_time
 from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data._store import KVStore
+from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
-from proposed import ControlPlane, Dispatcher, KeySelector
+from proposed import ControlPlane, Dispatcher, KeySelector, LoadView
 from proposed.selector import Discount, FirstMatch
 from kvcache_sim.control._selector import LocalOnly, LongestPrefixKeySelector
-from kvcache_sim.control._sensor import Committed
+from kvcache_sim.control._sensor import Committed, SourceLoad
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, Plan, PrefillFinished, Response,
     _Scheduler,
@@ -1424,10 +1426,11 @@ def test_control_rtt_lands_in_the_wait():
     assert cache_aware.ledger.mean_ttft < load_balance.ledger.mean_ttft
 
 
-# 16b. The client seam: a request is redirected, so the round trips it pays are
-#      client<->host ones and there are three of them (route, prefill, decode).
-#      There is no host-to-host hop left to charge, which is why ``host_rtt``
-#      became ``client_rtt`` rather than being deleted.
+# 16b. The client seam: a request is rerouted, so the round trips it pays are
+#      client<->host ones -- one per call, and a turn makes two (a prefill that serves,
+#      a decode) or three (a prefill that answers with an address, then the two). There
+#      is no host-to-host hop left to charge, which is why ``host_rtt`` became
+#      ``client_rtt`` rather than being deleted.
 def test_client_rtt_defaults_to_free_and_byte_identical():
     baseline = run_shared_prefix(seed=1)[0]
     with config.overrides(client_rtt=0.0):
@@ -1436,20 +1439,121 @@ def test_client_rtt_defaults_to_free_and_byte_identical():
     assert explicit.ledger.mean_ttft == baseline.ledger.mean_ttft
 
 
-def test_a_distant_client_delays_the_request_and_costs_reuse():
-    """Three round trips per turn, paid before each leg can start.
+def test_a_distant_client_pays_per_call_and_a_reroute_costs_one_more():
+    """One round trip per call, and a turn makes two of them, or three.
 
-    The same two effects the control hop has and measured the same way, for
-    the reason the test above spells out: TTFT is a prediction made before any hop
-    is paid, and on a self-pacing workload it moves the wrong way anyway. What the
-    hops are inside is the caller's own interval, and three of them per turn at
-    0.5s put ~1.5s into it.
+    A turn is a prefill and a decode. A prefill that answers with another host's
+    address is a third call, so a rerouted request pays the extra hop and one served
+    where it landed does not -- which is the whole of what the client seam charges.
+
+    Reuse is deliberately unasserted, for the reason the control-hop test above spells
+    out: pacing hands a delayed turn a fresher directory, so the hit rate drifts by a
+    small amount whose sign is the workload's rather than the seam's.
     """
+    rtt = 0.5
     free = run_disaggregation(seed=0)[0]
-    with config.overrides(client_rtt=0.5):
+    with config.overrides(client_rtt=rtt):
         distant = run_disaggregation(seed=0)[0]
-    assert distant.ledger.mean_latency > free.ledger.mean_latency + 1.5
-    assert distant.ledger.hit_rate < free.ledger.hit_rate
+    turns = len(free.ledger.accepted)
+    rerouted = sum(1 for _at, kind, _msg in free.trace.events if kind == "REDIR")
+    assert 0 < rerouted < turns, "the two costs are only distinguishable if both occur"
+    # Every turn pays two calls out and back; the rerouted ones pay a third.
+    assert distant.ledger.mean_latency > free.ledger.mean_latency + 2 * 2 * rtt
+
+
+# 16c. One member reroutes, and asking about a request is not booking it: every host
+#      on the way asks control for itself, and only the ask whose answer names the
+#      caller books anything.
+def test_prefill_is_the_one_member_that_reroutes():
+    assert list(ServingHost.routes) == ["prefill"]
+
+
+def test_a_request_is_priced_and_booked_once_however_many_hosts_ask():
+    """As many asks as hops, one pricing, one booking -- at the first ask.
+
+    A decision books what it admits, so pricing a request twice would price a cluster
+    that has already booked it: the host just chosen reads as busier and the answer can
+    move. So the decision that moves a request is recorded as it is booked, and the ask
+    from the host it names is answered with it
+    (:class:`~kvcache_sim.control._sensor.PlacementSensor`) -- priced by the host it
+    landed on, booked there, and re-judged nowhere.
+    """
+    run = scenarios.SharedPrefix(1).runs()[0]
+    asked: list[str] = []
+    booked: list[str] = []
+    decide = run.control.decide
+
+    async def counted(request, requester):
+        asked.append(requester)
+        return await decide(request, requester)
+
+    def counting(self, action):
+        if isinstance(action, Committed):
+            booked.append(action.response.prefill)
+        return dispatch_sync(self, action)
+
+    run.control.decide = counted
+    dispatch_sync = Dispatcher.dispatch_sync
+    Dispatcher.dispatch_sync = counting
+    try:
+        result = run.execute()
+    finally:
+        Dispatcher.dispatch_sync = dispatch_sync
+    served = [r for r in result.ledger.rows if r.accepted]
+    assert served, "nothing was served -- the counts are vacuous"
+    assert len(asked) > len(served), "no request was passed on: the count is vacuous"
+    # One booking per served request, on the host the decision named.
+    assert sorted(booked) == sorted(r.prefill for r in served)
+    # ...and every placement was read by the ask it was recorded for.
+    assert run.control._placed == {}
+
+
+@pytest.mark.parametrize(
+    "knob", ({}, {"client_rtt": 2.0}, {"control_rtt": 0.5}, {"control_rtt": 2.0})
+)
+def test_a_request_is_placed_in_one_reroute_at_any_distance(knob):
+    """A journey is one call or two, however stale the picture a host reads.
+
+    The anti-churn property, and the reason a placement is recorded rather than
+    re-derived: priced again, a request would be sent on by its own booking -- each host
+    reading the one before it as busier -- and a caller would follow a chain bounded
+    only by its hop cap. Asserted at each distance separately, because what a second
+    pricing would disagree about is exactly what a hop makes stale.
+    """
+    calls = Counter()
+    original = ServingHost.prefill
+
+    async def counted(self, request):
+        calls[request.id] += 1
+        return await original(self, request)
+
+    # One configuration, not the scenario's pair: two runs would count one request id
+    # twice and the maximum below is per journey.
+    run = scenarios.SharedPrefix(1).runs()[0]
+    ServingHost.prefill = counted
+    try:
+        with config.overrides(**knob):
+            result = run.execute()
+    finally:
+        ServingHost.prefill = original
+    assert result.ledger.accepted, "nothing was served -- the count is vacuous"
+    assert max(calls.values()) == 2      # one reroute, never two
+    assert min(calls.values()) == 1      # ...and some land where they belong
+
+
+def test_a_prefill_only_run_makes_no_decode_call():
+    """A run that models no second half ends where the prefill host says it does.
+
+    Control names a decode host for every request it admits, so ``response.decode``
+    is always somebody. Whether anybody goes there is this host's answer
+    (:attr:`~kvcache_sim.data.serving.Prefilled.decode`), and taking the address out
+    of the decision instead would fetch a whole KV chain per request and charge a
+    handoff for it.
+    """
+    result = run_shared_prefix(seed=1)[0]
+    assert result.ledger.accepted, "no accepted requests -- the assertion is vacuous"
+    assert all(not r.decode for r in result.ledger.rows)
+    assert result.ledger.handoff_bytes == 0
 
 
 # 17. The peer that serves a pull is the peer control priced.
@@ -1462,8 +1566,6 @@ def test_a_distant_client_delays_the_request_and_costs_reuse():
 #     the fetch names its source, so the answer is narrowed to the priced peer.
 def _unplanned_edges(result) -> int:
     """Transfer edges whose (source, destination) no accepted plan asked for."""
-    from collections import Counter
-
     planned = Counter(
         (r.reuse_source, r.prefill)
         for r in result.ledger.rows
@@ -1519,11 +1621,10 @@ def test_the_source_selector_accepts_a_plain_view():
 # 19. Spreading reads: the prefix ranking under a Discount breaks its tie on load.
 #     Reuse value is a property of the prefix, so replicas of a hot prefix rank
 #     identically and the id tie-break sends every read to the same host. The
-#     combinator counts the grants it issued -- its own bookkeeping, since nothing in
-#     the repo observes per-volume load -- and lets that settle the tie, under a bound
-#     that keeps a genuinely longer prefix winning. What is asserted here is what the
-#     pairing does to *prefix runs*; the combinator's own mechanics are in
-#     realsim/tests/test_planes.py.
+#     combinator reads how much each source has been sent (SourceLoad, moved by the
+#     decision that names one) and lets that settle the tie, under a bound that keeps a
+#     genuinely longer prefix winning. What is asserted here is what the pairing does to
+#     *prefix runs*; the combinator's own mechanics are in realsim/tests/test_planes.py.
 def _spread(**knobs):
     """The opt-in source ranking: longest prefix, discounted by recent grants."""
     return Discount(LongestPrefixKeySelector(), **knobs)
@@ -1550,17 +1651,25 @@ def _replicated(holders, blocks, *, num=4):
     return sim, keys
 
 
-def _select_heads(sim, selector, keys, *, count, gap=0.0):
-    """The head of ``count`` successive rankings, ``gap`` virtual seconds apart."""
-    selector.attach(sim.view)
+def _select_heads(sim, selector, keys, *, count, moving=True):
+    """The head of ``count`` successive rankings, the load moving as each is decided.
+
+    The pairing the run has: the ranking answers, the decision that follows names that
+    source, and the fold counts it
+    (:class:`~kvcache_sim.control._sensor.SourceLoad`). ``moving=False`` is a load
+    nothing moves, which is the base ranking's own order.
+    """
+    load = SourceLoad()
+    selector.attach(sim.view.derived(LoadView, load=load))
 
     async def scenario():
         heads = []
         with sim.mesh.installed():
             for _ in range(count):
-                heads.append((await selector.select(keys, "s0")).sources[0])
-                if gap:
-                    await asyncio.sleep(gap)
+                head = (await selector.select(keys, "s0")).sources[0]
+                heads.append(head)
+                if moving:
+                    load.folds[Committed](_accepted(source=head, pull=list(keys)))
         return heads
 
     return sim.loop.run_until_complete(scenario())
@@ -1598,26 +1707,21 @@ def test_spread_reads_still_prefers_a_materially_longer_prefix():
     assert wide == ["s2", "s2", "s1"]
 
 
-def test_spread_reads_forgets_a_grant_once_its_window_passes():
-    """A grant is a window, not a running total, so load cannot accumulate.
+def test_spread_reads_answers_the_base_order_when_nothing_has_been_sent():
+    """The ranking reads a load; a load nothing moves leaves the base order alone.
 
-    Back-to-back the selector rotates; spaced further apart than the window, every
-    read finds an empty tally and the id tie-break answers again -- which is the
-    difference between "recently routed there" and "has ever been routed there".
+    Which is what says the spreading is the observation's and not the wrapper's: the
+    same pairing, asked four times against an unmoved sensor, answers as the ranking
+    under it does.
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 4, "s2": 4})
     try:
-        prompt = _select_heads(sim, _spread(window=1.0), keys, count=4)
-        aged = _select_heads(
-            sim, _spread(window=1.0), keys, count=4, gap=2.0
-        )
-        # window <= 0 is no memory at all: the default selector's ranking, exactly.
-        forgetful = _select_heads(sim, _spread(window=0.0), keys, count=4)
+        moving = _select_heads(sim, _spread(), keys, count=4)
+        still = _select_heads(sim, _spread(), keys, count=4, moving=False)
     finally:
         sim.loop.close()
-    assert prompt == ["s1", "s2", "s1", "s2"]
-    assert aged == ["s1"] * 4
-    assert forgetful == ["s1"] * 4
+    assert moving == ["s1", "s2", "s1", "s2"]
+    assert still == ["s1"] * 4
 
 
 def test_spread_reads_ranks_deterministically():
@@ -1629,12 +1733,14 @@ def test_spread_reads_ranks_deterministically():
     reads the rest of it.
     """
     async def rankings(sim, keys):
-        selector = _spread()
-        selector.attach(sim.view)
+        load = SourceLoad()
+        selector = _spread().attach(sim.view.derived(LoadView, load=load))
         out = []
         with sim.mesh.installed():
             for _ in range(5):
-                out.append((await selector.select(keys, "s0")).sources)
+                ranked = (await selector.select(keys, "s0")).sources
+                out.append(ranked)
+                load.folds[Committed](_accepted(source=ranked[0], pull=list(keys)))
         return out
 
     holders, blocks = ["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 3}
@@ -1656,12 +1762,16 @@ def test_spread_reads_ranks_deterministically():
 def test_the_spread_reads_flag_reaches_a_scenario_run():
     """The opt-in entry point, exercised from the flag to the ledger.
 
-    ``python -m kvcache_sim hotspot --spread-reads``: the demo declares the flag,
-    the scenario reads it off the parsed command line and gives each cache-aware
-    run its *own* selector, and which peer serves a pull changes. What does not
-    change is that a *planned* pull is fetched from the peer it was priced against
-    -- the ranking sits behind the routed-pull memo in the chain the plane answers a
-    fetch with, so a different ranking cannot redirect a pull already decided.
+    ``python -m kvcache_sim hotspot --spread-reads``: the demo declares the flag, the
+    scenario reads it off the parsed command line and gives each cache-aware run its
+    *own* selector, and the reads of a replicated prefix land on several replicas
+    rather than all on whichever one sorts first -- with the split differing from the
+    ranking that cannot spread at all.
+
+    What does not change is that a *planned* pull is fetched from the peer it was
+    priced against -- the ranking sits behind the routed-pull memo in the chain the
+    plane answers a fetch with, so a different ranking cannot redirect a pull already
+    decided.
     """
     parser = argparse.ArgumentParser()
     KVCacheDemo().flags(parser)
@@ -1681,7 +1791,12 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
 
     default = run_hotspot(seed=0)[2]
     spread = run_hotspot(seed=0, args=args)[2]
-    assert pull_sources(spread) != pull_sources(default)
+    served = pull_sources(spread)
+    assert served, "nothing pulled -- there is no read to spread"
+    # Spread over the replicas, and no one of them serving every read of them.
+    assert len(set(served)) > 1
+    assert max(Counter(served).values()) < len(served)
+    assert served != pull_sources(default)
     assert _unplanned_edges(spread) == 0
 
 

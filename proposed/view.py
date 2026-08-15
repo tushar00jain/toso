@@ -61,7 +61,7 @@ from proposed.cost import TransferCost
 from proposed.deployment import Controller
 from proposed.topology import Endpoint
 
-__all__ = ["Sensed", "SensorView", "View"]
+__all__ = ["LoadView", "Sensed", "SensorView", "View"]
 
 
 class _Pin:
@@ -340,3 +340,32 @@ class SensorView(View):
             name: sensors.pop(name, None) for name in _sensed(type(self))
         }
         super().__init__(*ports, **sensors)
+
+
+class LoadView(SensorView):
+    """How much work has been sent at each volume: :attr:`load`.
+
+    The one read this package names a sensor for, because the subject is a *volume* and
+    the number is nobody's model of anything -- which is what the discussion above
+    leaves ``load()`` out for. What it carries is the application's own sensor, as every
+    :class:`Sensed` attribute does; what a caller may ask of it is one member:
+
+        ``named() -> Mapping[VolumeId, int]``
+
+    -- how many decisions have named each volume as a source. Absent means none.
+
+    Read by :class:`proposed.selector.Discount`, which spreads reads over sources a
+    ranking cannot separate, and written by whoever decides: a plane dispatches the
+    decision it commits, and the fold that counts the source it named is the one write
+    this observation has.
+
+    **It counts decisions, not reads.** A volume named by a decision has work coming to
+    it; nothing here says how much, how long it took, or that it is over, so the count
+    stands above what a volume is actually serving and never comes down. What would say
+    otherwise is the read itself, reported by the data plane that made it -- a fetch
+    beginning and ending against a volume, which is what turns this from a count of
+    intentions into an occupancy. That measurement is the remaining work, and it belongs
+    on this same attribute rather than beside it.
+    """
+
+    load = Sensed("load")

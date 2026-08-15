@@ -23,7 +23,11 @@ pin the contract each one owes its callers:
    nothing after), so a capability overrides one method rather than filling in
    a stub;
 5. the runner releases items in ``(release_time, id)`` order on the virtual
-   clock, installs the mesh once, and records one ledger row per item.
+   clock, installs the mesh once, and records one ledger row per item;
+6. a plane declares where in its own answer the address of another host is, and is
+   otherwise untouched by saying so; a :class:`~proposed.routed.RoutedPlane` calls
+   the member again there for any caller -- through the reference, so every hop is
+   charged -- and neither a cycle nor a host holding a peer survives.
 
 Run from the repo root::
 
@@ -33,14 +37,15 @@ Run from the repo root::
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 import pytest
 import torch
 
 from realsim.mesh import Mesh
+from realsim.seams.data_plane_service import DataPlaneService
 from realsim.simulation import Simulation
-from proposed import DataPlane
+from proposed import DataPlane, routed, RoutedPlane
 from proposed import AnySelector, ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
@@ -517,28 +522,44 @@ def _select(selector: Selector, keys=("K",), requester="r") -> Selection:
     return asyncio.run(selector.select(list(keys), requester))
 
 
-class _Clock:
-    """The whole of what a ``Discount`` senses: ``now()``, moved by hand.
+class _Load:
+    """Per-source load, moved by hand: what a ``Discount`` reads off its view."""
 
-    A ``View`` would bring a directory nothing here reads, and time here has to be
-    driveable a window at a time.
-    """
+    def __init__(self, **counts: int) -> None:
+        self.counts = dict(counts)
 
-    def __init__(self) -> None:
-        self.t = 0.0
+    def named(self):
+        return self.counts
+
+    def sent(self, source) -> None:
+        """What a decision naming ``source`` does to it."""
+        self.counts[source] = self.counts.get(source, 0) + 1
+
+
+class _Senses:
+    """The whole of what a ``Discount`` senses: one load sensor, and no directory."""
+
+    def __init__(self, load: Optional[_Load] = None) -> None:
+        self.load = load if load is not None else _Load()
 
     def now(self) -> float:
-        return self.t
+        return 0.0
 
 
-def _heads(selector: Selector, *, count: int, gap: float = 0.0) -> list:
-    """The head of ``count`` successive rankings, ``gap`` virtual seconds apart."""
-    clock = _Clock()
-    selector.attach(clock)
+def _heads(selector: Selector, *, count: int, moving: bool = True) -> list:
+    """The head of ``count`` successive rankings, the load moving as each is decided.
+
+    Which is the pairing in production: the ranking answers, the decision that follows
+    names that source, and the fold counts it. ``moving=False`` is a load nothing moves.
+    """
+    senses = _Senses()
+    selector.attach(senses)
     heads = []
     for _ in range(count):
-        heads.append(_select(selector).head)
-        clock.t += gap
+        head = _select(selector).head
+        heads.append(head)
+        if moving:
+            senses.load.sent(head)
     return heads
 
 
@@ -671,6 +692,24 @@ def test_discount_moves_the_tie_between_equally_priced_sources():
     assert _heads(discounted, count=4) == ["v0", "v1", "v0", "v1"]
 
 
+def test_discount_reads_a_load_it_does_not_keep():
+    """Asking is a read: the ranking writes nothing, so a load nothing moves is inert.
+
+    Which is what makes this a combinator over an observation rather than a tally of
+    its own -- what moves the number is the decision the answer is consulted for, and
+    a plane that prices ten candidates and decides once moves it once.
+    """
+    equal = Selection.priced([("v0", 5), ("v1", 5)])
+    assert _heads(Discount(_Fixed(equal)), count=4, moving=False) == ["v0"] * 4
+
+    # ...and the head follows the load, whoever moved it.
+    senses = _Senses(_Load(v0=1))
+    discounted = Discount(_Fixed(equal)).attach(senses)
+    assert _select(discounted).head == "v1"
+    senses.load.sent("v1")
+    assert _select(discounted).head == "v0"
+
+
 def test_discount_cannot_outvote_a_source_ahead_by_more_than_the_bound():
     """``max_discount`` is in the base's units, so the bound is a price gap.
 
@@ -684,27 +723,15 @@ def test_discount_cannot_outvote_a_source_ahead_by_more_than_the_bound():
     ]
 
 
-def test_discount_forgets_a_grant_once_its_window_passes():
-    """A window, not a running total, so load cannot accumulate.
-
-    Spaced further apart than the window, every read finds an empty tally and the
-    base's own order answers again -- the difference between "recently named" and
-    "has ever been named". A non-positive window is that with no memory at all.
-    """
-    equal = Selection.priced([("v0", 5), ("v1", 5)])
-    assert _heads(Discount(_Fixed(equal), window=1.0), count=4, gap=2.0) == ["v0"] * 4
-    assert _heads(Discount(_Fixed(equal), window=0.0), count=4) == ["v0"] * 4
-
-
 def test_discount_passes_an_answer_with_no_source_to_rank_straight_through():
     """The two empties again: neither names a source, so neither is re-ranked.
 
-    Returned as they were built, which is also what keeps the grant honest -- nothing
-    was named, so nothing is tallied and the next real answer is undiscounted.
+    Returned as they were built, and nothing is read off the load either: there is no
+    source to weigh.
     """
     for empty in (Selection.of([]), Selection()):
         discounted = Discount(_Fixed(empty))
-        discounted.attach(_Clock())
+        discounted.attach(_Senses())
         assert _select(discounted) is empty
         assert _select(discounted) is empty
 
@@ -716,7 +743,7 @@ def test_discount_refuses_a_ranking_that_prices_nothing():
     could only mean ignoring the order it chose.
     """
     discounted = Discount(_Fixed(Selection.of(["v0", "v1"])))
-    discounted.attach(_Clock())
+    discounted.attach(_Senses())
     with pytest.raises(ValueError, match="prices every source"):
         _select(discounted)
 
@@ -766,11 +793,11 @@ def test_discount_attaches_the_ranking_under_it_and_keeps_what_it_answered():
 
     base = _Fixed(Selection.priced([("v0", 5), ("v1", 5)], ready=gate))
     discounted = Discount(base)
-    clock = _Clock()
-    discounted.attach(clock)
+    senses = _Senses()
+    discounted.attach(senses)
 
-    assert base.view is clock                       # brought up by its holder
-    _select(discounted)                             # v0 granted ...
+    assert base.view is senses                      # brought up by its holder
+    senses.load.sent(_select(discounted).head)      # v0 ranked, and decided on ...
     second = _select(discounted)                    # ... so v1 leads now
     assert second.sources == ("v1", "v0")
     assert second.ready is gate
@@ -863,14 +890,18 @@ def test_a_data_plane_declares_a_lifecycle_and_no_verbs():
     ``attach`` is the whole surface, so the only thing a run can do with a plane is
     hand it the deployment; which member then carries the work is named by whoever
     wires the run. A declared verb would have to be one every capability implements,
-    and the two here do not execute alike -- dedup reads through, kvcache walks
-    three legs.
+    and the two here do not execute alike -- dedup reads through, kvcache prefills
+    and decodes.
+
+    ``routes`` is the one thing beside it, and it is a declaration rather than a
+    verb: empty until a plane says a member of its own answers with an address.
     """
     verbs = {
         name for name in vars(DataPlane)
-        if not name.startswith("_")
+        if not name.startswith("_") and callable(getattr(DataPlane, name))
     }
     assert verbs == {"attach"}
+    assert DataPlane.routes == {}
     assert DataPlane().attach(object()) is None   # a default that does nothing
 
 
@@ -983,3 +1014,199 @@ def test_the_controller_hop_is_charged_to_every_capability():
     # Every directory call now costs a round trip, so the run ends later -- by at
     # least one, since the reads that remain on the critical path are serialized.
     assert _end_of_run(distant) >= _end_of_run(free) + 2 * rtt
+
+
+# --------------------------------------------------------------------------
+# 6. Reroutes: the answer names the host, and a caller goes there.
+# --------------------------------------------------------------------------
+
+
+class _Rerouted(DataPlane):
+    """``ServingHost``'s shape with the work taken out.
+
+    One member and one signature: it works out where the subject belongs, and either
+    answers with that address or serves it. Whoever the address names is called with
+    exactly what this one was.
+    """
+
+    def __init__(self, me: str, *, names: Optional[str] = None) -> None:
+        self.me = me
+        self.names = names
+        self.seen: list[str] = []
+
+    @routed(at=lambda answered: answered.elsewhere)
+    async def serve(self, subject: str):
+        self.seen.append(subject)
+        if self.names is not None:
+            return _Answer(elsewhere=self.names)
+        return _Answer(served=f"{subject}@{self.me}")
+
+
+class _Answer:
+    """What ``_Rerouted.serve`` answers: an address, or the subject served."""
+
+    def __init__(self, *, elsewhere=None, served=None) -> None:
+        self.elsewhere = elsewhere
+        self.served = served
+
+
+class _Circling(DataPlane):
+    """A plane that always names the other host: an answer that never is one."""
+
+    def __init__(self, me: str, other: str) -> None:
+        self.me = me
+        self.other = other
+
+    @routed(at=lambda answered: answered.elsewhere)
+    async def serve(self, subject: str):
+        return _Answer(elsewhere=self.other)
+
+
+class _Refuses(DataPlane):
+    """A plane that answers nothing at all."""
+
+    @routed(at=lambda answered: answered.elsewhere)
+    async def serve(self, subject: str) -> None:
+        return None
+
+
+def _endpointish(method):
+    """Stand in for Monarch's ``@endpoint``: a descriptor holding the method.
+
+    Not the real one -- what matters is the shape a wrapper has (an object whose only
+    reference to the method is private), which is why ``routed`` may not be one and
+    has to record its declaration where a class can still find it.
+    """
+
+    class _Property:
+        def __init__(self, method) -> None:
+            self._method = method
+
+        def __get__(self, instance, owner):
+            return self
+
+    return _Property(method)
+
+
+class _EitherOrder(DataPlane):
+    """The declaration composes with a wrapper above it and below it."""
+
+    @_endpointish
+    @routed(at=lambda answered: None)
+    async def over(self, subject: str) -> None:
+        ...
+
+    @routed(at=lambda answered: None)
+    @_endpointish
+    async def under(self, subject: str) -> None:
+        ...
+
+
+def _fronted(**planes) -> Simulation:
+    """An assembled stack with one data plane per node, fronted for callers."""
+    sim = Simulation(_topology())
+    for node, plane in sorted(planes.items()):
+        sim.front_plane(node, plane)
+    return sim
+
+
+def test_a_declaration_leaves_the_member_alone_and_lands_on_the_class():
+    """``routed`` records; it does not wrap.
+
+    The member is the same object it was, so a service still finds a coroutine where
+    it looks for one and nothing follows an address near the host. Where the
+    declaration lands is the class -- and it survives a wrapper on either side of it,
+    because the class attribute is the wrapper by the time anything reads it.
+    """
+    async def member(self, subject: str) -> None:
+        ...
+
+    assert routed(at=lambda answered: None)(member) is member
+    assert list(_Rerouted.routes) == ["serve"]
+    assert set(_EitherOrder.routes) == {"over", "under"}
+    # What the declaration is: where the answer says to go.
+    assert _Rerouted.routes["serve"](_Answer(elsewhere="b")) == "b"
+
+
+def test_a_call_is_sent_wherever_its_answer_says():
+    """Two hosts, one member, and the caller names only the first.
+
+    The address is in the answer the first host produced, so the reroute is the
+    server's decision -- and the call the second host gets is the one the first got,
+    unchanged, so nothing about a member's signature says whether it was rerouted into.
+    """
+    a, b = _Rerouted("a", names="b"), _Rerouted("b")
+    sim = _fronted(a=a, b=b)
+    answered = _drive(sim, RoutedPlane(sim, _Rerouted).serve("x", at="a"))
+    assert answered.served == "x@b"
+    assert a.seen == ["x"] and b.seen == ["x"]
+
+
+def test_an_answer_that_names_nobody_is_the_result():
+    """A member that never yields a host is one call, and so is a refusal."""
+    lone = _Rerouted("a")                          # names nobody, so it serves
+    sim = _fronted(a=lone)
+    assert _drive(sim, RoutedPlane(sim, _Rerouted).serve("x", at="a")).served == "x@a"
+    assert lone.seen == ["x"]
+
+    sim = _fronted(a=_Refuses())
+    assert _drive(sim, RoutedPlane(sim, _Refuses).serve("x", at="a")) is None
+
+
+def test_a_cycle_hits_the_hop_cap():
+    """A plane that keeps naming a host cannot hang the caller.
+
+    Nothing is wrong with being sent on once or twice -- that is the point -- so the
+    only thing that can tell a long chain from an endless one is a cap on the hops.
+    """
+    sim = _fronted(a=_Circling("a", "b"), b=_Circling("b", "a"))
+    with pytest.raises(RuntimeError, match="still being sent on"):
+        _drive(sim, RoutedPlane(sim, _Circling, max_hops=4).serve("x", at="a"))
+
+
+def test_a_host_that_holds_its_peers_is_refused():
+    """Engines xor a peer table, checked where a host becomes reachable.
+
+    A plane that answers with an address *and* can call it forwards instead of
+    answering, which is what answering with one exists instead of -- and the
+    structure lint cannot see it, because a peer is not a control port.
+    """
+    DataPlaneService(_Rerouted("a", names="b"))     # holds nobody: fronted happily
+
+    holds_one = _Rerouted("a", names="b")
+    holds_one.peer = _Rerouted("b")
+    with pytest.raises(TypeError, match="holds another host"):
+        DataPlaneService(holds_one)
+
+    holds_a_table = _Rerouted("a", names="b")
+    holds_a_table.peers = {"b": _Rerouted("b")}
+    with pytest.raises(TypeError, match="holds another host"):
+        DataPlaneService(holds_a_table)
+
+
+def test_every_hop_pays_the_client_hop():
+    """Each call is charged out and back, and free by default.
+
+    A caller is off the box, so being sent on is a boundary crossing like reaching the
+    directory. Two hops at ``rtt`` cost four one-way trips; at the default the hop is
+    inline and the whole thing advances the clock not at all.
+    """
+    from sim_common import config
+
+    rtt = 0.25
+    with config.overrides(client_rtt=rtt):
+        sim = _fronted(a=_Rerouted("a", names="b"), b=_Rerouted("b"))
+        walked = _drive(
+            sim, _timed(RoutedPlane(sim, _Rerouted).serve("x", at="a"))
+        )
+    assert walked == 4 * rtt
+
+    sim = _fronted(a=_Rerouted("a", names="b"), b=_Rerouted("b"))
+    assert _drive(sim, _timed(RoutedPlane(sim, _Rerouted).serve("x", at="a"))) == 0.0
+
+
+async def _timed(awaitable) -> float:
+    """How much virtual time ``awaitable`` took."""
+    started = asyncio.get_running_loop().time()
+    await awaitable
+    return asyncio.get_running_loop().time() - started

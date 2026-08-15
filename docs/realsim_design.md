@@ -450,7 +450,7 @@ directory handle, trace, profile, registry, install).
 - **`DataPlane`.** One member — `attach(deployment)` — and no verbs. Moving bytes is
   an ordinary client call and needs no interface, and what a capability does around
   those calls it declares itself: `dedup_sim`'s plane reads through and reports the
-  put, `kvcache_sim`'s host walks three legs. The run-shaped members it used to carry
+  put, `kvcache_sim`'s host prefills and decodes. The run-shaped members it used to carry
   (`execute` / `drain` / `writes_own_outcomes`) were the runner's contract wearing the
   capability's name, and the two that survived are now `realsim.runner.ItemDispatch`.
   `drain` did not survive: its only caller was a decode batch outliving the request

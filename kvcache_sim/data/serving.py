@@ -4,22 +4,36 @@
 compute. A deployment runs one per host, and a host knows about exactly two other
 things: the store and its control plane. It does not know about another host.
 
-Three legs, and the client walks them
--------------------------------------
+One member, and the decision follows the request
+-----------------------------------------------
 A request can land on any host, and the host it lands on is rarely the host that
-should serve it: which instance holds the longest reusable prefix is a
-cluster-wide fact. So a host that receives a request asks control where it
-belongs (:meth:`ServingHost.route`) -- and then *answers with the address*. It does
-not call the host it named. The client does::
+should serve it: which instance holds the longest reusable prefix is a cluster-wide
+fact. So :meth:`ServingHost.prefill` asks control where the request belongs, and if the
+answer is another host it *answers with that address* -- it does not call the host it
+named. If the answer is this host, it serves the request in that same call::
 
     client -> A          "serve this" (a prompt)
-    A      -> client     "prefill is B"          (a redirect, not a forward)
-    client -> B          B prefills and publishes its KV blocks to the store
-    B      -> client     the first token, and "decode is C"   (another redirect)
+    A      -> client     "not here: B"       (a reroute; A ran nothing, and booked the
+                                              request onto B as it answered)
+    client -> B          B asks, is told what A was told, and prefills
+    B      -> client     the first token, and "decode is C"
     client -> C          C fetches that KV back out of the store, decodes, finishes
     C      -> client     the remaining tokens -- after the last one, which is what
                          makes the client's arrival-to-last-token stamp mean
                          anything
+
+One decision, one booking, and the second ask is answered rather than priced. The ask
+that moves a request books it (:class:`~kvcache_sim.control._sensor.Committed` -- the
+queue that decision spoke for, the promise no host can report yet, the peer its pull was
+priced against) *and* records where it sent it, so the host it named is told the same
+answer and prices nothing (:class:`~kvcache_sim.control._sensor.PlacementSensor`).
+
+That is what settles a placement rather than merely making one. A second pricing would
+read the cluster this booking has already moved, find the host just chosen busier than it
+was, and be entitled to send the request on again -- a request rerouted by its own
+booking, hop after hop, converging on nothing. So a request is passed on **once**,
+however far away a host or the control plane is, and no host needs a decision handed to
+it in order to serve.
 
 Both ends of that carry tensors, and the split follows the engines' division of
 labour: TTFT is the time to the *first* token, which is sampled from the prefill's
@@ -27,7 +41,7 @@ last position, so :meth:`prefill` answers with it; everything after it is the de
 batch's, so :meth:`decode` answers with the rest. The client is the only participant
 that sees both halves, and therefore the only one that can time the request.
 
-Consequences of the redirect model:
+Consequences of answering with an address:
 
 * **A host holds no reference to another host.** A serving instance's whole outward
   surface is the store's client and the two control ports below.
@@ -42,13 +56,22 @@ Consequences of the redirect model:
   and it moves disaggregation's headline number against it: a dedicated decode pool
   buys isolation from prefill and pays for it in KV transfer.
 
-Which host a request *arrives* at is a load balancer's answer -- a client SDK, an
-ingress proxy, DNS -- so it is not here. The run's wiring stands in for it
-(:mod:`kvcache_sim.workload._serving`), and that same wiring follows the redirects.
+The address is in the answer, so nobody writes the following
+------------------------------------------------------------
+:meth:`prefill` carries a :func:`~proposed.routed.routed` declaration naming where in
+its answer the address is (:attr:`Prefilled.elsewhere`), and that is the whole of it: a
+caller calls the same member at that host with the same arguments, and no code anywhere
+spells the sequence out (:class:`proposed.routed.RoutedPlane`). It is inert here -- this
+host reads none of it -- and what reads it is a caller, never a host.
+
+Which host a request *arrives* at is the one thing no answer can supply: it is a load
+balancer's answer -- a client SDK, an ingress proxy, DNS -- so it is not here. The
+run's wiring stands in for it (:mod:`kvcache_sim.workload._serving`).
 
 The lifecycle, once a host is prefilling:
 
-1. ask control to route the request, and record a rejection if it refuses;
+1. take the decision, made and booked at the ask that placed this request -- this ask,
+   or the one that sent it here;
 2. if the plan pulls a remote prefix, drive a **real** ``get_batch`` (charging
    fabric via the cost model);
 3. submit the forward pass to this host's accelerator, which runs it when the
@@ -108,13 +131,13 @@ between asking and telling:
   :mod:`kvcache_sim.data._store` where the fetch is). One plane answers both, and a
   question is answered, so it is called and waited for. ``decide``'s answer is a
   :class:`~kvcache_sim.control.scheduler.Response` -- a value naming both of the
-  request's hosts, and what prefilling on the first was priced at -- which this plane
-  carries to each leg beside the request it already holds;
+  request's hosts, and what prefilling on the first was priced at. The host it names
+  passes it on in its own answer (:class:`Prefilled`) as far as the host that decodes;
 * :class:`~proposed.dispatch.Dispatcher` -- the **facts**, each an
   :class:`~proposed.dispatch.Action`: this host's decode batch, its busy compute, the
   clock its prefill really reached. Nothing comes back, and the reply is waited for
-  anyway, because the next question has to be decided against sensors that have
-  already folded the action.
+  anyway, because the next question has to be decided against sensors that have already
+  folded the action.
 
 Those two are the *only* things this module may touch on the control side --
 ``check_structure.py`` rule 6 fails the build on a field read, a subscript or a
@@ -139,11 +162,12 @@ reports nothing, and prefill never stalls decode.
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 
-from proposed import ControlPlane, DataPlane, Deployment, Dispatcher
+from proposed import ControlPlane, DataPlane, Deployment, Dispatcher, routed
 
 from ..control.scheduler import (
     ComputeBusy, DecodeState, Plan, PrefillFinished, Response,
@@ -154,7 +178,25 @@ from ._decode import DecodeEngine
 from ._prefill import PrefillEngine
 from ._store import KVStore
 
-__all__ = ["ServingHost"]
+__all__ = ["Prefilled", "ServingHost"]
+
+
+@dataclass(frozen=True)
+class Prefilled:
+    """What :meth:`ServingHost.prefill` answers: an address, or a prefilled request.
+
+    One or the other, never both. ``elsewhere`` set is the host the request belongs on
+    and the whole of that answer -- nothing has run, so there is nothing else to say.
+    Otherwise the request was served here: the ``token`` this host produced, the
+    ``decode`` host that generates the rest (``None`` when nobody does, which is a run
+    that models no second half), and the ``response`` it was decided by, which is what
+    :meth:`ServingHost.decode` reads the request's two hosts off.
+    """
+
+    elsewhere: Optional[str] = None
+    response: Optional[Response] = None
+    token: Optional[torch.Tensor] = None
+    decode: Optional[str] = None
 
 
 class ServingHost(DataPlane):
@@ -162,10 +204,9 @@ class ServingHost(DataPlane):
 
     The running loop's ``time()`` is the only clock (virtual under simulation).
 
-    Three members are the whole surface a client reaches: :meth:`route`,
-    :meth:`prefill` and :meth:`decode`, in the order a request visits them. Two of
-    the three answer with an *address* rather than doing the next thing themselves,
-    so nothing here needs a way to reach another host.
+    Two members are the whole surface a client reaches: :meth:`prefill` and
+    :meth:`decode`. Both answer with an *address* where the next thing happens
+    somewhere else, so nothing here needs a way to reach another host.
 
     A :class:`~proposed.plane.DataPlane`, so the three things it reaches -- the
     store, the control plane it asks, the dispatcher it reports into -- arrive together
@@ -255,21 +296,27 @@ class ServingHost(DataPlane):
         """Forward this host's occupied compute timeline (coupled only)."""
         await self.dispatcher.dispatch.call_one(ComputeBusy(self.me, until))
 
-    # -- leg 1: the router role, which every host plays -------------------- #
-    async def route(self, request: Request) -> Optional[Response]:
-        """A client's request landed here. Answer with where it should actually go.
+    # -- the request's prefill: decide where it belongs, or serve it -------- #
+    @routed(at=lambda prefilled: prefilled.elsewhere)
+    async def prefill(self, request: Request) -> Optional["Prefilled"]:
+        """Ask control where ``request`` belongs; serve it here, or answer with there.
 
-        Which host should *serve* the request is a cluster-wide question about who
-        holds the longest reusable prefix, so every host asks control -- and hands
-        the answer back rather than acting on it.
+        One signature, whoever is calling: control is asked, and either it names this
+        host -- and the request is prefilled in this same call -- or it names another,
+        which goes back out as an address (:attr:`Prefilled.elsewhere`) and leaves this
+        host holding nothing. Nothing has run when that answer is given, which is what
+        makes a refusal -- ``None``, recorded here, since no other host will hear of this
+        request -- cost nothing.
 
-        Returns control's :class:`~kvcache_sim.control.scheduler.Response` for the
-        client to take to :meth:`prefill` on ``response.prefill``, or ``None`` when
-        control refused the request outright. A refusal is recorded *here*: no other
-        host will ever hear about this request.
+        Asked by the host a request landed on, this is where the decision is made and
+        booked; asked by the host that decision named, it is the same answer read back,
+        priced and judged nowhere (:mod:`kvcache_sim.control.scheduler`). Which is why a
+        request reaches the host it belongs on in one reroute however far away control
+        is.
 
-        The request itself is not in that answer and does not need to be: the client
-        holds it already and hands it to each leg beside the decision.
+        Answers with the first token and where the rest of it is generated. The token
+        comes back even when no address does: every request prefilled here got
+        prefilled, and a request that got this far was admitted before any of it ran.
         """
         response = await self.control.decide.call_one(request, self.me)
         if response is None:
@@ -283,28 +330,12 @@ class ServingHost(DataPlane):
             )
             return None
         if response.prefill != self.me:
-            # Traced only when the answer moves the request; the prefill host's own
+            # Traced only when the answer moves the request; the serving host's own
             # ROUTE line already records where it landed.
             self.trace.record(
                 self._now(), "REDIR", f"{request.id} {self.me} -> {response.prefill}"
             )
-        return response
-
-    # -- leg 2: the request's prefill, on the host control chose ----------- #
-    async def prefill(
-        self, request: Request, response: Response
-    ) -> Tuple[Optional[str], torch.Tensor]:
-        """Prefill ``request`` here as ``response`` priced it; answer with its first
-        token and where next.
-
-        Returns ``(next host, first token)``: the instance id the client should take
-        this plan to, or ``None`` when there is no next host, which is a run that
-        does not model decode at all.
-
-        The address is optional and the token is not: every request that reaches
-        this method gets prefilled, and a request that got this far was admitted
-        before any of it ran.
-        """
+            return Prefilled(elsewhere=response.prefill)
         # Nothing is reserved on the accelerator here: it books the pass when it is
         # submitted and decode books its steps on the same occupancy, so one object
         # owns the answer and no forecast is written over it.
@@ -378,7 +409,11 @@ class ServingHost(DataPlane):
         # already folded this completion, and a report left in flight leaves control
         # answering off a queue it knows to be wrong.
         await self.dispatcher.dispatch.call_one(PrefillFinished(self.me, self._now()))
-        return await self._prefill_done(request, response, row), first_token
+        return Prefilled(
+            response=response,
+            token=first_token,
+            decode=await self._prefill_done(request, response, row),
+        )
 
     def _recompute(self, request: Request, plan: Plan, row: RequestResult) -> int:
         """Re-price this prefill with the reuse that vanished; answer what is left.
@@ -468,7 +503,9 @@ class ServingHost(DataPlane):
         # The address, not the act: the client goes there next.
         return response.decode
 
-    # -- leg 3: decode, on a host that has to go and get the KV ------------ #
+    # -- decode, on a host that has to go and get the KV -------------------- #
+    # No declaration: this answer is tokens, and a host that has them is the last one
+    # the request visits.
     async def decode(
         self, request: Request, response: Response
     ) -> List[torch.Tensor]:

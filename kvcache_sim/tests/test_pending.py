@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from kvcache_sim.control._answer import Plan, Response
 from kvcache_sim.control._sensor import (
-    Committed, Reservation, ReservationSensor, RoutedPullSensor,
+    Committed, Reservation, ReservationSensor, RoutedPullSensor, SourceLoad,
 )
 
 
@@ -158,3 +158,18 @@ def test_a_pull_is_remembered_only_when_the_plan_priced_one():
     assert routed.claim("s0", ["a"]) is None, "nothing was priced, so nothing is owed"
     routed.folds[Committed](_committed(source="s1", pull=["a"]))
     assert routed.claim("s0", ["a"]) == "s1"
+
+
+def test_load_counts_the_source_a_decision_priced_a_pull_against():
+    """The load a ranking spreads over is written by the decision that names a source.
+
+    Only a decision that priced a pull counts: one that recomputes the gap sends
+    nothing to anybody, so loading a volume for it would rank down a source nobody is
+    reading from.
+    """
+    load = SourceLoad()
+    load.folds[Committed](_committed(source=None, pull=()))         # nothing named
+    load.folds[Committed](_committed(source="s1", pull=["a"]))
+    load.folds[Committed](_committed(source="s1", pull=["b"]))
+    load.folds[Committed](_committed(source="s2", pull=["c"]))
+    assert dict(load.named()) == {"s1": 2, "s2": 1}

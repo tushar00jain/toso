@@ -165,6 +165,9 @@ realsim/
                   one place that executes
   tools/          check_contract.py: the concurrency + plane-separation lint
                   check_structure.py: the shape of a sim package
+                  parity.py: every run of every scenario over a knob matrix, one
+                  diffable line each (fingerprint + headline metrics) -- what says
+                  whether a change moved a number, by diffing two checkouts' output
   tests/          seams smoke, determinism, contract lint, off-sim correctness,
                   perf guard, composability, mesh wiring, the shared plane types
 putget_sim/     the unrouted put/get burst (no control plane, no data plane) -- the m x
@@ -182,17 +185,24 @@ proposed/       every contract that outlives the simulator; imports nothing
                   the clock. Built over a Controller, and reads it through
                   locate_raw alone -- once per decision that pins it (pinned),
                   or live (locate_live) for a caller needing the directory now
-  deployment.py   Deployment -- how data-plane code reaches its store and the one
+  deployment.py   Deployment -- how data-plane code reaches its store, the one
                   control plane it asks (control_plane_handle, whatever that plane
-                  declares); and each service as a caller reaches it -- Controller,
+                  declares) and another node's data plane (plane_handle, for whoever
+                  follows an address one of them answered with); and each service as
+                  a caller reaches it -- Controller,
                   StorageVolume and Sensor (facts a decision reads, the load a
                   store cannot see, reached only in the process that holds it)
   dispatch.py     Dispatcher -- where a host's facts arrive, and one action, every
                   reducer that folds its type, one commit, and one payload-free
                   wake at it. Holds no state itself
   plane.py        ControlPlane -- attach(view) + dispatcher, the one a run puts a
-                  service in front of; DataPlane -- attach(deployment),
+                  service in front of; DataPlane -- attach(deployment), routes,
                   and no verbs: what a capability does is its own to name
+  routed.py       routed() -- a data plane declaring that a member may answer with
+                  the ADDRESS of the host a request belongs on, and where in that
+                  answer it is; RoutedPlane -- a caller that calls the member again
+                  there, over plane_handle, so nobody writes the following and no
+                  host holds a peer (peerless)
   cost.py         TransferCost -- what a fetch is predicted to cost
   topology.py     Endpoint / Tier / locality -- where a volume is
 domain/

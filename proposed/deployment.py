@@ -309,6 +309,20 @@ class Deployment(Protocol):
         """
         ...
 
+    def plane_handle(self, node_id: str) -> Any:
+        """A reference to ``node_id``'s **data plane**: the calls a caller makes.
+
+        The sibling of :attr:`control_plane_handle`, and untyped for its reason: what
+        a caller holds is a reference, one endpoint per member the plane declares, and
+        Monarch declares that shape. Read the argument lists off the plane.
+
+        Here for whoever follows an address a plane answered with -- a caller, never
+        another host (:func:`proposed.routed.routed`,
+        :class:`proposed.routed.RoutedPlane`).
+        A plane that redirects nobody needs nothing here.
+        """
+        ...
+
     @property
     def controller_handle(self) -> Any:
         """A reference to the directory service: the calls a caller makes.

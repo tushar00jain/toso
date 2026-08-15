@@ -39,6 +39,20 @@ New fidelity/perf features default to the historical behavior (`contention="none
 `collapse_charges=False`, `real_directory=True`, `trace=True`) so the default path
 stays byte-identical and nothing changes unless a run opts in.
 
+## Verification: a measurement you will make twice is a file, not a heredoc
+A one-off question ("does this attribute exist") is an inline script. A measurement
+you will repeat — a metric sweep, a parity check between two trees — is a saved
+script, uniquely named and overwritten deliberately; re-deriving it each time is how
+it drifts, and a stale one silently answers the wrong question.
+
+A measurement that checks a repo invariant belongs in `realsim/tools/`, run by
+`python -m`, printing a stable diffable report and knowing nothing about which
+checkout it runs in — comparing two trees is then `diff` of two runs. A measurement
+that must always hold is a test, not a tool.
+
+Print the assertion, not the evidence: a full metrics dump answering "did the
+fingerprint move" costs more to read than the answer is worth.
+
 ## Prose: the docs serve the code, not the other way round
 Comments and docstrings exist to make the code faster to read. Prose that does not
 do that is deleted, not shortened.

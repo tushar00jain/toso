@@ -38,6 +38,11 @@ simulator, ``proposed`` is the design being argued for.
   :class:`~proposed.dispatch.Reducer` that folds its type, and one commit, at which
   whoever is waiting is woken and re-reads. It stores nothing itself, and no reducer
   can reach another's state;
+* :mod:`proposed.routed` -- :func:`~proposed.routed.routed`, how a data plane says
+  that a member may answer with the *address* of the host a request belongs on and
+  where in that answer it is, and :class:`~proposed.routed.RoutedPlane`, a caller that
+  goes there over :meth:`~proposed.deployment.Deployment.plane_handle`. The reroute is
+  the server's decision; following it is nobody's to write twice;
 * :mod:`proposed.view` -- :class:`~proposed.view.View`, the read-only observation a
   control plane senses through: who holds a key, where volumes are, what time it is,
   and whatever sensors a capability composes onto it -- one
@@ -63,9 +68,10 @@ from .deployment import (
 )
 from .dispatch import Action, Dispatcher, Reducer, Stored
 from .plane import ControlPlane, DataPlane
+from .routed import routed, RoutedPlane
 from .selector import DecisionLog, AnySelector, KeySelector, Selection
 from .topology import Endpoint, locality, nearest, Tier, TIER_LABEL
-from .view import Sensed, SensorView, View
+from .view import LoadView, Sensed, SensorView, View
 
 __all__ = [
     # the torchstore ask
@@ -78,6 +84,7 @@ __all__ = [
     "View",
     "SensorView",
     "Sensed",
+    "LoadView",
     "Action",
     "Dispatcher",
     "Reducer",
@@ -95,5 +102,7 @@ __all__ = [
     "Deployment",
     "ControlPlane",
     "DataPlane",
+    "routed",
+    "RoutedPlane",
     "TransferCost",
 ]

@@ -20,7 +20,7 @@ handed a port and this supplies the implementation. It is why the store below is
 built with nothing but the deployment -- what a KV block *is* arrives at the store
 as an argument, from the accelerator, per request. The other two are the client:
 :func:`_affinity` decides which host a request lands on and :class:`_Client` takes
-it there and follows the redirects it gets back. Production has a client SDK, an
+it there and holds the dialogue. Production has a client SDK, an
 ingress proxy or DNS doing that, none of which is part of the serving system --
 which is why they are here rather than in ``data/``, whose test for membership is
 whether a thing advances the clock or moves bytes, and whose contents are what
@@ -31,25 +31,23 @@ its machines either: the **user**. A conversation's turns are serial because a
 reply cannot be written before the answer arrives, so somebody has to hold the
 dialogue open between them, and it is the caller.
 
-The client is where the request's itinerary lives
--------------------------------------------------
-A serving host answers with an *address* rather than acting on it: the host a
-request lands on says which host should prefill it, and that host says which host
-will decode it (see :mod:`kvcache_sim.data.serving`). Somebody has to walk that
-chain, and it is the same somebody who walks a ``307`` -- the client. So
-:class:`_Client` makes three calls per request where the old wiring made one and
-let the hosts call each other twice, and it reaches each host through a
-:class:`~realsim.seams.link.LocalEndpoint` over a shared
-:class:`~realsim.seams.link.ServiceHop`, so those three round trips are charged
-(:attr:`sim_common.config.SimConfig.client_rtt`, ``0.0`` by default, which keeps a
-hop inline and the run byte-identical).
+What the client does *not* hold is the addresses
+-----------------------------------------------
+A serving host answers with an *address* when the work belongs somewhere else, and says
+in its own declaration where in that answer the address is
+(:mod:`kvcache_sim.data.serving`), so going there is machinery: a
+:class:`~proposed.routed.RoutedPlane` over
+:meth:`~proposed.deployment.Deployment.plane_handle`, calling the same member at the
+host it was sent to. Every call it makes crosses the client-to-host boundary and is
+charged there (:attr:`sim_common.config.SimConfig.client_rtt`, ``0.0`` by default, which
+keeps a hop inline and the run byte-identical), so a turn costs two round trips, or
+three when its prefill answers with an address -- and never more, because the host that
+address names is told the decision that was already made rather than making its own.
 
-Walking the chain is also what makes the client the only thing that can time the
-request end to end, so it does: the last leg returns at the last token, and the
-client stamps ``now - request.arrival`` onto the row. That replaced a drain pass
-the run used to need -- when decode outlived the request's coroutine, something
-had to keep the loop alive for the tail, and nothing was left holding the request
-to measure it.
+What is left is the client's own, and it is two things: which host a turn lands on
+(:func:`_affinity`), which no host can answer, and the end-to-end stamp. The last
+call returns at the last token, so the caller is the one participant present at both
+ends -- and server-side timing is a different number.
 
 They are two functions because they are the two halves. The plane factory does not
 build the scheduler; it takes ``sim.control_plane_handle`` and
@@ -68,12 +66,10 @@ from typing import Callable, Dict, List, Optional
 from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
-from proposed import ControlPlane, Endpoint, KeySelector
+from proposed import ControlPlane, Endpoint, KeySelector, RoutedPlane
 from realsim.runner import ItemDispatch, WorkItem
-from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.simulation import Simulation
 from realsim.run import Workload
-from sim_common import config
 
 from ..control._sensor import ClusterSensor
 from ..control._selector import LongestPrefixKeySelector
@@ -203,31 +199,6 @@ def scheduler(
     return LoadBalanceScheduler(**knobs)
 
 
-class _ServingEndpoints:
-    """One serving host as a **client** reaches it: endpoint-shaped, hop-charged.
-
-    Standing in for whatever a client SDK holds for a serving instance -- a
-    connection, a stub, a Monarch handle over its actor -- as one
-    :class:`~realsim.seams.link.LocalEndpoint` per member, over a shared
-    :class:`~realsim.seams.link.ServiceHop`. A client is off the box, so reaching a
-    host is a boundary like reaching the directory or the control plane and is
-    charged like one: free by default, so a run that does not ask for the fidelity
-    is byte-identical.
-
-    All three of a host's members are here, because the client calls all three --
-    that is what a redirect chain is. Nothing else in the run holds one of these:
-    hosts do not, which is the whole point of the redirect model. This class
-    replaces the peer handle a host used to be given, and it is deliberately not
-    the same object under a new name: what changed is not the shape of the
-    reference but *who* is entitled to hold one.
-    """
-
-    def __init__(self, host: ServingHost, hop: ServiceHop) -> None:
-        self.route = LocalEndpoint(host.route, hop)
-        self.prefill = LocalEndpoint(host.prefill, hop)
-        self.decode = LocalEndpoint(host.decode, hop)
-
-
 def _affinity(ids: List[str]) -> Callable[[Request], str]:
     """Which host a request lands on: same conversation, same host.
 
@@ -261,38 +232,28 @@ def _affinity(ids: List[str]) -> Callable[[Request], str]:
 
 
 class _Client:
-    """The thing outside the cluster that holds a conversation and follows redirects.
+    """The thing outside the cluster that holds a conversation and times its turns.
 
     Stands in for what a deployment already has in front of its hosts -- a client
     SDK doing client-side balancing, an ingress proxy, DNS -- and therefore for
-    something that is deleted rather than moved when this ships. It holds no selector
-    of its own beyond ``landed``, and it never asks where a request should *run*:
-    it asks a host, and does what it is told.
+    something that is deleted rather than moved when this ships. It never asks where
+    a request should *run*: it calls the host the request landed on and is sent
+    wherever that host says (:class:`~proposed.routed.RoutedPlane`).
 
     It stands in for one more thing, and that one has no server-side counterpart at
     all: the **user**. A conversation is a turn, an answer, a pause, and another
     turn, and the only participant present for all four is the caller. So
-    :meth:`submit` is a loop over a dialogue's turns and :meth:`_turn` is the
-    single-request walk that used to be the whole object.
+    :meth:`submit` is a loop over a dialogue's turns and :meth:`_turn` is one turn.
 
-    Three legs per turn, which is nearly the rest of it::
-
-        answer = await hosts[landed(request)].route(request)   # "prefill is B"
-        decode, first = await hosts[answer.prefill].prefill(     # "decode is C"
-            request, answer)
-        rest = await hosts[decode].decode(request, answer)       # ...returns at the
-                                                                 # last token
-        metrics.completed(request.id, now - request.arrival, 1 + len(rest))
-
-    The last line is the rest of it, and it is the one measurement this object is
-    entitled to make. A client does not learn the hit rate or the handoff bytes --
-    each host records its own half of those into the run's ledger, and a client
-    that had to be told them would be part of the serving system. But how long the
-    request took is not a fact about a host: it spans two of them and the
-    redirects between, so the only participant present at both ends is the caller,
-    which is also who a latency SLO is written for. Server-side timing and
-    client-side timing are different numbers in every real deployment, and this is
-    the client-side one.
+    Two things are genuinely the caller's, and they are all that is left here. Where
+    a turn lands, because no host can answer that. And how long the turn took, which
+    is not a fact about a host either: it spans two of them and the reroutes
+    between, so the only participant present at both ends is the caller, which is
+    also who a latency SLO is written for. Server-side timing and client-side timing
+    are different numbers in every real deployment, and this is the client-side one.
+    A client learns neither the hit rate nor the handoff bytes -- each host records
+    its own half of those, and a client that had to be told them would be part of the
+    serving system.
 
     The same argument makes it the only thing that holds the whole **answer**. The
     output arrives in two pieces from two machines -- the first token out of the
@@ -303,28 +264,9 @@ class _Client:
     request. The two agree today, and the point is that they are now two numbers
     that could disagree: one is what was asked for and one is what was made.
 
-    That the stamp is even possible is what the decode leg's shape now buys. It
-    used to answer at *admission* -- the batch stepped on afterwards as its own
-    task -- so this coroutine returned long before the last token and the run
-    needed a separate drain pass to keep the loop alive for the tail. Now the leg
-    answers when the request is done, so waiting for the answer and waiting for
-    the run to finish are the same act, and the drain is gone rather than
-    replaced.
-
-    Note what it carries: the request it made, and beside it the
-    :class:`~kvcache_sim.control.scheduler.Response` control issued -- exactly the
-    kind of thing a client is handed and hands back (a routing token, a session
-    ticket) and which nothing here reads for a decision.
-
-    It also does not second-guess an address. ``prefill`` answers with the decode
-    host rather than the client reading ``response.decode``, because whether there is a
-    next leg at all is the serving host's answer and not a field to interpret --
-    ``None`` means the journey ends here.
-
     Args:
-        hosts: ``instance id -> _ServingEndpoints``. References, not objects: a
-            client is off the box, so each of the three legs is a charged round
-            trip rather than a free method call.
+        plane: the run's serving hosts as a caller reaches them, each call a charged
+            round trip rather than a free method call.
         landed: which host a request arrives at.
         metrics: the run's ledger, written to exactly once per *completed*
             request and never read. Not a hop: the stamp is taken on this side of
@@ -334,11 +276,11 @@ class _Client:
 
     def __init__(
         self,
-        hosts: Dict[str, _ServingEndpoints],
+        plane: RoutedPlane,
         landed: Callable[[Request], str],
         metrics: Metrics,
     ) -> None:
-        self.hosts = hosts
+        self.plane = plane
         self.landed = landed
         self.metrics = metrics
 
@@ -374,32 +316,25 @@ class _Client:
             await self._turn(replace(turn.request, arrival=loop.time()))
 
     async def _turn(self, request: Request) -> None:
-        """Take one turn through as many hosts as it is redirected to.
+        """Take one turn through as many hosts as it is sent to.
 
         Returns when the turn is finished, which for a run that models decode
         means its last token has landed -- which is also what makes it safe for
-        :meth:`submit` to treat this as "the user now has the answer". Every early
-        return is a journey that ended, not one abandoned: the host that ended it
-        recorded why, and neither leaves anything decoding behind this coroutine.
+        :meth:`submit` to treat this as "the user now has the answer". A turn that
+        ended early ended, it was not abandoned: the host that ended it recorded why,
+        and neither path leaves anything decoding behind this coroutine.
         """
-        answer = await self.hosts[self.landed(request)].route.call_one(request)
-        if answer is None:
-            return  # refused at the door; the host that refused recorded it
-        # The prefill leg answers with both: the first token it produced, and the
-        # address of whoever generates the rest. The token comes back even when the
-        # address does not -- a prefill that happened is a prefill that emitted one.
-        decode, first_token = await self.hosts[answer.prefill].prefill.call_one(
-            request, answer
-        )
-        if decode is None:
-            # Nothing after prefill: no decode modelled, or it was shed. The client
-            # holds one token and the run models no more of this request, so there
-            # is nothing to report -- the same reason the latency below is not
-            # stamped on this path, and not a place to invent a shorter one.
+        prefilled = await self.plane.prefill(request, at=self.landed(request))
+        if prefilled is None or prefilled.decode is None:
+            # Refused at the door, or a run that models no second half. Either way the
+            # journey ended where a host ended it, and the stamp below belongs to the
+            # requests that produced a last token.
             return
+        # The two halves of the answer, from the two hosts that made them: the first
+        # token out of the prefill's last position, the rest out of the decode batch.
         output = [
-            first_token,
-            *await self.hosts[decode].decode.call_one(request, answer),
+            prefilled.token,
+            *await self.plane.decode(request, prefilled.response, at=prefilled.decode),
         ]
         # Stamped only here, on the one path where a last token exists. A refused
         # request has no end-to-end latency and a prefill-only run has no last
@@ -448,7 +383,6 @@ def serving_plane(
         # control services a host reaches. So each host is handed it and takes
         # what it needs (:meth:`~kvcache_sim.data.serving.ServingHost.attach`) --
         # nothing here plumbs a port.
-        hop = ServiceHop(config.current().client_rtt)
         hosts: Dict[str, ServingHost] = {}
 
         prefills = set(prefill_pool) if prefill_pool else set(sim.ids)
@@ -479,11 +413,12 @@ def serving_plane(
                 models_decode=simulate_decode,
             )
             hosts[instance].attach(sim)
-        # The endpoints exist only on the client side, so there is no cycle to
-        # close: every host was fully constructed above, knowing nothing about any
-        # other, and this loop just gives the client a way to reach each of them.
+            # ...and fronted, so a caller off the box can reach it. There is no cycle
+            # to close: a host knows nothing about any other, and what the service
+            # refuses is precisely a host that did (``proposed.routed.peerless``).
+            sim.front_plane(instance, hosts[instance])
         client = _Client(
-            {i: _ServingEndpoints(h, hop) for i, h in sorted(hosts.items())},
+            RoutedPlane(sim, ServingHost),
             _affinity(sorted(sim.ids)),
             sim.ledger,
         )

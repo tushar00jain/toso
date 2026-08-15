@@ -49,6 +49,8 @@ from sim_common.trace import Trace
 from realsim.mesh import Mesh
 from realsim.seams.control_plane_handle import LocalControlPlaneHandle
 from realsim.seams.control_plane_service import ControlPlaneService
+from realsim.seams.data_plane_handle import LocalDataPlaneHandle
+from realsim.seams.data_plane_service import DataPlaneService
 from realsim.seams.link import ServiceHop
 from realsim.seams.dispatcher_handle import LocalDispatcherHandle
 from realsim.seams.dispatcher_service import DispatcherService
@@ -143,6 +145,11 @@ class Simulation:
         # passes them down to whatever it ranks with.
         self.control_plane_handle: Optional[Any] = None
         self.dispatcher_handle: Optional[Any] = None
+        # What reaching one of this run's *hosts* costs, and one distance for all of
+        # them: a caller is off the box whichever host it is calling. The planes
+        # themselves arrive later (:meth:`front_plane`).
+        self._plane_hop = ServiceHop(config.current().client_rtt)
+        self._planes: Dict[str, Any] = {}
         if control is not None:
             if not isinstance(control, ControlPlane):
                 raise TypeError(
@@ -188,7 +195,8 @@ class Simulation:
     # this one object (:meth:`~proposed.plane.DataPlane.attach`) and finds on it the
     # store to call, the control plane to ask (:attr:`control_plane_handle`, whatever
     # that plane declares) and the dispatcher to report into
-    # (:attr:`dispatcher_handle`).
+    # (:attr:`dispatcher_handle`). A *caller* finds one thing more on it, and no host
+    # does: :meth:`plane_handle`, whichever host an address names.
     def client_for(
         self,
         node_id: str,
@@ -205,6 +213,21 @@ class Simulation:
     def volume_handle(self, node_id: str) -> Any:
         """A reference to ``node_id``'s storage volume."""
         return self.mesh.volume_handle(node_id)
+
+    def front_plane(self, node_id: str, plane: Any) -> None:
+        """Put a service in front of ``node_id``'s data plane, so a caller can reach it.
+
+        The sibling of what ``__init__`` does for the control plane, called from the
+        capability's own wiring instead, because that is where a run's hosts are built
+        -- after the stack they attach to exists.
+        """
+        self._planes[node_id] = LocalDataPlaneHandle(
+            DataPlaneService(plane), hop=self._plane_hop
+        )
+
+    def plane_handle(self, node_id: str) -> Any:
+        """A reference to ``node_id``'s data plane, as a caller off the box holds it."""
+        return self._planes[node_id]
 
     @property
     def controller_handle(self) -> Any:

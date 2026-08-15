@@ -55,9 +55,10 @@ plane's thumb, which is the coupling this split exists to remove.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from proposed.dispatch import Dispatcher
+from proposed.routed import declared, Where
 
 __all__ = ["ControlPlane", "DataPlane"]
 
@@ -75,6 +76,22 @@ class DataPlane:
     What it does need is somewhere to *reach*, which is what :meth:`attach` hands
     over -- the store to call and the control plane to ask, both on one object.
     """
+
+    #: Which of this plane's members may answer with the address of another host, and
+    #: where in that answer it is (:func:`proposed.routed.routed`). Empty -- the
+    #: default -- is a plane that reroutes nobody: ``dedup_sim``'s reads bytes off a
+    #: preferred volume and dispatches no work to a host, so it declares nothing.
+    routes: Dict[str, Where] = {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Collect :attr:`routes` off the class body.
+
+        Here rather than in the decorator, which returns the member unchanged and
+        never sees the class it lands on -- and by the time there is a class the
+        attribute may be Monarch's ``@endpoint`` descriptor rather than the function.
+        """
+        super().__init_subclass__(**kwargs)
+        cls.routes = declared(cls)
 
     def attach(self, deployment: Any) -> None:
         """Receive the deployment this plane executes against. Default: nothing.

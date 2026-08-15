@@ -59,11 +59,13 @@ the hosts are what keep it true: every other fact in it comes from them, as acti
 dispatched into the one dispatcher the run fronts with a service
 (:attr:`_Scheduler.dispatcher`).
 
-An accepted decision goes the same way, as one
+A decision that names the host it was asked by goes the same way, as one
 :class:`~kvcache_sim.control._sensor.Committed` (:meth:`_Scheduler._admit`) folded into
 each sensor it moves: the cluster sensor holds the prefill instance the plan spoke for,
 the reservation sensor stands in for a request no host can report yet, and the routed
-one remembers the peer the pull was priced against. A run that judges the TBT SLO
+one remembers the peer the pull was priced against. One that names somebody else is an
+address and writes nothing, so a request passed from host to host is priced once per
+host and booked once, by the one that serves it. A run that judges the TBT SLO
 against the occupancy observed now composes no reservation sensor at all, so that same
 action promises nothing and the two halves of the prediction cannot come apart.
 
@@ -93,7 +95,7 @@ from ._selector import (
 )
 from ._sensor import (
     ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
-    ReservationSensor, RoutedPullSensor,
+    ReservationSensor, RoutedPullSensor, SourceLoad,
 )
 from ._view import KVView
 from .request import Request
@@ -219,6 +221,16 @@ class _Scheduler(ControlPlane):
         )
         self._prefill_pool = prefill_pool
         self._decode_pool = decode_pool
+        #: Requests this plane has sent to another host, and the answer it sent them
+        #: with. Private, because the only thing that reads it is the next ask about
+        #: the same request (:meth:`decide`) and this is what wrote it: state with one
+        #: reader that is also its writer is not something to sense.
+        #:
+        #: Only a decision that *moves* a request is kept -- one that names the host
+        #: that asked is served in that same call, so no second ask about it is coming
+        #: -- which gives every entry exactly one reader and needs no clock to forget
+        #: by.
+        self._placed: Dict[str, Response] = {}
         self.slo_ttft = slo_ttft
         self.slo_tbt = slo_tbt
         self.tbt_enabled = simulate_decode
@@ -286,7 +298,7 @@ class _Scheduler(ControlPlane):
         the only thing that writes any of them (:attr:`dispatcher`). Which is where the
         reservation's condition lives: a run that does not predict composes no
         reservation sensor, so the same :class:`~kvcache_sim.control._sensor.Committed`
-        every accepted decision dispatches reserves nothing -- the flag is spent on the
+        a serving decision dispatches reserves nothing -- the flag is spent on the
         wiring, and no fold reads it.
         """
         self.topo = dict(view.topology)
@@ -297,11 +309,12 @@ class _Scheduler(ControlPlane):
             cluster = ClusterSensor(self.ids)
         reserved = ReservationSensor() if self._lookahead else None
         routed = RoutedPullSensor()
+        load = SourceLoad()
         self.view = view.derived(
-            KVView, cluster=cluster, reserved=reserved, routed=routed,
+            KVView, cluster=cluster, reserved=reserved, routed=routed, load=load,
         )
         self.dispatcher = Dispatcher()
-        for sensor in (cluster, reserved, routed):
+        for sensor in (cluster, reserved, routed, load):
             # ``None`` is a sensor this run does not hold, so nothing folds for it.
             if sensor is not None:
                 self.dispatcher.compose(sensor)
@@ -337,6 +350,7 @@ class _Scheduler(ControlPlane):
         Settled before it travels, like any answer this plane gives: neither link
         gates, so there is nothing to wait for, and saying so here is what keeps that
         a property of the ranking rather than of the caller.
+
         """
         return await (await self._fetch.select(list(keys), requester)).settled()
 
@@ -351,16 +365,28 @@ class _Scheduler(ControlPlane):
         ``None`` is an SLO miss. There is no host this request may run on, and the
         refusal costs nothing because nothing has run.
 
-        ``requester`` is the host the request landed on. Nothing that ranks, prices or
-        holds a *candidate host* to an SLO reads it -- where a request should run is a
-        fact about the cluster, not about who was asked. Every ranking is handed it
-        because every selector is, and only the reuse ranking has a use for it: it is
-        the answer to that ranking's own question, "who wants these bytes". The
-        candidate under test is what the tests behind that ranking are handed.
+        ``requester`` is the host asking, and nothing that ranks, prices or holds a
+        *candidate host* to an SLO reads it -- where a request should run is a fact
+        about the cluster, not about who was asked, so two hosts asking about one
+        request are answered the same way by an unchanged cluster. Every ranking is
+        handed it because every selector is, and only the reuse ranking has a use for
+        it: it is the answer to that ranking's own question, "who wants these bytes".
+        The candidate under test is what the tests behind that ranking are handed.
+
+        Asked **once per request**, however many hosts the request is passed through: a
+        decision that moves it is recorded as it is booked (:attr:`_placed`), and the ask
+        from the host it names is answered with it rather than priced again. Which is what settles a request: pricing again would
+        price a cluster this decision has already booked, so the host just chosen reads
+        as busier and the answer could move -- a request rerouted by its own booking. A
+        request admitted once is also not judged again, so "a refusal costs nothing
+        because nothing has run" stays true of the one ask that can refuse.
         """
+        placed = self._placed.pop(request.id, None)
+        if placed is not None:
+            return placed
         prefill = await self._select_prefill(request, requester)
         decode = await self._select_decode(prefill.winner, requester)
-        return self._admit(request, prefill, decode)
+        return self._admit(request, requester, prefill, decode)
 
     async def _select_prefill(self, request: Request, requester: str) -> Selection[Plan]:
         """Every prefill instance, priced and ranked best first.
@@ -509,6 +535,7 @@ class _Scheduler(ControlPlane):
     def _admit(
         self,
         request: Request,
+        requester: str,
         prefill: Selection[Plan],
         decode: Selection[int],
     ) -> Optional[Response]:
@@ -539,18 +566,26 @@ class _Scheduler(ControlPlane):
         # A run that does not model decode has no batch to hold to a TBT SLO.
         if self.tbt_enabled and response.pred_tbt > self.slo_tbt:
             return None
-        # Accepted, so it is dispatched: one action, folded into every sensor it
-        # moves -- the cluster holds the instance the plan spoke for, the reservation
-        # stands in for a request the observed decode state cannot show until its
-        # prefill lands, and the routed pull remembers the peer it was priced against
-        # for when the fetch asks
-        # (:class:`~kvcache_sim.control._selector.RoutedPull`). Each fold writes its own
-        # sensor and reads no other, so their order is unobservable.
+        # Accepted, so it is dispatched: one action, folded into every sensor it moves
+        # -- the cluster holds the instance the plan spoke for, the reservation stands
+        # in for a request the observed decode state cannot show until its prefill
+        # lands, the routed pull remembers the peer it was priced against for when the
+        # fetch asks (:class:`~kvcache_sim.control._selector.RoutedPull`). Each fold
+        # writes its own sensor and reads no other, so their order is unobservable.
+        #
+        # At the instant the decision is made, which is what a booking has to be: a
+        # request placed here holds this instance from now, so nothing decided after it
+        # prices against a queue that does not hold it yet.
         #
         # The synchronous half, not the endpoint a host reports over: control is in the
         # same process, and nothing in this method may suspend -- an ``await`` here
         # would let a second decision interleave with a half-committed one.
         self.dispatcher.dispatch_sync(Committed(response, request.output_tokens))
+        if response.prefill != requester:
+            # ...and where this request was sent, for the one ask that follows it
+            # (:attr:`_placed`). Beside the commit and not in it: nothing outside this
+            # plane reads it, so nothing outside this plane needs to hear about it.
+            self._placed[request.id] = response
         return response
 
 

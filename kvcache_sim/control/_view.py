@@ -16,14 +16,17 @@ takes the one it needs:
   prediction of a run that rolls occupancy forward, and composed in only by such a run;
 * :class:`RoutedView`: the pulls a decision priced against a peer
   (:class:`~kvcache_sim.control._sensor.RoutedPullSensor`), read by the fetch chain's
-  head link alone (:class:`~kvcache_sim.control._selector.RoutedPull`).
+  head link alone (:class:`~kvcache_sim.control._selector.RoutedPull`);
+and one more the store's own surface declares, because what it holds is a *volume's*
+load rather than anything KV-shaped: :class:`~proposed.view.LoadView`, carrying this
+plane's :class:`~kvcache_sim.control._sensor.SourceLoad`.
 
 Each names its sensor with a :class:`~proposed.view.Sensed` attribute, so composing one
 in is a name in a class statement and nothing else moves. They are disjoint: different
 selectors read different ones and none of them touches another's, which is what makes
 sensing any of them ambiently safe.
 
-All four are *observed state* -- this plane's own sensors as much as the directory --
+All five are *observed state* -- this plane's own sensors as much as the directory --
 so whatever ranks, prices or gates senses it here instead of being handed the sensor. A
 *write* does not come this way at all: every one is an action dispatched into the
 plane's :class:`proposed.dispatch.Dispatcher`, whether a host reported it or the plane's
@@ -36,7 +39,7 @@ local matches, once per candidate when it asks the source
 them must see the *same* directory state or the decision is incoherent. The pin is on
 the directory read those runs are derived from, so the scheduler names the keys once
 (:meth:`~kvcache_sim.control.scheduler._Scheduler._select_prefill`) and nothing here
-carries a snapshot of its own. The other three are live: they move only when a fact is
+carries a snapshot of its own. The other four are live: they move only when a fact is
 folded or a decision commits, and neither happens inside a pin.
 """
 
@@ -44,7 +47,7 @@ from __future__ import annotations
 
 from typing import AbstractSet, Dict, Sequence
 
-from proposed import Sensed, SensorView, View
+from proposed import LoadView, Sensed, SensorView, View
 
 __all__ = [
     "prefix_lengths_of",
@@ -145,7 +148,7 @@ class RoutedView(SensorView):
     routed = Sensed("routed-pull")
 
 
-class KVView(PrefixView, ClusterView, ReservedView, RoutedView):
+class KVView(PrefixView, ClusterView, ReservedView, RoutedView, LoadView):
     """Every read a KV-cache decision makes, over the run's ports.
 
     Each is optional and independent, so a caller wanting the prefix runs alone

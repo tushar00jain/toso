@@ -27,7 +27,7 @@ It runs the scheduling/decode/cache algorithm on the **real** pieces via `realsi
 - **Real tensors at both ends of the request, too.** A `Request` carries its **prompt**
   (one `device="meta"` `int64` per prompt token), `Accelerator.prefill(prompt, cached)`
   takes it and answers with the KV *and* the request's **first token**, and each decode
-  step emits one token per batch member — so the client that walks the redirect chain
+  step emits one token per batch member — so the client that follows the addresses
   receives the whole output, first token from the prefill host and the rest from the
   decode host, and the run *counts* what it produced instead of reporting the
   `output_tokens` the workload asked for. One thing that deliberately does **not**
@@ -138,25 +138,34 @@ directory** (publish → `locate_volumes` → evict), on the outcome (hit rate, 
 eviction bounds, rejections, TBT), and on byte-identical traces across runs -- never
 on wall-clock timing.
 
-## A request is redirected, not forwarded
+## A request is rerouted, not forwarded
 
 No serving host calls another serving host. A host answers with an *address* and the
 client goes there:
 
 ```
 client -> A          "serve this" (a prompt tensor)
-A      -> client     "prefill is B"     # A asks the coordinator; A does not call B
-client -> B          B prefills, publishes its KV blocks to the store
+A      -> client     "not here: B"     # A asks the coordinator; A does not call B
+client -> B          B asks, is told what A was told, prefills, publishes its KV
 B      -> client     the FIRST token + "decode is C"
 client -> C          C fetches that KV back out of the store, decodes, finishes
 C      -> client     the remaining tokens   # at the LAST token, not at admission
 ```
 
+`prefill` is one member doing both: it asks the coordinator, and either answers with
+another host's address or serves the request in that same call. The ask that moves a
+request books it **and** records where it sent it, so B's ask is answered with A's
+decision instead of pricing a second one — one pricing, one booking, one reroute,
+however far away a host or the coordinator is. Pricing it again would read a cluster
+that booking has already moved, find the chosen host busier than it was, and send the
+request on again: a request rerouted by its own booking.
+
 Five consequences, and they are the reason for the shape:
 
 - **A host's whole outward surface is the store and the coordinator.** There is no
   peer lookup and nothing to wire up after all the hosts exist. `workload/_serving.py`
-  holds the client that walks the chain, which is where a client belongs.
+  holds the client that follows the addresses, which is where a client belongs -- and
+  following them is `proposed.routed`'s, declared by the member that answers with one.
 - **No measurement row crosses a host boundary.** Each host records what *it* did into
   the run's ledger (`report/metrics.py`), keyed by request id, and the ledger joins the
   two halves — the prefill host's routing/reuse/publish facts and the decode host's
@@ -183,15 +192,17 @@ Five consequences, and they are the reason for the shape:
 The only calls a "serving engine" makes are:
 
 ```python
-answer = await control.decide(request, me)             # route; None => rejected
+answer = await control.decide(request, me)             # None => rejected
 ...                                                    # pull remote prefix + prefill
 await store.publish(me, fresh, kv)                     # cache fill + decode handoff
 await dispatcher.dispatch(PrefillFinished(me, now))
 ```
 
-One question, asked once: the answer names the prefill host *and* the decode host, so
+One question, and its answer names the prefill host *and* the decode host, so
 everything a request needs is settled before any of it runs and no refusal can cost
-a prefill. Behind it are two selections -- the prefill hosts control priced and the
+a prefill. Every host the request is passed to asks it for itself, and the ask that
+*moves* the request is the one that prices it: it books the decision and records it, so
+the host it names is answered with the same one. Behind it are two selections -- the prefill hosts control priced and the
 decode hosts it ranked against the winner among them -- and what comes back is the
 winner of each plus the price of the one that won (a `Response`). `None` is the
 refusal.
@@ -258,13 +269,18 @@ kvcache_sim/
                           #     true, and nothing else. One per run, built in
                           #     attach(), written only by the fold it publishes,
                           #     and read by everything that ranks hosts by load
-      _pending.py         #     ReservationSensor / RoutedPullSensor: what this
-                          #     plane decided and has not yet seen carried out,
-                          #     both folded from the one Committed action. Each
-                          #     expires on its own terms, when read -- so no
-                          #     decision method carries a sweep. Only a run that
-                          #     predicts composes the reservation sensor, which
-                          #     is the whole of the condition on a reservation
+      _pending.py         #     ReservationSensor / RoutedPullSensor /
+                          #     PlacementSensor: what this plane decided and has
+                          #     not yet seen carried out, all folded from the one
+                          #     Committed action. Each expires on its own terms,
+                          #     when read -- a clock for a reservation, the fetch
+                          #     that claims a pull, the ask from the host a
+                          #     placement names -- so no decision method carries a
+                          #     sweep. Only a run that predicts composes the
+                          #     reservation sensor, which is the whole of the
+                          #     condition on a reservation. The placement is what
+                          #     makes a rerouted request's second ask an answer
+                          #     rather than a second pricing
     _view.py              #   KVView: what a decision senses, one class per read
                           #   and each a proposed.View -- prefix runs (a pure
                           #   function of the directory read one routing decision
@@ -282,15 +298,21 @@ kvcache_sim/
                           #   derived from the prompt -- a meta tensor has no
                           #   content to hash -- so they are generated with it
   data/                   # EXECUTES -- advances the clock, moves bytes
-    serving.py            #   one ServingHost per instance, as three things a
-                          #   client asks it: route (which host should prefill
-                          #   this -- answered with an address, not a forward),
-                          #   prefill (real pull, compute, publish -> answered
-                          #   with the FIRST token and the decode host's address)
-                          #   and decode (fetch the KV back out of the store and
-                          #   become resident for it, batch it -> answered with
-                          #   the remaining tokens, publish what they left). No
-                          #   host holds a reference to another host
+    serving.py            #   one ServingHost per instance, as two things a
+                          #   client asks it: prefill, which asks control where the
+                          #   request belongs and either answers with that ADDRESS
+                          #   (not a forward) or serves it here -- real pull,
+                          #   compute, publish -> the FIRST token and the decode
+                          #   host's address; and decode (fetch the KV back out of
+                          #   the store and become resident for it, batch it ->
+                          #   answered with the remaining tokens, publish what they
+                          #   left). No host holds a reference to another host, and
+                          #   one ask prices and books a request however many hosts
+                          #   read the decision (the ask that moves it records it
+                          #   for the host it names -- control/_sensor/_pending.py):
+                          #   prefill carries a proposed.routed declaration naming
+                          #   where in its answer that address is, and the caller
+                          #   goes there
     _compute.py           #   Accelerator: the port an engine runs its work on --
                           #   what it costs, making it take that long, the KV and
                           #   first token a forward pass over a prompt hands back,
@@ -331,7 +353,11 @@ kvcache_sim/
     _serving.py           #   KVWorkload (one work item per conversation) +
                           #   serving_plane, the wiring a run installs around it,
                           #   incl. the client that walks a dialogue's turns one
-                          #   at a time and follows the two redirects each gets
+                          #   at a time. Two things are the caller's own and both
+                          #   are here: where a turn lands, and the
+                          #   arrival-to-last-token stamp. The addresses it is
+                          #   answered with are followed by a RoutedPlane over
+                          #   the hosts the run fronts
     scenarios.py          #   the six Scenarios: each declares its Runs over one
                           #   request stream, and narrates the results
   report/                 # OUTCOME METRICS
@@ -539,7 +565,8 @@ plus the prefix-run read that express KV caching on a mesh.
   and the day a stopping rule or a preemption exists it is the answer.
 - **The client hops are free by default**, and are the only hops a request's journey
   has besides the coordinator's and the directory's: `TOSO_CLIENT_RTT` prices one
-  client↔host round trip, and a request makes three of them (route, prefill, decode).
+  client↔host round trip, and a request makes two of them (a prefill that serves, a
+  decode) plus one per reroute.
   Same caveat as the directory hop: TTFT is a prediction made before any of it is
   paid, so client latency shows up in the wall clock and in later requests' queue
   waits, not in the TTFT column.

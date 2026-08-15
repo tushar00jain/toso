@@ -180,6 +180,7 @@ PUBLIC_ANYWAY: Dict[str, str] = {
     "realsim/run.py": "Workload/Run/Result/Report/execute -- the run lifecycle",
     "realsim/tools/check_contract.py": "a CLI (python -m ...)",
     "realsim/tools/check_structure.py": "a CLI (python -m ...)",
+    "realsim/tools/parity.py": "a CLI (python -m ...)",
     "sim_common/engine.py": "the ancestor callback DES, kept as reference",
     "sim_common/diverge.py": "a divergence-bisection tool for debugging a run",
     "sim_common/config.py": "the ambient run config every leaf reads",
