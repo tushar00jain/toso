@@ -343,29 +343,32 @@ class SensorView(View):
 
 
 class LoadView(SensorView):
-    """How much work has been sent at each volume: :attr:`load`.
+    """How much work is on each volume: :attr:`load`.
 
     The one read this package names a sensor for, because the subject is a *volume* and
     the number is nobody's model of anything -- which is what the discussion above
     leaves ``load()`` out for. What it carries is the application's own sensor, as every
     :class:`Sensed` attribute does; what a caller may ask of it is one member:
 
-        ``named() -> Mapping[VolumeId, int]``
+        ``named() -> Mapping[VolumeId, <whatever this application measures>]``
 
-    -- how many decisions have named each volume as a source. Absent means none.
+    -- a count of decisions, a queue ratio, bytes in flight. The **unit is the
+    application's**, since it is the application's sensor reporting it and the
+    application's own fold that reads it (:class:`proposed.selector.Balance` appends this
+    number to the key of a ranking that cannot separate two sources, and what to make of
+    it is the fold's). Absent means none.
 
-    Read by :class:`proposed.selector.Discount`, which spreads reads over sources a
-    ranking cannot separate, and written by whoever decides: a plane dispatches the
-    decision it commits, and the fold that counts the source it named is the one write
-    this observation has.
+    Written by whoever decides: a plane dispatches the decision it commits, and the fold
+    that moves the number for the source it named is the one write this observation has.
 
-    **It counts decisions, not reads.** A volume named by a decision has work coming to
-    it; nothing here says how much, how long it took, or that it is over, so the count
-    stands above what a volume is actually serving and never comes down. What would say
-    otherwise is the read itself, reported by the data plane that made it -- a fetch
-    beginning and ending against a volume, which is what turns this from a count of
-    intentions into an occupancy. That measurement is the remaining work, and it belongs
-    on this same attribute rather than beside it.
+    **What both sensors in this repo report is decisions, not reads.** A volume named by
+    a decision has work coming to it; a count says nothing about how much, how long it
+    took, or that it is over, so it stands above what a volume is actually serving and
+    comes down only when a route is dropped. What would say otherwise is the read
+    itself, reported by the data plane that made it -- a fetch beginning and ending
+    against a volume, which is what turns a count of intentions into an occupancy. That
+    measurement is the remaining work, and it belongs on this same attribute rather than
+    beside it.
     """
 
     load = Sensed("load")

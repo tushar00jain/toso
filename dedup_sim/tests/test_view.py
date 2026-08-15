@@ -3,8 +3,8 @@
 The fan-out tree is a sensor both links reach through the view they are attached to
 (:mod:`dedup_sim.control._selector`), composed once in
 :meth:`dedup_sim.control.routing.Dedup.attach`. Two failures have to be loud rather
-than quiet: reading it when nobody composed it, and re-ranking a link whose answer
-was already spent.
+than quiet: reading it when nobody composed it, and a link losing its own read when a
+combinator narrows the view above it.
 
 Run from the repo root::
 
@@ -17,11 +17,11 @@ import asyncio
 
 import pytest
 
-from dedup_sim.control._selector import PlannedPeer
+from dedup_sim.control._selector import Candidates
 from dedup_sim.control._sensor import FanoutSensor
-from dedup_sim.control._view import FanoutView
-from proposed import Dispatcher
-from proposed.selector import Discount, FirstMatch
+from dedup_sim.control._view import DedupView
+from proposed import Endpoint
+from proposed.selector import Balance, FirstMatch
 from proposed.view import View
 
 
@@ -39,9 +39,27 @@ class _Holds:
         return {key: {self.volume: None} for key in keys}
 
 
+#: What a view is built over. The chain reads no tier off it -- a hop costs what the
+#: cost model below says -- so nothing these stage turns on the endpoints.
+_TOPOLOGY = {
+    v: Endpoint(id=v, host=v, node=v) for v in ("origin", "r0", "r1")
+}
+
+
+def _hop(src_id: str, dst_id: str, nbytes: int) -> float:
+    """The origin far and the peers near: the shape a chain forms in, staged.
+
+    A ranking in seconds needs a price for a hop, and what makes a peer worth reading
+    from is that its link is the cheaper one.
+    """
+    if src_id == dst_id:
+        return 0.0
+    return 10.0 if src_id == "origin" else 1.0
+
+
 def _view(directory=None, **sensors):
     """A view over ``directory``, or over none where nothing reads one."""
-    return View(directory, {}).derived(FanoutView, **sensors)
+    return View(directory, _TOPOLOGY, _hop).derived(DedupView, **sensors)
 
 
 def test_a_fanout_nobody_composed_raises():
@@ -62,30 +80,22 @@ def test_a_composed_fanout_answers_for_itself():
     assert composed.fanout.planned("r0") is None      # nothing routed yet
 
 
-def test_a_link_that_spends_a_slot_cannot_be_re_ranked():
-    """The hazard the chain's shape exists to prevent, asserted mechanically.
+def test_the_ranking_still_senses_the_fanout_under_a_re_ranking():
+    """A combinator narrows the view, and the ranking under it must keep its own read.
 
-    Answering consumes a fan-out slot, so a combinator that could reorder or drop that
-    answer would spend the slot and hand the requester a source nothing planned. A
-    reducer prices nothing, and a discount is arithmetic on a price, so the wrapping is
-    refused the moment it answers rather than by a rule a reader has to remember.
+    Load spreading is a :class:`~proposed.selector.Balance` over this ranking, so the
+    ranking is attached to whatever that combinator declared. It declares the ranking's
+    reads as well as its own (:func:`proposed.selector.declares`), or the ranking would
+    be handed a view with no fan-out in it and raise on the first peer it prices.
     """
     fanout = FanoutSensor(fanout_cap=1)
-    fanout.route("r0", "origin")                      # r0 joins, so it has a slot
-    discounted = Discount(PlannedPeer(Dispatcher()))
-    discounted.attach(_view(_Holds("r0"), fanout=fanout))
+    fanout.route("r0", "origin")                      # r0 is a peer, and owes W
+    fanout.promise("r0", ["K"])
+    ranking = Candidates()
+    chain = FirstMatch([Balance(ranking)])
+    chain.attach(_view(_Holds("origin"), fanout=fanout, load=fanout))
 
-    with pytest.raises(ValueError, match="prices every source"):
-        asyncio.run(discounted.select(["K"], "r1"))
-
-
-def test_the_chain_holds_the_spending_link_at_its_head_unwrapped():
-    """Head-of-chain is the position where spending and using coincide.
-
-    A link behind one that can answer might never be asked; a link under a combinator
-    might have its answer dropped. At the head of a FirstMatch, an answer wins.
-    """
-    peer = PlannedPeer(Dispatcher())
-    chain = FirstMatch([peer])
-    assert chain.selectors[0] is peer
-    assert not isinstance(chain.selectors[0], Discount)
+    assert ranking.view.fanout is fanout
+    # Folded here, as the plane folds it: the ranking prices, the re-ranking appends,
+    # and neither orders (:meth:`proposed.selector.Selection.sort`).
+    assert asyncio.run(chain.select(["K"], "r1")).sort().sources == ("r0", "origin")

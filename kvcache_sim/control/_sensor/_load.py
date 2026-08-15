@@ -3,7 +3,7 @@
 The load signal behind spreading reads over the replicas of a hot prefix. Reuse value
 is a property of the prefix, so replicas of one hold identical rank and the id
 tie-break sends every read to the same volume -- this is the thing that changes, so
-the tie can be broken on it (:class:`proposed.selector.Discount`).
+the tie can be broken on it (:class:`proposed.selector.Balance`).
 
 Written by the decision that names a source and read by the ranking that named it,
 which is what makes it a sensor rather than a tally inside the ranking: two parties,

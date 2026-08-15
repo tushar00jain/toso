@@ -1,265 +1,194 @@
-"""The links that fold a reader into the read-through tree, as key selectors.
+"""Every volume that could serve a read, priced in one pass: :class:`Candidates`.
 
-With no routing, ``m`` readers of one key all ``locate_volumes`` before anyone
-finishes, so all ``m`` are told "the origin" and each pulls from it -- ``m x`` fabric.
-Readers ask this chain in order instead: :class:`PlannedPeer` hands out the peers
-already planned to hold the key, :class:`HolderRanking` opens a tree at the volumes
-that hold it now, and the :class:`~proposed.selector.NaiveKeySelector` behind them
-leaves the answer to the directory (:class:`~dedup_sim.control.routing.Dedup`).
+With no routing, ``m`` readers of one key all ``locate_volumes`` before anyone finishes,
+so all ``m`` are told "the origin" and each pulls from it -- ``m x`` fabric. Readers ask
+this ranking instead, and it prices one pool: the volumes that hold the key **and** the
+readers already routed to fetch it, which will hold it shortly. A peer is not a
+different kind of source, only one whose copy has not arrived yet::
 
-Both links call :func:`_once_usable` for the answer's shape rather than inheriting it:
-what a source is worth waiting for follows from what it owes, not from which link
-picked it.
+    score = wait + hop + fabric * hop        (seconds; lower is better)
 
-No link suspends while it decides, and :func:`_once_usable` is not a coroutine, which
-is where that stops being a claim: the directory read cannot suspend
-(:meth:`~proposed.deployment.Controller.locate_raw`) and neither does building a gate
-(:meth:`~proposed.dispatch.Dispatcher.gate`), so a decision runs to completion before
-the next requester's starts -- the serialized mailbox a real controller would give it,
-and what makes the sensor's read-modify-writes safe without a lock. A read that could
-suspend would turn its slot queue into a check-then-act race, and the fan-out cap would
-be exceeded rather than enforced.
+    wait = seconds until that source holds the key -- zero for a holder, and for a peer
+           the sum of the real link times up its own branch
+    hop  = what the transfer to the requester costs over the link between them
+
+Both terms are seconds off the run's own cost model
+(:meth:`~proposed.view.View.transfer_cost`), so nothing here weighs a distance against a
+delay: a hop is expensive because the link is slow, and a chain is expensive because
+each of its links takes what it takes. No tier arithmetic, and no units to reconcile.
+
+``fabric`` is the one weight, and it is dimensionless: what a second of the link this
+read occupies is worth against a second of the requester's own waiting.
+
+* :data:`CHAIN` -- link time worth many times the requester's wait. A hop off a holder
+  is charged for the fabric it burns, so a near peer outprices a far holder, the burst
+  folds into a chain or a tree, and the holders are read once: dedup's 1x. It holds
+  while the branch's accumulated link time stays under that charge -- past that a fresh
+  hop off a holder really is the better answer, and the depth where that happens comes
+  out of the machine's own bandwidth ratio rather than a constant chosen here.
+* :data:`SPREAD` -- nothing: the fabric is nobody's but mine, so the soonest source
+  wins and a holder that has the key beats a peer still fetching it.
+
+No queue is charged in the score. How many readers are already behind a peer is read
+here, but only as the cap that stops offering it at all; what a busy source *costs* is
+the plane's trade to make over this ranking
+(:mod:`dedup_sim.control.routing`, :class:`~proposed.selector.Balance`).
+
+The ranking only prices. Ordering the pool and doing something with the winner -- the
+route recorded, the answer withheld until that source is usable -- is the plane's
+(:mod:`dedup_sim.control.routing`, :func:`~dedup_sim.control._answer.committed`), which
+is what lets a combinator re-key this from above. Nothing here suspends, so a decision
+runs to completion before the next requester's starts; the rest of that argument is on
+:mod:`dedup_sim.control._answer`.
 
 There is no burst loop, no reader list and no knowledge of how many readers there will
-be. The tree is assigned one requester at a time as they ask, and the chain *executes*
-because each reader's read-through commits an action whose boundary releases the next
-reader's withheld answer -- an emergent property of what the data plane commits, not a
-schedule this module runs.
+be. The tree is one requester at a time, and it *executes* because each reader's
+read-through commits an action whose boundary releases the next reader's withheld
+answer -- an emergent property of what the data plane commits, not a schedule this
+module runs.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import (
-    Any, Dict, Hashable, List, Optional, Sequence, Tuple, TypeVar,
-)
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from proposed import (
-    DecisionLog, Dispatcher, Key, KeySelector, locality, Selection, VolumeId,
-)
+from proposed import Key, KeySelector, Selection, VolumeId
 
-from ._sensor import FanoutSensor
+from ._answer import holders
 from ._view import FanoutView
 
-__all__ = ["PlannedPeer", "HolderRanking"]
+__all__ = ["Candidates", "CHAIN", "SPREAD"]
 
-#: The price a link here answers in, left open on the one that quotes none
-#: (:class:`PlannedPeer`, whose payload is empty). Every link of one chain answers in
-#: the same terms, and an empty payload is a payload in any of them.
-_P = TypeVar("_P")
-
-
-def _holders(located: Dict[str, Dict[str, Any]], key: str) -> List[str]:
-    """Volumes holding ``key`` in a :meth:`~proposed.view.View.locate` answer.
-
-    In directory order, and empty when nobody holds it -- a missing key is absent
-    from the answer rather than an error in it. Local because reading a located map
-    is this chain's arithmetic, not a member the store owes anyone.
-    """
-    return list(located.get(key, {}))
+#: What a second of the link a read occupies is worth against a second of the
+#: requester's own waiting -- the whole of the difference between folding a burst into a
+#: tree and fanning it across the replicas. :data:`CHAIN` is measured: on the default
+#: profile it keeps a cap-1 chain 1x seven readers deep and a cap-2 tree 1x well past
+#: sixty (``dedup_sim/tests/test_dedup.py``).
+CHAIN = 10.0
+SPREAD = 0.0
 
 
-def _registered(view: FanoutView, facts: Sequence[Hashable]) -> List[Hashable]:
-    """Which of these ``(volume, key)`` pairs the directory holds *now*.
-
-    The truth a readiness gate is opened against, read rather than remembered, and read
-    afresh every time an answer is formed *and* at every commit a parked requester wakes
-    on (:meth:`~proposed.dispatch.Dispatcher.gate`): volumes evict, so a peer that
-    registered the key and later dropped it for a newer version is a peer the next
-    requester has to wait for again. Hence the live read
-    (:meth:`~proposed.view.View.locate_live`): a gate is correct only against the
-    directory *now*, and one opened against a directory read taken before the
-    registration landed would park its requester forever.
-
-    The cross-slice read, and the only one: what the fan-out owes is one reducer's
-    state and what the directory holds is another's, and a decision is where the two are
-    read together (:mod:`proposed.dispatch`).
-    """
-    located = view.locate_live([key for _volume, key in facts])
-    return [
-        (volume, key)
-        for volume, key in facts
-        if volume in _holders(located, key)
-    ]
-
-
-def _fold(
-    view: FanoutView,
-    fanout: FanoutSensor,
-    requester: str,
-    source: str,
-    trace: Optional[DecisionLog],
-) -> None:
-    """Record the decision: ``requester`` reads from ``source`` from now on."""
-    fanout.route(requester, source)
-    if trace is not None:
-        trace.record(view.now(), "route", f"{requester} <- {source}")
-
-
-def _once_usable(
-    view: FanoutView,
-    fanout: FanoutSensor,
-    commits: Dispatcher,
-    keys: Sequence[Key],
-    requester: str,
-    ranking: Selection[_P],
-    trace: Optional[DecisionLog],
-) -> Selection[_P]:
-    """``ranking`` -- which must name a head -- gated until that head is usable.
-
-    Which of three shapes an answer takes is the whole of when waiting is safe, because
-    a gate nothing will ever open hangs the requester behind it. What bounds one is the
-    debt the sensor tracks: a routed requester is going to read the key through, so from
-    the moment it asks it *owes* that registration. A source that owes nothing has to
-    hold the key already, and one that holds nothing and owes nothing is no longer a
-    source at all.
-
-    The head is what the gate is opened on and what a caller preferring this ranking
-    reads from; whatever is ranked behind it rides through with its prices.
-    """
-    source = ranking.head
-    facts = [(source, key) for key in keys]
-    if fanout.owes(facts):
-        # It owes every key, so the wait is bounded by its read-through. The gate is
-        # still opened on a directory read, because it may already hold a key it is
-        # about to republish -- then there is nothing to wait for.
-        return replace(ranking, ready=commits.gate(
-            lambda: len(_registered(view, facts)) == len(facts)
-        ))
-    if len(_registered(view, facts)) == len(facts):
-        # Owes nothing, so a gate here could outlive the run -- nothing would ever
-        # record it. Usable because it holds every key right now, which is the ordinary
-        # case: this is how a requester routed to a pre-existing holder is answered.
-        return ranking
-    # Holds nothing, owes nothing: a peer that published and has since evicted. Waiting
-    # would hang and naming it would route a reader to a volume with nothing to serve,
-    # so it stops being a source and this requester gets the directory's own answer,
-    # once.
-    fanout.retire(requester, source)
-    if trace is not None:
-        trace.record(view.now(), "retire", f"{source} holds nothing")
-    return Selection()
-
-
-class PlannedPeer(KeySelector[_P]):
-    """The peer this requester is folded in behind, or the oldest one with a slot.
-
-    A **peer** is a reader that is *about to* hold the key rather than one that does,
-    which is why every requester but the first can be answered without a fabric hop.
-    Slots are handed out FIFO under the sensor's fan-out cap, so cap 1 builds a chain
-    and cap >= 2 a shallow tree, and a requester that already has a route keeps it --
-    a second ask costs no slot.
-
-    One source and no price: the requester is folded in behind that one peer, and the
-    alternative to reading from it is the origin hop this exists to avoid.
-
-    Answering **spends** a slot
-    (:meth:`~dedup_sim.control._sensor.FanoutSensor.claim_slot`), so this belongs at the
-    head of a :class:`~proposed.selector.FirstMatch` chain and under no combinator that
-    can drop the answer or rank it down (:class:`~proposed.selector.Discount`). There
-    spending and using coincide: a link that answers wins the chain, and an abstention
-    claimed nothing. Under one that could reject the peer, the slot would be gone and
-    that peer would feed one reader fewer than the cap allows.
+class Candidates(KeySelector[float]):
+    """Holders and planned peers as one pool, each priced in seconds.
 
     Args:
-        commits: the run's :class:`~proposed.dispatch.Dispatcher`. A withheld answer
-            waits on its commit and re-reads (:func:`_once_usable`), which is the whole
-            of what this link needs from it.
-        trace: optional :class:`~proposed.selector.DecisionLog` to record each routing
-            decision into. Changes no metric; the link behaves identically with none.
+        fabric: what a second of somebody else's link time is worth against a second of
+            the requester's own wait (:data:`CHAIN`, :data:`SPREAD`).
+        payload_bytes: bytes to price a hop for. The directory reports what a volume
+            holds and not how big it is, so this is a nominal byte by default and a hop
+            is priced at little more than its link's latency; a run that knows the size
+            can say so, and the bandwidth term then sharpens the ratio between tiers.
+
+    A peer is offered only while it still **owes** the key: from the moment it asks
+    until its read-through lands (:meth:`~dedup_sim.control._sensor.FanoutSensor.owes`).
+    One that published and has since evicted owes nothing and holds nothing, so it
+    simply is not a candidate -- there is no source to retire from a ranking that never
+    named it.
     """
 
-    name = "planned-peer"
+    name = "candidates"
     sensors = (FanoutView,)
 
-    def __init__(
-        self, commits: Dispatcher, *, trace: Optional[DecisionLog] = None
-    ) -> None:
-        self.commits = commits
-        self.trace = trace
+    def __init__(self, fabric: float = CHAIN, payload_bytes: int = 1) -> None:
+        self.fabric = fabric
+        self.payload_bytes = payload_bytes
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
-        """The peer ``requester`` reads from, once it is usable; else abstain."""
-        fanout = self.view.fanout
-        fanout.promise(requester, keys)
-        source = fanout.planned(requester)
-        if source is None:
-            source = fanout.claim_slot()
-            if source is None:
-                return Selection.of([])
-            _fold(self.view, fanout, requester, source, self.trace)
-        return _once_usable(
-            self.view, fanout, self.commits, keys, requester,
-            Selection.of([source]), self.trace,
-        )
+    async def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
+        """Everything that could serve every one of ``keys``, scored; else abstain.
 
-
-class HolderRanking(KeySelector[int]):
-    """The volumes that already hold every key, nearest first: where a tree starts.
-
-    Reached only when no peer is planned to hold the key. Every other requester is
-    folded in behind a peer, so a reader pulling from a pre-existing holder is one this
-    link routed -- which is what keeps ``origin_bytes`` the 1x union whatever the cap.
-
-    Ranked by the key :func:`~proposed.topology.nearest` minimises -- locality tier,
-    then volume id -- so the head is the nearest holder and the order is total, hence
-    reproducible. The head is the single fabric hop, and the one the answer is gated on;
-    the sources behind it are alternatives for a caller that re-ranks, and cost nothing
-    to carry because a whole-key read takes the first volume it is offered.
-
-    Priced at the **negated locality tier**, since a price is better when it is higher:
-    ``0`` same host, ``-1`` same node, ``-2`` cross-node. One unit is one tier, so a
-    :class:`~proposed.selector.Discount` over this with ``max_discount=1`` says load may
-    cost a source one tier and no more.
-
-    Abstains when nobody holds every key -- there is nothing to fold a requester in
-    behind, and the chain falls through to the directory's own answer.
-
-    Args:
-        commits: the run's :class:`~proposed.dispatch.Dispatcher`, for
-            :class:`PlannedPeer`'s reason.
-        trace: optional :class:`~proposed.selector.DecisionLog` to record each routing
-            decision into. Changes no metric; the link behaves identically with none.
-    """
-
-    name = "holder"
-    sensors = (FanoutView,)
-
-    def __init__(
-        self, commits: Dispatcher, *, trace: Optional[DecisionLog] = None
-    ) -> None:
-        self.commits = commits
-        self.trace = trace
-
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection[int]:
-        """The holders of every one of ``keys``, nearest first; else abstain."""
+        The score is both the price and the one dimension of the key
+        (:meth:`~proposed.selector.Selection.priced`): what a source costs *is* what
+        orders it here. Ordering is the plane's, one fold at the end
+        (:meth:`~dedup_sim.control.routing.Dedup._decide`).
+        """
         fanout = self.view.fanout
         fanout.promise(requester, keys)
         located = self.view.locate(keys)
-        candidates = set(_holders(located, keys[0]))
+        holds = set(holders(located, keys[0]))
         for key in keys[1:]:
-            candidates &= set(_holders(located, key))
-        candidates.discard(requester)
-        if not candidates:
+            holds &= set(holders(located, key))
+        routes, queued = fanout.routes(), fanout.named()
+        # The requester's own route, so a source it is already behind is not counted
+        # as full *by it*: a second ask costs no slot, and a reader re-asking after an
+        # eviction would otherwise be shut out by its own place in the queue.
+        mine = fanout.planned(requester)
+        priced: List[Tuple[VolumeId, float]] = []
+        # One entry per volume the walk below reaches, so the branch is walked once per
+        # decision and not once per candidate. The pool itself needs no order: what
+        # orders it is the score, and the fold that reads it is total (the id its last
+        # tie-break).
+        waits: Dict[VolumeId, Optional[float]] = {}
+        for volume in holds | routes.keys():
+            if volume == requester:
+                continue
+            wait = self._wait(volume, keys, holds, routes, waits)
+            if wait is None:
+                continue
+            behind = queued.get(volume, 0) - (volume == mine)
+            if wait and behind >= fanout.cap:
+                # A peer at its cap: the ceiling on how wide the tree may fan out, and
+                # the only thing the cap does. A holder has no such limit -- what keeps
+                # readers off one is its price, and whatever the plane weighs against
+                # it.
+                continue
+            hop = self.view.transfer_cost(volume, requester, self.payload_bytes)
+            priced.append((volume, wait + hop + self.fabric * hop))
+        if not priced:
             return Selection.of([])
-        ranked = self._by_locality(candidates, requester)
-        _fold(self.view, fanout, requester, ranked[0][0], self.trace)
-        return _once_usable(
-            self.view, fanout, self.commits, keys, requester,
-            Selection.priced(ranked), self.trace,
-        )
+        return Selection.priced(priced)
 
-    def _by_locality(
-        self, candidates: Sequence[str], requester: str
-    ) -> List[Tuple[VolumeId, int]]:
-        """``(volume, -tier)`` per candidate, nearest first, volume id breaking the tie.
+    def _wait(
+        self,
+        volume: VolumeId,
+        keys: Sequence[Key],
+        holds: Set[VolumeId],
+        routes: Mapping[VolumeId, VolumeId],
+        waits: Dict[VolumeId, Optional[float]],
+    ) -> Optional[float]:
+        """Seconds until ``volume`` holds ``keys``; ``0`` if it does, ``None`` if never.
 
-        Distance is arithmetic on endpoints and needs no directory read, so it comes off
-        the topology map (:func:`~proposed.topology.locality`).
+        A volume holding them now waits for nothing. Otherwise it is a peer, and what it
+        waits for is its own source's wait plus the link between the two -- so a branch
+        costs what its links cost rather than a hop count, and a peer two cheap hops
+        away can be sooner than one over a slow link. It counts only while every step
+        up that branch is still coming: a volume that owes nothing and holds nothing has
+        no copy on the way, and so is no source. Bounded by the number of edges, since
+        a walk that cannot terminate is a cycle this would otherwise follow forever.
+
+        Elapsed time is not subtracted: a fetch already in flight is priced as if it
+        started now, which reads a peer as slightly further off than it is. Exact for a
+        synchronized burst, where every decision is made at one instant; the correction
+        is a predicted landing time the fan-out does not keep.
+
+        Every volume the walk passes is answered on the way back down (``waits``), so
+        one decision costs one walk of the tree however many candidates hang off it --
+        a chain of ``m`` readers is ``m`` steps in total, not ``m`` per reader.
         """
-        topology = self.view.topology
-        here = topology[requester]
-        priced = [
-            (volume, -int(locality(topology[volume], here))) for volume in candidates
-        ]
-        return sorted(priced, key=lambda c: (-c[1], c[0]))
+        fanout = self.view.fanout
+        branch: List[VolumeId] = []
+        while True:
+            if volume in waits:
+                wait = waits[volume]
+                break
+            if volume in holds:
+                wait = waits[volume] = 0.0
+                break
+            if len(branch) > len(routes) or not fanout.owes(
+                [(volume, key) for key in keys]
+            ):
+                wait = waits[volume] = None
+                break
+            branch.append(volume)
+            source = routes.get(volume)
+            if source is None:
+                wait = waits[volume] = None
+                break
+            volume = source
+        for node in reversed(branch):
+            if wait is None:
+                waits[node] = None
+                continue
+            wait += self.view.transfer_cost(volume, node, self.payload_bytes)
+            waits[node] = wait
+            volume = node
+        return waits[branch[0]] if branch else wait

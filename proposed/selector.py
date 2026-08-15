@@ -2,8 +2,14 @@
 
     Selector[Subject, Price].select(subject, requester) -> Selection[Price]
 
-The answer is always volume ids, best first, plus the moment they become usable
-(and, for a selector handed candidates it did not price, what each one priced at).
+The answer is always volume ids, what orders them, and the moment they become usable
+(and, for a selector handed candidates it did not price, what each one priced at). A
+selector **annotates**: it appends a dimension to the sort key and leaves the order
+alone, so a chain of them costs one fold rather than one sort per stage, and that fold
+can be greedy over every dimension at once where a re-sort could only take them one at
+a time. Whoever answers folds -- :meth:`Selection.sort`, :meth:`Selection.max` -- and
+those two are the only things here that establish an order.
+
 What differs is the **subject**, and every selector names its own in its header::
 
     class RoutedPull(KeySelector[None]):        # keys, ranked without pricing
@@ -35,26 +41,30 @@ answered is simply not in the ranking.
 
 Selectors compose two ways, both of them one selector holding others:
 :class:`FirstMatch` picks between alternatives -- ask each in order, take the first
-answer. :class:`Discount` re-ranks one answer -- ask, then push back a source it has
-lately named, by a bounded amount. Both hand the subject down untouched, which is why
-one ``Discount`` re-ranks a ranking over keys and one over an application's own
+answer. :class:`Balance` annotates one answer -- ask, then append how loaded each source
+it named is as a further dimension. Both hand the subject down untouched, which is why
+one ``Balance`` annotates a ranking over keys and one over an application's own
 candidates alike, taking the kind of whichever it wraps. ``FirstMatch`` is over keys
 only, and checks its links are at construction: a chain hands *one* subject to every
 link.
 
-Re-ranking is why a ranking's *price* belongs in its type. A ranking that prices
-nothing can only be re-ordered by overruling it, so :class:`Discount` does its
-arithmetic on the base's own price and refuses a ranking that has none.
+Annotating is why a ranking says what orders it rather than leaving that to a sort of
+its own: a stage appended behind one that said nothing would be the whole of the order,
+so :class:`Balance` refuses such a ranking. The *price* rides through untouched, so a
+caller pricing the winner against something of its own still reads what the base said
+about it.
 
-Narrowing an answer is not a composition of selectors at all: a test an application
-owns is applied to the ranking it was given, by the caller that has both
-(:meth:`Selection.require`, :meth:`Selection.take`).
+Narrowing an answer is not a composition of selectors in this package: a test an
+application owns is applied to the ranking it was given, by whoever has both
+(:meth:`Selection.require`, :meth:`Selection.take`). A capability that writes a
+combinator of its own -- one narrowing an answer so that a chain reaches the link
+behind it, say -- needs only :func:`declares` and :func:`declared` from here.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any, Awaitable, Callable, Dict, Generic, List, Mapping, NamedTuple, Optional,
     Protocol, Sequence, Tuple, TypeVar, get_args, get_origin,
@@ -64,8 +74,9 @@ from proposed.deployment import Key, VolumeId
 from proposed.view import LoadView, View
 
 __all__ = [
-    "Ready", "Selection", "prefer", "DecisionLog", "Selector", "KeySelector",
-    "AnySelector", "NaiveKeySelector", "FirstMatch", "Discount",
+    "Ready", "Dims", "Fold", "Selection", "prefer", "DecisionLog", "declared",
+    "declares", "Selector", "KeySelector", "AnySelector", "NaiveKeySelector",
+    "FirstMatch", "Balance",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -85,34 +96,55 @@ _P = TypeVar("_P")
 _S = TypeVar("_S")
 
 #: The selector :meth:`Selector.attach` hands back: whatever it was called on, so a
-#: wired chain is still a chain and a wired discount still a discount.
+#: wired chain is still a chain and a wired combinator still a combinator.
 _Sel = TypeVar("_Sel", bound="Selector[Any, Any]")
+
+#: What orders one source (:attr:`Selection.key`): one comparable per stage that
+#: measured it, **positional** -- each stage appends its own behind the ones already
+#: there (:meth:`Selection.annotated`) -- and **lower is better** throughout.
+Dims = Tuple[Any, ...]
+
+#: How a caller blends one source's dimensions into the single comparable a fold
+#: orders by: ``dims -> comparable``, lower still better. Positional, so a fold reads
+#: ``dims[1]`` and a chain missing that stage raises instead of quietly comparing the
+#: wrong number. ``None`` at a fold is the lexicographic default, which needs no
+#: arithmetic at all (:meth:`Selection.sort`).
+Fold = Callable[[Dims], Any]
 
 
 @dataclass(frozen=True)
 class Selection(Generic[_P]):
-    """Ranked sources for one subject, plus when they become usable.
+    """Sources for one subject, what orders them, and when they become usable.
+
+    A stage annotates and does not order: it appends to :attr:`key` and leaves
+    :attr:`sources` however it built them. Whoever answers folds -- :meth:`sort` or
+    :meth:`max` -- and there is no flag saying which of the two has happened: a
+    selection's order is whatever its producer left, so a caller that needs one asks
+    for it.
 
     Args:
-        sources: volume ids, best first. ``None`` -- the default -- means *every
-            holder, in directory order*, which is what the real directory returns
-            on its own, so a ``None`` selection leaves the store's answer untouched
-            (:func:`prefer`).
-        ready: optional gate, for a selector that routes a requester to a peer
-            which has not registered yet. Spent by :meth:`settled` before the
-            answer travels, never handed to whoever asked.
+        sources: volume ids. ``None`` -- the default -- means *every holder, in
+            directory order*, which is what the real directory returns on its own, so
+            a ``None`` selection leaves the store's answer untouched (:func:`prefer`).
+        key: ``source id -> the dimensions that order it`` (:data:`Dims`), one per
+            stage that measured it. ``None`` for a producer with nothing to say about
+            the order.
         payload: ``source id -> what this selector holds about that source``,
             application-defined because this package cannot read an application's
             values. A ranking alone loses what produced it, and a selector handed
-            alternatives somebody else priced has to give the winner's price back
-            with it. Keyed by id rather than parallel to ``sources``, so a selection
-            cannot be built out of step with itself; empty for a selector that only
-            ranks.
+            alternatives somebody else priced has to give the winner's price back with
+            it. Not the same thing as the key wherever a stage ranks something it was
+            handed -- a plan ordered by the TTFT predicted for it -- and the two are
+            built from one sequence (:meth:`keyed`) so they cannot come apart.
+        ready: optional gate, for a selector that routes a requester to a peer which
+            has not registered yet. Spent by :meth:`settled` before the answer
+            travels, never handed to whoever asked.
     """
 
     sources: Optional[Tuple[VolumeId, ...]] = None
-    ready: Optional[Ready] = None
+    key: Optional[Mapping[VolumeId, Dims]] = None
     payload: Mapping[VolumeId, _P] = field(default_factory=dict)
+    ready: Optional[Ready] = None
 
     @classmethod
     def of(
@@ -121,14 +153,34 @@ class Selection(Generic[_P]):
         *,
         ready: Optional[Ready] = None,
     ) -> "Selection[_P]":
-        """A selection ranking ``sources`` best-first, priced at nothing.
+        """``sources`` as they are given, keyed by nothing and priced at nothing.
 
-        The two builders are the two kinds of selector: this one for a ranking,
-        :meth:`priced` for a ranking whose sources carry what they were priced at.
-        Prices are not reachable from here, so a ranking and the prices for it cannot
-        be built out of step with each other.
+        The three builders are the three kinds of producer: this one for a selector
+        that only names sources, :meth:`priced` for one whose price is also the one
+        dimension that orders them, :meth:`keyed` for one where the two differ.
         """
         return cls(sources=tuple(sources), ready=ready)
+
+    @classmethod
+    def keyed(
+        cls,
+        candidates: Sequence[Tuple[VolumeId, Dims, _P]],
+        *,
+        ready: Optional[Ready] = None,
+    ) -> "Selection[_P]":
+        """``(id, dims, payload)`` triples: what orders each source and what is held
+        about it, from one sequence.
+
+        The sequence's own order is not a ranking -- :meth:`sort` and :meth:`max` read
+        the dimensions. Neither mapping is reachable on its own, so a key and the
+        payload beside it cannot be built out of step.
+        """
+        return cls(
+            sources=tuple(i for i, _d, _p in candidates),
+            key={i: tuple(dims) for i, dims, _p in candidates},
+            payload={i: p for i, _d, p in candidates},
+            ready=ready,
+        )
 
     @classmethod
     def priced(
@@ -137,16 +189,60 @@ class Selection(Generic[_P]):
         *,
         ready: Optional[Ready] = None,
     ) -> "Selection[_P]":
-        """Ranked ids and what each was priced at, from one ordered sequence."""
-        return cls(
-            sources=tuple(i for i, _ in candidates),
-            ready=ready,
-            payload={i: price for i, price in candidates},
-        )
+        """``(id, price)`` pairs, the price standing as the one dimension too:
+        cheapest is best."""
+        return cls.keyed([(i, (p,), p) for i, p in candidates], ready=ready)
+
+    def annotated(self, readings: Mapping[VolumeId, Any]) -> "Selection[_P]":
+        """This selection with one reading per source appended as a further dimension.
+
+        What a stage that measures rather than ranks does (:class:`Balance`). Appended
+        behind what the stages before it left, never in place of it, so every fold
+        reads a position that does not move.
+        """
+        return replace(self, key={
+            source: (*(self.key or {}).get(source, ()), readings[source])
+            for source in (self.sources or ())
+        })
+
+    def _ranked(self, fold: Optional[Fold]) -> Optional[Tuple[VolumeId, ...]]:
+        """These sources best-first, or ``None`` if nothing here says what best is.
+
+        ``fold`` blends one source's dimensions into the comparable to order by; with
+        none they are compared as they stand, which is lexicographic over the stages in
+        the order they annotated. Either way the id is the last thing compared, here
+        and nowhere else, so the order is total whatever the stages keyed on and a run
+        reproduces.
+        """
+        if not self.sources or self.key is None:
+            return None
+        if fold is None:
+            return tuple(sorted(self.sources, key=lambda s: (*self.key[s], s)))
+        return tuple(sorted(self.sources, key=lambda s: (fold(self.key[s]), s)))
+
+    def sort(self, fold: Optional[Fold] = None) -> "Selection[_P]":
+        """This selection ordered best-first -- a **new** one, this being frozen.
+
+        Both empties pass through, as does a selection no stage keyed: the order a
+        producer left is the answer when there is nothing to beat it.
+        """
+        ranked = self._ranked(fold)
+        return self if ranked is None else self.only(ranked)
+
+    def max(self, fold: Optional[Fold] = None) -> "Selection[_P]":
+        """The single best source, with its key, its price and the gate.
+
+        What a plane naming one source folds to, and it is still a selection so
+        :meth:`settled` can be spent on it afterwards. Both empties pass through.
+        """
+        if not self.sources:
+            return self
+        ranked = self._ranked(fold)
+        return self.only((ranked or self.sources)[:1])
 
     @property
     def winner(self) -> Optional[_P]:
-        """What the best-ranked source was chosen *with*, or ``None`` if none was.
+        """What the leading source was chosen *with*, or ``None`` if none was.
 
         The payload under the head of :attr:`sources`, so a caller wanting the one
         answer does not have to index a ranking to reach it. ``None`` covers all
@@ -175,13 +271,14 @@ class Selection(Generic[_P]):
         await self.wait()
         if self.ready is None:
             return self
-        return Selection(sources=self.sources, payload=self.payload)
+        return replace(self, ready=None)
 
     @property
     def head(self) -> Optional[VolumeId]:
-        """The best-ranked source, or ``None`` if this names none in particular.
+        """The leading source, or ``None`` if this names none in particular.
 
-        The id, where :attr:`winner` is the price under it. ``None`` for both empties,
+        The id, where :attr:`winner` is the price under it, and the *best* source once
+        this has been folded (:meth:`sort`, :meth:`max`). ``None`` for both empties,
         which a caller reading the head cannot tell apart and does not need to: neither
         one names a source to act on.
         """
@@ -192,18 +289,22 @@ class Selection(Generic[_P]):
     def only(self, sources: Sequence[VolumeId]) -> "Selection[_P]":
         """This selection cut down to ``sources``, in the order given.
 
-        The readiness gate rides along and each kept source keeps its price, so
-        one selection narrowed by somebody else still answers for whoever built it.
+        The readiness gate rides along and each kept source keeps its key and its
+        price, so one selection narrowed by somebody else still answers for whoever
+        built it.
         """
         kept = tuple(sources)
         return Selection(
             sources=kept,
-            ready=self.ready,
+            key=None if self.key is None else {
+                s: self.key[s] for s in kept if s in self.key
+            },
             payload={s: self.payload[s] for s in kept if s in self.payload},
+            ready=self.ready,
         )
 
     def take(self, n: int) -> "Selection[_P]":
-        """The best ``n`` sources, price and gate intact."""
+        """The leading ``n`` sources, key, price and gate intact."""
         return self.only((self.sources or ())[:n])
 
     def require(self, ok: Callable[[VolumeId], bool]) -> "Selection[_P]":
@@ -216,8 +317,10 @@ class Selection(Generic[_P]):
         All or nothing: filtering the head out would **promote** the source behind it,
         and a ranking need not be in the order ``ok`` measures -- the sources behind the
         head are the ones the ranking preferred *less*, so promoting one on a raw
-        measurement would overrule it from outside. An abstention is returned unchanged,
-        since there is no head to judge.
+        measurement would overrule it from outside. Which is why a caller folds first
+        (:meth:`sort`, :meth:`max`): on an unfolded selection the head this judges is
+        the producer's build order and nothing more. An abstention is returned
+        unchanged, since there is no head to judge.
 
         Raises:
             ValueError: on the default selection (every holder in directory order),
@@ -342,7 +445,7 @@ class Selector(ABC, Generic[_S, _P]):
 
         Returned so building one and wiring it is a single expression::
 
-            source = Discount(LongestPrefixKeySelector()).attach(view)
+            source = Balance(LongestPrefixKeySelector()).attach(view)
         """
         self.view = view
         return self
@@ -395,14 +498,33 @@ class NaiveKeySelector(KeySelector[_P]):
         return Selection()
 
 
-def _declared(view: Any, selector: "Selector[Any, Any]") -> Any:
+def declares(
+    own: Sequence[type], base: "Selector[Any, Any]"
+) -> Tuple[type, ...]:
+    """What a combinator senses: ``own``, plus whatever ``base`` does, each named once.
+
+    A view is composed of exactly what a selector declared
+    (:attr:`Selector.sensors`), so a combinator declaring only its own read would
+    attach its base to a view missing the base's -- and an absent sensor raises rather
+    than answering quietly (:class:`~proposed.view.Sensed`). A combinator that senses
+    nothing itself declares nothing and hands the whole view down
+    (:class:`FirstMatch`); one that senses something has to say both.
+
+    ``()`` from ``base`` is the whole view, and every view carries the directory, so a
+    base that declared nothing loses nothing by being handed a narrower one.
+    """
+    return tuple(dict.fromkeys(tuple(own) + tuple(base.sensors)))
+
+
+def declared(view: Any, selector: "Selector[Any, Any]") -> Any:
     """The view ``selector`` declared, out of the one a combinator was handed.
 
-    A combinator declares nothing of its own, so what it narrows to is each link's own
-    header -- otherwise a chain would be the one place a declaration is not a fact, and
-    both of ``dedup_sim``'s links sit inside one. Something that is no view at all is
-    handed on untouched, which only a selector declaring nothing can be attached to
-    anyway (:attr:`Selector.sensors`).
+    What a combinator narrows to for a selector it holds is that selector's own header
+    -- otherwise a chain would be the one place a declaration is not a fact, and both of
+    ``dedup_sim``'s links sit inside one. Which is only reachable because the combinator
+    declared the link's reads along with its own (:func:`declares`). Something that is
+    no view at all is handed on untouched, which only a selector declaring nothing can
+    be attached to anyway (:attr:`Selector.sensors`).
     """
     return view.subset(*selector.sensors) if selector.sensors else view
 
@@ -456,7 +578,7 @@ class FirstMatch(KeySelector[_P]):
         turn comes.
         """
         for selector in self.selectors:
-            selector.attach(_declared(view, selector))
+            selector.attach(declared(view, selector))
         return self
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection[_P]:
@@ -468,146 +590,113 @@ class FirstMatch(KeySelector[_P]):
         return Selection.of([])
 
 
-class Discount(Selector[_S, int]):
-    """One ranking, re-ranked by a bounded discount for sources named lately.
+class Balance(Selector[_S, _P]):
+    """One ranking, annotated with how loaded each source it named is.
 
-    Load spreading as a layer over *any* ranking that prices, rather than a property
-    of one ranking: sources a ranking prices the same sort on whatever its last
-    tie-break is -- an id, typically -- and every read then goes to the same volume.
-    This moves that tie onto something that changes.
+    Load spreading as a layer over *any* ranking that says what orders it, rather than
+    a property of one ranking: two sources a ranking keys the same are left to the id
+    the fold breaks its ties on, so every read goes to the same volume. This puts
+    something that changes ahead of that tie-break.
 
     What it senses, and nothing else: :class:`~proposed.view.LoadView`, whose
-    ``named()`` says how much has been sent at each source. So this combinator holds no
-    tally of its own -- what it re-ranks by is an observation somebody else keeps, moved
-    by the decision that names a source and read here -- and what that number does and
-    does not mean is stated once, on the view.
+    ``named()`` says what has lately been sent at each source. So this combinator holds
+    no tally of its own -- what it appends is an observation somebody else keeps, moved
+    by the decision that names a source and read here -- and what that number means is
+    stated once, on the view.
+
+    **No arithmetic**, so there is nothing here for a caller to supply: it appends the
+    load as one more dimension (:meth:`Selection.annotated`) and whoever folds decides
+    what a busy source costs, which is the application's own trade -- blocks of prefix
+    run against reads routed at a host, seconds of link time against seconds of queue.
+    The base's key and payload both ride through, so a fold reads the ranking's own
+    numbers beside this one and a caller pricing the winner against something of its
+    own still reads what the *base* said about it.
 
     Over any subject, because the subject is handed to ``ranking`` untouched and never
     read here -- one wrapper serves a ranking over keys and one over an application's
     own candidates alike. Which *kind* it is follows what it wraps (:meth:`__new__`).
 
-    The key the base's answer is sorted by, over the base's own price -- higher is
-    better, and an integer, so no rank turns on a float:
-
-        ``(-(price - min(outstanding, max_discount)), outstanding, id)``
-
-    ``max_discount`` is in the base's units, so what load may cancel is stated in the
-    same terms as what it is weighed against: a source ahead by more than that wins
-    however busy it is. Among sources the discount has levelled, the raw grant count
-    decides, so two equally priced sources alternate indefinitely instead of
-    reverting to id order once the discount saturates.
-
-    The prices ride through unchanged (:meth:`Selection.only`), so a caller pricing
-    the winner against something of its own reads what the *base* said about it and
-    never a discounted figure.
-
-    Determinism: every component of the key is an integer or an id, the id is last,
-    and no branch reads a wall clock or an unseeded RNG, so a rank is total and a run
-    reproduces. The load is read once per ranking, with nothing awaited between the read
-    and the order it decides, so no fold can land inside one answer.
+    Determinism: the load is read once per ranking, with nothing awaited between the
+    read and the dimension it appends, so no fold can land inside one answer. Nothing
+    here reads a wall clock or an unseeded RNG, and nothing here decides an order at
+    all (:meth:`Selection.sort`).
 
     Args:
-        ranking: the selector asked, which must price every source it ranks.
-        max_discount: the most price load may cancel out. ``0`` makes the load term
-            a pure tie-break between sources already priced the same, which is
-            enough when the point is replicas of one hot thing. A source ahead by
-            more than this wins however loaded it is.
-        trace: optional :class:`DecisionLog`. Records only.
+        ranking: the selector asked, which must key every source it ranks. What it
+            senses is declared here too (:func:`declares`).
     """
 
-    name = "discount"
+    name = "balance"
     sensors = (LoadView,)
 
-    def __new__(cls, ranking: "Selector[_S, int]", **kwargs: Any) -> "Discount[_S]":
+    def __new__(
+        cls, ranking: "Selector[_S, _P]", *args: Any, **kwargs: Any
+    ) -> "Balance[_S, _P]":
         """Take the kind of the ranking wrapped: over keys, a :class:`KeySelector`.
 
-        A discount asks whatever question its ranking asks, so the kind cannot be
+        A combinator asks whatever question its ranking asks, so the kind cannot be
         declared once here -- and it has to be a type, because that is how a chain
-        checks its links (:class:`FirstMatch`). So a discounted key ranking is a chain
-        link and a discounted application ranking is refused by one, which is the same
+        checks its links (:class:`FirstMatch`). So a balanced key ranking is a chain
+        link and a balanced application ranking is refused by one, which is the same
         answer the ranking itself would get.
         """
         return object.__new__(
-            _KeyDiscount if cls is Discount and isinstance(ranking, KeySelector)
+            _KeyBalance if cls is Balance and isinstance(ranking, KeySelector)
             else cls
         )
 
-    def __init__(
-        self,
-        ranking: Selector[_S, int],
-        *,
-        max_discount: int = 1,
-        trace: Optional[DecisionLog] = None,
-    ) -> None:
+    def __init__(self, ranking: Selector[_S, _P]) -> None:
         self.ranking = ranking
-        #: What it re-ranks, which is what it takes: the subject is not this
+        #: What it annotates, which is what it takes: the subject is not this
         #: combinator's, so it is read off the ranking rather than declared.
         self.subject_type = ranking.subject_type
-        self.max_discount = max_discount
-        self.trace = trace
+        #: Load, and whatever the ranking senses (:func:`declares`).
+        self.sensors = declares((LoadView,), ranking)
 
-    def attach(self, view: Any) -> "Discount[_S]":
+    def attach(self, view: Any) -> "Balance[_S, _P]":
         """Sense through ``view``, and hand the ranking the view it declared."""
         super().attach(view)
-        self.ranking.attach(_declared(view, self.ranking))
+        self.ranking.attach(declared(view, self.ranking))
         return self
 
-    async def select(self, subject: _S, requester: str) -> Selection[int]:
-        """``ranking``'s answer, re-ordered by the load each source carries.
+    async def select(self, subject: _S, requester: str) -> Selection[_P]:
+        """``ranking``'s answer with the load at each source appended to its key.
 
-        The whole ranking is re-ordered rather than only its head, so a caller that
-        rejects the first source still has the rest in a useful order. Writes nothing:
-        the load is an observation, and what moves it is the decision this answer is
-        consulted for.
+        Every source is annotated, not just whichever one led, so a caller that folds
+        this and rejects the winner has the rest measured too. Nothing is ordered here
+        and nothing is written: the load is an observation, and what moves it is the
+        decision this answer is consulted for.
 
-        An answer with no source to re-order goes back untouched. Both empties
-        qualify, for the same reason and not by accident: an abstention names nobody,
-        and the default selection names every holder in directory order rather than
-        any source in particular.
+        An answer with no source to measure goes back untouched. Both empties qualify,
+        for the same reason and not by accident: an abstention names nobody, and the
+        default selection names every holder in directory order rather than any source
+        in particular.
 
         Raises:
-            ValueError: if ``ranking`` left a source it ranked unpriced. A discount is
-                arithmetic on a price; re-ordering a ranking without one would be
-                overruling it.
+            ValueError: if ``ranking`` left a source it ranked with no key. The load
+                would then be the *whole* of the order rather than a dimension behind
+                the ranking's own, which is overruling it.
         """
         ranked = await self.ranking.select(subject, requester)
         if not ranked.sources:
             return ranked
-        unpriced = [s for s in ranked.sources if s not in ranked.payload]
-        if unpriced:
+        keyed = ranked.key or {}
+        unkeyed = [s for s in ranked.sources if s not in keyed]
+        if unkeyed:
             raise ValueError(
-                f"{type(self.ranking).__name__} ranked {', '.join(unpriced)} without "
-                f"pricing them, so a discount has nothing to weigh: a ranking under "
-                f"one prices every source it ranks"
+                f"{type(self.ranking).__name__} ranked {', '.join(unkeyed)} without "
+                f"keying them, so a load appended here would be the whole of the "
+                f"order: a ranking under one keys every source it ranks"
             )
         load = self.view.load.named()
-        order = sorted(
-            ranked.sources,
-            key=lambda source: self._rank(source, ranked.payload, load),
+        return ranked.annotated(
+            {source: load.get(source, 0) for source in ranked.sources}
         )
-        if self.trace is not None:
-            self.trace.record(
-                self.view.now(),
-                self.name,
-                f"{requester} <- {order[0]} (priced {ranked.payload[order[0]]}, "
-                f"load {load.get(order[0], 0)})",
-            )
-        return ranked.only(order)
-
-    def _rank(
-        self,
-        source: VolumeId,
-        priced: Mapping[VolumeId, int],
-        load: Mapping[VolumeId, int],
-    ) -> Tuple[int, int, VolumeId]:
-        """Sort key for one source: discounted price, raw load, id. Total, always."""
-        held = load.get(source, 0)
-        return (-(priced[source] - min(held, self.max_discount)), held, source)
 
 
-class _KeyDiscount(Discount[Sequence[Key]], KeySelector[int]):
-    """A :class:`Discount` over keys, and so the store's own question.
+class _KeyBalance(Balance[Sequence[Key], _P], KeySelector[_P]):
+    """A :class:`Balance` over keys, and so the store's own question.
 
-    What :class:`Discount` answers with when the ranking it wraps is a
+    What :class:`Balance` answers with when the ranking it wraps is a
     :class:`KeySelector`, so such a one is a chain link like the ranking under it.
     """

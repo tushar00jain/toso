@@ -35,6 +35,7 @@ Run from the repo root::
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from dataclasses import replace
 from typing import Any, Callable, List, Optional
 
@@ -45,9 +46,9 @@ from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
 
-from dedup_sim.control._view import FanoutView
+from dedup_sim.control._view import DedupView
 from dedup_sim.control.routing import Dedup
-from proposed import Endpoint, Stored
+from proposed import Stored
 from dedup_sim.data.read_through import ReadThroughPlane
 
 #: The version that displaces ``W`` in a one-deep reader volume.
@@ -212,14 +213,7 @@ def test_the_fabric_is_1x_per_read_for_any_fanout_cap():
 # --------------------------------------------------------------------------
 
 
-class _OwnNode(dict):
-    """``volume id -> Endpoint``, inventing one per id: its own host and node."""
-
-    def __missing__(self, volume_id: str) -> Endpoint:
-        return Endpoint(id=volume_id, host=volume_id, node=volume_id)
-
-
-class Directory(FanoutView):
+class Directory(DedupView):
     """The reads a chain makes, over a ``key -> volumes`` map a test controls.
 
     Waiting is the part of routing that fails by *not* happening, and the two
@@ -240,6 +234,17 @@ class Directory(FanoutView):
         super().__init__(None, {}, None)
         self.by_key = {key: set(vols.split()) for key, vols in holders.items()}
 
+    def transfer_cost(self, src_id: str, dst_id: str, nbytes: int) -> float:
+        """The origin far, the peers near -- the shape a chain forms in, staged.
+
+        A ranking in seconds needs a price for a hop, and these tests are about the tree
+        rather than the topology, so this is the coarsest price that still makes a peer
+        worth reading from: ten seconds off the origin, one off anybody else.
+        """
+        if src_id == dst_id:
+            return 0.0
+        return 10.0 if src_id == "p" else 1.0
+
     # -- the View surface Dedup uses -------------------------------------- #
     def derived(self, cls: type, **sensors: Any) -> "Directory":
         """Compose ``sensors`` onto this view, where the real one builds a fresh view.
@@ -248,22 +253,17 @@ class Directory(FanoutView):
         staged rather than sensed -- so the sensor goes onto this object, which is
         already a view.
         """
-        assert isinstance(self, cls), f"{type(self).__name__} is not a {cls.__name__}"
+        # A subset of several views is a class made on the spot, so what this can be
+        # asked to stand in for is what that class was made of.
+        wanted = cls.__bases__ if "+" in cls.__name__ else (cls,)
+        missing = [v.__name__ for v in wanted if not isinstance(self, v)]
+        assert not missing, f"{type(self).__name__} is not a {', '.join(missing)}"
         self._sensors.update(sensors)
         return self
 
     def locate_live(self, keys):
         """The port read staged, so :meth:`~proposed.view.View.locate` is the real one."""
         return {k: {v: None for v in sorted(self.by_key.get(k, ()))} for k in keys}
-
-    @property
-    def topology(self):
-        """Every volume on a node of its own, so distance never breaks an id tie.
-
-        ``nearest`` then answers in id order, which is what these tests stage
-        against: which peer is *closest* is not what any of them is about.
-        """
-        return _OwnNode()
 
     def now(self) -> float:
         return 0.0
@@ -288,8 +288,6 @@ def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
 
     ``attach`` is the whole of it, as it is in a run: it composes the plane's own state
     onto the dispatcher it builds, and that state is the only thing a landed put folds.
-
-    Nothing here is priced, so the transfer-cost half of the port is ``None``.
     """
     plane = Dedup(fanout_cap=fanout_cap)
     plane.attach(directory)
@@ -330,7 +328,7 @@ def test_one_registration_releases_every_requester_waiting_on_it():
         directory.publish("r0", KEY)
         plane.dispatcher.dispatch_sync(Stored("r0", KEY))
         waiters = await asyncio.gather(*tasks)
-        assert all(w.sources == ("r0",) for w in waiters)
+        assert all(w.head == "r0" for w in waiters)
         # Nothing that crossed the boundary carries a closure with it.
         assert all(w.ready is None for w in waiters)
         return answered
@@ -358,62 +356,51 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
         plane.dispatcher.dispatch_sync(Stored("r0", KEY))
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
-        # It answers at all, which is the hang that would not: nothing to wait for,
-        # and nobody to be sent to, so the directory's own answer.
+        # It answers at all, which is the hang that would not: the retired peer is
+        # never priced, so what is left is the holder -- read from, not waited on.
         stale = await plane.sources([KEY], "r1")
-        assert stale.sources is None, "parked on a registration nobody owes"
+        assert stale.head == "p", "parked on a registration nobody owes"
+        assert stale.ready is None
 
         # r1 is a live source though -- it is fetching now -- so r2 attaches to it
         # rather than to the peer that was retired. Its decision therefore gates,
         # which is why this asks the chain rather than awaiting the plane's answer.
-        return await plane._chain.select([KEY], "r2")
+        return await plane._decide([KEY], "r2")
 
     selection, _trace = run_sim(_after_the_eviction())
-    assert selection.sources == ("r1",)
+    assert selection.head == "r1"
     assert selection.ready is not None  # r1's read-through is what it waits on
 
 
-def test_a_requester_reassigned_after_a_retire_is_not_offered_a_second_time():
-    """Being assigned twice does not make a requester a source twice over.
+def test_a_peer_never_feeds_more_than_the_cap():
+    """The cap is a count of who is behind a peer, not a batch of tickets.
 
-    A requester becomes a source for ``cap`` peers when it is first assigned one.
-    Retiring its own source drops its route, so its next ask is assigned afresh --
-    and an offer made there would hand it a whole second batch of slots. The
-    queue cannot catch that on its own, because a queue only remembers the slots
-    still *left*: a requester whose ``cap`` peers have all attached is absent from
-    it and looks exactly like one that was never offered. So it would go on to
-    feed ``2 x cap``, and the cap the run was configured with would not be the
-    one it got.
+    A requester assigned afresh -- after its own source stops being one -- replaces
+    its edge in the tree rather than being handed slots a second time, so nothing has
+    to be kept in step with anything and a peer cannot come to feed ``2 x cap``.
 
-    Asks the chain rather than the plane, because most of these requesters are
-    routed to a peer that never publishes here: what is under test is who was
-    assigned to whom, and ``sources`` would rightly still be waiting.
+    Asks the chain rather than the plane, because most of these requesters are routed
+    to a peer that never publishes here: what is under test is who was assigned to
+    whom, and ``sources`` would rightly still be waiting.
     """
     cap = 2
 
-    async def _fanout_across_a_retire() -> int:
+    async def _fanout_across_a_retire():
         directory = Directory(W="p")
         plane = _sensing(directory, fanout_cap=cap)
-        # r0 pulls from the origin and publishes: a source for cap peers now.
-        await plane.sources([KEY], "r0")
-        directory.publish("r0", KEY)
-        plane.dispatcher.dispatch_sync(Stored("r0", KEY))
-        served = 0
-        for i in range(cap):  # ...and every one of those slots is taken
-            if (await plane._chain.select([KEY], f"r{i + 1}")).sources == ("r0",):
-                served += 1
-        # The origin drops the key, so r0's source holds nothing and owes nothing:
-        # it is retired, and r0 is assigned afresh on the ask after that.
+        await plane.sources([KEY], "r0")            # r0 <- p, the origin
+        for name in ("r1", "r2", "r3"):             # r0 fills, then r1 takes the rest
+            await plane._decide([KEY], name)
+        # The origin drops the key, so nothing is coming to r0 or to anyone behind it:
+        # no volume has a copy on the way, and the next ask is the directory's answer.
         directory.evict("p", KEY)
-        await plane._chain.select([KEY], "r0")
-        await plane._chain.select([KEY], "r0")
-        for i in range(2 * cap):
-            if (await plane._chain.select([KEY], f"x{i}")).sources == ("r0",):
-                served += 1
-        return served
+        last = await plane._decide([KEY], "r4")
+        return Counter(plane.view.fanout.routes().values()), last.sources
 
-    served, _trace = run_sim(_fanout_across_a_retire())
-    assert served == cap
+    served, last = run_sim(_fanout_across_a_retire())[0]
+    assert served["r0"] == cap        # never a slot more, before the retire or after
+    assert served["r1"] == 1          # r3, once r0 was full
+    assert last is None               # nothing to route r4 to; the directory answers
 
 
 def test_the_sensor_remembers_no_registrations():

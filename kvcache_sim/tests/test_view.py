@@ -110,8 +110,8 @@ def test_a_ranking_that_declares_nothing_senses_nothing():
     assert ByBatch().attach(bare.subset(*ByBatch.sensors)).view is bare
     with pytest.raises(AttributeError):
         bare.cluster
-    ranked = asyncio.run(ByBatch().attach(bare).select([("s0", 3), ("s1", 1)], "r"))
-    assert ranked.sources == ("s1", "s0")
+    keyed = asyncio.run(ByBatch().attach(bare).select([("s0", 3), ("s1", 1)], "r"))
+    assert keyed.sort().sources == ("s1", "s0")      # the ranking keys, the fold orders
 
 
 def test_a_subset_composing_a_sensor_this_view_never_carried_raises():

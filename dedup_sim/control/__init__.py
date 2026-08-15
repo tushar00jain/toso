@@ -3,8 +3,9 @@
 One plane, one chain. :class:`~dedup_sim.control.routing.Dedup` is a
 :class:`proposed.plane.ControlPlane` with one member -- the source question a reader
 asks -- and it answers it from the :class:`proposed.selector.FirstMatch` chain it
-builds over :mod:`dedup_sim.control._selector`, where the routing decision and the
-waiting live. What makes that answer come true is not asked of it: a reader commits one
+builds over :mod:`dedup_sim.control._selector`, where the ranking lives, plus
+:mod:`dedup_sim.control._answer`, where the route it records and the waiting do. What
+makes that answer come true is not asked of it: a reader commits one
 :class:`proposed.dispatch.Stored`, and this plane's own state
 (:mod:`dedup_sim.control._sensor`) is what folds it.
 

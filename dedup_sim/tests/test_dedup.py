@@ -78,6 +78,20 @@ def test_fabric_dedup_1x_independent_of_fanout_cap(mode):
         assert dedup.ledger.origin_bytes == PAYLOAD_BYTES, cap
 
 
+def test_a_chain_deeper_than_the_fabric_charge_starts_a_new_one():
+    """Where 1x stops, which is a trade the price makes rather than a promise it keeps.
+
+    A peer wins while the wait behind it costs less than the fabric a fresh hop burns
+    (:mod:`dedup_sim.control._selector`), so a cap-1 chain folds readers in until it is
+    seven deep and then reads a holder again -- a 64-hop chain being the worse answer,
+    not the safer one. Any cap above 1 keeps the tree logarithmic, so it never reaches
+    that depth and the fabric is 1x for a burst of any size.
+    """
+    assert run(num_readers=7, fanout_cap=1).ledger.origin_bytes == PAYLOAD_BYTES
+    assert run(num_readers=8, fanout_cap=1).ledger.origin_bytes == 2 * PAYLOAD_BYTES
+    assert run(num_readers=64, fanout_cap=2).ledger.origin_bytes == PAYLOAD_BYTES
+
+
 # 4. Exactly one reader pulls from the origin; the rest pull from peers.
 @pytest.mark.parametrize("mode", MODES)
 def test_only_one_hop_crosses_from_the_origin(mode):

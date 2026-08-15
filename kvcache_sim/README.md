@@ -79,9 +79,10 @@ python -m kvcache_sim --help            # usage + valid scenario names
   trace prints (capped to the first 60 events per scenario); the default INFO level
   prints only the `(b)` summaries.
 - `--spread-reads` puts the **hotspot** scenario's cache-aware source ranking under
-  `proposed.selector.Discount`, so longest-prefix-then-id becomes
-  longest-prefix-minus-recent-load and one replica of a hot prefix does not serve
-  every read of it. Off by default: it changes which replica answers, so it is not
+  `proposed.selector.Balance`, which appends the load lately routed at each source to the
+  ranking's sort key, and folds the two with `by_prefix_and_load`, so
+  longest-prefix-then-id becomes longest-prefix-minus-recent-load and one replica of a
+  hot prefix does not serve every read of it. Off by default: it changes which replica answers, so it is not
   byte-identical.
 
 ## The scenarios
@@ -249,11 +250,16 @@ kvcache_sim/
                           #   above and below it, so a ranking may be typed on a
                           #   plan and nothing cycles
     _selector.py          #   every ranking a decision here makes, each a
-                          #   proposed selector: LongestPrefixKeySelector (the
+                          #   proposed selector, and each one keying its
+                          #   candidates rather than ordering them:
+                          #   LongestPrefixKeySelector (the
                           #   one store question, "which peer serves this gap",
                           #   priced in blocks of prefix run so the opt-in
-                          #   proposed.selector.Discount can spread reads over
-                          #   equally good replicas), LocalOnly, ByTTFT/ByLoad
+                          #   proposed.selector.Balance can spread reads over
+                          #   equally good replicas, by_prefix_and_load being
+                          #   the fold that reads the two dimensions that
+                          #   leaves), LocalOnly,
+                          #   ByTTFT/ByLoad
                           #   over the priced prefill candidates, ByBatch over
                           #   the decode ones, and RoutedPull answering a fetch
                           #   with the pull already priced for it. A ranking is

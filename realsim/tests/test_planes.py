@@ -13,12 +13,14 @@ pin the contract each one owes its callers:
    swapped in as the only difference between two runs;
 3. a preference reorders a directory answer to its ranked sources, a selection
    withholds itself until its readiness gate opens and crosses a service boundary
-   without it -- and the two combinators built on it tell an *abstention* from the
-   *naive answer*, carry a wrapped selector's gate and prices through, and wake every
+   without it, and folding one -- ``sort`` / ``max`` -- is the only thing that puts it
+   in an order; the two combinators built on it tell an *abstention* from the *naive
+   answer*, carry a wrapped selector's gate, key and prices through, and wake every
    selector they hold -- off the view that selector declared -- whether or not they
-   consult it. ``FirstMatch`` picks between alternatives, ``Discount`` re-ranks one
-   answer by how much it has lately named each source, and a ranking narrows itself
-   in place (``require``, ``take``);
+   consult it. ``FirstMatch`` picks between alternatives, ``Balance`` appends the load
+   on the sources one answer named as a further dimension of its key (what to make of
+   that is the fold's, and the fold is the caller's), and a ranking narrows itself in
+   place (``require``, ``take``);
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -50,12 +52,12 @@ from proposed import AnySelector, ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
-    Discount, FirstMatch, NaiveKeySelector, prefer, Selector,
+    Balance, declares, FirstMatch, NaiveKeySelector, prefer, Selector,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
 from realsim.seams.transport import Endpoint
-from proposed import locality, nearest, Sensed, SensorView, View
+from proposed import locality, LoadView, nearest, Sensed, SensorView, View
 from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier
@@ -439,8 +441,71 @@ def test_a_run_with_no_plane_fronts_nothing():
 
 
 # --------------------------------------------------------------------------
-# 3. Selection: ranking + readiness.
+# 3. Selection: what a stage annotates, what a fold makes of it, and readiness.
 # --------------------------------------------------------------------------
+
+
+def test_a_fold_is_the_only_thing_that_puts_a_selection_in_an_order():
+    """A stage keys; ``sort`` orders and ``max`` picks, off the dimensions it left.
+
+    With no fold the dimensions are compared as they stand, which is what a chain of
+    stages costs when nothing has to be blended -- and a selection no stage keyed keeps
+    the order it was built with, since there is nothing to beat it.
+    """
+    keyed = Selection.keyed([("v0", (9,), "p0"), ("v1", (2,), "p1")])
+    assert keyed.sources == ("v0", "v1")            # built, not ranked
+    assert keyed.sort().sources == ("v1", "v0")
+    assert keyed.max().sources == ("v1",)
+    assert Selection.priced([("v0", 9), ("v1", 2)]).sort().sources == ("v1", "v0")
+    unkeyed = Selection.of(["v1", "v0"])
+    assert unkeyed.sort() is unkeyed
+    assert unkeyed.max().sources == ("v1",)
+
+
+def test_a_fold_blends_the_dimensions_the_stages_left():
+    """The dimensions are positional, and a fold is any arithmetic over them.
+
+    Which is what a re-sort could not express: two numbers traded against each other
+    rather than one applied after the other. A stage that never ran is a dimension that
+    is not there, so a fold reaching for it raises instead of comparing whatever landed
+    in that position.
+    """
+    two = Selection.keyed([("v0", (4, 3), "p0"), ("v1", (5, 0), "p1")])
+    assert two.sort().sources == ("v0", "v1")                     # 4 < 5
+    assert two.sort(lambda d: d[0] * (1 + d[1])).sources == ("v1", "v0")   # 16 > 5
+    with pytest.raises(IndexError):
+        Selection.priced([("v0", 4)]).sort(lambda d: d[0] + d[1])
+
+
+def test_the_id_breaks_every_tie_in_one_place():
+    """Two sources the stages cannot separate go id-ascending, folded or not.
+
+    In one place, so a run reproduces however many stages annotated the selection and
+    whatever the fold made of them.
+    """
+    tied = Selection.keyed([("v1", (5, 1), "p"), ("v0", (5, 1), "p")])
+    assert tied.sort().sources == ("v0", "v1")
+    assert tied.sort(lambda d: 0).sources == ("v0", "v1")
+
+
+def test_both_empties_survive_a_fold():
+    """Neither names a source, so there is nothing to order and nothing to pick."""
+    for empty in (Selection.of([]), Selection()):
+        assert empty.sort() is empty
+        assert empty.max() is empty
+
+
+def test_max_keeps_the_gate_and_the_winner_s_key_and_price():
+    """A plane folds and *then* spends the gate, so the pick has to carry it."""
+
+    async def gate() -> None:
+        return None
+
+    best = Selection.keyed([("v0", (9,), "p0"), ("v1", (2,), "p1")], ready=gate).max()
+    assert (best.head, best.winner) == ("v1", "p1")
+    assert best.ready is gate
+    assert best.key == {"v1": (2,)}
+    assert "v0" not in best.payload      # dropped with the source it spoke for
 
 
 def test_a_preference_reorders_a_directory_answer_to_its_ranked_sources():
@@ -523,7 +588,7 @@ def _select(selector: Selector, keys=("K",), requester="r") -> Selection:
 
 
 class _Load:
-    """Per-source load, moved by hand: what a ``Discount`` reads off its view."""
+    """Per-source load, moved by hand: what a ``Balance`` reads off its view."""
 
     def __init__(self, **counts: int) -> None:
         self.counts = dict(counts)
@@ -537,7 +602,7 @@ class _Load:
 
 
 class _Senses:
-    """The whole of what a ``Discount`` senses: one load sensor, and no directory."""
+    """The whole of what a ``Balance`` senses: one load sensor, and no directory."""
 
     def __init__(self, load: Optional[_Load] = None) -> None:
         self.load = load if load is not None else _Load()
@@ -546,17 +611,35 @@ class _Senses:
         return 0.0
 
 
-def _heads(selector: Selector, *, count: int, moving: bool = True) -> list:
-    """The head of ``count`` successive rankings, the load moving as each is decided.
+def _bounded(bound: int):
+    """A fold in which load may cost a source ``bound`` of price and no more.
 
-    Which is the pairing in production: the ranking answers, the decision that follows
-    names that source, and the fold counts it. ``moving=False`` is a load nothing moves.
+    The knob every caller of this combinator ends up wanting, written where it belongs
+    -- in the caller's own fold, over the two dimensions the pairing leaves: the price,
+    then the load. The raw count rides behind the bounded number, so two sources the
+    bound has levelled keep alternating.
+    """
+    def fold(dims):
+        price, load = dims
+        return (price + min(load, bound), load)
+
+    return fold
+
+
+def _heads(
+    selector: Selector, *, count: int, moving: bool = True, fold=None
+) -> list:
+    """The winner of ``count`` successive folds, the load moving as each is decided.
+
+    Which is the pairing in production: the stages key, the plane folds and takes one
+    (``Selection.max``), the decision that follows names that source, and the sensor
+    counts it. ``moving=False`` is a load nothing moves.
     """
     senses = _Senses()
     selector.attach(senses)
     heads = []
     for _ in range(count):
-        head = _select(selector).head
+        head = _select(selector).max(fold).head
         heads.append(head)
         if moving:
             senses.load.sent(head)
@@ -626,15 +709,39 @@ def test_a_combinator_hands_each_link_the_view_that_link_declared():
     that is no view at all.
     """
     view = View(None, {}).derived(_Thing, thing="sensed")
-    declares, plain = _SensesThing(Selection.of([])), _Fixed(Selection.of(["v1"]))
-    FirstMatch([declares, plain]).attach(view)
-    assert declares.view.thing == "sensed"     # composed out of the one it was given
-    assert declares.view is not view
+    senses, plain = _SensesThing(Selection.of([])), _Fixed(Selection.of(["v1"]))
+    FirstMatch([senses, plain]).attach(view)
+    assert senses.view.thing == "sensed"       # composed out of the one it was given
+    assert senses.view is not view
     assert plain.view is view
 
     under = _SensesThing(Selection.priced([("v0", 1)]))
-    Discount(under).attach(view)
-    assert under.view is declares.view         # one view per distinct declaration
+    Balance(under).attach(view)
+    assert under.view is senses.view           # one view per distinct declaration
+
+
+class _ThingAndLoad(_Thing, LoadView):
+    """A view carrying both reads: the ranking's sensor and the combinator's load."""
+
+
+def test_a_combinator_declares_its_base_s_reads_as_well_as_its_own():
+    """Otherwise the narrowing loses the base's sensor, and the base senses nothing.
+
+    A combinator senses load, so it narrows -- and a view is composed of exactly what
+    was declared, so a declaration naming only load would hand the ranking under it a
+    view without the ranking's own sensor, which raises rather than answering quietly.
+    This is the shape it happens in: a balanced ranking as a link of a chain, where what
+    each link is attached to is its own header.
+    """
+    view = View(None, {}).derived(_ThingAndLoad, thing="sensed", load=_Load())
+    under = _SensesThing(Selection.priced([("v0", 1)]))
+    balanced = Balance(under)
+    assert declares((LoadView,), under) == (LoadView, _Thing) == balanced.sensors
+
+    FirstMatch([balanced]).attach(view)
+    assert under.view.thing == "sensed"        # the read its header declared
+    assert balanced.view.load.named() == {}    # and the one the combinator declared
+    assert _select(balanced).sources == ("v0",)
 
 
 def test_first_match_attaches_every_selector_even_unconsulted_ones():
@@ -659,8 +766,8 @@ def test_attaching_a_selector_hands_it_back_however_it_is_wrapped():
     """
     ranking = _Fixed(Selection.priced([("v0", 1)]))
     assert ranking.attach("a-view") is ranking
-    discounted = Discount(ranking)
-    assert discounted.attach("a-view") is discounted
+    balanced = Balance(ranking)
+    assert balanced.attach("a-view") is balanced
 
 
 def test_a_chain_is_a_key_selector_and_refuses_a_link_that_is_not():
@@ -679,20 +786,35 @@ def test_a_chain_is_a_key_selector_and_refuses_a_link_that_is_not():
         FirstMatch([_Fixed(), _FixedPlacement()])
 
 
-def test_discount_moves_the_tie_between_equally_priced_sources():
+def test_balance_appends_a_dimension_and_computes_nothing():
+    """What it adds is a reading, behind what the ranking under it said.
+
+    So the fold sees both numbers and decides between them -- and the payload arrives
+    as the base wrote it, which is what lets a caller price the winner against
+    something of its own without ever reading a weighed figure.
+    """
+    base = _FixedPlacement(Selection.keyed([("h0", (5,), "plan0"), ("h1", (9,), "p1")]))
+    balanced = Balance(base).attach(_Senses(_Load(h0=2)))
+    annotated = _select(balanced)
+    assert annotated.key == {"h0": (5, 2), "h1": (9, 0)}
+    assert annotated.payload == {"h0": "plan0", "h1": "p1"}
+    assert annotated.sources == ("h0", "h1")          # ordered nothing
+
+
+def test_balance_moves_the_tie_between_equally_priced_sources():
     """The point of the combinator: two sources a ranking cannot separate.
 
-    The base answers the same way every time, so the alternation is the discount's
-    and nothing else's -- and it goes on alternating rather than reverting to id order
-    once both sources carry a grant, because the raw count breaks the tie the bounded
-    discount levelled.
+    The base answers the same way every time, so the alternation is the load's and
+    nothing else's -- and it goes on alternating rather than reverting to id order once
+    both sources carry a grant, because the load dimension is still there to compare
+    when the price has been levelled.
     """
-    discounted = Discount(_Fixed(Selection.priced([("v0", 5), ("v1", 5)])))
-    assert isinstance(discounted, KeySelector)   # so a chain can still hold it
-    assert _heads(discounted, count=4) == ["v0", "v1", "v0", "v1"]
+    balanced = Balance(_Fixed(Selection.priced([("v0", 5), ("v1", 5)])))
+    assert isinstance(balanced, KeySelector)     # so a chain can still hold it
+    assert _heads(balanced, count=4) == ["v0", "v1", "v0", "v1"]
 
 
-def test_discount_reads_a_load_it_does_not_keep():
+def test_balance_reads_a_load_it_does_not_keep():
     """Asking is a read: the ranking writes nothing, so a load nothing moves is inert.
 
     Which is what makes this a combinator over an observation rather than a tally of
@@ -700,69 +822,73 @@ def test_discount_reads_a_load_it_does_not_keep():
     a plane that prices ten candidates and decides once moves it once.
     """
     equal = Selection.priced([("v0", 5), ("v1", 5)])
-    assert _heads(Discount(_Fixed(equal)), count=4, moving=False) == ["v0"] * 4
+    assert _heads(Balance(_Fixed(equal)), count=4, moving=False) == ["v0"] * 4
 
-    # ...and the head follows the load, whoever moved it.
+    # ...and the winner follows the load, whoever moved it.
     senses = _Senses(_Load(v0=1))
-    discounted = Discount(_Fixed(equal)).attach(senses)
-    assert _select(discounted).head == "v1"
+    balanced = Balance(_Fixed(equal)).attach(senses)
+    assert _select(balanced).max().head == "v1"
     senses.load.sent("v1")
-    assert _select(discounted).head == "v0"
+    assert _select(balanced).max().head == "v0"
 
 
-def test_discount_cannot_outvote_a_source_ahead_by_more_than_the_bound():
-    """``max_discount`` is in the base's units, so the bound is a price gap.
+def test_a_caller_s_fold_decides_what_load_may_outvote():
+    """The bound is the caller's, in the caller's own units, and so is its absence.
 
-    A discount wide enough to cover the gap does trade the price away, and only once
-    it has been fully spent -- stated here because that is the knob's meaning.
+    Compared as they stand, the price is the first dimension and a source ahead on it
+    wins however loaded it is; folded against a bound wide enough to cover the gap, load
+    does trade the price away -- and only once the bound has been fully spent. Both live
+    at the fold, which is why the combinator has no knob of its own to get the units of
+    wrong.
     """
-    apart = Selection.priced([("v0", 9), ("v1", 5)])
-    assert _heads(Discount(_Fixed(apart), max_discount=1), count=4) == ["v0"] * 4
-    assert _heads(Discount(_Fixed(apart), max_discount=4), count=5) == [
+    apart = Balance(_Fixed(Selection.priced([("v0", 5), ("v1", 9)])))
+    assert _heads(apart, count=4) == ["v0"] * 4
+    assert _heads(apart, count=4, fold=_bounded(1)) == ["v0"] * 4
+    assert _heads(apart, count=5, fold=_bounded(4)) == [
         "v0", "v0", "v0", "v0", "v1",
     ]
 
 
-def test_discount_passes_an_answer_with_no_source_to_rank_straight_through():
-    """The two empties again: neither names a source, so neither is re-ranked.
+def test_balance_passes_an_answer_with_no_source_to_rank_straight_through():
+    """The two empties again: neither names a source, so neither is annotated.
 
     Returned as they were built, and nothing is read off the load either: there is no
-    source to weigh.
+    source to measure.
     """
     for empty in (Selection.of([]), Selection()):
-        discounted = Discount(_Fixed(empty))
-        discounted.attach(_Senses())
-        assert _select(discounted) is empty
-        assert _select(discounted) is empty
+        balanced = Balance(_Fixed(empty))
+        balanced.attach(_Senses())
+        assert _select(balanced) is empty
+        assert _select(balanced) is empty
 
 
-def test_discount_refuses_a_ranking_that_prices_nothing():
-    """A discount is arithmetic on a price; without one it would overrule the base.
+def test_balance_refuses_a_ranking_that_keys_nothing():
+    """A dimension appended behind nothing would be the whole of the order.
 
-    Which is why a ranking's price is in its type: re-ordering an unpriced ranking
-    could only mean ignoring the order it chose.
+    Which is why a ranking under one has to say what orders it: the load would
+    otherwise decide a ranking that had already made up its mind, from outside it.
     """
-    discounted = Discount(_Fixed(Selection.of(["v0", "v1"])))
-    discounted.attach(_Senses())
-    with pytest.raises(ValueError, match="prices every source"):
-        _select(discounted)
+    balanced = Balance(_Fixed(Selection.of(["v0", "v1"])))
+    balanced.attach(_Senses())
+    with pytest.raises(ValueError, match="keys every source"):
+        _select(balanced)
 
 
-def test_discount_takes_the_kind_of_the_ranking_it_wraps():
+def test_balance_takes_the_kind_of_the_ranking_it_wraps():
     """One combinator over both subjects, and a chain still refuses the wrong one.
 
-    A discount asks whatever its ranking asks -- it hands the subject down untouched --
-    so its own kind cannot be declared once. It has to *be* a type, because that is how
-    a chain checks its links, so it is derived: a discounted key ranking is a chain
-    link, and a discounted application ranking gets the answer that ranking would get
-    by itself.
+    A combinator asks whatever its ranking asks -- it hands the subject down untouched
+    -- so its own kind cannot be declared once. It has to *be* a type, because that is
+    how a chain checks its links, so it is derived: a balanced key ranking is a chain
+    link, and a balanced application ranking gets the answer that ranking would get by
+    itself.
     """
-    over_keys = Discount(_Fixed(Selection.priced([("v0", 5)])))
-    over_payload = Discount(_FixedPlacement(Selection.priced([("v0", 5)])))
+    over_keys = Balance(_Fixed(Selection.priced([("v0", 5)])))
+    over_payload = Balance(_FixedPlacement(Selection.priced([("v0", 5)])))
 
     assert isinstance(over_keys, KeySelector)
     assert not isinstance(over_payload, KeySelector)
-    assert isinstance(over_payload, Discount)        # still the combinator
+    assert isinstance(over_payload, Balance)         # still the combinator
     assert over_payload.subject_type is Any          # read off the ranking under it
 
     FirstMatch([over_keys])                          # a link like the ranking it wraps
@@ -770,35 +896,35 @@ def test_discount_takes_the_kind_of_the_ranking_it_wraps():
         FirstMatch([over_payload])
 
 
-def test_discount_spreads_an_application_ranking_too():
-    """The tie a discount breaks is not the store's question in particular.
+def test_balance_spreads_an_application_ranking_too():
+    """The tie this breaks is not the store's question in particular.
 
     Two hosts an application priced the same sort on its last tie-break, exactly as two
     volumes do, so the combinator is the same one -- which is the whole point of it
     taking any subject.
     """
-    discounted = Discount(_FixedPlacement(Selection.priced([("h0", 5), ("h1", 5)])))
-    assert _heads(discounted, count=4) == ["h0", "h1", "h0", "h1"]
+    ranking = _FixedPlacement(Selection.priced([("h0", 5), ("h1", 5)]))
+    assert _heads(Balance(ranking), count=4) == ["h0", "h1", "h0", "h1"]
 
 
-def test_discount_attaches_the_ranking_under_it_and_keeps_what_it_answered():
-    """The wrapped selector is sensing, and the answer is re-ordered and nothing else.
+def test_balance_attaches_the_ranking_under_it_and_keeps_what_it_answered():
+    """The wrapped selector is sensing, and the answer is annotated and nothing else.
 
-    The gate rides through and every kept source keeps the *base's* price, so a caller
-    pricing the winner against something of its own never reads a discounted figure.
+    The gate rides through and every source keeps the *base's* price, so a caller
+    pricing the winner against something of its own never reads a weighed figure.
     """
 
     async def gate() -> None:
         return None
 
     base = _Fixed(Selection.priced([("v0", 5), ("v1", 5)], ready=gate))
-    discounted = Discount(base)
+    balanced = Balance(base)
     senses = _Senses()
-    discounted.attach(senses)
+    balanced.attach(senses)
 
-    assert base.view is senses                      # brought up by its holder
-    senses.load.sent(_select(discounted).head)      # v0 ranked, and decided on ...
-    second = _select(discounted)                    # ... so v1 leads now
+    assert base.view is senses                          # brought up by its holder
+    senses.load.sent(_select(balanced).max().head)      # v0 won, and decided on ...
+    second = _select(balanced).sort()                   # ... so v1 leads now
     assert second.sources == ("v1", "v0")
     assert second.ready is gate
     assert (second.head, second.winner) == ("v1", 5)

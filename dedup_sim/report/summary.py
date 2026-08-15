@@ -9,10 +9,13 @@ selector, and who served whom.
 
 from __future__ import annotations
 
+from collections import Counter
+from typing import Sequence
+
 from realsim.run import Report, Result
 from sim_common.report import render_tree
 
-__all__ = ["DedupReport", "BaselineReport"]
+__all__ = ["BaselineReport", "DedupReport", "WeightSyncReport"]
 
 
 class DedupReport(Report):
@@ -70,3 +73,54 @@ class BaselineReport(Report):
             f"concurrent so it wins wallclock, but pays "
             f"{naive.workload.num_readers}x the bytes.",
         ])
+
+
+class WeightSyncReport(Report):
+    """The three routings of one weight-sync burst, side by side.
+
+    The measurement the spread run exists for is not total fabric -- it is worse on that
+    than the chain -- but **how much of it any one trainer serves**, and what the depth
+    of the resulting tree costs in wallclock. So the table is per run: bytes out of the
+    trainers, the worst single trainer's share of them, and the wallclock; then the
+    who-served-whom picture, which is where the shape shows.
+    """
+
+    def __init__(self, results: Sequence[Result]) -> None:
+        self.results = list(results)
+
+    def _served(self, result: Result) -> Counter:
+        """``source -> reads it served``, over the run's transfer edges."""
+        return Counter(src for src, _dst, _label in result.ledger.edges)
+
+    def render(self) -> str:
+        workload = self.results[0].workload
+        payload = workload.payload_bytes
+        labels = [r.label for r in self.results]
+        width = max(12, *(len(label) + 2 for label in labels))
+        rows = [
+            f"trainers: {workload.num_trainers}   "
+            f"generators: {workload.num_generators}   payload: {payload}B",
+            f"  {'':22}" + "".join(f"{label:>{width}}" for label in labels),
+        ]
+
+        def row(title: str, cell) -> str:
+            return f"  {title:22}" + "".join(
+                f"{cell(r):>{width}}" for r in self.results
+            )
+
+        rows.append(row(
+            "fabric off trainers",
+            lambda r: f"{r.ledger.origin_bytes}B "
+                      f"({r.ledger.origin_bytes / payload:.0f}x)",
+        ))
+        rows.append(row(
+            "reads off one trainer",
+            lambda r: str(max(
+                (self._served(r)[t] for t in workload.trainer_ids), default=0
+            )),
+        ))
+        rows.append(row("wallclock", lambda r: f"{r.ledger.wallclock:.4f}"))
+        for result in self.results:
+            rows.append(f"  source->dest, {result.label}:")
+            rows += ["    " + line for line in render_tree(result.ledger.edges)]
+        return "\n".join(rows)

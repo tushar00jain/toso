@@ -1,4 +1,4 @@
-"""The dedup scenario: one comparison, as a :class:`realsim.demo.Scenario`.
+"""The dedup scenarios: two comparisons, as :class:`realsim.demo.Scenario` values.
 
 :class:`Dedup` declares its choices as :class:`~realsim.run.Run` values -- how
 many readers, which fan-out caps, and what each configuration installs -- and
@@ -6,13 +6,17 @@ narrates the results. It wires no clock, no mesh and no plane, and it executes
 nothing; :meth:`realsim.demo.Demo.main` does that with
 :meth:`realsim.run.Run.execute`.
 
-Every run shares one :class:`~putget_sim.workload.put_get.PutGetBurst` -- ordinary
-user code: seed ``W``, then a gather of ``client.get(W)``. The baseline adds
-nothing and gets ``m x``; the routed runs add
-:class:`~dedup_sim.control.routing.Dedup` and the read-through
+Every run of :class:`Dedup` shares one
+:class:`~putget_sim.workload.put_get.PutGetBurst` -- ordinary user code: seed ``W``,
+then a gather of ``client.get(W)``. The baseline adds nothing and gets ``m x``; the
+routed runs add :class:`~dedup_sim.control.routing.Dedup` and the read-through
 :class:`~dedup_sim.data.read_through.ReadThroughPlane` and get 1x. Same topology,
 payload, cost model and client calls -- the *only* difference is what the ``Run``
 carries, which is what makes the comparison mean something.
+
+:class:`WeightSync` is the same three-way comparison over a key with **two** holders
+(:class:`~dedup_sim.workload._weight_sync.WeightSync`), which is where the chain has an
+alternative: one trainer per generator instead of a queue behind one trainer.
 """
 
 from __future__ import annotations
@@ -27,9 +31,10 @@ from sim_common.trace import Trace
 
 from ..control import routing
 from ..data.read_through import ReadThroughPlane
-from ..report.summary import BaselineReport, DedupReport
+from ..report.summary import BaselineReport, DedupReport, WeightSyncReport
+from ._weight_sync import WeightSync as WeightSyncWorkload
 
-__all__ = ["NUM_READERS", "FANOUT_CAPS", "Dedup"]
+__all__ = ["NUM_READERS", "FANOUT_CAPS", "Dedup", "WeightSync"]
 
 #: Readers in the burst. Three is enough to show a chain and a shallow tree.
 NUM_READERS = 3
@@ -123,3 +128,59 @@ class Dedup(Scenario):
         console.section("NAIVE baseline  --  every reader pulls from the origin")
         console.trace(naive.trace, label="naive run")
         console.summary(BaselineReport(naive))
+
+
+class WeightSync(Scenario):
+    """One key, two trainer replicas, two generators: chain it or spread it.
+
+    Three runs over the one workload, in the order the trade reads: no routing at all,
+    dedup as it stands, and dedup with ``spread`` on. What differs is one flag on the
+    control plane -- the data plane is the same read-through in both routed runs, so
+    every generator publishes what it read either way.
+
+    Parameterized by construction so a test can widen it (more generators than
+    replicas is where the peer chain comes back), not by a flag.
+    """
+
+    name = "weight_sync"
+
+    def __init__(self, num_trainers: int = 2, num_generators: int = 2) -> None:
+        self.num_trainers = num_trainers
+        self.num_generators = num_generators
+
+    def runs(self, args=None) -> List[Run]:
+        """``["baseline", "dedup", "dedup+spread"]`` over one shared workload."""
+        workload = WeightSyncWorkload(self.num_trainers, self.num_generators)
+        runs = [Run("baseline", workload, profile=workload.profile)]
+        for label, spread in (("dedup", False), ("dedup+spread", True)):
+            # The plane records into the trace the run reports, so the trace exists
+            # before the stack the plane is attached to (as in ``Dedup`` above).
+            trace = Trace()
+            runs.append(
+                Run(
+                    label,
+                    workload,
+                    control=routing.Dedup(spread=spread, trace=trace),
+                    data=lambda sim, w=workload: _read_through(sim, w),
+                    profile=workload.profile,
+                    trace=trace,
+                )
+            )
+        return runs
+
+    def show(self, console: Console, results: Sequence[Result]) -> None:
+        workload = results[0].workload
+        console.section(
+            f"WEIGHT SYNC  --  {workload.num_generators} generators get W from "
+            f"{workload.num_trainers} trainer replicas"
+        )
+        console.info(
+            "the replicas are equidistant, so locality prices them identically and the"
+        )
+        console.info(
+            "id tie-break sends every generator to t0; a load term is what separates"
+        )
+        console.info("them, and the read-through is on in both routed runs.")
+        for result in results:
+            console.trace(result.trace, label=f"{result.label} run")
+        console.summary(WeightSyncReport(results))

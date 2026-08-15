@@ -1,17 +1,18 @@
-"""What one dedup decision senses: :class:`FanoutView`.
+"""What a dedup decision senses: :class:`FanoutView`, and :class:`DedupView` over it.
 
-Dedup senses one thing beside the directory, so there is no view to assemble out of
-several: ``view.derived(FanoutView, fanout=...)``
-(:meth:`~proposed.view.View.derived`) is the whole of it. The keyword is claimed here
-and nowhere else -- one no view claims reaches :class:`~proposed.view.View`, which
-takes none, and raises there.
+Dedup holds one sensor, and its decisions read it two ways: as the tree they extend
+(:class:`FanoutView`) and as the load they spread over
+(:class:`~proposed.view.LoadView`). :class:`DedupView` is the pair, which is what
+:meth:`dedup_sim.control.routing.Dedup.attach` derives; each link is attached to the
+subset its own header declares. A keyword no view claims reaches
+:class:`~proposed.view.View`, which takes none, and raises there.
 """
 
 from __future__ import annotations
 
-from proposed import Sensed, SensorView
+from proposed import LoadView, Sensed, SensorView
 
-__all__ = ["FanoutView"]
+__all__ = ["DedupView", "FanoutView"]
 
 
 class FanoutView(SensorView):
@@ -24,3 +25,14 @@ class FanoutView(SensorView):
     """
 
     fanout = Sensed("fan-out")
+
+
+class DedupView(FanoutView, LoadView):
+    """Both reads of dedup's one sensor: the tree, and the load on it.
+
+    One sensor composed under two names, because the two reads are the same record:
+    who is routed to whom is the tree a link extends and the load a
+    :class:`~proposed.selector.Balance` appends
+    (:meth:`~dedup_sim.control._sensor.FanoutSensor.named`). A second sensor would be a
+    second copy of it to keep in step.
+    """

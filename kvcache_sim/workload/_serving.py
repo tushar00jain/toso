@@ -67,6 +67,7 @@ from zlib import crc32
 
 from domain import DEFAULT_MODEL, DEFAULT_PROFILE
 from proposed import ControlPlane, Endpoint, KeySelector, RoutedPlane
+from proposed.selector import Fold
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.simulation import Simulation
 from realsim.run import Workload
@@ -151,6 +152,7 @@ def scheduler(
     decode_pool: Optional[List[str]] = None,
     early_rejection: str = "early",
     source_selector: Optional[KeySelector[int]] = None,
+    source_fold: Optional[Fold] = None,
 ) -> ControlPlane:
     """This run's **control plane**, as an object a scenario can just declare.
 
@@ -166,11 +168,13 @@ def scheduler(
 
     ``source_selector`` is the one knob that is an object rather than a value: which
     peer serves a prefix gap is a :class:`~proposed.selector.KeySelector`, and one
-    under a :class:`~proposed.selector.Discount` keeps state across the decisions it
-    makes. ``None`` -- the default -- is
+    under a :class:`~proposed.selector.Balance` senses through a view of its own.
+    ``None`` -- the default -- is
     :class:`~kvcache_sim.control._selector.LongestPrefixKeySelector`. Give each run its
-    own: two runs sharing one would tally each other's grants and neither would
-    reproduce alone.
+    own: one object attached twice senses only the view it was attached to last, so
+    neither run would reproduce alone. ``source_fold`` travels with it, being how the
+    plane folds that ranking's key, and is safe to share -- a fold is arithmetic over a
+    key and holds nothing.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
@@ -188,6 +192,7 @@ def scheduler(
         early_rejection=early_rejection,
         cluster=cluster,
         source_selector=source,
+        source_fold=source_fold,
     )
     if kind == "cache_aware":
         # The same ranking twice over: the reuse axis names a peer while pricing, and

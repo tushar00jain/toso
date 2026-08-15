@@ -33,8 +33,10 @@ from kvcache_sim.data._store import KVStore
 from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, Dispatcher, KeySelector, LoadView
-from proposed.selector import Discount, FirstMatch
-from kvcache_sim.control._selector import LocalOnly, LongestPrefixKeySelector
+from proposed.selector import Balance, FirstMatch
+from kvcache_sim.control._selector import (
+    by_prefix_and_load, LocalOnly, LongestPrefixKeySelector,
+)
 from kvcache_sim.control._sensor import Committed, SourceLoad
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, Plan, PrefillFinished, Response,
@@ -1618,16 +1620,17 @@ def test_the_source_selector_accepts_a_plain_view():
     assert ranked.sources == ("s1",)            # ...and now the holder is ranked
 
 
-# 19. Spreading reads: the prefix ranking under a Discount breaks its tie on load.
+# 19. Spreading reads: the prefix ranking under a Balance breaks its tie on load.
 #     Reuse value is a property of the prefix, so replicas of a hot prefix rank
 #     identically and the id tie-break sends every read to the same host. The
 #     combinator reads how much each source has been sent (SourceLoad, moved by the
 #     decision that names one) and lets that settle the tie, under a bound that keeps a
 #     genuinely longer prefix winning. What is asserted here is what the pairing does to
 #     *prefix runs*; the combinator's own mechanics are in realsim/tests/test_planes.py.
-def _spread(**knobs):
-    """The opt-in source ranking: longest prefix, discounted by recent grants."""
-    return Discount(LongestPrefixKeySelector(), **knobs)
+def _spread(bound: int = 1):
+    """The opt-in pairing, as the plane holds it: the ranking that keys the prefix run
+    with the recent grants appended, and the fold that docks one by the other."""
+    return Balance(LongestPrefixKeySelector()), by_prefix_and_load(bound)
 
 
 def _replicated(holders, blocks, *, num=4):
@@ -1651,11 +1654,11 @@ def _replicated(holders, blocks, *, num=4):
     return sim, keys
 
 
-def _select_heads(sim, selector, keys, *, count, moving=True):
-    """The head of ``count`` successive rankings, the load moving as each is decided.
+def _select_heads(sim, selector, keys, *, count, moving=True, fold=None):
+    """The winner of ``count`` successive folds, the load moving as each is decided.
 
-    The pairing the run has: the ranking answers, the decision that follows names that
-    source, and the fold counts it
+    The pairing the run has: the ranking keys, the plane folds and takes one, the
+    decision that follows names that source, and the sensor counts it
     (:class:`~kvcache_sim.control._sensor.SourceLoad`). ``moving=False`` is a load
     nothing moves, which is the base ranking's own order.
     """
@@ -1666,7 +1669,7 @@ def _select_heads(sim, selector, keys, *, count, moving=True):
         heads = []
         with sim.mesh.installed():
             for _ in range(count):
-                head = (await selector.select(keys, "s0")).sources[0]
+                head = (await selector.select(keys, "s0")).max(fold).head
                 heads.append(head)
                 if moving:
                     load.folds[Committed](_accepted(source=head, pull=list(keys)))
@@ -1678,8 +1681,9 @@ def _select_heads(sim, selector, keys, *, count, moving=True):
 def test_spread_reads_rotates_between_equal_prefix_replicas():
     """Three replicas of one prefix, so the ranking has nothing else to go on."""
     sim, keys = _replicated(["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 4})
+    ranking, fold = _spread()
     try:
-        heads = _select_heads(sim, _spread(), keys, count=6)
+        heads = _select_heads(sim, ranking, keys, count=6, fold=fold)
         # ...and the same replicas under the default selector, which cannot spread.
         stuck = _select_heads(sim, LongestPrefixKeySelector(), keys, count=6)
     finally:
@@ -1689,18 +1693,20 @@ def test_spread_reads_rotates_between_equal_prefix_replicas():
 
 
 def test_spread_reads_still_prefers_a_materially_longer_prefix():
-    """Load may shave off ``max_discount`` blocks and no more.
+    """Load may dock a source ``bound`` blocks of prefix run and no more.
 
-    s2 holds twice the prefix and is granted every read regardless: the discount is
+    s2 holds twice the prefix and is granted every read regardless: the fold is
     bounded, so the cost signal can settle a tie but never outvote reuse.
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 2, "s2": 4})
+    ranking, fold = _spread()
+    wider, wide_fold = _spread(bound=4)
     try:
-        heads = _select_heads(sim, _spread(max_discount=1), keys, count=5)
-        # A discount wide enough to cover the gap does trade reuse away, and only
-        # once it has been fully spent -- stated here because it is the knob's
-        # meaning, not a defect.
-        wide = _select_heads(sim, _spread(max_discount=4), keys, count=3)
+        heads = _select_heads(sim, ranking, keys, count=5, fold=fold)
+        # A bound wide enough to cover the gap does trade reuse away, and only once it
+        # has been fully spent -- stated here because it is the knob's meaning, not a
+        # defect.
+        wide = _select_heads(sim, wider, keys, count=3, fold=wide_fold)
     finally:
         sim.loop.close()
     assert heads == ["s2"] * 5
@@ -1715,9 +1721,14 @@ def test_spread_reads_answers_the_base_order_when_nothing_has_been_sent():
     under it does.
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 4, "s2": 4})
+    moving_pair, still_pair = _spread(), _spread()
     try:
-        moving = _select_heads(sim, _spread(), keys, count=4)
-        still = _select_heads(sim, _spread(), keys, count=4, moving=False)
+        moving = _select_heads(
+            sim, moving_pair[0], keys, count=4, fold=moving_pair[1]
+        )
+        still = _select_heads(
+            sim, still_pair[0], keys, count=4, moving=False, fold=still_pair[1]
+        )
     finally:
         sim.loop.close()
     assert moving == ["s1", "s2", "s1", "s2"]
@@ -1727,18 +1738,19 @@ def test_spread_reads_answers_the_base_order_when_nothing_has_been_sent():
 def test_spread_reads_ranks_deterministically():
     """Same grants, same clock, same ranking -- every time, whole list.
 
-    The rank key ends in the instance id, so no two sources can compare equal and
+    The fold ends in the instance id, so no two sources can compare equal and
     nothing is left for dict or arrival order to decide. Asserted over the full
-    ranking rather than the head, because a caller that rejects the first source
+    ranking rather than the winner, because a caller that rejects the first source
     reads the rest of it.
     """
     async def rankings(sim, keys):
         load = SourceLoad()
-        selector = _spread().attach(sim.view.derived(LoadView, load=load))
+        ranking, fold = _spread()
+        selector = ranking.attach(sim.view.derived(LoadView, load=load))
         out = []
         with sim.mesh.installed():
             for _ in range(5):
-                ranked = (await selector.select(keys, "s0")).sources
+                ranked = (await selector.select(keys, "s0")).sort(fold).sources
                 out.append(ranked)
                 load.folds[Committed](_accepted(source=ranked[0], pull=list(keys)))
         return out
@@ -1764,9 +1776,9 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
 
     ``python -m kvcache_sim hotspot --spread-reads``: the demo declares the flag, the
     scenario reads it off the parsed command line and gives each cache-aware run its
-    *own* selector, and the reads of a replicated prefix land on several replicas
-    rather than all on whichever one sorts first -- with the split differing from the
-    ranking that cannot spread at all.
+    *own* selector and the fold that reads what it appends, and the reads of a
+    replicated prefix land on several replicas rather than all on whichever one sorts
+    first -- with the split differing from the ranking that cannot spread at all.
 
     What does not change is that a *planned* pull is fetched from the peer it was
     priced against -- the ranking sits behind the routed-pull memo in the chain the
@@ -1781,8 +1793,10 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     # The one ranking the plane holds: it prices against it and answers a fetch with
     # it, so this is where a run's own selector is reachable.
     selectors = [run.control._source for run in aware]
-    assert all(isinstance(p, Discount) for p in selectors)
+    assert all(isinstance(p, Balance) for p in selectors)
     assert selectors[0] is not selectors[1], "a shared tally would count both runs"
+    # Both halves reach the plane, or the load would be a dimension nothing reads.
+    assert all(run.control._fold is not None for run in aware)
 
     def pull_sources(result):
         return sorted(

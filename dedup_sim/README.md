@@ -25,11 +25,12 @@ finishes, so each pulls from the origin volume -- `m x` fabric.
 `Dedup` is asked first, and the read then prefers what it named. It is this
 capability's whole control plane, reached as a service of its own:
 
-1. Readers ask it in order. The **first** is routed to a volume that already holds
-   the key -- the single fabric hop.
-2. Every later reader is routed to a **peer**: a reader that is about to hold the
-   key. Peers are handed out FIFO under a fan-out cap (`fanout_cap=1` -> a chain,
-   `>=2` -> a shallow tree).
+1. Readers ask it in order, and one ranking prices everything that could serve them:
+   the volumes holding the key, and the readers already routed to fetch it. The
+   **first** reader has only the holders to choose from -- the single fabric hop.
+2. Every later reader finds a **peer** cheaper: a reader that is about to hold the
+   key, one tier away instead of across the fabric. A peer stops being offered once
+   `fanout_cap` readers are behind it (`1` -> a chain, `>=2` -> a shallow tree).
 3. That peer has not registered yet, so the decision carries a **readiness gate**
    and `sources` *does not answer* until the peer's read-through put lands. The
    caller's read is then an unmodified `client.get` with a preference passed to it:
@@ -43,9 +44,29 @@ capability's whole control plane, reached as a service of its own:
    parked reader, each of which re-reads the directory: one of them now finds its peer
    there, and the gate is open.
 
-Because exactly one reader ever pulls from a pre-existing holder, the only
-origin-sourced transfer is that first hop: `origin_bytes == 1x` the payload, for
-**any** fan-out cap. The baseline stays `m x`.
+Because a peer outprices a holder, exactly one reader ever pulls from a pre-existing
+holder: the only origin-sourced transfer is that first hop, `origin_bytes == 1x` the
+payload, for **any** fan-out cap. The baseline stays `m x`.
+
+The price is where that preference lives, rather than an order the chain is written in
+(`dedup_sim.control._selector`), and it is in **seconds off the run's own cost model**,
+so nothing weighs a distance against a delay:
+
+```
+score = wait + hop + fabric * hop        (seconds; lower wins)
+
+  wait     seconds until that source holds the key -- 0 for a holder, and for a peer
+           the sum of the real link times up its own branch
+  hop      what the transfer to the requester costs over the link between them
+  fabric   the one dial: what a second of the link this read occupies is worth against
+           a second of the requester's own waiting (10 chained, 0 spread)
+```
+
+A near peer wins because its link is cheap, and 1x holds while the branch's accumulated
+link time stays under the fabric charge -- on the default profile a cap-1 chain seven
+readers deep, past which a fresh hop off a holder really is the better answer. That is a
+trade the price makes rather than a promise it keeps; any cap above 1 keeps the tree
+shallow enough that a burst of any size never reaches it.
 
 There is no burst loop anywhere. `dedup_sim/workload/scenarios.py` runs
 [`putget_sim`](../putget_sim/)'s ordinary put/get fixture -- a `client.put` and a
@@ -70,8 +91,9 @@ This sim imports `torch` + `torchstore` (through `realsim`), so use the project'
 ## How to run
 
 ```
-PYTHONPATH=. .venv/bin/python -m dedup_sim        # INFO: fabric summaries + ASCII
-PYTHONPATH=. .venv/bin/python -m dedup_sim -v     # add the full per-event trace (DEBUG)
+PYTHONPATH=. .venv/bin/python -m dedup_sim              # both scenarios
+PYTHONPATH=. .venv/bin/python -m dedup_sim weight_sync  # just the two-replica one
+PYTHONPATH=. .venv/bin/python -m dedup_sim -v           # add the per-event trace (DEBUG)
 PYTHONPATH=. .venv/bin/python -m dedup_sim --help
 ```
 
@@ -86,6 +108,40 @@ who-served-whom diagram:
 - **dedup, `fanout_cap=1` (chain)** -- `origin -> r0 -> r1 -> r2`;
 - **dedup, `fanout_cap=2` (tree)** -- `origin -> r0 -> {r1, r2}` (narrower wallclock);
 - **unrouted baseline** -- every reader pulls from the origin (`m x` fabric).
+
+## Load spreading: the same chain over a key with more than one holder
+
+`python -m dedup_sim weight_sync` is the second scenario: two trainer replicas hold
+`W` and two generators want it. The replicas are equidistant, so distance prices them
+identically and the id tie-break puts every first hop on `t0`: the unrouted baseline
+sends both generators there, and the chain sends one and queues the other behind it.
+Neither reads `t1` at all.
+
+`Dedup(spread=True)` is the same ranking with the dial at `0` -- a trainer is charged
+nothing for the fabric a read of it burns, so what is left of the score is how soon each
+source can serve me. The queue is then what separates two replicas:
+[`proposed.selector.Balance`](../proposed/selector.py) appends it to the ranking's sort
+key and the plane's own fold charges it -- a reader already routed at a source costs one
+more read of that source, so waiting behind one is worth a hop somewhere else. No new
+fact and no new link -- a route *is* a decision naming a source, so the load is a read of
+the fan-out the plane already keeps.
+
+|                       | baseline | dedup | dedup+spread |
+|---|---|---|---|
+| bytes off the trainers | 2x | **1x** | 2x |
+| reads off any one trainer | 2 | 1 | **1** |
+| depth (2 generators) | 1 hop | 2 hops | **1 hop** |
+| depth (4 generators) | 1 hop | 4 hops | **2 hops** |
+
+So spreading buys **1x per replica** and a tree of depth `ceil(m / n)` in place of a
+chain of depth `m`, and pays one origin hop per replica for it. Both routed runs read
+through, so a generator that has finished is a holder like any other -- which is why the
+third generator is folded in behind a peer rather than becoming a third trainer hop.
+
+What the load number does *not* say is on
+[`proposed.view.LoadView`](../proposed/view.py): it counts requesters currently routed
+to a source, not bytes in flight, so it comes down when a route is retired but not when
+a read finishes.
 
 ## Testing
 
@@ -106,6 +162,10 @@ mid-run. The same key is read twice with that eviction in between, and the fabri
 is 1x per read -- the chain re-forms because each answer is withheld against what
 the directory holds now, not against a registration that has since been dropped.
 
+`test_spread.py` asserts the other outcome: which trainer each generator read from,
+that each replica is read once and no more, and that a generator past the replicas is
+folded in behind a peer.
+
 ## Module layout
 
 Split by plane: `control/` decides, `data/` executes, and neither imports the
@@ -117,28 +177,38 @@ dedup_sim/
   control/                # DECIDES
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
                           #   with a source once it is usable, off the chain it
-                          #   builds; a landed put is an action it folds, not a
-                          #   question it is asked
-    _selector.py          #   PlannedPeer / HolderRanking: the routing itself -- the
-                          #   next peer under a fan-out cap, else the holders that
-                          #   could open a tree, nearest first and priced by tier;
-                          #   both gated on the put the head owes
+                          #   builds and the one fold that orders what the chain
+                          #   keyed; a landed put is an action it folds, not a
+                          #   question it is asked. `spread` picks the fabric dial
+                          #   and the fold that reads the queue at a source
+    _selector.py          #   Candidates: one ranking over everything that could
+                          #   serve the read -- the holders and the peers already
+                          #   routed to fetch it -- priced in seconds: the wait
+                          #   until a source has the key, the hop to me, and the
+                          #   fabric that hop burns
+    _answer.py            #   committed(): what a decision is made of once the chain
+                          #   names a head -- the route recorded and the answer
+                          #   withheld until that head holds the key
     _sensor/              #   the one kind of fact this plane holds
       _fanout.py          #     FanoutSensor: who is folded in behind whom, which
                           #     puts are owed, who waits on them -- a
-                          #     proposed.Sensor, the links' one record, and the
+                          #     proposed.Sensor, the plane's one record, and the
                           #     proposed.dispatch.Reducer that folds a landed put
-    _view.py              #   FanoutView: that sensor as a read of the plane's
-                          #   View, which is how a link reaches it
+    _view.py              #   FanoutView / DedupView: that sensor as the two reads a
+                          #   decision makes of it -- the tree, and the load on it
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- ask, read,
                           #   put, commit one Stored action, over the Deployment's
                           #   client and ports
   workload/               # WHAT IS SIMULATED
-    scenarios.py          #   the Dedup Scenario: the Runs to compare (the fixture
-                          #   as it is, and with the two planes added) + narration
+    scenarios.py          #   the Dedup and WeightSync Scenarios: the Runs to compare
+                          #   (the fixture as it is, and with the two planes added)
+                          #   + narration
+    _weight_sync.py       #   WeightSync: the same burst over a key that n trainer
+                          #   replicas hold, which is where spreading has a choice
   report/                 # OUTCOME METRICS
-    summary.py            #   DedupReport / BaselineReport: fabric summary + tree
+    summary.py            #   DedupReport / BaselineReport / WeightSyncReport: fabric
+                          #   summary + tree
   __main__.py             # `python -m dedup_sim`: a realsim.Demo declaration
   tests/                  # the dedup-outcome assertions (pytest, deterministic)
 ```

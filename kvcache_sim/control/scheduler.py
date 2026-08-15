@@ -82,7 +82,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from proposed import (
     AnySelector, ControlPlane, Dispatcher, Endpoint, Key, KeySelector, Selection,
 )
-from proposed.selector import FirstMatch, Selector
+from proposed.selector import FirstMatch, Fold, Selector
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
@@ -161,7 +161,7 @@ class _Scheduler(ControlPlane):
             gives. ``reuse`` ranks the peers holding a prefix, priced in blocks of that
             prefix (``Selector[Sequence[Key], int]``); what a peer is *worth* to one
             candidate is this scheduler's to work out, off the snapshot it read itself
-            (:meth:`_priced_reuse`), so a re-ranking under the axis cannot move a price
+            (:meth:`_priced_reuse`), so a stage annotating the axis cannot move a price
             this scheduler compares. ``rank`` ranks the candidates this scheduler
             priced, so its subject is those candidates and its price their
             :class:`~kvcache_sim.control._answer.Plan`.
@@ -174,6 +174,13 @@ class _Scheduler(ControlPlane):
             :class:`~kvcache_sim.control._selector.LongestPrefixKeySelector`. A pulling
             preset hands the *same* object to its reuse axis, so the peer priced is
             the peer read from.
+        source_fold: :data:`~proposed.selector.Fold` for that ranking's key, which is
+            ``(-prefix_run,)`` from the selector above plus ``(load,)`` where it sits
+            under a :class:`~proposed.selector.Balance`. ``None`` compares those
+            positions as they stand, which is longest run first. Belongs beside
+            ``source_selector`` because the two have to agree on how many dimensions
+            there are, and it is read at both of the places that ranking is folded
+            (:meth:`sources`, :meth:`_select_prefill`).
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -196,6 +203,7 @@ class _Scheduler(ControlPlane):
         rank: AnySelector[Sequence[Priced], Plan],
         balance_threshold: float = 1.5,
         source_selector: Optional[KeySelector[int]] = None,
+        source_fold: Optional[Fold] = None,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
@@ -219,6 +227,7 @@ class _Scheduler(ControlPlane):
             source_selector if source_selector is not None
             else LongestPrefixKeySelector()
         )
+        self._fold = source_fold
         self._prefill_pool = prefill_pool
         self._decode_pool = decode_pool
         #: Requests this plane has sent to another host, and the answer it sent them
@@ -347,12 +356,17 @@ class _Scheduler(ControlPlane):
         abstention rule rather than an ``if`` here. ``Selection.of([])`` names nobody,
         which leaves the read to the directory's own order.
 
+        Folded here (``source_fold``), because the links only key what they name: a
+        chain answering with the memo names one peer and has nothing to order, while the
+        ranking behind it keys every holder of the prefix and the caller reads down what
+        this returns (:func:`~proposed.selector.prefer`).
+
         Settled before it travels, like any answer this plane gives: neither link
         gates, so there is nothing to wait for, and saying so here is what keeps that
         a property of the ranking rather than of the caller.
-
         """
-        return await (await self._fetch.select(list(keys), requester)).settled()
+        ranked = (await self._fetch.select(list(keys), requester)).sort(self._fold)
+        return await ranked.settled()
 
     async def decide(self, request: Request, requester: str) -> Optional[Response]:
         """Where should ``request`` run? Both selections, or ``None`` if refused.
@@ -389,11 +403,13 @@ class _Scheduler(ControlPlane):
         return self._admit(request, requester, prefill, decode)
 
     async def _select_prefill(self, request: Request, requester: str) -> Selection[Plan]:
-        """Every prefill instance, priced and ranked best first.
+        """Every prefill instance, priced and folded into an order, best first.
 
         Each one's :class:`Plan` rides under its id in
         :attr:`~proposed.selector.Selection.payload`, so the answer says what was
-        compared as well as what won.
+        compared as well as what won -- which is why the fold here is
+        :meth:`~proposed.selector.Selection.sort` and not
+        :meth:`~proposed.selector.Selection.max`.
 
         Atomic: every read is off one pinned directory snapshot
         (:meth:`~proposed.view.View.pinned`) and one clock read, so the
@@ -402,30 +418,37 @@ class _Scheduler(ControlPlane):
         no trace and the winner is chosen after the whole field is known. Both axes are
         awaited inside the pin and neither suspends, so no second decision can enter it.
 
-        The reuse ranking is asked once and tested per candidate: which peers hold this
-        prefix is the same question whoever would prefill it, and only the tests behind
-        it -- is that peer me, is its run worth the transfer -- read the candidate.
+        The reuse ranking is asked once, folded to its best peer once (``source_fold``,
+        the same fold :meth:`sources` uses on the same ranking), and tested per
+        candidate: which peers hold this prefix is the same question whoever would
+        prefill it, and only the tests behind it -- is that peer me, is its run worth
+        the transfer -- read the candidate. Folded *before* the loop, because each test
+        is all-or-nothing on the head (:meth:`~proposed.selector.Selection.require`) and
+        the head of an unfolded answer is whatever order the axis built it in.
+
+        The candidates are folded on their own key, which is one dimension deep -- the
+        TTFT or the queue the rank axis measured (:class:`ByTTFT`,
+        :class:`ByLoad`) -- so nothing here has to blend anything.
         """
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
             counts = self.view.prefix_lengths(keys)
-            ranked = await self._reuse.select(keys, requester)
+            best = (await self._reuse.select(keys, requester)).max(self._fold)
             candidates: List[Priced] = []
             for inst in self.prefill_ids:
                 # A host is not its own peer, and a peer is only worth the transfer if
                 # it holds materially more than this candidate already does.
                 peer = (
-                    ranked
+                    best
                     .require(lambda head, me=inst: head != me)
                     .require(_worth_pulling(counts, inst, self._threshold))
-                    .take(1)
                 )
                 match, src, pull = self._priced_reuse(counts, keys, inst, peer)
                 candidates.append((inst, self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
                 )))
-            return await self._rank.select(candidates, requester)
+            return (await self._rank.select(candidates, requester)).sort()
 
     @staticmethod
     def _priced_reuse(
@@ -523,14 +546,14 @@ class _Scheduler(ControlPlane):
         """Decode instances, each with the batch a request admitted at ``plan``'s
         completion is predicted to meet there.
 
-        Ranked by :class:`~kvcache_sim.control._selector.ByBatch`. With decode
-        unmodelled every candidate prices at zero, so the id tie-break is the whole of
-        the choice.
+        Keyed by :class:`~kvcache_sim.control._selector.ByBatch` and folded here, as
+        this plane's other answer is. With decode unmodelled every candidate keys at
+        zero, so the id tie-break is the whole of the choice.
         """
         batches: List[Batched] = [
             (d, self._predicted_batch(d, plan.done_time)) for d in self.decode_ids
         ]
-        return await self._decode.select(batches, requester)
+        return (await self._decode.select(batches, requester)).sort()
 
     def _admit(
         self,
@@ -615,9 +638,9 @@ class CacheAwareScheduler(_Scheduler):
             ``replicate=False`` never asks it anything while pricing, and a fetch
             still is.
 
-            Required here, and deliberately without a default: this ranking may keep
-            state across the decisions it makes (one under a
-            :class:`~proposed.selector.Discount` does), so which one a run uses is the
+            Required here, and deliberately without a default: this ranking may sense
+            state of its own across the decisions it makes (one under a
+            :class:`~proposed.selector.Balance` does), so which one a run uses is the
             run's to choose (:func:`kvcache_sim.workload._serving.scheduler`).
     """
 
