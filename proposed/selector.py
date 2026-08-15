@@ -65,14 +65,15 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import (
     Any, Awaitable, Callable, Dict, Generic, List, Mapping, NamedTuple, Optional,
-    Protocol, Sequence, Tuple, TypeVar, get_args, get_origin,
+    Protocol, Sequence, Tuple, TypeVar, Union, get_args, get_origin,
 )
 
 from proposed.deployment import Key, VolumeId
 from proposed.view import LoadView, View
 
 __all__ = [
-    "Ready", "Dims", "Fold", "Selection", "prefer", "DecisionLog", "declared",
+    "Ready", "Dims", "Fold", "Readings", "Selection", "prefer", "DecisionLog",
+    "declared",
     "declares", "Selector", "KeySelector", "AnySelector", "NaiveKeySelector",
     "FirstMatch", "Balance",
 ]
@@ -103,6 +104,10 @@ Dims = Tuple[Any, ...]
 #: wrong number. ``None`` at a fold is the lexicographic default, which needs no
 #: arithmetic at all (:meth:`Selection.sort`).
 Fold = Callable[[Dims], Any]
+
+#: What one stage appends (:meth:`Selection.annotated`): a reading per source, either
+#: measured already or measurable on demand.
+Readings = Union[Mapping[VolumeId, Any], Callable[[VolumeId], Any]]
 
 
 @dataclass(frozen=True)
@@ -185,18 +190,23 @@ class Selection:
         best."""
         return cls.keyed([(i, (p,)) for i, p in candidates], ready=ready)
 
-    def annotated(self, readings: Mapping[VolumeId, Any]) -> "Selection":
+    def annotated(self, readings: "Readings") -> "Selection":
         """This selection with one reading per source appended as a further dimension.
 
         What a stage that measures rather than ranks does (:class:`Balance`). Appended
         behind what the stages before it left, never in place of it, so every fold
         reads a position that does not move.
 
-        One call per stage: the whole key mapping is rebuilt here, so ``readings`` has
-        to cover every source and a call per source would cost a walk per source.
+        ``readings`` is a mapping covering every source, or a callable measuring one --
+        which is the form for a stage whose readings do not exist yet, since building a
+        mapping to hand over here would walk the sources an extra time.
+
+        One call per stage: the whole key mapping is rebuilt here, so a call per source
+        would cost a walk per source.
         """
+        read = readings if callable(readings) else readings.__getitem__
         return replace(self, key={
-            source: (*(self.key or {}).get(source, ()), readings[source])
+            source: (*(self.key or {}).get(source, ()), read(source))
             for source in (self.sources or ())
         })
 
@@ -668,9 +678,7 @@ class Balance(Selector[_S]):
         if not ranked.sources:
             return ranked
         load = self.view.load.named()
-        annotated = ranked.annotated(
-            {source: load.get(source, 0) for source in ranked.sources}
-        )
+        annotated = ranked.annotated(lambda source: load.get(source, 0))
         return annotated if self.fold is None else replace(annotated, fold=self.fold)
 
 

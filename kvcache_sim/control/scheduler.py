@@ -481,9 +481,10 @@ class _Scheduler(ControlPlane):
         ranking two ways), and tested per
         candidate: which peers hold this prefix is the same question whoever would
         prefill it, and only the tests behind it -- is that peer me, is its run worth
-        the transfer -- read the candidate. Folded *before* the loop, because each test
-        is all-or-nothing on the head (:meth:`~proposed.selector.Selection.require`) and
-        the head of an unfolded answer is whatever order the axis built it in.
+        the transfer -- read the candidate. Folded *before* any candidate is priced,
+        because each test is all-or-nothing on the head
+        (:meth:`~proposed.selector.Selection.require`) and the head of an unfolded answer
+        is whatever order the axis built it in.
 
         The two winner axes are one dimension apart. Both key the pool at the plan and
         both name what they compare of it -- the predicted TTFT (:func:`_by_ttft`), or
@@ -492,17 +493,16 @@ class _Scheduler(ControlPlane):
         compared as they stand ``(plan, busy)`` would break a TTFT tie by load rather
         than by id, and two idle instances holding no prefix do price identically.
 
-        Annotated once per dimension rather than once per candidate: annotating rebuilds
-        the whole key mapping (:meth:`~proposed.selector.Selection.annotated`), so the
-        loop fills a mapping and the appending happens after it.
+        Priced as the dimension is appended (:meth:`~proposed.selector.Selection.annotated`
+        takes the measure, not a mapping of it), so the pool is walked once.
         """
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
             counts = self.view.prefix_lengths(keys)
             best = (await self._reuse.select(keys, requester)).max()
-            plans: Dict[str, Plan] = {}
-            for inst in self.prefill_ids:
+
+            def priced(inst: str) -> Plan:
                 # A host is not its own peer, and a peer is only worth the transfer if
                 # it holds materially more than this candidate already does.
                 peer = (
@@ -511,13 +511,13 @@ class _Scheduler(ControlPlane):
                     .require(_worth_pulling(counts, inst, self._threshold))
                 )
                 match, src, pull = self._priced_reuse(counts, keys, inst, peer)
-                plans[inst] = self._candidate(
+                return self._candidate(
                     request, inst, now, match=match, source=src, pull_keys=pull
                 )
-            pool = Selection.of(self.prefill_ids).annotated(plans)
+
+            pool = Selection.of(self.prefill_ids).annotated(priced)
             if self._rank == "load":
-                busy = self.view.cluster.busy_until
-                queued = pool.annotated({i: busy[i] for i in self.prefill_ids})
+                queued = pool.annotated(self.view.cluster.busy_until)
                 return queued.sort(_by_queue)
             return pool.sort(_by_ttft)
 
@@ -622,9 +622,9 @@ class _Scheduler(ControlPlane):
         With decode unmodelled every candidate keys at zero and the tie-break is the
         whole of the choice.
         """
-        return Selection.of(self.decode_ids).annotated({
-            d: self._predicted_batch(d, plan.done_time) for d in self.decode_ids
-        }).sort()
+        return Selection.of(self.decode_ids).annotated(
+            lambda d: self._predicted_batch(d, plan.done_time)
+        ).sort()
 
     def _admit(
         self,
