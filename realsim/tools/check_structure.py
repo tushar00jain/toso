@@ -5,7 +5,7 @@ enforces what a package *is* -- the part that had been maintained by hand across
 six files per package and had already drifted (two of three READMEs stopped
 naming a structural file after it was added).
 
-Six rules, none of which a type system can express:
+Seven rules, none of which a type system can express:
 
 1. **A sim package has the same parts.** Every ``*_sim/`` carries ``__init__.py``,
    ``__main__.py``, ``README.md``, ``workload/`` and ``report/``. ``control/`` and
@@ -45,6 +45,17 @@ Six rules, none of which a type system can express:
    control plane it asks and ``dispatch`` on the dispatcher it reports into. **Only
    the first is policed** -- see :func:`_proposed_ports` for why the second is not
    found.
+7. **A selector remembers nothing on itself.** What a decision remembers between
+   calls is a :class:`~proposed.deployment.Sensor`, read through a view and moved
+   by an action somebody dispatched -- which is what makes it observable, foldable
+   and one thing rather than a copy per holder. So a
+   :class:`~proposed.selector.Selector` may write to ``self`` in ``__init__`` and
+   ``attach`` (its knobs and its view) and nowhere else. What this buys is that a
+   ranking is a *value*: two built the same way answer the same, so a plane may
+   build one where it uses it rather than threading one object to every consumer,
+   and nothing has to assert that two references are the same object. It catches
+   the plain case -- ``self.x = ...`` in ``select`` -- and not a container held on
+   the selector and mutated in place; that one is left to review.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -140,6 +151,7 @@ __all__ = [
     "check_private_naming",
     "check_name_privacy",
     "check_plane_ports",
+    "check_selector_state",
     "check_readme_layout",
     "public_defs",
     "declared_all",
@@ -682,6 +694,54 @@ def check_plane_ports(
     return sorted(out)
 
 
+def check_selector_state(
+    root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS
+) -> List[Violation]:
+    """Rule 7: a selector writes to ``self`` in ``__init__`` / ``attach`` and nowhere else.
+
+    Read off the class statement rather than the type: anything whose bases name a
+    selector is one, which is what a reader sees too. Mutating a *sensor* the view
+    carries (``self.view.routed.claim(...)``) is the sanctioned way to remember, and is
+    not a write to the selector.
+    """
+    out: List[Violation] = []
+    for rel in sorted(_module_map(root, pkgs).values()):
+        if _is_test(".".join(rel.with_suffix("").parts)):
+            continue
+        tree = ast.parse((root / rel).read_text())
+        for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+            bases = {
+                getattr(b, "id", None) or getattr(b, "attr", None)
+                or getattr(getattr(b, "value", None), "id", None)
+                for b in cls.bases
+            }
+            if not any(b and "Selector" in b for b in bases):
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if fn.name in ("__init__", "__new__", "attach"):
+                    continue
+                for node in ast.walk(fn):
+                    targets = (
+                        node.targets if isinstance(node, ast.Assign)
+                        else [node.target]
+                        if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else []
+                    )
+                    for target in targets:
+                        if isinstance(target, ast.Attribute) and isinstance(
+                            target.value, ast.Name
+                        ) and target.value.id == "self":
+                            out.append(Violation(
+                                str(rel), node.lineno, "selector-keeps-state",
+                                f"{cls.name}.{fn.name} writes self.{target.attr}: a "
+                                f"ranking is a value, and what a decision remembers "
+                                f"between calls is a sensor the view carries, not a "
+                                f"field on the selector",
+                            ))
+    return sorted(out)
+
+
 def _layout_block(text: str) -> str | None:
     """The fenced block under a ``## Layout`` / ``## Module layout`` heading."""
     m = re.search(
@@ -813,6 +873,7 @@ def check_all(root: Path = REPO_ROOT) -> List[Violation]:
         + check_private_naming(root)
         + check_name_privacy(root)
         + check_plane_ports(root)
+        + check_selector_state(root)
         + check_readme_layout(root)
         + check_module_exports(root)
     )

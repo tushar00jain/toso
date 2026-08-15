@@ -251,12 +251,16 @@ class _Scheduler(ControlPlane):
         self.B = block_tokens
         self.profile = profile
         self.model = model
-        self._source = _built(_SOURCES, source, "source ranking")
-        # One object on both sides of a pull, which is what makes the peer priced the
-        # peer read from; a preset that never pulls prices against nobody instead.
+        # Both sides of a pull build the same ranking, and it is a value: a selector
+        # remembers nothing on itself (``check_structure`` rule 7), so two of them
+        # answer alike off the sensors they share and neither side has to be handed the
+        # other's. A preset that never pulls prices against nobody instead.
         self._reuse = (
-            self._source if reuse == "peers"
+            _built(_SOURCES, source, "source ranking") if reuse == "peers"
             else _built({"none": LocalOnly}, reuse, "reuse axis")
+        )
+        self._fetch = FirstMatch(
+            [RoutedPull(), _built(_SOURCES, source, "source ranking")]
         )
         self._rank = _built(_RANKS, rank, "winner ranking")
         # Built rather than named: not an axis (see the module it comes from).
@@ -305,7 +309,6 @@ class _Scheduler(ControlPlane):
         #: arrive, and the only thing that writes any sensor here. The run harvests it
         #: after :meth:`attach` to put a service in front of.
         self.dispatcher: Optional[Dispatcher] = None
-        self._fetch: Optional[FirstMatch[int]] = None
 
     # -- the stack hands over its ports ----------------------------------- #
     def attach(self, view) -> None:
@@ -373,11 +376,6 @@ class _Scheduler(ControlPlane):
         # (:meth:`~proposed.view.View.subset`), so a ranking consulted inside a routing
         # decision reads the snapshot the decision pinned rather than past it into the
         # live directory.
-        # The source ranking is a link of the fetch chain and the reuse axis both, so
-        # it is brought up twice -- with the same view each time, one declaration being
-        # one subset, so the second is the first over again and no order here is
-        # load-bearing.
-        self._fetch = FirstMatch([RoutedPull(), self._source])
         for ranking in (self._fetch, self._reuse, self._rank, self._decode):
             ranking.attach(self.view.subset(*ranking.sensors))
 

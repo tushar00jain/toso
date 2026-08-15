@@ -162,6 +162,57 @@ def test_structure_lint_flags_a_folder_private_module(tmp_path):
     assert violations[0].path.endswith("helper.py")
 
 
+def test_structure_lint_flags_a_selector_that_remembers_on_itself(tmp_path):
+    """Rule 7 fires: a cursor on the ranking is state a sensor should be holding.
+
+    Which is what lets a plane build a ranking where it uses one instead of threading
+    one object to every consumer: two built alike answer alike, so nothing has to
+    assert that two references are the same object.
+    """
+    pkgs = _toy_pkg(tmp_path, {
+        "__init__.py": "",
+        "control/__init__.py": "",
+        "control/_selector.py": (
+            "__all__ = ['RoundRobin']\n\n\n"
+            "class RoundRobin(KeySelector):\n"
+            "    def __init__(self):\n"
+            "        self.turn = 0\n\n"
+            "    async def select(self, keys, requester):\n"
+            "        self.turn += 1\n"
+            "        return self.turn\n"
+        ),
+        "workload/__init__.py": "",
+        "workload/scenarios.py": "from ..control._selector import RoundRobin\n",
+    })
+    violations = check_structure.check_selector_state(tmp_path, pkgs)
+    assert [v.code for v in violations] == ["selector-keeps-state"]
+    assert "self.turn" in violations[0].message
+
+
+def test_structure_lint_accepts_a_selector_that_remembers_in_a_sensor(tmp_path):
+    """The same ranking, with the count where it belongs: no finding.
+
+    Writing a sensor the view carries is how a decision remembers -- observable,
+    foldable, and one thing however many rankings read it.
+    """
+    pkgs = _toy_pkg(tmp_path, {
+        "__init__.py": "",
+        "control/__init__.py": "",
+        "control/_selector.py": (
+            "__all__ = ['RoundRobin']\n\n\n"
+            "class RoundRobin(KeySelector):\n"
+            "    def __init__(self):\n"
+            "        self.view = None\n\n"
+            "    async def select(self, keys, requester):\n"
+            "        self.view.turns.taken(requester)\n"
+            "        return self.view.turns.next()\n"
+        ),
+        "workload/__init__.py": "",
+        "workload/scenarios.py": "from ..control._selector import RoundRobin\n",
+    })
+    assert check_structure.check_selector_state(tmp_path, pkgs) == []
+
+
 def test_structure_lint_accepts_an_underscored_private_module(tmp_path):
     """The same tree, renamed: no finding."""
     pkgs = _toy_pkg(tmp_path, {

@@ -1790,13 +1790,14 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     args = parser.parse_args(["--spread-reads"])
 
     aware = scenarios.Hotspot(0).runs(args)[1:]
-    # The one ranking the plane holds: it prices against it and answers a fetch with
-    # it, so this is where a run's own selector is reachable.
-    selectors = [run.control._source for run in aware]
-    assert all(isinstance(p, Balance) for p in selectors)
-    assert selectors[0] is not selectors[1], "a shared tally would count both runs"
-    # The fold rides with the ranking, or the load would be a dimension nothing reads.
-    assert all(p.fold is not None for p in selectors)
+    # The flag reaches both planes: each builds the spread ranking for the fetch it
+    # answers, and carries the fold that reads the dimension it appends -- or the load
+    # would be measured and never read.
+    fetched = [run.control._fetch.selectors[-1] for run in aware]
+    assert all(isinstance(p, Balance) and p.fold is not None for p in fetched)
+    # ...and the replicating run prices against one too, so the pull it plans is
+    # spread the same way the read that carries it out will be.
+    assert isinstance(aware[-1].control._reuse, Balance)
 
     def pull_sources(result):
         return sorted(
@@ -2020,23 +2021,34 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
 def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     """Why one plane: neither the memo nor the ranking crosses a boundary.
 
-    The peer a pull was priced against is recorded in this plane's own sensor and read
-    back by the member a fetch asks, and the ranking behind that memo is the *same
-    object* the pricing ranked with. Two planes had to keep both in step; one holds
-    them.
+    Asserted by driving it rather than by reading its wiring -- decide, then ask what
+    should serve the read that plan implies -- so how the plane holds its rankings is
+    free to change and this still says what it means. The memo carries the first answer
+    (:class:`~kvcache_sim.control._selector.RoutedPull`) and is spent once; the ranking
+    behind it answers the second, and names the same peer, which is the whole of what
+    "one plane" buys. Two planes had to keep both in step.
     """
-    sched = scheduler("cache_aware", _make_topology(2))
-    assert sched.dispatcher is None, "nothing to dispatch into before attach"
-    sim = Simulation(_make_topology(2), control=sched)   # attach builds the chain
+    sim, keys = _replicated(["s1"], {"s1": 2}, num=2)
+    # Only s0 may prefill, so the prefix it needs is on the other host and a pull is
+    # the cheaper half of the trade.
+    sched = scheduler("cache_aware", _make_topology(2), prefill_pool=["s0"])
+    sched.attach(sim.view)
+    request = _request(
+        id="r0", arrival=0.0, prompt_tokens=BLOCK_TOKENS * len(keys), output_tokens=1,
+        block_keys=tuple(keys),
+    )
+
+    async def scenario():
+        with sim.mesh.installed():
+            response = await sched.decide(request, "s0")
+            return response, [await sched.sources(list(keys), "s0") for _ in range(2)]
+
     try:
-        # The memo link reads the plane's own sensor, off the view it declared and out
-        # of the plane's -- it is handed no sensor of its own.
-        assert sched._fetch.selectors[0].view.routed is sched.view.routed
-        assert sched._fetch.selectors[-1] is sched._reuse
-        # And what the run fronted for the hosts is the plane's one dispatcher: the
-        # sensors it folds into are reachable no other way.
-        assert sim.dispatcher_handle.dispatcher is sched.dispatcher
+        response, (memo, ranked) = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
+    assert response.plan.reuse_source == "s1", "no pull was priced -- nothing to answer"
+    assert memo.head == "s1"      # the peer the pull was priced against
+    assert ranked.head == "s1"    # the memo spent, and the ranking agrees
 
 
