@@ -72,7 +72,9 @@ from realsim.simulation import Simulation
 from realsim.run import Workload
 
 from ..control.request import Request
-from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
+from ..control.scheduler import (
+    CacheAwareScheduler, LoadBalanceScheduler, Occupancy, Source,
+)
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
 from ..data._decode import DecodeEngine
 from ..data._prefill import PrefillEngine
@@ -146,8 +148,8 @@ def scheduler(
     simulate_decode: bool = False,
     prefill_pool: Optional[List[str]] = None,
     decode_pool: Optional[List[str]] = None,
-    early_rejection: str = "early",
-    source: str = "prefix",
+    early_rejection: Occupancy = Occupancy.EARLY,
+    source: Source = Source.PREFIX,
 ) -> ControlPlane:
     """This run's **control plane**, as an object a scenario can just declare.
 
@@ -160,10 +162,10 @@ def scheduler(
     fetch that plan implies. Its sensors are the plane's own, built where it learns
     its instances (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`).
 
-    ``source`` names which peers a fetch is answered from -- ``"prefix"`` or
-    ``"spread"`` -- and the plane builds it, so two runs configured alike still get a
-    ranking each: one object attached twice senses only the view it was attached to
-    last, and neither run would reproduce alone.
+    ``source`` (:class:`~kvcache_sim.control.scheduler.Source`) names which peers a
+    fetch is answered from, and the plane builds it, so two runs configured alike still
+    get a ranking each: one object attached twice senses only the view it was attached
+    to last, and neither run would reproduce alone.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")

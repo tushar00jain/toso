@@ -64,6 +64,7 @@ executed cost off it.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
 
 from proposed import (
@@ -95,24 +96,52 @@ __all__ = [
     "DecodeState",
     "Plan",
     "Response",
+    "Reuse",
+    "Rank",
+    "Source",
+    "Occupancy",
     "LoadBalanceScheduler",
     "CacheAwareScheduler",
 ]
 
 
-def _source_ranking(name: str) -> Selector[Sequence[Key]]:
-    """Which peers may serve a prefix, by name -- a fresh one every call.
+class Reuse(Enum):
+    """Where a candidate may pull a prefix from while it is priced."""
 
-    ``"spread"`` weighs a busy holder against a long match, and carries that fold with
-    it, so both chains it goes into weigh them the same way.
+    PEERS = "peers"  # whoever the source ranking names
+    NONE = "none"    # nobody -- reuse only what the candidate already holds
+
+
+class Rank(Enum):
+    """Which number orders the priced prefill pool."""
+
+    TTFT = "ttft"  # predicted time to first token (:func:`_by_ttft`)
+    LOAD = "load"  # the queue a candidate would join (:func:`_by_queue`)
+
+
+class Source(Enum):
+    """Which holders of a prefix a fetch is answered with."""
+
+    PREFIX = "prefix"  # longest match first
+    SPREAD = "spread"  # ...docked by how busy the holder is
+
+
+class Occupancy(Enum):
+    """Which decode occupancy the TBT SLO is judged against."""
+
+    EARLY = "early"      # the one observed now
+    PREDICT = "predict"  # the one predicted at prefill completion
+
+
+def _source_ranking(source: Source) -> Selector[Sequence[Key]]:
+    """Which peers may serve a prefix -- a fresh one every call.
+
+    :attr:`Source.SPREAD` weighs a busy holder against a long match, and carries that
+    fold with it, so both chains it goes into weigh them the same way.
     """
-    if name == "prefix":
-        return LongestPrefixKeySelector()
-    if name == "spread":
+    if source is Source.SPREAD:
         return Folded(Balance(LongestPrefixKeySelector()), by_prefix_and_load())
-    raise ValueError(
-        f"unknown source ranking {name!r}: the choice is 'prefix' or 'spread'"
-    )
+    return LongestPrefixKeySelector()
 
 
 # -- the two winner folds: what each preset compares of a priced pool ------- #
@@ -143,35 +172,29 @@ class _Scheduler(ControlPlane):
     the way an object can.
 
     Args:
-        reuse: where a candidate may pull a prefix from -- ``"peers"``, the ``source``
-            ranking itself, or ``"none"``, nobody.
-        rank: which number orders the priced prefill pool -- ``"ttft"`` by predicted
-            time to first token (:func:`_by_ttft`), ``"load"`` by what each host is
-            already serving (:func:`_by_queue`).
+        reuse: :class:`Reuse` -- where a candidate may pull a prefix from.
+        rank: :class:`Rank` -- which number orders the priced prefill pool.
         balance_threshold: how much longer the head's prefix run must be than a
             candidate's own before pulling beats recomputing. Unread when ``reuse``
             names nobody.
-        source: which holders of a prefix :meth:`sources` answers a fetch with, behind
-            the pull it already priced -- ``"prefix"``, longest match first, or
-            ``"spread"``, which docks a busy holder so one holding a hot prefix does
-            not serve every read of it.
+        source: :class:`Source` -- which holders of a prefix :meth:`sources` answers a
+            fetch with, behind the pull it already priced.
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
         slo_ttft / slo_tbt: what admission holds a decision to (:meth:`_admit`).
         simulate_decode: whether the run models batched decode at all.
-        early_rejection: ``"early"`` | ``"predict"`` -- whether the decode occupancy
-            the TBT SLO is judged against is the one observed now or the one predicted
-            at prefill completion.
+        early_rejection: :class:`Occupancy` -- which decode occupancy the TBT SLO is
+            judged against.
     """
 
     def __init__(
         self,
         *,
-        reuse: str,
-        rank: str,
+        reuse: Reuse,
+        rank: Rank,
         balance_threshold: float = 1.5,
-        source: str = "prefix",
+        source: Source = Source.PREFIX,
         block_tokens: int,
         profile: MachineProfile = DEFAULT_PROFILE,
         model: Model = DEFAULT_MODEL,
@@ -180,34 +203,23 @@ class _Scheduler(ControlPlane):
         slo_ttft: float = float("inf"),
         slo_tbt: float = float("inf"),
         simulate_decode: bool = False,
-        early_rejection: str = "early",
+        early_rejection: Occupancy = Occupancy.EARLY,
     ) -> None:
         self.B = block_tokens
         self.profile = profile
         self.model = model
         # A selector remembers nothing on itself (``check_structure`` rule 7), so both
         # sides of a pull can build their own and answer alike off the shared sensors.
-        if reuse not in ("peers", "none"):
-            raise ValueError(
-                f"unknown reuse axis {reuse!r}: a candidate pulls from the peers the "
-                f"source ranking names or from nobody, so the choice is 'peers' or "
-                f"'none'"
-            )
+        #
         # Which peer a candidate may pull the prefix from. One winner, asked once per
         # decision; ``LocalOnly`` names nobody, so the baseline reuses only what a host
         # already holds.
         self._reuse = Max(
-            _source_ranking(source) if reuse == "peers" else LocalOnly()
+            _source_ranking(source) if reuse is Reuse.PEERS else LocalOnly()
         )
         # Which peer serves a fetch: the one this plane already priced the pull
         # against, else whoever holds the longest prefix.
         self._fetch = Sort(FirstMatch([RoutedPull(), _source_ranking(source)]))
-        if rank not in ("ttft", "load"):
-            raise ValueError(
-                f"unknown winner ranking {rank!r}: what orders the candidates this "
-                f"plane priced is their predicted TTFT or the queue each would join, "
-                f"so the choice is 'ttft' or 'load'"
-            )
         #: Which fold orders the prefill pool, and with it whether the queue is
         #: measured at all (:meth:`attach`).
         self._rank = rank
@@ -225,19 +237,12 @@ class _Scheduler(ControlPlane):
         self.slo_ttft = slo_ttft
         self.slo_tbt = slo_tbt
         self.tbt_enabled = simulate_decode
-        if early_rejection not in ("early", "predict"):
-            # Refused rather than read as "not predict": an unknown mode is a caller
-            # expecting a rule this scheduler has no way to apply.
-            raise ValueError(
-                f"unknown early_rejection {early_rejection!r}: the choice is which "
-                f"occupancy the TBT SLO is judged against, 'early' or 'predict'"
-            )
         #: Does this run roll decode occupancy forward to prefill completion, counting
         #: the promised prefills that will have landed by then? Both modes hold a
         #: decision to the same two SLOs and differ only in what feeds them. Read in
         #: three places -- composing the reservation sensor, writing it, predicting off
         #: it -- so no two of them can disagree about whether this run predicts.
-        self._lookahead = simulate_decode and early_rejection == "predict"
+        self._lookahead = simulate_decode and early_rejection is Occupancy.PREDICT
         # All built in attach(), where the sensors they read and the pools they rank
         # exist.
         self.view: Optional[KVView] = None
@@ -302,7 +307,7 @@ class _Scheduler(ControlPlane):
             model=self.model,
             threshold=self._threshold,
         )
-        if self._rank == "load":
+        if self._rank is Rank.LOAD:
             # The queue dimension goes on only where that fold reads it: compared as
             # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
             # id, and two idle instances holding no prefix do price identically.
@@ -444,7 +449,7 @@ class LoadBalanceScheduler(_Scheduler):
     """Baseline (~vLLM): least-loaded instance, local-only cache reuse."""
 
     def __init__(self, **knobs: Any) -> None:
-        super().__init__(reuse="none", rank="load", **knobs)
+        super().__init__(reuse=Reuse.NONE, rank=Rank.LOAD, **knobs)
 
 
 class CacheAwareScheduler(_Scheduler):
@@ -461,8 +466,8 @@ class CacheAwareScheduler(_Scheduler):
     def __init__(self, *, balance_threshold: float = 1.5, replicate: bool = True,
                  **knobs: Any) -> None:
         super().__init__(
-            reuse="peers" if replicate else "none",
+            reuse=Reuse.PEERS if replicate else Reuse.NONE,
             balance_threshold=balance_threshold,
-            rank="ttft",
+            rank=Rank.TTFT,
             **knobs,
         )

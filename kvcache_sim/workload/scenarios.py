@@ -31,6 +31,7 @@ from ..report.summary import (
     EvictionReport,
     HotspotReport,
 )
+from ..control.scheduler import Occupancy, Source
 from ._generator import make_workload
 from ._serving import BLOCK_TOKENS, KVWorkload, scheduler, serving_plane
 
@@ -289,7 +290,9 @@ class Hotspot(Scenario):
     def runs(self, args=None) -> List[Run]:
         topo = _make_topology(4)
         convs = _hotspot_workload(self.seed)
-        source = "spread" if getattr(args, "spread_reads", False) else "prefix"
+        source = (
+            Source.SPREAD if getattr(args, "spread_reads", False) else Source.PREFIX
+        )
         return [
             _configure("baseline", topo, convs, "load_balance"),
             _configure("no_replication", topo, convs, "cache_aware",
@@ -448,8 +451,10 @@ class EarlyRejection(Scenario):
             simulate_decode=True, slo_tbt=EARLY_SLO_TBT, max_batch=EARLY_MAX_BATCH
         )
         return [
-            _configure(mode, topo, convs, "cache_aware", early_rejection=mode, **common)
-            for mode in ("early", "predict")
+            _configure(
+                mode.value, topo, convs, "cache_aware", early_rejection=mode, **common
+            )
+            for mode in Occupancy
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:

@@ -41,7 +41,8 @@ from kvcache_sim.control._selector import (
 )
 from kvcache_sim.control._sensor import Committed, SourceLoad
 from kvcache_sim.control.scheduler import (
-    ComputeBusy, DecodeState, LoadBalanceScheduler, Plan, PrefillFinished, Response,
+    ComputeBusy, DecodeState, LoadBalanceScheduler, Occupancy, Plan, PrefillFinished,
+    Response,
     _by_queue, _by_ttft, _Scheduler,
 )
 from kvcache_sim.workload._serving import scheduler
@@ -2000,7 +2001,7 @@ def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
     """
     sim = Simulation(_make_topology(2))
     sched = LoadBalanceScheduler(
-        block_tokens=512, simulate_decode=True, early_rejection="predict",
+        block_tokens=512, simulate_decode=True, early_rejection=Occupancy.PREDICT,
     )
     sched.attach(sim.view)
     assert not inspect.iscoroutinefunction(Dispatcher.dispatch_sync)
