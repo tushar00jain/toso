@@ -1,17 +1,16 @@
 """What a dedup decision answers with once a head is named: :func:`committed`.
 
-A link ranks; this is what the plane does with the ranking it gets back
-(:meth:`dedup_sim.control.routing.Dedup.sources`) -- record the route, and withhold the
-answer until that head is usable. It belongs to the plane and not to the link because a
-ranking is in no order until this plane folds it and a stage above the link may have
-added a dimension first (:class:`~proposed.selector.Balance`): a link that recorded its
-own head would record a source the requester never reads from, and gate on it.
+The route is recorded by the plane, not by the link that ranked: a stage above the link
+can still reorder the ranking, so a link recording its own head would record a source
+the requester never reads from, and gate on it.
 
-Nothing here suspends, which is where the chain's own claim stops being one: the
-directory read cannot (:meth:`~proposed.deployment.Controller.locate_raw`) and neither
-does building a gate (:meth:`~proposed.dispatch.Dispatcher.gate`), so a whole decision
--- the chain and this -- runs to completion before the next requester's starts. That is
-the serialized mailbox a real controller would give it, and what makes the sensor's
+What the fan-out owes is one reducer's state and what the directory holds is another's;
+:func:`committed` is the only place the two are read together.
+
+Nothing here suspends: neither the directory read
+(:meth:`~proposed.deployment.Controller.locate_raw`) nor building a gate
+(:meth:`~proposed.dispatch.Dispatcher.gate`). A whole decision therefore runs to
+completion before the next requester's starts, which is what makes the sensor's
 read-modify-writes safe without a lock.
 """
 
@@ -28,12 +27,7 @@ __all__ = ["committed", "holders"]
 
 
 def holders(located: Dict[str, Dict[str, Any]], key: str) -> List[str]:
-    """Volumes holding ``key`` in a :meth:`~proposed.view.View.locate` answer.
-
-    In directory order, and empty when nobody holds it -- a missing key is absent
-    from the answer rather than an error in it. Here because reading a located map is
-    this plane's arithmetic, not a member the store owes anyone.
-    """
+    """Volumes holding ``key``, in directory order; empty when nobody holds it."""
     return list(located.get(key, {}))
 
 
@@ -47,46 +41,39 @@ def committed(
 ) -> Selection:
     """``ranking``, routed to its head and gated until that head is usable.
 
-    Which of three shapes an answer takes is the whole of when waiting is safe, because
-    a gate nothing will ever open hangs the requester behind it. What bounds one is the
-    debt the sensor tracks: a routed requester is going to read the key through, so from
-    the moment it asks it *owes* that registration. A source that owes nothing has to
-    hold the key already, and one that holds nothing and owes nothing is no longer a
-    source at all.
+    An answer takes one of three shapes, and picking the wrong one hangs the requester
+    behind a gate nothing will open. The debt the sensor tracks is what bounds a wait:
+    a routed requester is going to read the key through, so from the moment it asks it
+    *owes* that registration. A source that owes nothing must hold the key already, and
+    one that holds nothing and owes nothing is no source at all.
 
-    The head is what the route is recorded against, what the gate is opened on, and what
-    a caller preferring this ranking reads from; whatever is ranked behind it rides
-    through as it was ranked. A ranking naming no head in particular -- an abstention,
-    or the directory's own answer -- comes back untouched: there is nothing to route
-    to.
+    The head is what the route is recorded against and what the gate is opened on;
+    whatever is ranked behind it rides through as it was ranked. A ranking naming no
+    head -- an abstention, or the directory's own answer -- comes back untouched.
     """
     source = ranking.head
     if source is None:
         return ranking
     fanout = view.fanout
     if fanout.planned(requester) != source:
-        # Re-asked and unmoved is not a decision: recording it again would trace a
-        # route nothing changed.
+        # Skipped when re-asked and unmoved: no route changed, nothing to trace.
         fanout.route(requester, source)
         if trace is not None:
             trace.record(view.now(), "route", f"{requester} <- {source}")
     facts = [(source, key) for key in keys]
     if fanout.owes(facts):
-        # It owes every key, so the wait is bounded by its read-through. The gate is
-        # still opened on a directory read, because it may already hold a key it is
-        # about to republish -- then there is nothing to wait for.
+        # Owes every key: the wait is bounded by its read-through. Still gated on a
+        # directory read, since it may already hold a key it is about to republish.
         return replace(ranking, ready=commits.gate(
             lambda: len(_registered(view, facts)) == len(facts)
         ))
     if len(_registered(view, facts)) == len(facts):
-        # Owes nothing, so a gate here could outlive the run -- nothing would ever
-        # record it. Usable because it holds every key right now, which is the ordinary
-        # case: this is how a requester routed to a pre-existing holder is answered.
+        # A pre-existing holder, the ordinary case: usable now, and owing nothing it
+        # would never record the facts a gate here waited on.
         return ranking
-    # Holds nothing, owes nothing: a peer that published and has since evicted. Waiting
-    # would hang and naming it would route a reader to a volume with nothing to serve,
-    # so it stops being a source and this requester gets the directory's own answer,
-    # once.
+    # Published, then evicted: holds nothing and owes nothing. A gate would hang and
+    # naming it would route a reader to a volume with nothing to serve, so it stops
+    # being a source and this requester gets the directory's own answer.
     fanout.retire(requester, source)
     if trace is not None:
         trace.record(view.now(), "retire", f"{source} holds nothing")
@@ -96,19 +83,10 @@ def committed(
 def _registered(view: FanoutView, facts: Sequence[Hashable]) -> List[Hashable]:
     """Which of these ``(volume, key)`` pairs the directory holds *now*.
 
-    The truth a readiness gate is opened against, read rather than remembered, and read
-    afresh every time an answer is formed *and* at every commit a parked requester wakes
-    on (:meth:`~proposed.dispatch.Dispatcher.gate`): volumes evict, so a peer that
-    registered the key and later dropped it for a newer version is a peer the next
-    requester has to wait for again. Hence the live read
-    (:meth:`~proposed.view.View.locate_live`): a gate is correct only against the
-    directory *now*, and one opened against a directory read taken before the
-    registration landed would park its requester forever.
-
-    The cross-slice read, and the only one: what the fan-out owes is one reducer's
-    state and what the directory holds is another's, and a decision is where the two are
-    read together (:mod:`proposed.dispatch`).
-    """
+    Read live, and re-read at every commit a parked requester wakes on: volumes evict,
+    so a peer that registered the key and later dropped it is one the next requester
+    waits for again. A gate opened against a read taken before the registration landed
+    parks forever."""
     located = view.locate_live([key for _volume, key in facts])
     return [
         (volume, key)

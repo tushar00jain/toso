@@ -1,162 +1,105 @@
 """The serving loop: turning one routing decision into real store calls.
 
-:class:`ServingHost` is **one serving instance**: its cache, its decode batch, its
-compute. A deployment runs one per host, and a host knows about exactly two other
-things: the store and its control plane. It does not know about another host.
+:class:`ServingHost` is one serving instance: its cache, its decode batch, its
+compute. A deployment runs one per host, and a host reaches exactly two things --
+the store and its control plane. Never another host.
 
-One member, and the decision follows the request
------------------------------------------------
-A request can land on any host, and the host it lands on is rarely the host that
-should serve it: which instance holds the longest reusable prefix is a cluster-wide
-fact. So :meth:`ServingHost.prefill` asks control where the request belongs, and if the
-answer is another host it *answers with that address* -- it does not call the host it
-named. If the answer is this host, it serves the request in that same call::
+How does a request reach the host that should serve it?
+-------------------------------------------------------
+Which instance holds the longest reusable prefix is a cluster-wide fact, so the
+host a request lands on is rarely the host that should serve it.
+:meth:`ServingHost.prefill` asks control, and an answer naming another host comes
+back as an address rather than a call to it::
 
     client -> A          "serve this" (a prompt)
-    A      -> client     "not here: B"       (a reroute; A ran nothing, and booked the
-                                              request onto B as it answered)
+    A      -> client     "not here: B"   (a reroute; A ran nothing, and booked the
+                                          request onto B as it answered)
     client -> B          B asks, is told what A was told, and prefills
     B      -> client     the first token, and "decode is C"
-    client -> C          C fetches that KV back out of the store, decodes, finishes
-    C      -> client     the remaining tokens -- after the last one, which is what
-                         makes the client's arrival-to-last-token stamp mean
-                         anything
+    client -> C          C fetches that KV back out of the store and decodes
+    C      -> client     the remaining tokens, after the last one is emitted
 
-One decision, one booking, and the second ask is answered rather than priced. The ask
-that moves a request books it (:class:`~kvcache_sim.control._sensor.Committed` -- the
-queue that decision spoke for, the promise no host can report yet, the peer its pull was
-priced against) *and* records where it sent it, so the host it named is told the same
-answer and prices nothing (:class:`~kvcache_sim.control._sensor.PlacementSensor`).
+A request is passed on **once**. The ask that moves it books it
+(:class:`~kvcache_sim.control._sensor.Committed`) and records where it sent it, so
+the host it named is told the same answer and prices nothing. A second pricing would read the cluster
+that booking has already moved, find the host just chosen busier than it was, and
+be entitled to send the request on again -- hop after hop, converging on nothing.
 
-That is what settles a placement rather than merely making one. A second pricing would
-read the cluster this booking has already moved, find the host just chosen busier than it
-was, and be entitled to send the request on again -- a request rerouted by its own
-booking, hop after hop, converging on nothing. So a request is passed on **once**,
-however far away a host or the control plane is, and no host needs a decision handed to
-it in order to serve.
-
-Both ends of that carry tensors, and the split follows the engines' division of
-labour: TTFT is the time to the *first* token, which is sampled from the prefill's
-last position, so :meth:`prefill` answers with it; everything after it is the decode
-batch's, so :meth:`decode` answers with the rest. The client is the only participant
-that sees both halves, and therefore the only one that can time the request.
+TTFT is the time to the first token, sampled from the prefill's last position, so
+:meth:`prefill` answers with it and :meth:`decode` answers with the rest. The
+client sees both halves and is the only participant that can time the request.
 
 Consequences of answering with an address:
 
-* **A host holds no reference to another host.** A serving instance's whole outward
-  surface is the store's client and the two control ports below.
-* **Reporting state does not travel.** Each host records what *it* did into the
-  run's ledger, keyed by request id (the prefill host: the routing decision, the
-  reuse, the publish; the decode host: the KV it pulled and the inter-token gaps),
-  and the join happens at the collector.
-* **The handoff is a real transfer.** Under disaggregation the decode host has none
-  of the request's KV, so :meth:`ServingHost.decode` drives a real ``get_batch``
-  over the whole block chain, priced by the same cost model as every other fetch.
-  That is what a prefill/decode-disaggregated system spends most of its time on,
-  and it moves disaggregation's headline number against it: a dedicated decode pool
-  buys isolation from prefill and pays for it in KV transfer.
+* a host's whole outward surface is the store's client and the two control ports;
+* reporting does not travel. Each host writes its own half of a request's row into
+  the run's ledger, keyed by request id, and the join happens at the collector;
+* the handoff is a real transfer. Under disaggregation the decode host has none of
+  the request's KV, so :meth:`ServingHost.decode` drives a real ``get_batch`` over
+  the whole block chain, priced by the same cost model as every other fetch. A
+  dedicated decode pool buys isolation from prefill and pays for it in KV transfer.
 
-The address is in the answer, so nobody writes the following
-------------------------------------------------------------
 :meth:`prefill` carries a :func:`~proposed.routed.routed` declaration naming where in
-its answer the address is (:attr:`Prefilled.elsewhere`), and that is the whole of it: a
-caller calls the same member at that host with the same arguments, and no code anywhere
-spells the sequence out (:class:`proposed.routed.RoutedPlane`). It is inert here -- this
-host reads none of it -- and what reads it is a caller, never a host.
+its answer the address is (:attr:`Prefilled.elsewhere`).
 
-Which host a request *arrives* at is the one thing no answer can supply: it is a load
-balancer's answer -- a client SDK, an ingress proxy, DNS -- so it is not here. The
-run's wiring stands in for it (:mod:`kvcache_sim.workload._serving`).
+**Missing:** which host a request *arrives* at is a load balancer's answer -- a
+client SDK, an ingress proxy, DNS -- and is not modelled. The run's wiring stands
+in for it (:mod:`kvcache_sim.workload._serving`).
 
-The lifecycle, once a host is prefilling:
-
-1. take the decision, made and booked at the ask that placed this request -- this ask,
-   or the one that sent it here;
-2. if the plan pulls a remote prefix, drive a **real** ``get_batch`` (charging
-   fabric via the cost model);
-3. submit the forward pass to this host's accelerator, which runs it when the
-   device is free -- so the queue wait is *waited*, not slept from a number, and
-   what the request actually waited is recorded next to what control predicted;
-4. publish what this host now holds and did not before -- a real ``put_batch``;
-5. dispatch the clock the real ops actually reached into control's sensors;
-6. answer the client with the first token and, where the run models decode, the
-   address of the host the plan named to run the rest.
-
-...and then, on that host:
-
-7. fetch the request's KV out of the store (a **real** ``get_batch``, and under
-   disaggregation the dominant cost of the request), and **publish it here**,
-   because the bytes are now on this host and this host's volume has to know;
-8. admit it to the decode batch, record its inter-token gaps when the last token
-   lands, publish the KV the generation left behind -- and only then answer the
-   client, with the tokens the batch generated. That is what lets the client stamp
-   arrival-to-last-token and what removed the drain hook the run used to need.
-
-A decode host holds KV, so a decode host pays for it
-----------------------------------------------------
-Steps 7 and 8 close the same hole. Everywhere in this model, KV that lands on a
-host is registered on that host's volume: a prefill host publishes the suffix it
-computed *and* the prefix it pulled, because it holds both. The decode host pulls
-an entire block chain in and generates more KV on top of it, so it publishes both
-too, through the same :meth:`~kvcache_sim.data._store.KVStore.publish` -- evictable
-by the same LRU, refusable by the same bounded volume. Otherwise a decode host has
-unbounded free memory and no capacity, eviction or hit-rate number ever feels it.
+Why does a decode host publish?
+-------------------------------
+KV that lands on a host is registered on that host's volume. A prefill host
+publishes the prefix it pulled and the suffix it computed; a decode host publishes
+the chain it pulled in and the KV it generated, through the same
+:meth:`~kvcache_sim.data._store.KVStore.publish` -- evictable by the same LRU,
+refusable by the same bounded volume. Otherwise a decode host has unbounded free
+memory and no capacity, eviction or hit-rate number ever feels it.
 
 Two consequences, both intended. The decode host becomes a **replica**: the
-directory maps the chain to the prefill host *and* the decode host, so a later
-request can be routed to, or pull from, a host that only ever decoded that prefix
--- which is what a read-through cache is. And decode **competes** for the volume
-with the cached prefixes on it: on a bounded instance a decode pool that holds
-every chain it has served will evict the prefixes prefill is trying to reuse.
+directory maps the chain to it as well as to the prefill host, so a later request
+can be routed to, or pull from, a host that only ever decoded that prefix. And
+decode **competes** for the volume: a decode pool holding every chain it has served
+will evict the prefixes prefill is trying to reuse.
 
-Note where the queue wait sits in that list. Control's arithmetic puts it first (it
-prices ``queue -> transfer -> prefill`` and reserves the instance for all three),
-but a forward pass cannot be submitted before its inputs have arrived, so here it
-is *behind* the fetch and the fetch runs on the fabric while the device belongs to
-somebody else. That is why control's forecast diverges from what happens, most for
-the requests that pull.
+Where does control's forecast diverge from what happens?
+--------------------------------------------------------
+Control prices ``queue -> transfer -> prefill`` and reserves the instance for all
+three, but a forward pass cannot be submitted before its inputs have arrived, so
+here the queue wait sits *behind* the fetch, and the fetch runs on the fabric while
+the device belongs to somebody else. The gap is widest for requests that pull.
 
 Simplification (documented in SPEC): a block becomes reusable at prefill
 *completion*, not while in flight, so two requests racing for the same brand-new
 prefix may both compute it. Arrivals are typically spaced enough that this is rare.
 
-Control is not on this host, and it is two ports
------------------------------------------------
-Control runs as a service, so this plane reaches it the way it reaches the store:
-through a port, over calls that carry values. There are two ports, and the split is
-between asking and telling:
+What may this host touch on the control side?
+---------------------------------------------
+Two ports, split between asking and telling:
 
-* :class:`~proposed.plane.ControlPlane` -- the **questions**: where should this run
-  (``decide``, here), and which peer serves a fetch (``sources``, asked by
-  :mod:`kvcache_sim.data._store` where the fetch is). One plane answers both, and a
-  question is answered, so it is called and waited for. ``decide``'s answer is a
-  :class:`~kvcache_sim.control.scheduler.Response` -- a value naming both of the
-  request's hosts, and what prefilling on the first was priced at. The host it names
-  passes it on in its own answer (:class:`Prefilled`) as far as the host that decodes;
-* :class:`~proposed.dispatch.Dispatcher` -- the **facts**, each an
-  :class:`~proposed.dispatch.Action`: this host's decode batch, its busy compute, the
-  clock its prefill really reached. Nothing comes back, and the reply is waited for
-  anyway, because the next question has to be decided against sensors that have already
-  folded the action.
+* :class:`~proposed.plane.ControlPlane` -- the **questions**. ``decide`` (here)
+  answers a :class:`~kvcache_sim.control.scheduler.Response`: a value naming both
+  of the request's hosts and what prefilling on the first was priced at, which the
+  named host passes on in its own answer (:class:`Prefilled`) as far as the host
+  that decodes. ``sources`` (asked by :mod:`kvcache_sim.data._store`, where the
+  fetch is) names which peer serves a fetch;
+* :class:`~proposed.dispatch.Dispatcher` -- the **facts**: this host's decode batch,
+  its busy compute, the clock its prefill really reached. Nothing comes back, and
+  the reply is awaited anyway, because the next question has to be decided against
+  sensors that have already folded the action.
 
-Those two are the *only* things this module may touch on the control side --
+Those two are the *only* things this module may touch on the control side.
 ``check_structure.py`` rule 6 fails the build on a field read, a subscript or a
 ``getattr`` through either, since none of those survive the planes being in
-different processes.
+different processes. So the decode engine's callbacks come back to their owner on
+this host, and this plane decides what to send on as a
+:class:`~kvcache_sim.control.scheduler.DecodeState` fact.
 
-So this plane owns the decode engine and *reports* it: every batch change goes out
-as a :class:`~kvcache_sim.control.scheduler.DecodeState` fact. The engine's
-callbacks come back here first, to their owner on this host, and this plane decides
-what to send on.
-
-Coupling lives here
--------------------
 Whether prefill and decode contend for this host's compute is a fact about the
-deployment, not the selector, so the host owns it: by handing both engines one
-accelerator or two, and by reporting each decode step's end onward as a
+deployment, so the host owns it: it hands both engines one accelerator or two, and
+reports each decode step's end as a
 :class:`~kvcache_sim.control.scheduler.ComputeBusy` fact so control's *predicted*
 prefill queue tracks the device decode is actually using. A disaggregated host
-reports nothing, and prefill never stalls decode.
+reports nothing.
 """
 
 from __future__ import annotations
@@ -185,17 +128,17 @@ __all__ = ["Prefilled", "ServingHost"]
 class Prefilled:
     """What :meth:`ServingHost.prefill` answers: an address, or a prefilled request.
 
-    One or the other, never both. ``elsewhere`` set is the host the request belongs on
-    and the whole of that answer -- nothing has run, so there is nothing else to say.
-    Otherwise the request was served here: the ``token`` this host produced, the
-    ``decode`` host that generates the rest (``None`` when nobody does, which is a run
-    that models no second half), and the ``response`` it was decided by, which is what
-    :meth:`ServingHost.decode` reads the request's two hosts off.
+    An address or the other three, never both.
     """
 
+    #: The host the request belongs on. Set means nothing ran here.
     elsewhere: Optional[str] = None
+    #: The decision this request was served by; :meth:`ServingHost.decode` reads
+    #: the request's two hosts off it.
     response: Optional[Response] = None
+    #: The first token, produced by this host's prefill.
     token: Optional[torch.Tensor] = None
+    #: The host that generates the rest, ``None`` in a run with no second half.
     decode: Optional[str] = None
 
 
@@ -203,22 +146,13 @@ class ServingHost(DataPlane):
     """One serving instance: its cache, its decode batch, its compute.
 
     The running loop's ``time()`` is the only clock (virtual under simulation).
-
-    Two members are the whole surface a client reaches: :meth:`prefill` and
-    :meth:`decode`. Both answer with an *address* where the next thing happens
-    somewhere else, so nothing here needs a way to reach another host.
-
-    A :class:`~proposed.plane.DataPlane`, so everything it reaches -- the store, the
-    control plane it asks, the dispatcher it reports into -- arrives at :meth:`attach`
-    as the one deployment that has them all, rather than being plumbed in by whoever
-    builds the hosts.
+    :meth:`prefill` and :meth:`decode` are the whole surface a client reaches.
 
     Args:
         me: this host's instance id -- the only one this object holds. A plan may
             name others, but they are addresses to hand back to a client.
         trace: the run's shared trace.
-        metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger --
-            the collector each host writes its own half of a request's story into.
+        metrics: the run's :class:`~kvcache_sim.report.metrics.Metrics` ledger.
         prefill: this host's :class:`~kvcache_sim.data._prefill.PrefillEngine`,
             or ``None`` if it does not prefill.
         decode: this host's :class:`~kvcache_sim.data._decode.DecodeEngine`, or
@@ -253,26 +187,13 @@ class ServingHost(DataPlane):
         if decode is not None:
             decode.on_finish = self._decode_done
             decode.on_state = self._decode_state
-            # A prefill here delays a decode step here -- and so is worth reporting
-            # -- exactly when both engines were given the same accelerator. A run
-            # that models two engines on one host as *not* contending says so by
-            # handing them separate timelines.
+            # Coupled: one accelerator, so a prefill here delays a decode step here.
             if prefill is not None and prefill.compute is decode.compute:
                 decode.on_compute_busy = self._compute_busy
 
-    # -- proposed.DataPlane: the deployment hands over what this host reaches -- #
+    # -- what this host reaches: the store, and the two control ports -------- #
     def attach(self, deployment: Deployment) -> None:
-        """Keep the deployment this host reaches its control plane and store through.
-
-        One object rather than a port per service: a host reaching its control plane
-        is reaching *this deployment's* control plane, so whoever builds the hosts has
-        nothing to plumb and cannot pair a host with the wrong run's services.
-
-        The store is built here, over that same deployment, because
-        :class:`~kvcache_sim.data._store.KVStore` is the KV-shaped reading of the
-        store's verbs and holds nothing else -- a host per process builds its own,
-        and so does each of a simulation's.
-        """
+        """Take the deployment this host reaches its control plane and store through."""
         self.deployment = deployment
         self.store = KVStore(deployment)
 
@@ -297,22 +218,13 @@ class ServingHost(DataPlane):
     async def prefill(self, request: Request) -> Optional["Prefilled"]:
         """Ask control where ``request`` belongs; serve it here, or answer with there.
 
-        One signature, whoever is calling: control is asked, and either it names this
-        host -- and the request is prefilled in this same call -- or it names another,
-        which goes back out as an address (:attr:`Prefilled.elsewhere`) and leaves this
-        host holding nothing. Nothing has run when that answer is given, which is what
-        makes a refusal -- ``None``, recorded here, since no other host will hear of this
-        request -- cost nothing.
+        An answer naming another host goes back out as an address
+        (:attr:`Prefilled.elsewhere`) with nothing run and nothing held here. A
+        refusal is ``None``, and is recorded here: no other host will hear of this
+        request.
 
-        Asked by the host a request landed on, this is where the decision is made and
-        booked; asked by the host that decision named, it is the same answer read back,
-        priced and judged nowhere (:mod:`kvcache_sim.control.scheduler`). Which is why a
-        request reaches the host it belongs on in one reroute however far away control
-        is.
-
-        Answers with the first token and where the rest of it is generated. The token
-        comes back even when no address does: every request prefilled here got
-        prefilled, and a request that got this far was admitted before any of it ran.
+        The first token comes back whenever this host prefilled, even in a run that
+        names no decode host.
         """
         control: ControlPlane = self.deployment.control_plane_handle
         response = await control.decide.call_one(request, self.me)
@@ -333,78 +245,62 @@ class ServingHost(DataPlane):
                 self._now(), "REDIR", f"{request.id} {self.me} -> {response.prefill}"
             )
             return Prefilled(elsewhere=response.prefill)
-        # Nothing is reserved on the accelerator here: it books the pass when it is
-        # submitted and decode books its steps on the same occupancy, so one object
-        # owns the answer and no forecast is written over it.
+        # Serve it here. Nothing is reserved: the pass books the device when it is
+        # submitted, behind whatever already has it.
         plan = response.plan
         self._trace_route(request, response)
         row = self._make_accepted(request, response)
-        # Published before the work below: this host is the only one that will know
-        # these fields, and the row is amended in place as the facts land.
+        # Added before the work below; amended in place as the facts land.
         self.metrics.add(row)
 
-        # (1) the prefix this host already had is a read the store never sees,
-        # so tell it: the volume evicts on what it has observed.
+        # (1) A local prefix is a read the store never sees, so tell it: the volume
+        # evicts on what it has observed.
         if plan.local_blocks:
             await self.store.reuse(
                 self.me, list(request.block_keys[:plan.local_blocks])
             )
-        # ...then pull the remote prefix (a real get_batch -> real fabric cost). The
-        # KV comes back because this host is about to hold it: it goes into the
-        # forward pass below and out again in what that pass publishes.
+        # Pull the remote prefix: a real get_batch, real fabric cost. The KV goes into
+        # the forward pass below and out again in what that pass publishes.
         uncached = plan.uncached_tokens
         pulled: List[torch.Tensor] = []
         if plan.reuse_source is not None and plan.pull_keys:
             try:
                 pulled = await self.store.fetch(self.me, plan.pull_keys)
             except KeyError:
-                # The peer dropped those blocks between routing and now (its volume
-                # ran out of room). The plan is stale, so recompute the whole
-                # planned reuse rather than fail: a pull is all-or-nothing, and half
-                # a prefix is not a prefix.
+                # Evicted on the peer since routing. A pull is all-or-nothing, so the
+                # whole planned reuse is recomputed rather than half a prefix used.
                 uncached = self._recompute(request, plan, row)
                 pulled = []
-        # (2) submit the forward pass for the uncached suffix. The engine is told
-        # the work, not a duration: what it costs and *when* it runs are both the
-        # accelerator's answer, so the pass waits here for the device behind
-        # whatever prefill or decode step already has it. It answers with the KV
-        # (the prefix handed in, then the suffix it computed) and the first token.
-        # The request's id tags the submission, breaking same-instant ties in the
-        # accelerator's service order.
+        # (2) Submit the forward pass for the uncached suffix. The engine is told the
+        # work, not a duration: it waits here for the device behind whatever pass or
+        # decode step has it, and answers with the KV (prefix in, suffix computed)
+        # and the first token. The id tags the submission, breaking same-instant ties
+        # in the accelerator's service order.
         #
-        # Sliced by *offset* off the request's own prompt, not as ``prompt[-n:]``,
-        # which would hand a fully-cached request its entire prompt back.
+        # Sliced by *offset*: ``prompt[-uncached:]`` would hand a fully-cached
+        # request its entire prompt back.
         prompt = request.prompt[request.prompt_tokens - uncached:]
         submitted_at = self._now()
         kv, first_token = await self.prefill_engine.run(
             prompt, pulled, tag=request.id
         )
         # Whatever that took beyond the pass itself was queueing for the device: the
-        # *measured* wait, next to control's prediction of it already on the row.
-        # Derived rather than reported back through the engine, which would put a
-        # simulation's bookkeeping in a member a deployment implements.
+        # *measured* wait, beside control's prediction of it already on the row.
         row.queue_wait = (
             self._now() - submitted_at - self.prefill_engine.cost(uncached)
         )
 
-        # (3) publish what this host now holds and did not before: the prefix it
-        # pulled, plus the suffix it computed -- everything past what was already
-        # local. Under disaggregation this is not only a cache fill for some later
-        # request; it is how *this* request's KV reaches its decode host.
+        # (3) Publish everything past what was already local: the prefix pulled plus
+        # the suffix computed. Under disaggregation this is also how *this* request's
+        # KV reaches its decode host.
         fresh = list(request.block_keys[plan.local_blocks:])
-        # A cache fill may fail: the request is already served and the only loss is
-        # that nobody reuses this prefix. Recorded rather than dropped -- "cached"
-        # and "had no room" are the two outcomes a capacity sweep exists to tell
-        # apart, and a hit rate cannot.
+        # A refused fill costs the request nothing, but "cached" and "had no room"
+        # are the two outcomes a capacity sweep exists to tell apart, so record it.
         row.published = await self.store.publish(self.me, fresh, kv)
-        # (4) dispatch the clock the real ops actually reached -- the only thing that
-        # closes the loop between the predicted queue for this host and the queue, and
-        # the first news control gets that it was wrong.
-        #
-        # Awaited for the ordering, not the answer, which carries nothing: the next
-        # request routed against this host must be priced against a sensor that has
-        # already folded this completion, and a report left in flight leaves control
-        # answering off a queue it knows to be wrong.
+        # (4) Dispatch the clock the real ops reached: the first news control gets
+        # that its queue forecast was wrong. Awaited for the ordering, not the answer
+        # -- the next request routed against this host must be priced against a
+        # sensor that has already folded this completion.
         await self.deployment.dispatcher_handle.dispatch.call_one(
             PrefillFinished(self.me, self._now())
         )
@@ -415,12 +311,11 @@ class ServingHost(DataPlane):
         )
 
     def _recompute(self, request: Request, plan: Plan, row: RequestResult) -> int:
-        """Re-price this prefill with the reuse that vanished; answer what is left.
+        """Re-price this prefill without the reuse that vanished; answer what is left.
 
-        The remote prefix is gone, so only what this host already held is still
-        cached. Corrects the row too: the request really did compute those tokens,
-        and a hit rate counting the plan rather than the outcome would flatter the
-        cache that dropped them.
+        Only what this host already held is still cached. The row is corrected too:
+        a hit rate counting the plan rather than the outcome would flatter the cache
+        that dropped the blocks.
         """
         cached = min(
             plan.local_blocks * self.prefill_engine.block_tokens,
@@ -489,9 +384,8 @@ class ServingHost(DataPlane):
                 f" (published {stored}blk){note}",
             )
             return None
-        # Decode-simulating path: nothing is asked here. The decision already names
-        # the decode host, and the SLO that could have refused this request was
-        # decided against before its prefill ran.
+        # Decode is modelled: nothing is asked here, the decision already named the
+        # host and refused this request or did not, before its prefill ran.
         self.trace.record(
             self._now(),
             "DONE",
@@ -510,102 +404,47 @@ class ServingHost(DataPlane):
     ) -> List[torch.Tensor]:
         """The client brought a prefilled request here. Fetch its KV, decode, finish.
 
-        Answers with **the tokens this host generated** -- the request's output
-        minus the first, which the prefill host produced. Not a stream: the tokens
-        arrive together at the end, which is the ``stream=False`` shape of a serving
-        API and matches a leg that already returns at the last token so the client
-        can stamp the request end to end.
+        Answers with the tokens **this host** generated -- the output minus the first
+        -- and only once the last one is emitted. The fetch below lands in neither
+        headline column (not TTFT, predicted before any of it happens; not TBT,
+        measured between decode tokens, and this finishes before the first), so an
+        early return would charge the dominant cost of disaggregation on the clock and
+        report it nowhere (:mod:`kvcache_sim.workload._serving`).
 
-        Returns when the **last token** has been emitted, not at admission. That is
-        what puts this method's cost inside a measured latency: the ``get_batch``
-        below lands in neither headline column -- not TTFT, which control predicted
-        before any of it happens, and not TBT, which is measured between decode
-        tokens while this finishes before the first of them -- so without the wait
-        the dominant cost of a disaggregated deployment is charged on the clock and
-        reported nowhere. It is inside arrival-to-last-token by construction
-        (:mod:`kvcache_sim.workload._serving`).
-
-        Waiting cannot deadlock. A request refused at :meth:`route` or at the decode
-        admission never reaches here; one with <= 1 output token is retired inside
+        Waiting cannot deadlock: a refused request never reaches here, one with <= 1
+        output token retires inside
         :meth:`~kvcache_sim.data._decode.DecodeEngine.admit` on the instant it
-        arrived; one whose handoff found no KV still admits; a queued request enters
-        the batch as a slot frees, and slots always free because every member's
-        ``remaining`` falls by one per step; and a host with no engine returns below
-        without waiting.
+        arrived, a host with no engine returns without waiting, and a queued request
+        enters the batch as a slot frees -- slots always free, because every member's
+        ``remaining`` falls by one per step.
 
-        The handoff fetch
-        -----------------
-        Under disaggregation none of this request's KV is on this host, so getting
-        it is a real ``get_batch`` over the request's **whole block chain** (a
-        decode step attends over every token of the prompt, not just the blocks the
-        prefill host happened to publish), charged fabric / storage / RAM by the
-        same cost model as every other fetch.
+        The fetch covers the **whole block chain**, not just what the prefill host
+        published: a decode step attends over every token of the prompt. It completes
+        before the batch admits the request, as DistServe and Mooncake also put KV
+        migration in TTFT; as an inter-token gap it takes both the disaggregated and
+        the coupled column to 0.0% attainment against a five-step target. **Unless
+        this host prefilled the request**, which the decision says outright: the chain
+        is here and the local-hit rule charges nothing. Not a rare corner -- with
+        prefill and decode drawn from one pool it was 73% of this scenario's reported
+        handoff bytes.
 
-        **Unless this host prefilled the request**, which the decision says outright.
-        Then the chain is already here and the store's local-hit rule applies:
-        nothing moves and nothing is charged
-        (:meth:`~kvcache_sim.data._store.KVStore.reuse`). Fetching it back would
-        charge a storage read for KV that never left and report it as a handoff.
-        Not a rare corner -- with prefill and decode drawn from one pool it was 73%
-        of this scenario's reported handoff bytes before the plan was consulted.
+        A missing block is not fatal. ``get_batch`` is all-or-nothing, so a failed
+        publish or a since-evicted block surfaces as a ``KeyError`` over the whole
+        batch; the request decodes anyway, and
+        :attr:`~kvcache_sim.report.metrics.Metrics.handoff_misses` tells a run its
+        decode pool is fed by a cache too small for the handoff.
 
-        Whether a host that did *not* prefill nonetheless holds part of the chain
-        (from another request sharing the prefix) is not asked. Until it is, a
-        cross-host handoff pays for the whole chain, over-charging by whatever the
-        decode host happened to share.
+        Both what arrives and what the batch generates are published here
+        (:meth:`_reside`, the second under keys continuing the prompt's chain), and
+        the generated publish waits for the last token: the loop is one coroutine
+        driving one accelerator, so publishing between two steps would stall every
+        other member of the batch, a TBT effect the hardware does not have.
 
-        The fetch completes **before** the request enters the batch. Charging it as
-        an inter-token gap instead was tried and rejected: it is not how these
-        systems are measured (DistServe and Mooncake both put KV migration in TTFT
-        and leave TPOT/TBT for the decode cadence), and on this workload it takes
-        *both* the disaggregated and the coupled column to 0.0% attainment against a
-        target set at five decode steps.
-
-        A missing block is not fatal. The publish may have failed on a full volume,
-        or a volume may have dropped a block since, and ``get_batch`` is
-        all-or-nothing, so either surfaces as a ``KeyError`` over the whole batch.
-        The request decodes anyway, the transfer is recorded as not having happened,
-        and :attr:`~kvcache_sim.report.metrics.Metrics.handoff_misses` is what tells
-        a run its decode pool is fed by a cache too small to hold the handoff.
-        Re-deriving KV on a decode-only host would be a second serving path, which
-        is not worth inventing to cover a capacity misconfiguration.
-
-        What this host then holds
-        -------------------------
-        The KV that arrives is published **on this host** (:meth:`_reside`), the
-        same rule the prefill leg follows for the prefix it pulled. A ``get_batch``
-        delivers bytes and stores nothing, so without this a decode host attends
-        over a chain its own volume has never heard of: no capacity consumed, no
-        directory entry, no eviction pressure. Publishing makes the directory say
-        two hosts hold the chain, which is true, and control routes on it.
-
-        Kept after the request finishes rather than dropped. Both models are
-        defensible, but keeping them is what this model does with every other block
-        it holds -- nothing has a lifetime, the volume's LRU decides -- and a decode
-        host that just served a conversation's turn is exactly the host that should
-        still have that prefix when the next turn arrives.
-
-        The last thing before answering is publishing the KV the batch **generated**
-        (``ceil(n / block_tokens)`` blocks for ``n`` generated tokens,
-        :meth:`~kvcache_sim.data._compute.Accelerator.generated_kv`, under keys
-        continuing the prompt's chain,
-        :meth:`~kvcache_sim.control.request.Request.continuation_keys`). Otherwise
-        decoding is free in capacity terms.
-
-        **After the last token, not during the generation.** Awaiting a publish
-        between two steps would stall *every other member of the batch* -- the loop
-        is one coroutine driving one accelerator -- widening everybody's inter-token
-        gap with a TBT effect the hardware does not have. The cost lands where the
-        handoff fetch lands: on the clock, inside arrival-to-last-token. What
-        deferring costs is intra-generation residency, under-charged until the
-        generation ends; no scenario here generates the 512 tokens that would take.
-
-        Generated KV that does not fit is a cache fill like any other -- ``publish``
-        answers ``False`` -- and by then the request has already been answered, so
-        nothing is dropped mid-generation. Recorded as
-        :attr:`~kvcache_sim.report.metrics.Metrics.decode_unpublished`. Preemption
-        (a real engine evicting and recomputing a running sequence's blocks) is
-        deliberately not modelled -- that is a scheduler this model does not have.
+        **Missing:** a host that did not prefill may still hold part of the chain,
+        which is not asked, so a cross-host handoff over-charges by whatever it
+        shared. Deferring the generated publish under-charges intra-generation
+        residency, which nothing here runs long enough to feel. Preemption is not
+        modelled.
         """
         keys = list(request.block_keys)
         if response.decode == response.prefill:
@@ -627,9 +466,8 @@ class ServingHost(DataPlane):
                 )
                 self.metrics.handed_off(request.id, self.me, 0, missed=True)
             else:
-                # Measured off the KV that arrived -- the same tensors the transport
-                # just charged for -- so the reported handoff cannot drift from the
-                # charged one.
+                # Measured off the tensors the transport just charged for, so the
+                # reported handoff cannot drift from the charged one.
                 nbytes = sum(b.numel() * b.element_size() for b in kv)
                 self.trace.record(
                     self._now(),
@@ -638,14 +476,11 @@ class ServingHost(DataPlane):
                     f"({len(keys)}blk, {nbytes}B of KV)",
                 )
                 self.metrics.handed_off(request.id, self.me, nbytes)
-                # The chain is on this host now, so the volume must charge itself
-                # for it and the directory must know of the second copy. Published
-                # *after* the handoff is recorded, so the reported transfer stays
-                # the bytes that crossed the fabric.
+                # Published *after* the handoff is recorded, so the reported transfer
+                # stays the bytes that crossed the fabric.
                 await self._reside(keys, kv, request.id, "chain")
-        # The only path that answers without the request having finished: a run
-        # whose decode side is not modelled, reaching a host with no engine. No last
-        # token is coming and nothing here generates any.
+        # No engine: a run that does not model decode. The only path that answers
+        # without the request having finished, since no last token is coming.
         if self.decode_engine is None:
             return []
         generated = await self.decode_engine.admit(request)
@@ -663,20 +498,11 @@ class ServingHost(DataPlane):
     ) -> None:
         """Register KV this host now holds on this host's volume.
 
-        One method for both of the decode side's publishes -- the chain it pulled in
-        and the blocks it generated -- because they are the same act: the bytes are
-        here, so the volume accounting for this host's memory has to be told and the
-        directory has to know a copy is here.
-
-        ``why`` names which of the two it was, for the trace only; nothing branches
-        on it.
-
-        A refusal is not fatal, as on the prefill side: the request is served (or,
-        for the chain, is about to be served off KV this host holds in hand either
-        way) and the loss is only that the volume will not keep it. Flagged on the
-        row rather than counted into it, since blocks the volume threw back occupy
-        nothing -- a decode pool that cannot keep what it decodes is mis-sized, and
-        the hit rate will not say so.
+        ``why`` names which publish it was, for the trace only; nothing branches on it.
+        A refusal is not fatal -- the request is served off KV held in hand either way
+        -- and is flagged on the row rather than counted into it
+        (:attr:`~kvcache_sim.report.metrics.Metrics.decode_unpublished`), since blocks
+        the volume threw back occupy nothing.
         """
         if not blocks:
             return
@@ -691,12 +517,7 @@ class ServingHost(DataPlane):
         )
 
     def _decode_done(self, request: Request, tbt: float) -> None:
-        """Finalize a request once its last decode token is emitted.
-
-        The gaps are this host's measurement of its own batch, so this host records
-        them into the ledger's row -- the prefill host wrote the rest of that row
-        before it ever named this one.
-        """
+        """Record this batch's inter-token gaps into the row the prefill host opened."""
         self.metrics.decoded(request.id, tbt)
         self.trace.record(
             self._now(), "DECODE", f"{request.id} decode done (tbt {tbt:.3f})"

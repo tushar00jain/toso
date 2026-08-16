@@ -13,43 +13,32 @@ Two levers the design cares about are modelled here:
 * **VRAM cap** (``max_batch``): a batch grows only to the cap; requests over it
   queue (``pending``) and their wait counts against their TBT.
 * **Prefill/decode coupling**: this host's compute
-  (:class:`~kvcache_sim.data._compute.Accelerator`) is owned by the *host*,
-  because it is the host's accelerator, and handed to whichever engines run on it.
-  A host with a :class:`~kvcache_sim.data._prefill.PrefillEngine` too shares one
-  between them, so a long prefill delays the next decode step and spikes that
-  token's TBT -- and a host with only this engine shares it with nothing. That is
-  what coupling *is*, so there is no flag for it. ``on_compute_busy`` reports each
-  step's end back out so the control plane's *predicted* prefill queue can be
-  corrected.
+  (:class:`~kvcache_sim.data._compute.Accelerator`) is owned by the *host* and handed
+  to whichever engines run on it. A host with a
+  :class:`~kvcache_sim.data._prefill.PrefillEngine` too shares one between them, so a
+  long prefill delays the next decode step and spikes that token's TBT. That is what
+  coupling *is*, so there is no flag for it. ``on_compute_busy`` reports each step's
+  end back out so control's *predicted* prefill queue can be corrected.
 
 One engine is **one host's** decode side: one batch, one compute timeline, one step
-loop. A host has its own VRAM and its own GPU and knows nothing of another's batch,
-so nothing here takes an ``inst`` argument.
+loop, and nothing here takes an ``inst`` argument.
 
-Async & deterministic: decode runs as a coroutine on the shared run's event loop,
-one step at a time, each booked on and awaited through the accelerator. Clocks are
-the loop's virtual time; no wall-clock, no randomness.
+Async & deterministic: decode runs as a coroutine on the shared run's event loop, one
+step at a time, each booked on and awaited through the accelerator. Clocks are the
+loop's virtual time; no wall-clock, no randomness.
 
-Admission answers with a completion
------------------------------------
-The step loop is a task, so it outlives the call that fed it -- but that is how the
-batch is driven, not a licence for the request to outlive its caller.
-:meth:`DecodeEngine.admit` returns when that request emits its last token, which is
-what lets the caller stay on the request long enough to stamp
-arrival-to-last-token (:mod:`kvcache_sim.workload._serving`).
+What admission answers with
+---------------------------
+The step loop is a task and outlives the call that fed it, but
+:meth:`DecodeEngine.admit` returns only when its request emits its last token, so the
+caller can stamp arrival-to-last-token (:mod:`kvcache_sim.workload._serving`).
 
-It answers with a :class:`Generated`: **the tokens this engine produced**,
-accumulated per batch member as the steps land, and **the KV those tokens left
-behind**, in whole blocks
-(:meth:`kvcache_sim.data._compute.Accelerator.generated_kv`). The host publishes the
-KV, not this engine -- a store call is the host's, and this object owns a batch and
-a compute timeline and reaches nothing off this box. Without it a volume would only
-ever hold blocks a prefill published, and a bounded cache could be decoded into
+It answers with a :class:`Generated`: **the tokens this engine produced**, accumulated
+per batch member as the steps land, and **the KV those tokens left behind**, in whole
+blocks (:meth:`kvcache_sim.data._compute.Accelerator.generated_kv`). The host publishes
+that KV, not this engine, which makes no store calls at all. Unpublished, a volume
+would hold only what a prefill put there and a bounded cache could be decoded into
 forever without once being pressured.
-
-Deliberately not a stream: the tokens arrive together at the end, which is the
-``stream=False`` shape of a serving API. The inter-token gaps are recorded per step
-either way.
 """
 
 from __future__ import annotations
@@ -70,21 +59,20 @@ __all__ = ["DecodeEngine", "Generated"]
 class Generated:
     """What a decode batch produced for one request: its tokens and its KV.
 
-    The value :meth:`DecodeEngine.admit` answers with. A named pair
-    rather than a 2-tuple of ``List[torch.Tensor]``: unpacked the wrong way round it
-    would publish tokens under block keys and answer the client with KV, and both
-    halves would typecheck all the way down.
+    A named pair rather than a 2-tuple of ``List[torch.Tensor]``: unpacked the wrong
+    way round it would publish tokens under block keys and answer the client with KV,
+    and both halves would typecheck all the way down.
 
-    ``eq=False`` for the reason :attr:`_Active.tokens` carries ``compare=False``: a
-    generated ``__eq__`` would compare tensors elementwise and answer with a tensor,
-    so the first ``==`` anywhere would raise "Boolean value of Tensor is ambiguous".
+    ``eq=False``, as :attr:`_Active.tokens` carries ``compare=False``: a generated
+    ``__eq__`` compares tensors elementwise and answers with a tensor, so the first
+    ``==`` anywhere would raise "Boolean value of Tensor is ambiguous".
     """
 
-    #: One token per decode step this request was in, in order: the request's
-    #: output minus the first, which prefill produced.
+    #: One token per decode step this request was in, in order: its output minus the
+    #: first, which prefill produced.
     tokens: List[torch.Tensor]
-    #: The KV those tokens left on the decode host, in whole blocks. Empty when
-    #: no step ran. What makes decode cost memory (see the module docstring).
+    #: The KV those tokens left on the decode host, in whole blocks. Empty when no
+    #: step ran.
     kv: List[torch.Tensor]
 
 
@@ -136,11 +124,9 @@ class DecodeEngine:
             forwards it to control's model, which is how control knows the decode
             load without holding this object.
 
-    Both callbacks are the plane's, not control's: this engine reports to its
-    owner on the same host, and the owner decides what to send onward. Awaited
-    because the owner sends them over a hop, and a report fired off as a task would
-    reorder the run; what that costs is the step loop's, which is where a report to
-    another service really lands.
+    Both callbacks are the plane's, not control's: this engine reports to its owner on
+    the same host and the owner decides what to send onward. Awaited, because the owner
+    sends them over a hop and a report fired off as a task would reorder the run.
     """
 
     def __init__(
@@ -170,9 +156,9 @@ class DecodeEngine:
 
         One estimated finish time per request decoding or queued here, under the
         uniform per-token assumption (each remaining token ~ one uncontended step).
-        The count is the occupancy and the values answer "still decoding at ``t``?"
-        -- everything control asks about decode, so it never has to hold this
-        object. Sent on every batch change, because that is when either answer moves.
+        The count is the occupancy and the values answer "still decoding at ``t``?",
+        which is everything control asks about decode. Sent on every batch change,
+        because that is when either answer moves.
         """
         if self.on_state is None:
             return
@@ -188,19 +174,15 @@ class DecodeEngine:
     async def admit(self, request: Request) -> Generated:
         """Enter ``request`` into this host's decode batch; answer with its tokens.
 
-        Returns when its **last token** lands, with a :class:`Generated` -- the
-        tokens this engine produced and the KV they left on this host. The first
-        token was produced by prefill (TTFT); decode generates the remaining
-        ``output_tokens - 1``. A request with <= 1 output token needs no decode and
-        finishes immediately with an empty :class:`Generated`: nothing was left to
-        generate, so no tokens and no KV.
+        Returns when its **last token** lands, with a :class:`Generated`. Prefill
+        produced the first token, so decode generates ``output_tokens - 1``; a request
+        with <= 1 of them finishes immediately with an empty :class:`Generated`.
 
-        Inside, the wait is on the slot's own future, which is what lets the step
-        loop -- a task, so that it outlives this call -- retire one member without
-        knowing who admitted it. Both ways out resolve that future exactly once and
-        both do it *after* ``on_finish`` has run (see :meth:`_finish`); a step task
-        that dies resolves every outstanding one with the exception rather than
-        leaving a caller parked forever (:meth:`_abandon`).
+        The wait is on the slot's own future, so the step loop retires a member without
+        knowing who admitted it. Both ways out resolve that future exactly once, and
+        both after ``on_finish`` has run (:meth:`_finish`); a step task that dies
+        resolves every outstanding one with the exception rather than leaving a caller
+        parked forever (:meth:`_abandon`).
         """
         loop = asyncio.get_running_loop()
         done: "asyncio.Future" = loop.create_future()
@@ -234,25 +216,17 @@ class DecodeEngine:
     ) -> None:
         """Retire one request: report it, then hand over what it produced.
 
-        The order is why this is a method rather than two lines at each call site.
-        ``on_finish`` is how this host's half of the request's row reaches the run's
-        ledger (the inter-token gaps); the future is what the caller is parked on,
-        and a caller released first could read that row before the half it spent the
-        whole decode waiting for was written into it.
+        ``on_finish`` runs first. It writes this host's half of the request's row (the
+        inter-token gaps), and a caller released before that could read the row without
+        the half it spent the whole decode waiting for.
 
-        ``tokens`` is passed in rather than read off the slot because one call site
-        has no slot: a request with nothing to decode is retired inside
-        :meth:`admit`, with an empty list.
+        ``tokens`` is passed in rather than read off a slot, because a request with
+        nothing to decode is retired from :meth:`admit` and has none. The KV is derived
+        from ``len(tokens)``, so a single count stays in play.
 
-        The **KV** is derived from them here instead. A token has to be accumulated
-        as the steps land, but the KV of those positions is a function of how many
-        there were, so one call at the end gives the same answer as ``n`` calls --
-        and ``len(tokens)`` keeps a single count in play rather than a second
-        per-slot list that could disagree with it.
-
-        ``set_result`` is unguarded on purpose: a second retirement of the same
-        request raises :class:`asyncio.InvalidStateError` rather than silently
-        overwriting a measurement.
+        ``set_result`` is unguarded on purpose: a second retirement of the same request
+        raises :class:`asyncio.InvalidStateError` rather than silently overwriting a
+        measurement.
         """
         if self.on_finish is not None:
             self.on_finish(request, tbt)
@@ -287,15 +261,13 @@ class DecodeEngine:
     def _abandon(self, exc: BaseException) -> None:
         """Fail everything this engine will now never finish.
 
-        Nothing in the step loop is expected to raise. This exists because this task
-        is the only thing that resolves an admitted request's future: a caller
-        parked on a future nobody resolves does not fail, it hangs and takes the run
-        with it, with the original exception swallowed into a task nobody joins. So
+        The step loop is the only thing that resolves an admitted request's future, and
+        a caller parked on a future nobody resolves does not fail: it hangs and takes
+        the run with it, the original exception swallowed into a task nobody joins. So
         a dying loop hands its exception to every caller waiting on it.
 
-        The batch is cleared with it: those requests are not decoding, and leaving
-        them listed would have the next :meth:`admit` start a step loop over slots
-        whose futures are already resolved.
+        The batch is cleared with it, or the next :meth:`admit` would start a step loop
+        over slots whose futures are already resolved.
         """
         for a in self.batch + self.pending:
             if not a.done.done():
@@ -306,9 +278,8 @@ class DecodeEngine:
     async def _step_complete(self, members: List[_Active], step_end: float) -> None:
         """Emit one token for each member; retire finished; promote pending.
 
-        The tokens come from the accelerator that just ran the step, one per member
-        and in the order the members were frozen in, so a slot accumulates the token
-        the step produced *for it*.
+        One token per member, in the order the members were frozen in, so a slot
+        accumulates the token the step produced *for it*.
         """
         emitted = self.compute.step_tokens(len(members))
         for a, token in zip(members, emitted):

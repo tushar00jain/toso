@@ -1,13 +1,12 @@
 """What this plane answers with: :class:`Plan`, :class:`Response`, and the pair a
 ranking over decode hosts is built out of.
 
-Values only, so each crosses a service boundary unchanged, and the layer under both
-the ranking that sorts those hosts (:mod:`kvcache_sim.control._selector`) and the plane
-that prices and answers with them (:mod:`kvcache_sim.control.scheduler`) -- which is
-what lets a selector be typed on this plane's own values without a cycle back into the
-plane that builds one. What is decided *about* is :mod:`kvcache_sim.control.request`;
-the facts a host reports are with the sensor they write
-(:mod:`kvcache_sim.control._sensor`).
+Values only, so each crosses a service boundary unchanged. The layer under both the
+ranking over decode hosts (:mod:`kvcache_sim.control._selector`) and the plane that
+prices and answers with them (:mod:`kvcache_sim.control.scheduler`), so a selector can
+be typed on this plane's own values without a cycle back into it. What is decided
+*about* is :mod:`kvcache_sim.control.request`; the facts a host reports are with the
+sensor they write (:mod:`kvcache_sim.control._sensor`).
 """
 
 from __future__ import annotations
@@ -24,14 +23,13 @@ __all__ = ["Plan", "Response"]
 class Plan:
     """What prefilling one request on one instance was priced at.
 
-    No order of its own: a plan rides in the key of the pool it was priced into, and
-    which of its numbers orders that pool is the fold's to name
-    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`). So nothing can
-    compare two of these by accident.
+    No order of its own: which of its numbers orders a pool of plans is named where the
+    chain is (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`), so nothing
+    compares two of these by accident.
 
-    One candidate's price and nothing else: which instance this is, and which one
-    decodes, are the two selections' winners and live on the :class:`Response`. Every
-    field here is about the prefill, so a losing candidate is a complete value too.
+    Which instance this is, and which one decodes, are the two selections' winners and
+    live on the :class:`Response`. Every field here is about the prefill, so a losing
+    candidate is a complete value too.
     """
 
     match_blocks: int            # reused prefix length (blocks)
@@ -49,9 +47,8 @@ class Plan:
     def local_blocks(self) -> int:
         """Blocks the prefill host already held: the match, minus what it pulls.
 
-        Derived rather than a field: the data plane needs it three times over (reuse
-        to report, suffix to publish, prefix to fall back on when a planned pull is
-        gone) and all three have to agree.
+        Derived, not a field: the data plane reads it three times (reuse to report,
+        suffix to publish, prefix to fall back on) and all three must agree.
         """
         return self.match_blocks - len(self.pull_keys)
 
@@ -60,17 +57,16 @@ class Plan:
 class Response:
     """Where one request runs: the winner of each selection, and the price of one.
 
-    What :meth:`~kvcache_sim.control.scheduler._Scheduler.decide` answers and the only
-    part of a decision that travels. The rankings behind it stay inside the scheduler:
-    nothing outside asks what lost.
+    The only part of a decision that travels; the rankings behind it stay inside the
+    scheduler.
 
     Args:
         prefill / decode: the two instances chosen, one from each selection.
         plan: what prefilling on ``prefill`` was priced at.
-        pred_tbt: the inter-token gap the decode batch this request was predicted to
-            meet implies. What the TBT SLO is applied to
-            (:meth:`~kvcache_sim.control.scheduler._Scheduler._admit`), which is why
-            it is here and not on the plan -- it is the decode side's.
+        pred_tbt: the inter-token gap implied by the decode batch this request was
+            predicted to meet -- the decode side's, so not on the plan. What the TBT
+            SLO is applied to
+            (:meth:`~kvcache_sim.control.scheduler._Scheduler._admit`).
     """
 
     prefill: VolumeId

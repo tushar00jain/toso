@@ -7,26 +7,21 @@ reuse falls out for free. A block key is a plain ``str`` and is used directly as
 key in the **real** TorchStore directory (``Controller.keys_to_storage_volumes``),
 so no separate key type is needed.
 
-Building that chain is the *prompt generator's* job
-(``workload/_generator.py``) and walking it against a directory snapshot is the
-*view's* (``control/_view.py``); both are private to those modules. What is left
-here is the request itself.
+Building that chain is the prompt generator's job (``workload/_generator.py``) and
+walking it against a directory snapshot is the view's (``control/_view.py``).
 
-The keys are not derived from the prompt
-----------------------------------------
-A request carries the prompt it was submitted with -- under simulation a
-``device="meta"`` tensor of token ids: real dtype and shape, no storage behind it,
-the same compromise the KV blocks are (:mod:`kvcache_sim.workload._accelerator`).
-A meta tensor has no tokens *in* it to hash (reading one is an error, not a zero),
-so the block-key chain cannot be computed from :attr:`Request.prompt` and is handed
-in by whatever generated it. Hashing the *shape* instead would be worse: every
-prompt of a given length would collide, so every request would "reuse" every other
-one's prefix. The honest fix is real token ids, i.e. a real tokenizer and corpus,
-which is a workload change rather than a plumbing one.
+Why are the keys not derived from the prompt?
+---------------------------------------------
+Under simulation the prompt is a ``device="meta"`` tensor of token ids: real dtype and
+shape, no storage behind it, the same compromise the KV blocks are
+(:mod:`kvcache_sim.workload._accelerator`). It has no tokens *in* it to hash (reading
+one is an error, not a zero), so the chain is handed in by whatever generated it.
+Hashing the *shape* instead would collide every prompt of a given length, so every
+request would "reuse" every other one's prefix. **Missing:** real token ids, i.e. a
+real tokenizer and corpus -- a workload change rather than a plumbing one.
 
-Generated tokens extend the sequence, so the KV a decode host produces belongs
-under keys that continue the same chain; :meth:`Request.continuation_keys` builds
-them, with the same stand-in one step further out.
+Generated tokens extend the sequence, so the KV a decode host produces belongs under
+keys continuing the same chain (:meth:`Request.continuation_keys`).
 """
 
 from __future__ import annotations
@@ -41,19 +36,17 @@ __all__ = ["Request"]
 
 @dataclass(frozen=True)
 class Request:
-    """One inference request.
-
-    ``block_keys`` is the prefix-hash chain for the prompt (one directory key per
-    ``B``-token block). ``prompt_tokens == len(block_keys) * B``. ``output_tokens``
-    is what control *predicts* decode occupancy against; the produced output is
-    counted by the data plane from the tokens it actually made (see
-    :attr:`kvcache_sim.report.metrics.RequestResult.output_tokens`).
-    """
+    """One inference request."""
 
     id: str
     arrival: float
+    #: The prefix-hash chain for the prompt, one directory key per ``B``-token block.
     block_keys: Tuple[str, ...]
+    #: ``len(block_keys) * B``.
     prompt_tokens: int
+    #: What control *predicts* decode occupancy against. What was produced is counted
+    #: by the data plane from the tokens it made
+    #: (:attr:`kvcache_sim.report.metrics.RequestResult.output_tokens`).
     output_tokens: int
     #: The prompt itself: a 1-D tensor of ``prompt_tokens`` token ids, as the
     #: caller submitted it. Under simulation a ``device="meta"`` tensor with no ids
@@ -72,11 +65,9 @@ class Request:
     def __post_init__(self) -> None:
         """Refuse a prompt whose length is not the length everything prices.
 
-        ``prompt_tokens`` is what the control plane routes on (prefix match,
-        uncached suffix, predicted TTFT) and the tensor is what the data plane runs
-        the forward pass over. If they disagree the scheduler prices one length
-        while the accelerator computes another, and every reported number stays
-        internally consistent while being wrong.
+        Control routes on ``prompt_tokens`` and the data plane runs the forward pass
+        over the tensor. If they disagree every reported number stays internally
+        consistent while being wrong.
         """
         if self.prompt.numel() != self.prompt_tokens:
             raise ValueError(
@@ -92,20 +83,15 @@ class Request:
         answers ``("<last>|g1", "<last>|g1|g2")`` -- a later sequence that really did
         continue this one walks the same keys and stops where they stop.
 
-        Two callers, and it matters that they share this method rather than spelling
-        the keys out twice: the decode host publishing its generated KV
-        (:meth:`kvcache_sim.data.serving.ServingHost.decode`) and the workload
-        building turn N+1 out of turn N (:mod:`kvcache_sim.workload._generator`).
-
         **Synthetic.** A real chain hashes each block's token ids; this run's tokens
         are ``device="meta"`` and have none, so this concatenates a counter instead.
-        ``g<i>`` cannot collide with a prompt key: the generator's segments are
-        decimal integers, so no prompt chain names a key ending in ``|g1``.
+        ``g<i>`` cannot collide with a prompt key: the generator's segments are decimal
+        integers, so no prompt chain names a key ending in ``|g1``.
 
-        Modelling limit: two requests generating *different* tokens after the same
-        prompt would collide here and would not in a real system. This workload
-        cannot produce that -- every prompt chain is unique, because each request
-        gets a fresh query segment -- but that is a property of the workload.
+        **Missing:** two requests generating *different* tokens after the same prompt
+        collide here and would not in a real system. This workload cannot produce that
+        -- each request gets a fresh query segment -- but that is a property of the
+        workload, not of the keys.
         """
         # A request with no prompt blocks is degenerate (the generator never makes
         # one) but not an error: its id is a unique root.

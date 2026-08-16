@@ -5,14 +5,12 @@ is a property of the prefix, so replicas of one hold identical rank and the id
 tie-break sends every read to the same volume -- this is the thing that changes, so
 the tie can be broken on it (:class:`proposed.selector.Balance`).
 
-Written by the decision that names a source and read by the ranking that named it,
-which is what makes it a sensor rather than a tally inside the ranking: two parties,
-one fact, and neither holds the other's state. The fact is the one every accepted
-decision already dispatches (:class:`~kvcache_sim.control._sensor.Committed`), so a
-source's load rises where the pull it was priced for was decided.
+Written by the decision that names a source and read by the ranking that named it, off
+the action every accepted decision already dispatches
+(:class:`~kvcache_sim.control._sensor.Committed`), so a source's load rises where the
+pull it was priced for was decided.
 
-What it does *not* observe, and what it would take, is stated where a reader looks for
-it: :class:`proposed.view.LoadView`.
+What it does *not* observe is stated on :class:`proposed.view.LoadView`.
 """
 
 from __future__ import annotations
@@ -31,12 +29,11 @@ __all__ = ["SourceLoad"]
 class SourceLoad(Sensor):
     """Per-volume count of the decisions that named it as a source.
 
-    Read through the scheduler's view (:class:`proposed.view.LoadView`), whose docstring
-    is where the number's meaning and its limits are stated -- there rather than here,
-    because that is the surface a ranking is written against.
+    Read through the scheduler's view (:class:`proposed.view.LoadView`), where the
+    number's meaning and its limits are stated.
 
-    Counts only a decision that priced a pull: one that recomputes the gap instead sends
-    nothing to anybody, and counting it would load a volume nobody is going to read.
+    Counts only a decision that priced a pull: one that recomputes the gap sends nothing
+    to anybody, and counting it would load a volume nobody is going to read.
     """
 
     def __init__(self) -> None:
@@ -45,7 +42,7 @@ class SourceLoad(Sensor):
 
     @property
     def folds(self) -> Mapping[type, Fold]:
-        """:class:`proposed.dispatch.Reducer` -- what it folds, by action type."""
+        """What this sensor folds, by action type."""
         return MappingProxyType(self._folds)
 
     def _committed(self, action: Committed) -> None:

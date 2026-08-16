@@ -1,13 +1,10 @@
 """What this capability dispatches: the five things that happen to a cluster.
 
-Each is a :class:`proposed.dispatch.Action`, folded by every sensor here that folds
-its type and committed once (:class:`proposed.dispatch.Dispatcher`). Three come from a
-host over the seam in front of that dispatcher and two the scheduler dispatches to
-itself, one per question it answers; nothing here says which sensor folds what, because
-an action does not know who folds it.
+Three come from a host over the seam in front of this plane's dispatcher, two the
+scheduler dispatches to itself, one per question it answers. Nothing here says which
+sensor folds what.
 
-Frozen values, so they cross a process boundary unchanged and cannot be edited after
-they are handed over.
+Frozen values, so they cross a process boundary unchanged.
 """
 
 from __future__ import annotations
@@ -65,10 +62,10 @@ class DecodeState(Action):
 class FetchAnswered(Action):
     """``requester`` has been told which peers serve its fetch of ``keys``.
 
-    Dispatched as the answer is given, whatever answered it: a fetch a decision priced a
-    pull for spends the memo that answered it
-    (:class:`~kvcache_sim.control._sensor.RoutedPullSensor`), and one nothing priced
-    spends nothing, so the plane never has to know which link won.
+    Dispatched as the answer is given, whatever answered it: a fetch a pull was priced
+    for spends that memo
+    (:class:`~kvcache_sim.control._sensor.RoutedPullSensor`), one nothing priced spends
+    nothing, so the plane never has to know which link won.
     """
 
     requester: str

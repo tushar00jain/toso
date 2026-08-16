@@ -1,78 +1,108 @@
 # toso — project conventions
 
-## Cross-cutting run knobs: use ambient config, don't thread arguments
-New run-wide options (fidelity models, debug/output toggles, resource limits) go
-through `sim_common/config.py` (`SimConfig`), read ambiently — NOT as scalar
-parameters threaded down scenario → cluster/coordinator → transport call chains.
-Threading a scalar through every layer is churn across many files; ambient config
-is one edit.
+## Run knobs: ambient config, never threaded arguments
+Run-wide options (fidelity models, debug toggles, resource limits) live in
+`sim_common/config.py` (`SimConfig`) and are read ambiently.
 
-To add a flag:
-1. Add a field to `SimConfig` (+ parse its `TOSO_*` env var in `_from_env`).
-2. Read it at the leaf that needs it via `config.current().<flag>` (or, for a
-   shared object built once per run, a `from_config()` factory that reads the
-   flag when its explicit arg is `None`).
-3. Wire the CLI once at startup: `config.configure(<flag>=args.<flag>)`
-   (`configure` ignores `None`, so an unset flag defers to env/default).
-4. In tests, set it with the scoped `config.overrides(<flag>=...)` context
-   manager (auto-restored) — not by passing an argument.
+- **NEVER** add a knob as a parameter on intermediate functions. Threading a scalar
+  through every layer is churn across many files; ambient config is one edit.
+- Copy an existing flag: `trace`, `fingerprint`, `real_directory`, `contention`,
+  `collapse_charges`.
 
-Do NOT add the flag as a parameter to intermediate functions. Flags to copy:
-`trace`, `fingerprint`, `real_directory`, `contention`, `collapse_charges`.
+To add one:
+1. Add a field to `SimConfig`, and parse its `TOSO_*` env var in `_from_env`.
+2. Read it at the leaf: `config.current().<flag>`. For an object built once per run,
+   use a `from_config()` factory that reads the flag when its explicit arg is `None`.
+3. Wire the CLI once at startup: `config.configure(<flag>=args.<flag>)`. `configure`
+   ignores `None`, so an unset flag defers to env/default.
+4. In tests use `config.overrides(<flag>=...)` (scoped, auto-restored) — **not** an
+   argument.
 
-Nuances:
-- Shared OBJECTS (e.g. a per-run `ResourceRegistry`) are still created once and
-  injected — inject the object, but let its mode/settings come from config, not a
-  threaded scalar.
-- A leaf may keep an optional explicit override param defaulting to `None`
-  (→ ambient) so it can be unit-tested in isolation; just don't thread it.
+Two exceptions:
+- Shared **objects** (e.g. a per-run `ResourceRegistry`) are still built once and
+  injected. Inject the object; read its settings from config.
+- A leaf may keep an optional override param defaulting to `None` (→ ambient) so it
+  is unit-testable alone. Do not thread it further.
 
 ## Determinism
-Most flags must be debug/output-only and never change a measured metric — that
-keeps an ambient read safe under the contract enforced by
-`realsim/tools/check_contract.py`. A flag that changes simulated timing (e.g.
-`contention`) is a deliberate, documented exception: call it out in the field
-comment, keep it fixed for the whole run, and keep any ordering seq-tie-broken.
+- A flag must be debug/output-only and must not move a measured metric. That is what
+  makes an ambient read safe under `realsim/tools/check_contract.py`.
+- A flag that changes simulated timing (e.g. `contention`) is a documented exception:
+  say so in the field comment, hold it fixed for the whole run, keep ordering
+  seq-tie-broken.
 
 ## Opt-in, default-off
-New fidelity/perf features default to the historical behavior (`contention="none"`,
-`collapse_charges=False`, `real_directory=True`, `trace=True`) so the default path
-stays byte-identical and nothing changes unless a run opts in.
+New fidelity/perf features default to historical behavior (`contention="none"`,
+`collapse_charges=False`, `real_directory=True`, `trace=True`), so the default path
+stays byte-identical until a run opts in.
 
-## Verification: a measurement you will make twice is a file, not a heredoc
-A one-off question ("does this attribute exist") is an inline script. A measurement
-you will repeat — a metric sweep, a parity check between two trees — is a saved
-script, uniquely named and overwritten deliberately; re-deriving it each time is how
-it drifts, and a stale one silently answers the wrong question.
+## Verification
+- A one-off question ("does this attribute exist") is an inline script.
+- A measurement you will repeat is a **saved script**, uniquely named. Re-deriving it
+  each time is how it drifts.
+- A measurement of a repo invariant goes in `realsim/tools/`, run by `python -m`,
+  printing a stable diffable report, knowing nothing about which checkout it is in.
+  Comparing two trees is then `diff` of two runs.
+- A measurement that must **always** hold is a test, not a tool.
+- Print the assertion, not the evidence. A metrics dump answering "did the
+  fingerprint move" costs more to read than the answer is worth.
 
-A measurement that checks a repo invariant belongs in `realsim/tools/`, run by
-`python -m`, printing a stable diffable report and knowing nothing about which
-checkout it runs in — comparing two trees is then `diff` of two runs. A measurement
-that must always hold is a test, not a tool.
+## Comments and docstrings
+Prose exists to make the code faster to read. Prose that does not is deleted, not
+shortened. Check with `python -m realsim.tools.prose_budget`.
 
-Print the assertion, not the evidence: a full metrics dump answering "did the
-fingerprint move" costs more to read than the answer is worth.
+**Write:**
+- what the thing is and how to use it;
+- why it is **correct** when that is not obvious — an invariant, a tie-break, an
+  ordering constraint, a reason a race cannot happen;
+- what is **missing** — a gap, a simplification, a limit to trust less;
+- which case a branch is: 3–8 words, at the line.
 
-## Prose: the docs serve the code, not the other way round
-Comments and docstrings exist to make the code faster to read. Prose that does not
-do that is deleted, not shortened.
-
-Write:
-- what the thing is and how to use it, in as few words as it takes;
-- why it is **correct** when that is not obvious (an invariant, a tie-break, an
-  ordering constraint, a reason a race cannot happen);
-- what is **missing** — remaining work, a known gap, a limit worth trusting less.
-
-Do not write:
-- **history.** No "used to", "no longer", "previously", "this replaced", "a claim
-  withdrawn", "it was N, now it is M". A comment describes the code beside it, not
-  the code it replaced. Git holds the past.
-- **justification of a decision already visible in the code.** If the signature says
-  it, the docstring does not need a paragraph arguing for it.
-- **essays.** A class docstring that runs longer than the class is a design doc in
-  the wrong file; put it in `docs/` and link, or cut it.
+**NEVER write:**
+- **history** — "used to", "no longer", "previously", "this replaced", "it was N, now
+  M". Git holds the past.
+- **narration** — walking the code in the order it runs. Delete it; the code is right
+  there.
+- **argument for the code** — no defending a signature, no praising the design, no
+  "which is the point". A rejected alternative gets one clause with its cost, or a
+  `TODO:`.
+- **machinery** — how `attach`, a `View`, a `Dispatcher`, a base class or a
+  `proposed/` helper works. Document it once, where it is implemented.
+- **glue** — "which is what/why…", "and that is the whole of it", one idea restated
+  three ways.
 - restating what the next line plainly does.
 
-Rules of thumb: a module's prose should not exceed roughly a third of its lines; a
-docstring longer than ~15 lines needs a reason; one idea is stated **once**, in the
-one place it belongs, and cross-referenced from anywhere else that needs it.
+### Where prose goes
+Python has no header/impl split, so apply the budget **per unit**, not per file.
+
+- **Declarations** may carry real prose: module docstring, abstract/Protocol members,
+  dataclass fields, a constructor's `Args:`.
+- **Concrete bodies** stay near-bare: branch labels, plus invariants that cannot be
+  asserted.
+- A **concrete** docstring must not outrun the code it heads. Abstract members are
+  exempt.
+- Put a comment **at the field**. This is the one place prose here is underweight.
+
+### How to write it
+- One idea, one sentence, flattest phrasing. A comment is read at a skim, once.
+- No em-dash appositive chains, no inverted syntax.
+- Link where a reader would go hunting. A `:class:` on every noun is overhead on
+  every sentence.
+- Prefer a check to a sentence: if an assert, a type, a validator or a raised
+  `ValueError` can state it, state it there and write no comment.
+- Quantify or cut. "73% of reported handoff bytes" earns its line; "which is what
+  settles a placement" does not.
+- Say what is true of **this** use, not of the mechanism: a threshold's units, why
+  this argument and not the obvious other, an ordering this composition depends on.
+- A section header is the reader's question ("how does a read find the right
+  block?"), not a conclusion.
+
+### Length
+Design needed to read **this** module stays in this module, at whatever length that
+takes. Only cross-module system design goes in a document.
+
+- Length is earned by teaching a model the code cannot show: a picture the types do
+  not draw, an invariant graph, the states a field ranges over, what happens when
+  inputs contradict each other.
+- It is not earned by narration.
+- Test: would reading the code top to bottom say the same thing? Then delete it.

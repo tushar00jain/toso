@@ -1,14 +1,13 @@
 """KV directory verbs over real TorchStore clients: :class:`KVStore`.
 
-A **serving instance** is a storage volume plus a co-located ``LocalClient``.
-Obtaining that client is not this module's business: it asks a
-:class:`~proposed.deployment.Deployment` for the one belonging to an instance and
-drives ordinary torchstore APIs on it. Under simulation the deployment resolves an
-instance id to one of many in-process clients; a real one has a single client and
-ignores the id. Either way what follows is the same code -- which is the point:
-nothing here imports the simulator.
+A **serving instance** is a storage volume plus a co-located ``LocalClient``. This
+module asks a :class:`~proposed.deployment.Deployment` for the client belonging to an
+instance and drives ordinary torchstore APIs on it. Under simulation the deployment
+resolves an instance id to one of many in-process clients; a real one has a single
+client and ignores the id. Either way the code below is the same, and nothing here
+imports the simulator.
 
-This module holds only the KV verbs that move bytes or change the directory.
+Only the KV verbs that move bytes or change the directory are here.
 
 Mapping (real directory + real types throughout):
 
@@ -26,30 +25,26 @@ Mapping (real directory + real types throughout):
 
 Three verbs over whatever it is handed
 --------------------------------------
-The verbs take the blocks; what produces them is the accelerator
+The verbs take the blocks; the accelerator produces them
 (:meth:`kvcache_sim.data._compute.Accelerator.prefill`) and what they *are* is that
-implementation's answer -- zero-storage ``device="meta"`` tensors under simulation,
-attention output in a deployment. This module is indifferent, which is what lets it
-be three calls and no premises. In particular the byte count every transfer is
-priced against belongs with the thing that computes the KV, not with the thing that
-moves it.
+implementation's answer -- ``device="meta"`` tensors under simulation, attention output
+in a deployment. This module makes no assumption about either, including the byte count
+a transfer is priced against.
 
-**Eviction is not here.** A volume drops its own coldest keys when a put does not
-fit and tells the directory itself, so a verb here that deregistered a key would be
-half an eviction: the entry would go and the bytes would stay. Which key to drop is
-the volume's (``realsim.seams._retention``), and saying so is the volume's too.
+**Eviction is not here.** A volume drops its own coldest keys when a put does not fit
+and tells the directory itself, so a verb here that deregistered a key would be half an
+eviction: the entry would go and the bytes would stay
+(``realsim.seams._retention``).
 
-**Reading the directory is not here either**: a ``locate`` decides nothing and moves
+**Reading the directory is not here either.** A ``locate`` decides nothing and moves
 nothing, so per-instance prefix presence is a control-plane view
-(:class:`kvcache_sim.control._view.KVView`). That includes re-reading it to see
-whether a planned pull is still available -- :meth:`KVStore.fetch` asks for what it
-was told to and lets the store answer.
+(:class:`kvcache_sim.control._view.KVView`) -- including re-reading it to see whether a
+planned pull is still available. :meth:`KVStore.fetch` asks for what it was told to and
+lets the store answer.
 
-What *is* here is the asking. A fetch is the one verb whose source matters, so it
-asks the control plane which peers should serve it and passes the answer to the
-client as a preference. Two ordinary calls in one order, with nothing installed
-anywhere: the plane is reached over a port like any other service, and the store
-applies a value rather than consulting anybody.
+A fetch is the one verb whose source matters, so it asks the control plane which peers
+should serve it and passes the answer to the client as a preference: the store applies
+a value rather than consulting anybody.
 """
 
 from __future__ import annotations
@@ -66,19 +61,12 @@ __all__ = ["KVStore"]
 class KVStore:
     """Publish / reuse / fetch, over a deployment's real clients.
 
-    Three verbs and one field. The verbs are thin because the mapping is thin -- a
-    block is a key, publishing is a ``put_batch`` -- and they are an object rather
-    than three functions only so that the deployment is named once instead of at
-    every call site.
-
-    Deliberately absent: what a KV block *is*, and how big one is (see the module
-    docstring). The one thing this class insists on is that a caller publishing
-    ``n`` keys hands it ``n`` blocks -- an arity check, not a size premise.
+    Deliberately absent: what a KV block *is*, and how big one is. The one thing this
+    class insists on is that a caller publishing ``n`` keys hands it ``n`` blocks -- an
+    arity check, not a size premise.
 
     Args:
-        deployment: the :class:`~proposed.deployment.Deployment` these instances
-            run against; it vends the client for an instance id. A real one vends
-            its single client and ignores the id.
+        deployment: the deployment these instances run against.
     """
 
     def __init__(self, deployment: Deployment) -> None:
@@ -91,12 +79,12 @@ class KVStore:
         """Publish ``keys`` on ``inst`` via a real ``put_batch`` of ``blocks``.
 
         Writes the KV into ``inst``'s real store (co-located -> zero fabric) and
-        registers ``key -> volume`` in the real directory. ``blocks[i]`` is the KV
-        of ``keys[i]``; the caller is the host that holds both.
+        registers ``key -> volume`` in the real directory. ``blocks[i]`` is the KV of
+        ``keys[i]``.
 
-        A **cache fill**, so it is allowed to fail: ``False`` when the instance has
-        no room for these blocks even after evicting what it could. The request has
-        already been served, and the only loss is that nobody reuses this prefix.
+        A **cache fill**, so it is allowed to fail: ``False`` when the instance has no
+        room even after evicting what it could. The request has already been served,
+        and the only loss is that nobody reuses this prefix.
 
         Raises:
             ValueError: if there is not exactly one block per key. Loud rather than
@@ -122,11 +110,9 @@ class KVStore:
     async def reuse(self, inst: str, keys: List[str]) -> None:
         """Tell ``inst``'s volume it just served ``keys`` from what it already had.
 
-        A local prefix hit never reaches the store -- the instance has the blocks, so
-        nothing is fetched and nothing is charged. The volume is the one deciding
-        what to drop when it fills up, and on its own evidence those blocks look
-        untouched, so it would drop the hottest prefix in the run. This is the read
-        it could not see.
+        A local prefix hit never reaches the store, so nothing is fetched and nothing
+        is charged. On its own evidence the volume would see those blocks as untouched
+        and drop the hottest prefix in the run; this is the read it could not see.
         """
         if not keys:
             return
@@ -148,23 +134,19 @@ class KVStore:
     async def fetch(self, inst: str, keys: List[str]) -> List[torch.Tensor]:
         """Pull ``keys`` into ``inst`` via a real ``get_batch`` (charges fabric).
 
-        Drives the real client planning core + transport seam, so the storage / RAM
-        / network cost is charged by the real cost model against the peer that
-        actually serves the blocks. That peer is the one the control plane priced:
-        this asks it for the ranking (:meth:`_sources`) and hands that to the client as
-        a preference, so the read itself is an ordinary ``get_batch`` and the store
-        decides nothing.
+        Drives the real client planning core + transport seam, so storage / RAM /
+        network cost is charged by the real cost model against the peer that serves the
+        blocks -- the one the control plane priced (:meth:`_sources`), handed to the
+        client as a preference.
 
-        Answers with the KV, one block per key in the order asked for
-        (``get_batch`` answers with a dict, so the prefix order is re-imposed here).
-        A caller that wants the bytes can sum them off the tensors, which is the
-        same number the transport charged.
+        Answers with the KV, one block per key in the order asked for (``get_batch``
+        answers with a dict, so the prefix order is re-imposed here). Summing the
+        tensors gives the same byte count the transport charged.
 
-        The pull runs after the prefill queue, by which time the peer may have
-        dropped some of the planned blocks. ``get_batch`` is all-or-nothing, so that
-        surfaces as a ``KeyError`` and the caller decides: whether a half-usable
-        prefix is worth pulling is a question about the request. Filtering the batch
-        down to what survived would answer it here, silently, and charge the caller
+        The pull runs after the prefill queue, by which time the peer may have dropped
+        some of the planned blocks. ``get_batch`` is all-or-nothing, so a half-usable
+        prefix surfaces as a ``KeyError`` and the caller decides. Filtering the batch
+        down to what survived would answer that here, silently, and charge the caller
         for a reuse it did not get.
         """
         if not keys:

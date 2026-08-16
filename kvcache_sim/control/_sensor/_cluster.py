@@ -22,11 +22,9 @@ A prefill this plane has *promised* is neither -- nothing corrects it, it stands
 until it lands, and what reads it reads against its own clock -- so it is a sensor of its
 own (:class:`kvcache_sim.control._sensor.ReservationSensor`).
 
-Nothing reaches this sensor from outside the process holding it. A host's report is an
-action dispatched into the plane's :class:`proposed.dispatch.Dispatcher`, which folds it
-by calling the reducer below (:attr:`ClusterSensor.folds`), while the control plane
-reads it through the view it is composed into
-(:class:`kvcache_sim.control._view.ClusterView`).
+Nothing reaches this sensor from outside the process holding it: a host's report
+arrives as a dispatched action, and the control plane reads the result through
+:class:`kvcache_sim.control._view.ClusterView`.
 """
 
 from __future__ import annotations
@@ -45,13 +43,11 @@ __all__ = ["ClusterSensor"]
 class ClusterSensor(Sensor):
     """Every instance's predicted prefill queue and observed decode batch.
 
-    One per run, and that is load-bearing: a second one starts empty, and an empty
-    sensor would report every host idle -- a run that looks healthy and is wrong.
-    Two things keep it to one. It is built in a single place, the control plane's
-    :meth:`~kvcache_sim.control.scheduler._Scheduler.attach`, which the run calls
-    once when the stack exists; and it is keyed by the instances handed to it
-    there, so one built for the wrong cluster (or for none) raises on the
-    first read instead of answering "idle".
+    One per run: a second starts empty and would report every host idle, a run that
+    looks healthy and is wrong. It is built in one place
+    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`, called once), and keyed
+    by the instances handed to it there, so one built for the wrong cluster raises on
+    the first read instead of answering "idle".
 
     Args:
         ids: every instance in the run -- the prefill and decode pools may each
@@ -76,11 +72,7 @@ class ClusterSensor(Sensor):
     # -- what it folds ------------------------------------------------------- #
     @property
     def folds(self) -> Mapping[type, Fold]:
-        """:class:`proposed.dispatch.Reducer` -- what it folds, by action type.
-
-        Read-only, so the one way to move this state is to dispatch something that
-        moves it.
-        """
+        """What this sensor folds, by action type."""
         return MappingProxyType(self._folds)
 
     def _compute_busy(self, action: ComputeBusy) -> None:
@@ -100,10 +92,10 @@ class ClusterSensor(Sensor):
     def _prefill_finished(self, action: PrefillFinished) -> None:
         """Correct the predicted queue with the clock the real ops reached.
 
-        Raises the tail and never lowers it. An early completion leaves the
-        instance looking busier than it is until the next request is routed
-        against it, whereas lowering on one report would under-count the prefills
-        control has promised and not yet seen finish.
+        Raises the tail, never lowers it: lowering on one report would under-count the
+        prefills control has promised and not yet seen finish. An early completion
+        therefore leaves the instance looking busier than it is until the next request
+        is routed against it.
         """
         if action.now > self._busy_until[action.inst]:
             self._busy_until[action.inst] = action.now
@@ -115,10 +107,10 @@ class ClusterSensor(Sensor):
     # -- what ranking against the load reads -------------------------------- #
     @property
     def busy_until(self) -> Mapping[str, float]:
-        """Predicted prefill queue tail per instance, read-only.
+        """Predicted prefill queue tail per instance.
 
-        A mapping rather than the dict, so the only way to move a tail is to
-        dispatch something that moved it.
+        A mapping and not the dict, so the only way to move a tail is to dispatch
+        something that moved it.
         """
         return MappingProxyType(self._busy_until)
 

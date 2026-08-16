@@ -10,12 +10,11 @@ that thing does**, folded from the action that says so
 
 A read filters as well, and that is what keeps the prediction honest rather than the
 expiry: a reservation is read against the clock of the decision reading it, so one whose
-prefill has landed is not offered even if no report has arrived yet -- which would count
-a request twice, once as a reservation and once through the observed decode state that
-had superseded it.
+prefill has landed is not offered even if no report has arrived yet. Offering it would
+count a request twice, once as a reservation and once through the observed decode state
+that superseded it.
 
-Grouped in one module because that is the one idea behind both, and because both are
-written by the same decision: the one that took them
+Both are written by the decision that took them
 (:class:`~kvcache_sim.control._sensor.Committed`, folded here and by the cluster sensor,
 each into its own state).
 """
@@ -44,21 +43,20 @@ class Reservation(NamedTuple):
 class ReservationSensor(Sensor):
     """Prefills promised and not yet finished, oldest first.
 
-    Held because a request routed now shares its decode instance with requests
-    whose prefill has not completed yet: they are invisible to the observed decode
-    state and would otherwise be predicted as absent.
+    A request routed now shares its decode instance with requests whose prefill has not
+    completed: they are invisible to the observed decode state and would otherwise be
+    predicted as absent.
 
     Read through the scheduler's view
     (:class:`~kvcache_sim.control._view.ReservedView`): the decision that promises a
-    prefill and the host that finishes one write it, and the decode-side prediction in
+    prefill and the host that finishes one write it, the decode-side prediction in
     between reads it.
 
-    **Only a run that predicts holds one**, and that is the whole of the condition:
-    this sensor is composed exactly when decode occupancy is rolled forward
-    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`), so a run that does not
-    predict has no reservation sensor to compose onto its dispatcher, and the same
-    :class:`~kvcache_sim.control._sensor.Committed` every decision dispatches reserves
-    nothing. Nothing tests a flag, because a sensor cannot see the scheduler's.
+    **Only a run that predicts holds one.** The sensor is composed exactly when decode
+    occupancy is rolled forward
+    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`), so in a run that does
+    not predict the same :class:`~kvcache_sim.control._sensor.Committed` reserves
+    nothing and no fold tests a flag.
     """
 
     def __init__(self) -> None:
@@ -70,7 +68,7 @@ class ReservationSensor(Sensor):
 
     @property
     def folds(self) -> Mapping[type, Fold]:
-        """:class:`proposed.dispatch.Reducer` -- what it folds, by action type."""
+        """What this sensor folds, by action type."""
         return MappingProxyType(self._folds)
 
     def _committed(self, action: Committed) -> None:
@@ -84,9 +82,9 @@ class ReservationSensor(Sensor):
     def _prefill_finished(self, action: PrefillFinished) -> None:
         """Drop what a host has now been seen to finish.
 
-        The clock a host reports is one it has reached, and a clock only goes forward, so
-        this drops exactly what every later :meth:`pending` would filter out -- which is
-        what keeps a run of any length from carrying every prefill it ever promised.
+        The clock a host reports is one it has reached and a clock only goes forward, so
+        this drops exactly what every later :meth:`pending` would filter out. Without it
+        a run carries every prefill it ever promised.
         """
         self._held = [r for r in self._held if r.prefill_done >= action.now]
 
@@ -107,14 +105,13 @@ class ReservationSensor(Sensor):
 class RoutedPullSensor(Sensor):
     """Pulls priced against a chosen peer, waiting for the store to ask about them.
 
-    A pull is routed when the request is planned and fetched later, and in between
-    the host that fetches will ask who should serve it. This is the note that lets
-    the answer be the decision already made rather than a second,
-    differently-derived one.
+    A pull is routed when the request is planned and fetched later, and in between the
+    host that fetches asks who should serve it. This is the note that answers with the
+    decision already made rather than a second, differently derived one.
 
     Read through the scheduler's view (:class:`~kvcache_sim.control._view.RoutedView`):
     the decision that prices a pull writes it and the answer that spends one writes it
-    again, while the one link that answers a fetch from it only reads.
+    again; the link that answers a fetch from it only reads.
     """
 
     def __init__(self) -> None:
@@ -126,7 +123,7 @@ class RoutedPullSensor(Sensor):
 
     @property
     def folds(self) -> Mapping[type, Fold]:
-        """:class:`proposed.dispatch.Reducer` -- what it folds, by action type."""
+        """What this sensor folds, by action type."""
         return MappingProxyType(self._folds)
 
     def _committed(self, action: Committed) -> None:
@@ -144,8 +141,7 @@ class RoutedPullSensor(Sensor):
 
         One answer per priced pull, so a second fetch of the same keys falls through to
         the ranking rather than reading a peer whose transfer nothing charged for. A
-        fetch nothing priced spends nothing, which is why the plane dispatches this
-        without having to know which link answered.
+        fetch nothing priced spends nothing.
         """
         found = self._match(action.requester, action.keys)
         if found is not None:
@@ -158,13 +154,12 @@ class RoutedPullSensor(Sensor):
     def peer(self, requester: str, keys: Sequence[str]) -> Optional[str]:
         """The peer ``requester``'s pull of ``keys`` was priced against.
 
-        ``None`` if this caller has no routed pull of exactly these keys -- "I
-        decided nothing about this", not a refusal; the caller falls back to the
-        ranking.
+        ``None`` if this caller has no routed pull of exactly these keys -- "I decided
+        nothing about this", not a refusal; the caller falls back to the ranking.
 
-        The keys must match *exactly*. A pull is all-or-nothing, so a fetch asks for
-        precisely what it was told to; a smaller set is a different pull, and
-        handing it this peer would charge a locality tier chosen for someone else.
+        The keys must match *exactly*: a pull is all-or-nothing, so a smaller set is a
+        different pull, and handing it this peer would charge a locality tier chosen
+        for someone else.
         """
         found = self._match(requester, keys)
         return None if found is None else self._pending[found][2]

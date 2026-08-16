@@ -12,14 +12,12 @@ separates them is who writes each:
 * :class:`SourceLoad` -- how much this plane has sent at each source, moved by the same
   decision and read by a ranking that spreads reads over equally good ones.
 
-None of the three is reached from outside this process. Every write is an action
+None is reached from outside this process. Every write is an action
 (:mod:`kvcache_sim.control._sensor._action`) dispatched into this plane's one
-:class:`proposed.dispatch.Dispatcher`, which folds it into every sensor it moves and
-commits them together -- so an accepted decision moves all three or none, and what the
-run fronts with a service is that dispatcher rather than a sensor.
+dispatcher, so an accepted decision moves every sensor it touches or none of them. What
+the run fronts with a service is that dispatcher, never a sensor.
 
-Folder-private, all four: what a decision may read is the view, not the sensor
-behind it.
+Folder-private, all four: what a decision may read is the view.
 """
 
 from ._action import (
