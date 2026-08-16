@@ -208,9 +208,6 @@ class _Scheduler(ControlPlane):
         self.B = block_tokens
         self.profile = profile
         self.model = model
-        # A selector remembers nothing on itself (``check_structure`` rule 7), so both
-        # sides of a pull can build their own and answer alike off the shared sensors.
-        #
         # Which peer a candidate may pull the prefix from. One winner, asked once per
         # decision; ``LocalOnly`` names nobody, so the baseline reuses only what a host
         # already holds.
