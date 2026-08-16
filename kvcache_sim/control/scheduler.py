@@ -193,9 +193,14 @@ class _Scheduler(ControlPlane):
                 f"source ranking names or from nobody, so the choice is 'peers' or "
                 f"'none'"
             )
+        # Which peer a candidate may pull the prefix from. One winner, asked once per
+        # decision; ``LocalOnly`` names nobody, so the baseline reuses only what a host
+        # already holds.
         self._reuse = Max(
             _source_ranking(source) if reuse == "peers" else LocalOnly()
         )
+        # Which peer serves a fetch: the one this plane already priced the pull
+        # against, else whoever holds the longest prefix.
         self._fetch = Sort(FirstMatch([RoutedPull(), _source_ranking(source)]))
         if rank not in ("ttft", "load"):
             raise ValueError(
@@ -260,21 +265,26 @@ class _Scheduler(ControlPlane):
         nothing and no fold has an empty sensor to read.
         """
         ids = sorted(view.topology)
-        # Over ALL instances: the prefill and decode pools may each be a subset.
-        cluster = ClusterSensor(ids)
-        reserved = ReservationSensor() if self._lookahead else None
-        routed = RoutedPullSensor()
-        load = SourceLoad()
-        self.view = view.derived(
-            KVView, cluster=cluster, reserved=reserved, routed=routed, load=load,
+        # Held here, not read back off the view: a view raises for a sensor this run
+        # composed without, so ``reserved`` could not be tested for ``None`` there.
+        sensors = dict(
+            # Over ALL instances: the prefill and decode pools may each be a subset.
+            cluster=ClusterSensor(ids),
+            reserved=ReservationSensor() if self._lookahead else None,
+            routed=RoutedPullSensor(),
+            load=SourceLoad(),
         )
+        self.view = view.derived(KVView, **sensors)
         self.dispatcher = Dispatcher()
-        for sensor in (cluster, reserved, routed, load):
+        for sensor in sensors.values():
             # ``None`` is a sensor this run does not hold, so nothing folds for it.
             if sensor is not None:
                 self.dispatcher.compose(sensor)
+        # Every instance, unless the preset named a subset to rank.
         self.prefill_ids = self.prefill_ids or ids
         self.decode_ids = self.decode_ids or ids
+        # Which host decodes: every instance in the decode pool, keyed at the batch it
+        # would be holding when this request's prefill lands.
         self._decode = Sort(DecodeBatch(
             self.decode_ids,
             tbt_enabled=self.tbt_enabled,
@@ -282,6 +292,9 @@ class _Scheduler(ControlPlane):
             profile=self.profile,
             model=self.model,
         ))
+        # Which host prefills: every instance in the prefill pool, keyed at what
+        # serving the request there would cost -- queue, then transfer, then prefill --
+        # with the peer the reuse ranking named priced in against recomputing.
         priced = Priced(
             self.prefill_ids,
             block_tokens=self.B,
@@ -303,6 +316,7 @@ class _Scheduler(ControlPlane):
             ))
         else:
             self._prefill = Sort(Folded(priced, _by_ttft))
+
         for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
             ranking.attach(declared(self.view, ranking))
 
