@@ -675,6 +675,16 @@ class Folded(_Link[_S]):
         return replace(self.ranking.select(subject, requester), fold=self.fold)
 
 
+def _order_key(selection: Selection) -> Optional[Callable[[VolumeId], Any]]:
+    """The total key this selection orders by, or ``None`` when it has none."""
+    if not selection.sources or selection.key is None:
+        return None
+    key, fold = selection.key, selection.fold
+    if fold is None:
+        return lambda source: (*key[source], source)
+    return lambda source: (fold(key[source]), source)
+
+
 def _ranked(selection: Selection) -> Optional[Tuple[VolumeId, ...]]:
     """``selection``'s sources best-first, or ``None`` if nothing says what best is.
 
@@ -684,12 +694,10 @@ def _ranked(selection: Selection) -> Optional[Tuple[VolumeId, ...]]:
     last thing compared, here and nowhere else, so the order is total whatever the stages
     keyed on and a run reproduces.
     """
-    if not selection.sources or selection.key is None:
+    order_key = _order_key(selection)
+    if order_key is None:
         return None
-    key, fold = selection.key, selection.fold
-    if fold is None:
-        return tuple(sorted(selection.sources, key=lambda s: (*key[s], s)))
-    return tuple(sorted(selection.sources, key=lambda s: (fold(key[s]), s)))
+    return tuple(sorted(selection.sources or (), key=order_key))
 
 
 class Sort(_Link[_S]):
@@ -720,4 +728,10 @@ class Max(_Link[_S]):
         answer = self.ranking.select(subject, requester)
         if not answer.sources:
             return answer
-        return answer.only((_ranked(answer) or answer.sources)[:1])
+        order_key = _order_key(answer)
+        winner = (
+            answer.sources[0]
+            if order_key is None
+            else min(answer.sources, key=order_key)
+        )
+        return answer.only((winner,))

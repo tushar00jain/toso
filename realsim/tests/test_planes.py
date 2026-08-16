@@ -44,6 +44,7 @@ from typing import Any, Optional, Sequence
 import pytest
 import torch
 
+import proposed.selector as selector_module
 from realsim.mesh import Mesh
 from realsim.seams.data_plane_service import DataPlaneService
 from realsim.simulation import Simulation
@@ -531,6 +532,21 @@ def test_max_keeps_the_gate_and_the_winner_s_key():
     assert best.ready is gate
     assert best.key == {"v1": (2,)}      # what the stages measured about the pick
     assert "v0" not in best.key          # dropped with the source it spoke for
+
+
+def test_max_finds_the_winner_without_sorting(monkeypatch):
+    """A one-source answer takes a linear minimum, not a full ranking."""
+    def fail(*_args, **_kwargs):
+        raise AssertionError("Max sorted the candidates")
+
+    monkeypatch.setattr(selector_module, "sorted", fail, raising=False)
+    ranked = Folded(
+        Const(Selection.keyed([
+            ("v2", (4, 3)), ("v1", (5, 0)), ("v0", (5, 0)),
+        ])),
+        lambda d: d[0] * (1 + d[1]),
+    )
+    assert _select(Max(ranked)).sources == ("v0",)
 
 
 def test_a_preference_reorders_a_directory_answer_to_its_ranked_sources():

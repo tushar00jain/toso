@@ -287,7 +287,7 @@ class _Scheduler(ControlPlane):
         self.decode_ids = self.decode_ids or ids
         # Which host decodes: every instance in the decode pool, keyed at the batch it
         # would be holding when this request's prefill lands.
-        self._decode = Sort(DecodeBatch(
+        self._decode = Max(DecodeBatch(
             self.decode_ids,
             tbt_enabled=self.tbt_enabled,
             lookahead=self._lookahead,
@@ -308,7 +308,7 @@ class _Scheduler(ControlPlane):
             # The queue dimension goes on only where that fold reads it: compared as
             # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
             # id, and two idle instances holding no prefix do price identically.
-            self._prefill = Sort(Folded(
+            self._prefill = Max(Folded(
                 Annotate(
                     priced,
                     lambda view, _ask: view.cluster.busy_until,
@@ -317,7 +317,7 @@ class _Scheduler(ControlPlane):
                 _by_queue,
             ))
         else:
-            self._prefill = Sort(Folded(priced, _by_ttft))
+            self._prefill = Max(Folded(priced, _by_ttft))
 
         for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
             ranking.attach(declared(self.view, ranking))

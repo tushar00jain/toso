@@ -216,10 +216,9 @@ class Priced(Selector[PrefillAsk]):
         """Which peer ``inst`` would pull from, if any, and what that comes to."""
         # A host is not its own peer, and a peer is only worth the transfer if it holds
         # materially more than this candidate already does.
-        peer = (
-            ask.peer
-            .require(lambda head: head != inst)
-            .require(_worth_pulling(ask.counts, inst, self.threshold))
+        worth_pulling = _worth_pulling(ask.counts, inst, self.threshold)
+        peer = ask.peer.require(
+            lambda head: head != inst and worth_pulling(head)
         )
         match, src, pull = self._priced_reuse(ask.counts, ask.keys, inst, peer)
         return self._candidate(

@@ -1876,10 +1876,8 @@ def test_one_answer_names_both_of_a_request_s_hosts():
     assert response.prefill in sched.prefill_ids
     assert response.decode in sched.decode_ids
     assert response.plan.ttft > 0.0
-    # ...and the prefill host is the head of the selection it came from, which ranked
-    # every instance in the pool.
-    assert sorted(ranked.sources) == sorted(sched.prefill_ids)
-    assert response.prefill == ranked.sources[0]
+    # ...and the private prefill selection retains only the winner the response names.
+    assert ranked.sources == (response.prefill,)
     # ...and what it was priced at is the dimension that pool was keyed with.
     assert ranked.key[ranked.head][0].ttft == response.plan.ttft
 
@@ -2045,7 +2043,8 @@ def test_a_run_that_does_not_predict_reserves_nothing():
         # And the decode-side prediction is the observed occupancy, untouched by a
         # promise this run never made.
         decode = sched._decode.select(_plan(ttft=0.0, done_time=5.0), "s0")
-        assert decode.key["s1"][0] == 0
+        assert decode.sources == ("s0",)
+        assert decode.key[decode.head][0] == 0
     finally:
         sim.loop.close()
 
@@ -2118,5 +2117,3 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     assert response.plan.reuse_source == "s1", "no pull was priced -- nothing to answer"
     assert memo.head == "s1"      # the peer the pull was priced against
     assert ranked.head == "s1"    # the memo spent, and the ranking agrees
-
-
