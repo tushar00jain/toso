@@ -81,8 +81,10 @@ class Dedup(ControlPlane):
         sensor = FanoutSensor(fanout_cap=self._cap)
         self.view = view.derived(DedupView, fanout=sensor, load=sensor)
         self.dispatcher = Dispatcher()
-        # A landed put moves this plane's own state, so the sensor is the reducer.
         self.dispatcher.compose(sensor)
+        # Which volumes serve a read: every holder of the key and every peer already
+        # planned to hold it, priced together in seconds, so which one wins is
+        # arithmetic off the score rather than an order the caller has to know.
         self._chain = Sort(FirstMatch([
             Folded(
                 Balance(Candidates(SPREAD if self._spread else CHAIN)),
