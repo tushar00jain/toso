@@ -37,7 +37,7 @@ from proposed.selector import (
     Balance, Const, FirstMatch, Folded, Max, Selector, Sort,
 )
 from kvcache_sim.control._selector import (
-    by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk,
+    by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk, Priced,
 )
 from kvcache_sim.control._sensor import Committed, SourceLoad
 from kvcache_sim.control.scheduler import (
@@ -1846,6 +1846,27 @@ def _prefill_ranking(sched, request, requester):
         )
 
 
+def _priced_pool(sched, request, requester) -> tuple:
+    """Every candidate the prefill ranking priced, under the ``Max`` that cuts to one.
+
+    The chain answers with the winner alone, so the pool it chose from is read off the
+    ranking beneath it -- which is where "every instance, priced" is a property.
+    """
+    now = sched.view.now()
+    keys = list(request.block_keys)
+    with sched.view.pinned(keys):
+        return sched._prefill.ranking.select(
+            PrefillAsk(
+                request=request,
+                now=now,
+                keys=keys,
+                counts=sched.view.prefix_lengths(keys),
+                peer=sched._reuse.select(keys, requester),
+            ),
+            requester,
+        ).sources
+
+
 def test_one_answer_names_both_of_a_request_s_hosts():
     """One member, one question, answered before anything runs.
 
@@ -1862,26 +1883,46 @@ def test_one_answer_names_both_of_a_request_s_hosts():
 
     async def scenario():
         with sim.mesh.installed():
-            # The ranking first: committing the decision moves the load the ranking
-            # is read off, so asking afterwards would price a different field.
+            # The rankings first: committing the decision moves the load they are read
+            # off, so asking afterwards would price a different field.
             return (
                 _prefill_ranking(sched, request, "s0"),
+                _priced_pool(sched, request, "s0"),
                 await sched.decide(request, "s0"),
             )
 
     try:
-        ranked, response = sim.loop.run_until_complete(scenario())
+        ranked, pool, response = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
     assert response.prefill in sched.prefill_ids
     assert response.decode in sched.decode_ids
     assert response.plan.ttft > 0.0
-    # ...and the prefill host is the head of the selection it came from, which ranked
-    # every instance in the pool.
-    assert sorted(ranked.sources) == sorted(sched.prefill_ids)
-    assert response.prefill == ranked.sources[0]
+    # ...and the prefill host is the one source the chain named, out of a pool the
+    # ranking under it priced whole.
+    assert ranked.sources == (response.prefill,)
+    assert sorted(pool) == sorted(sched.prefill_ids)
     # ...and what it was priced at is the dimension that pool was keyed with.
     assert ranked.key[ranked.head][0].ttft == response.plan.ttft
+
+
+def test_a_candidate_named_as_its_own_peer_pulls_nothing():
+    """The reuse ranking answers one question for the whole pool, so its head is a
+    candidate too.
+
+    Priced against itself there is nothing to transfer, and the local match is what it
+    recomputes from -- which is why the per-candidate test upstream is the transfer's
+    worth alone, with no self-peer clause of its own.
+    """
+    counts = {"s0": 4, "s1": 1}
+    keys = list(_extend("m0", [0, 1, 2, 3]))
+    reuse = Selection.of(["s0"])
+    assert Priced._priced_reuse(counts, keys, "s0", reuse) == (4, None, ())
+    # ...while a candidate that is *not* the head pulls the gap between the two matches.
+    match, src, pull = Priced._priced_reuse(counts, keys, "s1", reuse)
+    assert (match, src, list(pull)) == (4, "s0", keys[1:4])
+    # A ranking the worth test dropped leaves the local match the same way.
+    assert Priced._priced_reuse(counts, keys, "s1", Selection.of([])) == (1, None, ())
 
 
 def _plan(*, ttft: float, match_blocks: int = 0, done_time: float = 0.0) -> Plan:
@@ -2043,9 +2084,10 @@ def test_a_run_that_does_not_predict_reserves_nothing():
         assert sched.view.cluster.busy_until["s0"] == 5.0
         assert sched.view.routed.peer("s0", ["a"]) == "s1"
         # And the decode-side prediction is the observed occupancy, untouched by a
-        # promise this run never made.
-        decode = sched._decode.select(_plan(ttft=0.0, done_time=5.0), "s0")
-        assert decode.key["s1"][0] == 0
+        # promise this run never made -- read off the ranking, since the chain above it
+        # keeps only the host it named.
+        pool = sched._decode.ranking.select(_plan(ttft=0.0, done_time=5.0), "s0")
+        assert pool.key["s1"][0] == 0
     finally:
         sim.loop.close()
 

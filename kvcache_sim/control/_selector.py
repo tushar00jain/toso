@@ -214,13 +214,9 @@ class Priced(Selector[PrefillAsk]):
 
     def _plan(self, ask: PrefillAsk, inst: str) -> Plan:
         """Which peer ``inst`` would pull from, if any, and what that comes to."""
-        # A host is not its own peer, and a peer is only worth the transfer if it holds
-        # materially more than this candidate already does.
-        peer = (
-            ask.peer
-            .require(lambda head: head != inst)
-            .require(_worth_pulling(ask.counts, inst, self.threshold))
-        )
+        # Worth the transfer only if the peer holds materially more than this candidate
+        # already does; a candidate named as its own peer is left to _priced_reuse.
+        peer = ask.peer.require(_worth_pulling(ask.counts, inst, self.threshold))
         match, src, pull = self._priced_reuse(ask.counts, ask.keys, inst, peer)
         return self._candidate(
             ask.request, inst, ask.now, match=match, source=src, pull_keys=pull,
@@ -232,8 +228,8 @@ class Priced(Selector[PrefillAsk]):
     ) -> Tuple[int, Optional[str], Sequence[str]]:
         """What one peer buys ``inst``: ``(match, source, pull_keys)``.
 
-        A selection naming nobody -- a test having dropped the ranking -- leaves the
-        local match to recompute from.
+        A selection naming nobody or naming ``inst`` itself leaves the local match to
+        recompute from, so no self-peer test is needed upstream.
         """
         local = counts.get(inst, 0)
         src = peer.head

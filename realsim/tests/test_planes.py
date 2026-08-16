@@ -533,6 +533,52 @@ def test_max_keeps_the_gate_and_the_winner_s_key():
     assert "v0" not in best.key          # dropped with the source it spoke for
 
 
+class _Counted:
+    """A fold reading that tallies the comparisons an ordering link spends on it."""
+
+    compared = 0
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return self.value == other.value                        # type: ignore[attr-defined]
+
+    def __lt__(self, other: "_Counted") -> bool:
+        type(self).compared += 1
+        return self.value < other.value
+
+
+def test_max_takes_the_winner_in_one_pass_and_sort_would_leave_it_in_front():
+    """A chain wanting a head pays for a head, and gets the one an order would give it.
+
+    The two links have to agree, or the same pool ranked and picked would name different
+    sources: they share the comparable, which admits no ties, so the least of it is
+    exactly what a full order puts first. What ``Max`` does *not* spend is the ordering of
+    the sources behind that one -- ``n - 1`` comparisons, not ``n log n``.
+    """
+    pool = Selection.keyed([(f"v{i}", (v,)) for i, v in enumerate([3, 7, 1, 8, 2, 6, 5, 4])])
+    folded = Folded(Const(pool), lambda d: _Counted(d[0]))
+
+    _Counted.compared = 0
+    assert _select(Max(folded)).sources == ("v2",)               # the 1
+    assert _Counted.compared == len(pool.sources or ()) - 1
+
+    _Counted.compared = 0
+    ordered = _select(Sort(folded)).sources
+    assert ordered[0] == "v2"                                   # the same winner
+    assert _Counted.compared > len(pool.sources or ()) - 1       # and the losers cost extra
+
+    # Every case an unordered pool can be in, the two links still agreeing on the head.
+    for ranking in (
+        Const(pool),
+        folded,
+        Const(Selection.keyed([("v1", (5, 1)), ("v0", (5, 1))])),    # tie -> id
+        Const(Selection.of(["v1", "v0"])),                          # keyed by nothing
+    ):
+        assert _select(Max(ranking)).head == _select(Sort(ranking)).head
+
+
 def test_a_preference_reorders_a_directory_answer_to_its_ranked_sources():
     located = {"K": {"v0": "i0", "v1": "i1", "v2": "i2"}}
     preferred = prefer(located, Selection.of(["v2", "v0"]).sources)

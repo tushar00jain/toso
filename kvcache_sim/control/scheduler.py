@@ -285,18 +285,22 @@ class _Scheduler(ControlPlane):
         # Every instance, unless the preset named a subset to rank.
         self.prefill_ids = self.prefill_ids or ids
         self.decode_ids = self.decode_ids or ids
-        # Which host decodes: every instance in the decode pool, keyed at the batch it
-        # would be holding when this request's prefill lands.
-        self._decode = Sort(DecodeBatch(
+        # Which host decodes: whichever instance in the decode pool would hold the
+        # smallest batch when this request's prefill lands.
+        self._decode = Max(DecodeBatch(
             self.decode_ids,
             tbt_enabled=self.tbt_enabled,
             lookahead=self._lookahead,
             profile=self.profile,
             model=self.model,
         ))
-        # Which host prefills: every instance in the prefill pool, keyed at what
-        # serving the request there would cost -- queue, then transfer, then prefill --
-        # with the peer the reuse ranking named priced in against recomputing.
+        # Which host prefills: whichever instance in the prefill pool serving the request
+        # costs least -- queue, then transfer, then prefill -- with the peer the reuse
+        # ranking named priced in against recomputing.
+        #
+        # Both of these name one host and are read at one head (:meth:`_admit`), so they
+        # end in ``Max``: a decision refused for an SLO miss does not fall to the
+        # runner-up, and nothing here reads what a loser was priced at.
         priced = Priced(
             self.prefill_ids,
             block_tokens=self.B,
@@ -308,7 +312,7 @@ class _Scheduler(ControlPlane):
             # The queue dimension goes on only where that fold reads it: compared as
             # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
             # id, and two idle instances holding no prefix do price identically.
-            self._prefill = Sort(Folded(
+            self._prefill = Max(Folded(
                 Annotate(
                     priced,
                     lambda view, _ask: view.cluster.busy_until,
@@ -317,7 +321,7 @@ class _Scheduler(ControlPlane):
                 _by_queue,
             ))
         else:
-            self._prefill = Sort(Folded(priced, _by_ttft))
+            self._prefill = Max(Folded(priced, _by_ttft))
 
         for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
             ranking.attach(declared(self.view, ranking))

@@ -55,7 +55,9 @@ A stage measures from the view and the subject alone: it appends behind whatever
 stages before it left, reads no key and names no source, so a fold still reads what each
 earlier one measured, and behind a ranking that keyed nothing one reading is the whole of
 the order. Two rankings combined into one answer is a **plane's** job, not a chain's: it
-does the join and hands the result down as part of the subject.
+does the join and hands the result down as part of the subject. A stage takes that earlier
+answer as a **value**, so it is measured once per decision; one holding a *selector* would
+re-select once per candidate.
 
 Narrowing an answer is not a composition of selectors in this package: a test an
 application owns is applied to the ranking it was given, by whoever has both
@@ -675,21 +677,22 @@ class Folded(_Link[_S]):
         return replace(self.ranking.select(subject, requester), fold=self.fold)
 
 
-def _ranked(selection: Selection) -> Optional[Tuple[VolumeId, ...]]:
-    """``selection``'s sources best-first, or ``None`` if nothing says what best is.
+def _comparable(selection: Selection) -> Optional[Callable[[VolumeId], Any]]:
+    """What orders one of ``selection``'s sources, or ``None`` if nothing says what best is.
 
     The fold it carries (:attr:`Selection.fold`) blends one source's dimensions into the
     comparable to order by; with none they are compared as they stand, which is
     lexicographic over the stages in the order they annotated. Either way the id is the
-    last thing compared, here and nowhere else, so the order is total whatever the stages
-    keyed on and a run reproduces.
+    last thing compared, here and nowhere else, so no two sources compare equal: a run
+    reproduces, and the least of a pool (:class:`Max`) is the front of a sort of it
+    (:class:`Sort`).
     """
     if not selection.sources or selection.key is None:
         return None
     key, fold = selection.key, selection.fold
     if fold is None:
-        return tuple(sorted(selection.sources, key=lambda s: (*key[s], s)))
-    return tuple(sorted(selection.sources, key=lambda s: (fold(key[s]), s)))
+        return lambda s: (*key[s], s)
+    return lambda s: (fold(key[s]), s)
 
 
 class Sort(_Link[_S]):
@@ -703,8 +706,10 @@ class Sort(_Link[_S]):
 
     def select(self, subject: _S, requester: str) -> Selection:
         answer = self.ranking.select(subject, requester)
-        ranked = _ranked(answer)
-        return answer if ranked is None else answer.only(ranked)
+        order = _comparable(answer)
+        if order is None:
+            return answer
+        return answer.only(sorted(answer.sources or (), key=order))
 
 
 class Max(_Link[_S]):
@@ -712,6 +717,11 @@ class Max(_Link[_S]):
 
     What a chain naming one source ends in, and it is still a selection, so
     :meth:`Selection.settled` can be spent on it afterwards. Both empties pass through.
+
+    Takes the winner without ordering the losers: one pass over the pool rather than a
+    sort of it, which is what a chain wanting only a head should cost. The head is the one
+    :class:`Sort` would leave in front, since :func:`_comparable` admits no ties. An
+    answer no stage keyed has no best, so the producer's leading source stands.
     """
 
     name = "max"
@@ -720,4 +730,6 @@ class Max(_Link[_S]):
         answer = self.ranking.select(subject, requester)
         if not answer.sources:
             return answer
-        return answer.only((_ranked(answer) or answer.sources)[:1])
+        order = _comparable(answer)
+        best = answer.sources[0] if order is None else min(answer.sources, key=order)
+        return answer.only((best,))
