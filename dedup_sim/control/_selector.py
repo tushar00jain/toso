@@ -77,7 +77,7 @@ class Candidates(KeySelector):
         self.fabric = fabric
         self.payload_bytes = payload_bytes
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection:
         """Everything that could serve every one of ``keys``, scored; else abstain."""
         fanout = self.view.fanout
         located = self.view.locate(keys)

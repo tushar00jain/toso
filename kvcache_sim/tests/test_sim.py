@@ -1609,10 +1609,10 @@ def test_the_source_selector_accepts_a_plain_view():
 
     async def scenario():
         with sim.mesh.installed():
-            empty = await selector.select(keys, "s0")
+            empty = selector.select(keys, "s0")
             store = KVStore(sim)
             await store.publish("s1", list(keys), _kv(len(keys)))
-            ranked = await selector.select(keys, "s0")
+            ranked = selector.select(keys, "s0")
         return empty, ranked
 
     try:
@@ -1668,17 +1668,14 @@ def _select_heads(sim, selector, keys, *, count, moving=True):
     load = SourceLoad()
     best = Max(selector).attach(sim.view.derived(LoadView, load=load))
 
-    async def scenario():
-        heads = []
-        with sim.mesh.installed():
-            for _ in range(count):
-                head = (await best.select(keys, "s0")).head
-                heads.append(head)
-                if moving:
-                    load.folds[Committed](_accepted(source=head, pull=list(keys)))
-        return heads
-
-    return sim.loop.run_until_complete(scenario())
+    heads = []
+    with sim.mesh.installed():
+        for _ in range(count):
+            head = best.select(keys, "s0").head
+            heads.append(head)
+            if moving:
+                load.folds[Committed](_accepted(source=head, pull=list(keys)))
+    return heads
 
 
 def test_spread_reads_rotates_between_equal_prefix_replicas():
@@ -1738,13 +1735,13 @@ def test_spread_reads_ranks_deterministically():
     ranking rather than the winner, because a caller that rejects the first source
     reads the rest of it.
     """
-    async def rankings(sim, keys):
+    def rankings(sim, keys):
         load = SourceLoad()
         selector = Sort(_spread()).attach(sim.view.derived(LoadView, load=load))
         out = []
         with sim.mesh.installed():
             for _ in range(5):
-                ranked = (await selector.select(keys, "s0")).sources
+                ranked = selector.select(keys, "s0").sources
                 out.append(ranked)
                 load.folds[Committed](_accepted(source=ranked[0], pull=list(keys)))
         return out
@@ -1752,12 +1749,12 @@ def test_spread_reads_ranks_deterministically():
     holders, blocks = ["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 3}
     first_sim, keys = _replicated(holders, blocks)
     try:
-        first = first_sim.loop.run_until_complete(rankings(first_sim, keys))
+        first = rankings(first_sim, keys)
     finally:
         first_sim.loop.close()
     second_sim, keys = _replicated(holders, blocks)
     try:
-        second = second_sim.loop.run_until_complete(rankings(second_sim, keys))
+        second = rankings(second_sim, keys)
     finally:
         second_sim.loop.close()
     assert first == second
@@ -1826,7 +1823,7 @@ def _scheduler(n: int = 2):
     return sim, sched
 
 
-async def _prefill_ranking(sched, request, requester):
+def _prefill_ranking(sched, request, requester):
     """The prefill chain's answer, asked the way the plane asks it.
 
     The join is the plane's -- one pinned directory snapshot, the reuse chain asked once,
@@ -1837,13 +1834,13 @@ async def _prefill_ranking(sched, request, requester):
     now = sched.view.now()
     keys = list(request.block_keys)
     with sched.view.pinned(keys):
-        return await sched._prefill.select(
+        return sched._prefill.select(
             PrefillAsk(
                 request=request,
                 now=now,
                 keys=keys,
                 counts=sched.view.prefix_lengths(keys),
-                peer=await sched._reuse.select(keys, requester),
+                peer=sched._reuse.select(keys, requester),
             ),
             requester,
         )
@@ -1868,7 +1865,7 @@ def test_one_answer_names_both_of_a_request_s_hosts():
             # The ranking first: committing the decision moves the load the ranking
             # is read off, so asking afterwards would price a different field.
             return (
-                await _prefill_ranking(sched, request, "s0"),
+                _prefill_ranking(sched, request, "s0"),
                 await sched.decide(request, "s0"),
             )
 
@@ -1899,7 +1896,7 @@ def _plan(*, ttft: float, match_blocks: int = 0, done_time: float = 0.0) -> Plan
 def _ordered(pool: Selection, fold) -> tuple:
     """``pool`` ordered as the prefill chain orders one: stamped with ``fold``, sorted."""
     chain = Sort(Folded(Const(pool), fold))
-    return asyncio.run(chain.select(None, "s0")).sources
+    return chain.select(None, "s0").sources
 
 
 def test_a_plan_in_a_key_is_ordered_only_by_a_fold_that_names_what_it_compares():
@@ -2047,9 +2044,7 @@ def test_a_run_that_does_not_predict_reserves_nothing():
         assert sched.view.routed.peer("s0", ["a"]) == "s1"
         # And the decode-side prediction is the observed occupancy, untouched by a
         # promise this run never made.
-        decode = sim.loop.run_until_complete(
-            sched._decode.select(_plan(ttft=0.0, done_time=5.0), "s0")
-        )
+        decode = sched._decode.select(_plan(ttft=0.0, done_time=5.0), "s0")
         assert decode.key["s1"][0] == 0
     finally:
         sim.loop.close()
@@ -2084,7 +2079,7 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
     assert chain.subject_type == KeySelector.subject_type
 
     class _OverSomethingElse(Selector[int]):
-        async def select(self, subject, requester):
+        def select(self, subject, requester):
             return Selection.of([])
 
     with pytest.raises(TypeError, match="must select over the same one"):

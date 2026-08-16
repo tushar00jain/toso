@@ -404,11 +404,16 @@ class Selector(ABC, Generic[_S]):
         return self
 
     @abstractmethod
-    async def select(self, subject: _S, requester: str) -> Selection:
+    def select(self, subject: _S, requester: str) -> Selection:
         """Rank the sources that should serve ``subject`` for ``requester``.
 
         ``subject`` is whatever this selector was parameterized with, and
         :attr:`subject_type` is that type as a value a check can compare.
+
+        Synchronous, so a whole chain is one turn: nothing can be decided between the
+        readings a ranking prices against and the answer they produce. A ranking that
+        must wait says so with a gate on the answer instead (:attr:`Selection.ready`),
+        which is spent where the answer crosses a boundary (:meth:`Selection.settled`).
         """
 
 
@@ -432,7 +437,7 @@ class NaiveKeySelector(KeySelector):
 
     name = "naive"
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection:
         return Selection()
 
 
@@ -521,10 +526,10 @@ class FirstMatch(Selector[_S]):
             selector.attach(declared(view, selector))
         return self
 
-    async def select(self, subject: _S, requester: str) -> Selection:
+    def select(self, subject: _S, requester: str) -> Selection:
         """The first non-abstaining answer, or an abstention if there is none."""
         for selector in self.selectors:
-            selection = await selector.select(subject, requester)
+            selection = selector.select(subject, requester)
             if selection.sources is None or selection.sources:
                 return selection
         return Selection.of([])
@@ -542,7 +547,7 @@ class Const(Selector[Any]):
     def __init__(self, selection: Selection) -> None:
         self.selection = selection
 
-    async def select(self, subject: Any, requester: str) -> Selection:
+    def select(self, subject: Any, requester: str) -> Selection:
         return self.selection
 
 
@@ -592,7 +597,7 @@ class Annotate(_Link[_S]):
         super().__init__(ranking, senses)
         self.readings = readings
 
-    async def select(self, subject: _S, requester: str) -> Selection:
+    def select(self, subject: _S, requester: str) -> Selection:
         """``ranking``'s answer with one reading per source appended to its key.
 
         Every source is measured, not just whichever one leads, so a caller that folds
@@ -604,7 +609,7 @@ class Annotate(_Link[_S]):
         default selection names every holder in directory order rather than any source in
         particular.
         """
-        ranked = await self.ranking.select(subject, requester)
+        ranked = self.ranking.select(subject, requester)
         if not ranked.sources:
             return ranked
         return ranked.annotated(self.readings(self.view, subject))
@@ -666,8 +671,8 @@ class Folded(_Link[_S]):
         super().__init__(ranking)
         self.fold = fold
 
-    async def select(self, subject: _S, requester: str) -> Selection:
-        return replace(await self.ranking.select(subject, requester), fold=self.fold)
+    def select(self, subject: _S, requester: str) -> Selection:
+        return replace(self.ranking.select(subject, requester), fold=self.fold)
 
 
 def _ranked(selection: Selection) -> Optional[Tuple[VolumeId, ...]]:
@@ -696,8 +701,8 @@ class Sort(_Link[_S]):
 
     name = "sort"
 
-    async def select(self, subject: _S, requester: str) -> Selection:
-        answer = await self.ranking.select(subject, requester)
+    def select(self, subject: _S, requester: str) -> Selection:
+        answer = self.ranking.select(subject, requester)
         ranked = _ranked(answer)
         return answer if ranked is None else answer.only(ranked)
 
@@ -711,8 +716,8 @@ class Max(_Link[_S]):
 
     name = "max"
 
-    async def select(self, subject: _S, requester: str) -> Selection:
-        answer = await self.ranking.select(subject, requester)
+    def select(self, subject: _S, requester: str) -> Selection:
+        answer = self.ranking.select(subject, requester)
         if not answer.sources:
             return answer
         return answer.only((_ranked(answer) or answer.sources)[:1])

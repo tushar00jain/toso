@@ -13,8 +13,6 @@ Run from the repo root::
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from dedup_sim.control._selector import Candidates
@@ -98,4 +96,4 @@ def test_the_ranking_still_senses_the_fanout_under_a_re_ranking():
     assert ranking.view.fanout is fanout
     # Ordered by the chain's own last link, as the plane declares it: the ranking prices,
     # the stage appends, and neither orders.
-    assert asyncio.run(chain.select(["K"], "r1")).sources == ("r0", "origin")
+    assert chain.select(["K"], "r1").sources == ("r0", "origin")

@@ -118,7 +118,7 @@ class Dedup(ControlPlane):
         # source is named. Dispatched without suspending, so the debt and the decision
         # priced against it are one turn.
         self.dispatcher.dispatch_sync(Asked(requester, tuple(keys)))
-        ranking = await self._chain.select(keys, requester)
+        ranking = self._chain.select(keys, requester)
         return committed(
             self.view, self.dispatcher, keys, requester, ranking, self._trace
         )

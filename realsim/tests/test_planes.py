@@ -162,7 +162,7 @@ class _Ranks(ControlPlane):
         self.selector.attach(view)
 
     async def sources(self, keys, requester) -> Selection:
-        return await (await self.selector.select(list(keys), requester)).settled()
+        return await self.selector.select(list(keys), requester).settled()
 
 
 def _burst_trace(selector) -> str:
@@ -215,7 +215,7 @@ class _Answers:
         self.selection = selection if selection is not None else Selection()
         self.asked: list[str] = []
 
-    async def select(self, subject, requester):
+    def select(self, subject, requester):
         self.asked.append(requester)
         return self.selection
 
@@ -248,14 +248,14 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
     """
 
     class _Parameterised(Selector[Sequence[Key]]):
-        async def select(self, keys, requester):
+        def select(self, keys, requester):
             return Selection()
 
     class _Inherits(_Parameterised):        # narrows behaviour, not the subject
         pass
 
     class _Bare(KeySelector):               # binds nothing, so it inherits the subject
-        async def select(self, keys, requester):
+        def select(self, keys, requester):
             return Selection()
 
     class _DeclaresItsOwn(Selector):
@@ -263,7 +263,7 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
         def subject_type(self):             # computed, not read off a base
             return "computed"
 
-        async def select(self, subject, requester):
+        def select(self, subject, requester):
             return Selection()
 
     assert _Parameterised.subject_type == Sequence[Key]
@@ -285,7 +285,7 @@ def test_taking_keys_is_not_the_same_claim_as_answering_for_the_store():
     """
 
     class _KeysButNotTheStore(Selector[Sequence[Key]]):
-        async def select(self, subject, requester):
+        def select(self, subject, requester):
             return Selection.of([])
 
     assert _KeysButNotTheStore.subject_type == KeySelector.subject_type  # same subject
@@ -609,7 +609,7 @@ def test_selection_withholds_until_its_gate_opens():
 
 def _select(selector: Selector, keys=("K",), requester="r") -> Selection:
     """Run one ``select`` off any clock -- no store is involved."""
-    return asyncio.run(selector.select(list(keys), requester))
+    return selector.select(list(keys), requester)
 
 
 class _Load:

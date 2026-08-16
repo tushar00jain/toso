@@ -429,8 +429,8 @@ directory handle, trace, profile, registry, install).
   *when* is it usable. A `Selection` is a set of sources plus what orders them (each
   stage appends a dimension; one fold at the fan-in ranks them), and a decision that
   gates on something not yet true carries a **readiness gate** the plane spends
-  itself, so `select` simply does not answer until its sources are usable and what
-  crosses the boundary is values. It is reached in two named places: as a service the
+  itself, so `select` is a synchronous ranking and what crosses the boundary is
+  values, usable when they arrive. It is reached in two named places: as a service the
   data plane asks before an ordinary `client.get`, passing the answer along as a
   source preference the store applies (`prefer()`); and directly from an app, when
   the app wants to price the alternatives rather than be handed one. Either way the

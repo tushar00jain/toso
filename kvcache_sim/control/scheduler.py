@@ -337,7 +337,7 @@ class _Scheduler(ControlPlane):
         chain's answer and the dispatch suspends, so no second fetch of the same keys
         can read the memo this one answered from.
         """
-        answer = await self._fetch.select(list(keys), requester)
+        answer = self._fetch.select(list(keys), requester)
         self.dispatcher.dispatch_sync(FetchAnswered(requester, tuple(keys)))
         return await answer.settled()
 
@@ -368,20 +368,20 @@ class _Scheduler(ControlPlane):
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
-            prefill = await self._prefill.select(
+            prefill = self._prefill.select(
                 PrefillAsk(
                     request=request,
                     now=now,
                     keys=keys,
                     counts=self.view.prefix_lengths(keys),
-                    peer=await self._reuse.select(keys, requester),
+                    peer=self._reuse.select(keys, requester),
                 ),
                 requester,
             )
             # The winning plan, read once off the dimension it rides in, so both halves
             # of the answer are formed against the same one.
             plan: Plan = prefill.key[prefill.head][0]
-            decode = await self._decode.select(plan, requester)
+            decode = self._decode.select(plan, requester)
 
         return self._admit(request, requester, prefill, plan, decode)
 

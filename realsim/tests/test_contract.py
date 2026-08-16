@@ -177,7 +177,7 @@ def test_structure_lint_flags_a_selector_that_remembers_on_itself(tmp_path):
             "class RoundRobin(KeySelector):\n"
             "    def __init__(self):\n"
             "        self.turn = 0\n\n"
-            "    async def select(self, keys, requester):\n"
+            "    def select(self, keys, requester):\n"
             "        self.turn += 1\n"
             "        return self.turn\n"
         ),
@@ -203,7 +203,7 @@ def test_structure_lint_accepts_a_selector_that_remembers_in_a_sensor(tmp_path):
             "class RoundRobin(KeySelector):\n"
             "    def __init__(self):\n"
             "        self.view = None\n\n"
-            "    async def select(self, keys, requester):\n"
+            "    def select(self, keys, requester):\n"
             "        self.view.turns.taken(requester)\n"
             "        return self.view.turns.next()\n"
         ),

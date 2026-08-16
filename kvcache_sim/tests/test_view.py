@@ -16,8 +16,6 @@ Run from the repo root::
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from kvcache_sim.control._selector import (
@@ -118,7 +116,7 @@ def test_a_ranking_that_declares_nothing_senses_nothing():
         bare.cluster
     # ...and it answers, which is what makes "reads nothing" a fact rather than a
     # ranking that happens never to have been asked.
-    assert asyncio.run(LocalOnly().attach(bare).select(["k"], "r")).sources == ()
+    assert LocalOnly().attach(bare).select(["k"], "r").sources == ()
 
 
 def test_a_subset_composing_a_sensor_this_view_never_carried_raises():

@@ -66,7 +66,7 @@ class LongestPrefixKeySelector(KeySelector):
     name = "longest-prefix"
     sensors = (PrefixView,)
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection:
         """Instances holding a leading run of ``keys``, keyed at the **negated** run.
 
         Negated because a fold takes the lowest and a longer run is the better source.
@@ -115,7 +115,7 @@ class LocalOnly(Selector[Sequence[Key]]):
     name = "local-only"
     sensors = ()
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection:
         return Selection.of([])
 
 
@@ -136,7 +136,7 @@ class RoutedPull(KeySelector):
     name = "routed-pull"
     sensors = (RoutedView,)
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection:
         peer = self.view.routed.peer(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
@@ -206,7 +206,7 @@ class Priced(Selector[PrefillAsk]):
         self.model = model
         self.threshold = threshold
 
-    async def select(self, ask: PrefillAsk, requester: str) -> Selection:
+    def select(self, ask: PrefillAsk, requester: str) -> Selection:
         """Priced as the dimension is appended, so the pool is walked once."""
         return Selection.of(self.instances).annotated(
             lambda inst: self._plan(ask, inst)
@@ -318,11 +318,8 @@ class DecodeBatch(Selector[Plan]):
         self.profile = profile
         self.model = model
 
-    async def select(self, plan: Plan, requester: str) -> Selection:
-        """Every instance in the pool, keyed at its predicted batch.
-
-        Nothing suspends, so no answer interleaves with the decision it is part of.
-        """
+    def select(self, plan: Plan, requester: str) -> Selection:
+        """Every instance in the pool, keyed at its predicted batch."""
         return Selection.of(self.instances).annotated(
             lambda d: self._predicted_batch(d, plan.done_time)
         )
