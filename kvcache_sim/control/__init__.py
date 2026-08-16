@@ -23,8 +23,8 @@
 * :mod:`~kvcache_sim.control._sensor` -- what those decisions are made against: one
   sensor per kind of fact this plane holds -- the cluster's load, and what this plane
   decided and has not yet seen carried out (the prefills it promised, the pulls it
-  priced), each expiring on its own terms as it is read. Beside them, the actions that
-  move them and the fold each sensor publishes, since every write here is one action
+  priced), each expiring when the thing it stood for happens. Beside them, the actions
+  that move them and the fold each sensor publishes, since every write here is one action
   dispatched into this plane's :class:`proposed.Dispatcher`;
 * :mod:`~kvcache_sim.control._view` -- what a decision senses, as one class per read
   composed onto :class:`proposed.View`: per-instance prefix-run lengths (with the

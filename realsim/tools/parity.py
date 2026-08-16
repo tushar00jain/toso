@@ -12,8 +12,25 @@ Comparing two checkouts is a diff of two runs of this::
 
 which is why nothing here knows about checkouts, worktrees or where it lives: a report
 line carries no path, no timestamp and no wallclock, so two runs of the same tree are
-byte-identical and any line that differs is a behaviour change. A dependency's
-import banner may precede the report; it says the same thing in either tree.
+byte-identical. A dependency's import banner may precede the report; it says the same
+thing in either tree.
+
+How to read a line that moved
+-----------------------------
+A line carries a fingerprint and then metrics, and the two answer different questions.
+
+* a **metric** that moved is a behaviour change: reject it, or say what the change was
+  meant to move and why the new number is the right one;
+* a **fingerprint** that moved with every metric identical is events *reordered*, not
+  events changed. The digest chains the whole ordered event sequence
+  (:meth:`sim_common.trace.Trace.fingerprint`), so it pins the relative order of two
+  events at one simulated instant -- including where nothing gives them one. Where a
+  tie-break is stated (an id, a sequence number) that order is a guarantee and moving it
+  is a bug; where nothing states one, two concurrent events may land either way and both
+  are the run. So such a line is neither automatically a bug nor automatically fine: name
+  the events that swapped, the instant they swapped at
+  (:func:`sim_common.diverge.first_divergence`) and what makes them concurrent, then
+  rebaseline.
 
 The first line is this file's own hash, which is what makes that diff mean anything: a
 comparison between two *versions of this tool* is not a comparison of two trees, and

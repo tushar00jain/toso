@@ -144,7 +144,13 @@ class Trace:
     def fingerprint(self) -> str:
         """Hash-chain digest of every event so far -- a single run fingerprint.
 
-        Two deterministic runs share a fingerprint iff their traces are identical.
+        Two deterministic runs share a fingerprint iff their traces are identical, which
+        is a **stronger** claim than answering alike: the sequence pins the relative order
+        of two events at one simulated instant, and a run orders those only where a
+        tie-break is stated. So two runs of one tree must agree on it, while two
+        *versions* of a tree are read digest-against-metrics
+        (:mod:`realsim.tools.parity`).
+
         With ``hash_chain`` on this is the O(1) running digest (cheap to sample
         mid-run); with it off, the digest is folded on demand from the recorded
         events (one pass -- you pay only when you ask). To locate *where* two runs

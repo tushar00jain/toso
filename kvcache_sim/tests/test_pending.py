@@ -1,12 +1,11 @@
 """What the coordinator decided and the cluster has not done yet.
 
-Both sensors in :mod:`kvcache_sim.control._sensor._pending` are self-expiring, and
-both expire on the *read* -- which is the whole reason they are objects rather than
-two lists swept by whichever decision method happens to touch them. These assert the
-expiry directly, because the scenarios that would exercise it do so rarely: a
-measured run of the early-rejection comparison reads the reservations 800 times and
-only 3 of those reads see an entry that has come true. The rule has to hold on all
-800.
+Every entry in :mod:`kvcache_sim.control._sensor._pending` stands for one thing that is
+going to happen, and expires when it does -- folded from the action that says so, while a
+read of the reservations filters at its own clock besides. These assert both directly,
+because the scenarios that would exercise them do so rarely: a measured run of the
+early-rejection comparison reads the reservations 800 times and only 3 of those reads see
+an entry that has come true. The rule has to hold on all 800.
 
 Run from the repo root::
 
@@ -17,7 +16,8 @@ from __future__ import annotations
 
 from kvcache_sim.control._answer import Plan, Response
 from kvcache_sim.control._sensor import (
-    Committed, Reservation, ReservationSensor, RoutedPullSensor, SourceLoad,
+    Committed, FetchAnswered, PrefillFinished, Reservation, ReservationSensor,
+    RoutedPullSensor, SourceLoad,
 )
 
 
@@ -46,21 +46,35 @@ def test_a_reservation_is_pending_up_to_the_instant_it_lands():
     assert len(reserved.pending(now=10.0)) == 1
 
 
-def test_expiry_runs_on_the_read_not_on_the_write():
+def test_a_read_filters_at_its_own_clock_and_not_at_the_last_write():
     """The property the extraction exists for.
 
-    A routing decision reads this sensor before it writes to it, so expiry driven
-    by the write is always one decision late -- every read would see entries whose
-    prefill has since completed. Here the read is what cleans, so a read is never
-    stale however long it has been since the last reservation.
+    A routing decision reads this sensor before anything reports, so a sensor that only
+    dropped what it was told about would serve entries whose prefill has since completed.
+    The read filters, so it is never stale however long it has been since the last write
+    or the last report.
     """
     reserved = ReservationSensor()
     reserved.reserve(prefill_done=1.0, decode_id="d0", output_tokens=4)
     reserved.reserve(prefill_done=2.0, decode_id="d1", output_tokens=4)
-    # No further writes -- and the read is still correct at every instant.
+    # Nothing reported -- and the read is still correct at every instant.
     assert len(reserved.pending(now=0.0)) == 2
     assert [r.decode_id for r in reserved.pending(now=1.5)] == ["d1"]
     assert list(reserved.pending(now=99.0)) == []
+
+
+def test_a_landed_prefill_drops_the_reservations_it_made_stale():
+    """What keeps a long run from carrying every prefill it ever promised.
+
+    A host's report is a clock it has reached, so what it retires is what no later read
+    could return anyway -- asserted at a clock earlier than the report, where the entries
+    would still be pending if the fold had kept them.
+    """
+    reserved = ReservationSensor()
+    reserved.reserve(prefill_done=1.0, decode_id="d0", output_tokens=4)
+    reserved.reserve(prefill_done=9.0, decode_id="d1", output_tokens=4)
+    reserved.folds[PrefillFinished](PrefillFinished("s0", 5.0))
+    assert [r.decode_id for r in reserved.pending(now=0.0)] == ["d1"]
 
 
 # --------------------------------------------------------------------------
@@ -68,29 +82,52 @@ def test_expiry_runs_on_the_read_not_on_the_write():
 # --------------------------------------------------------------------------
 
 
-def test_a_routed_pull_is_answered_once():
-    """Consumed on the match: a pull is fetched once.
+def _answered(requester="s0", keys=("a",)):
+    """The action a plane dispatches as it answers one fetch."""
+    return FetchAnswered(requester, tuple(keys))
 
-    An entry left behind would be claimed by some later fetch from the same
-    instance, which would be handed a peer chosen for a different request -- and
-    charged a locality tier nobody priced.
+
+def test_a_routed_pull_is_answered_once():
+    """A pull is fetched once, so the answer spends the memo it came from.
+
+    An entry left behind would answer some later fetch from the same instance with a
+    peer chosen for a different request -- and charge a locality tier nobody priced.
     """
     routed = RoutedPullSensor()
     routed.route("s0", ["a", "b"], "s1")
-    assert routed.claim("s0", ["a", "b"]) == "s1"
-    assert routed.claim("s0", ["a", "b"]) is None
+    assert routed.peer("s0", ["a", "b"]) == "s1"
+    routed.folds[FetchAnswered](_answered(keys=("a", "b")))
+    assert routed.peer("s0", ["a", "b"]) is None
 
 
-def test_pulls_to_one_instance_are_claimed_oldest_first():
-    """Two requests in flight to one instance resolve in a fixed order."""
+def test_answering_a_fetch_nothing_priced_spends_nothing():
+    """Which is what lets the plane dispatch it without knowing which link answered.
+
+    A fetch the ranking answered names keys no memo matches, and the fold leaves every
+    other requester's memo where it was.
+    """
+    routed = RoutedPullSensor()
+    routed.route("s0", ["a"], "s1")
+    routed.folds[FetchAnswered](_answered(requester="s2"))
+    routed.folds[FetchAnswered](_answered(keys=("z",)))
+    assert routed.peer("s0", ["a"]) == "s1"
+
+
+def test_pulls_to_one_instance_are_answered_oldest_first():
+    """Two requests in flight to one instance resolve in a fixed order.
+
+    One rule for the read and the expiry, so the memo an answer came from is the memo
+    that answer spends.
+    """
     routed = RoutedPullSensor()
     routed.route("s0", ["a"], "s1")
     routed.route("s0", ["a"], "s2")
-    assert routed.claim("s0", ["a"]) == "s1"
-    assert routed.claim("s0", ["a"]) == "s2"
+    assert routed.peer("s0", ["a"]) == "s1"
+    routed.folds[FetchAnswered](_answered())
+    assert routed.peer("s0", ["a"]) == "s2"
 
 
-def test_a_claim_is_for_exactly_what_was_planned():
+def test_a_memo_answers_exactly_what_was_planned():
     """A pull is all-or-nothing, so a fetch asks for precisely what it was told to.
 
     A smaller set is therefore not this pull with the evicted blocks removed -- it
@@ -99,21 +136,21 @@ def test_a_claim_is_for_exactly_what_was_planned():
     """
     routed = RoutedPullSensor()
     routed.route("s0", ["a", "b", "c"], "s1")
-    assert routed.claim("s0", ["a", "b"]) is None
-    assert routed.claim("s0", ["c", "b", "a"]) == "s1"  # order is not identity
+    assert routed.peer("s0", ["a", "b"]) is None
+    assert routed.peer("s0", ["c", "b", "a"]) == "s1"  # order is not identity
 
 
-def test_nobody_elses_pull_is_claimable():
+def test_nobody_elses_pull_answers_a_fetch():
     """A peer priced for one requester says nothing about another's fetch."""
     routed = RoutedPullSensor()
     routed.route("s0", ["a"], "s1")
-    assert routed.claim("s2", ["a"]) is None       # different requester
-    assert routed.claim("s0", ["a", "z"]) is None  # more than was planned
-    assert routed.claim("s0", ["a"]) == "s1"       # ...and it is still there
+    assert routed.peer("s2", ["a"]) is None       # different requester
+    assert routed.peer("s0", ["a", "z"]) is None  # more than was planned
+    assert routed.peer("s0", ["a"]) == "s1"       # ...and it is still there
 
 
 # --------------------------------------------------------------------------
-# Both fold the one action a decision dispatches, each into its own state.
+# Both fold the action a decision dispatches, each into its own state.
 # --------------------------------------------------------------------------
 
 
@@ -148,16 +185,16 @@ def test_a_pull_is_remembered_only_when_the_plan_priced_one():
     """The condition is on the action's own payload, so the fold applies it.
 
     Most accepted plans recompute the gap rather than pull it, and a plan with no
-    source (or no keys to fetch) leaves nothing for a later fetch to claim -- so
-    recording one would answer a fetch with a peer nothing was priced against.
+    source (or no keys to fetch) leaves nothing for a later fetch to be answered from --
+    so recording one would answer a fetch with a peer nothing was priced against.
     """
     routed = RoutedPullSensor()
     routed.folds[Committed](_committed(source=None, pull=()))
     routed.folds[Committed](_committed(source="s1", pull=()))     # priced no keys
     routed.folds[Committed](_committed(source=None, pull=["a"]))  # named no peer
-    assert routed.claim("s0", ["a"]) is None, "nothing was priced, so nothing is owed"
+    assert routed.peer("s0", ["a"]) is None, "nothing was priced, so nothing is owed"
     routed.folds[Committed](_committed(source="s1", pull=["a"]))
-    assert routed.claim("s0", ["a"]) == "s1"
+    assert routed.peer("s0", ["a"]) == "s1"
 
 
 def test_load_counts_the_source_a_decision_priced_a_pull_against():

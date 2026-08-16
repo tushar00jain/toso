@@ -159,24 +159,21 @@ class RoutedPull(KeySelector):
     pull falls through to the ranking behind this link.
 
     A selector like any other: the sensor arrives on the view it is attached to, the way
-    every other read does, and nothing hands this one the sensor.
+    every other read does, this reads it and writes nothing, and the memo is spent by the
+    plane as it answers (:class:`~kvcache_sim.control._sensor.FetchAnswered`).
 
-    Reading it **consumes** it
-    (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim` expires the entry on
-    a match), so this belongs at the head of a
-    :class:`~proposed.selector.FirstMatch` chain and under no combinator that can drop
-    the answer or rank it down (:class:`~proposed.selector.Balance`). In that one
-    position spending and using coincide: a link that answers wins the chain, an
-    abstention matched nothing and spends nothing. Under one that could reject the
-    peer, the entry would be gone and the fetch would fall through to a ranking that
-    never saw it.
+    Which is why this belongs at the head of a :class:`~proposed.selector.FirstMatch`
+    chain and under no combinator that can drop the answer or rank it down
+    (:class:`~proposed.selector.Balance`): the transfer was priced against *this* peer,
+    and the memo is spent whether or not the answer won, so a memo ranked down is a pull
+    served by a volume nothing charged for. At the head, answering and spending coincide.
     """
 
     name = "routed-pull"
     sensors = (RoutedView,)
 
     async def select(self, keys: Sequence[Key], requester: str) -> Selection:
-        peer = self.view.routed.claim(requester, keys)
+        peer = self.view.routed.peer(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
 

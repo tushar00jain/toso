@@ -37,7 +37,7 @@ from proposed.selector import (
     Balance, Const, FirstMatch, Folded, Max, Selector, Sort,
 )
 from kvcache_sim.control._selector import (
-    by_prefix_and_load, LocalOnly, LongestPrefixKeySelector,
+    by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk,
 )
 from kvcache_sim.control._sensor import Committed, SourceLoad
 from kvcache_sim.control.scheduler import (
@@ -1825,6 +1825,29 @@ def _scheduler(n: int = 2):
     return sim, sched
 
 
+async def _prefill_ranking(sched, request, requester):
+    """The prefill chain's answer, asked the way the plane asks it.
+
+    The join is the plane's -- one pinned directory snapshot, the reuse chain asked once,
+    and the peer it named riding down as part of the subject -- so reading the ranking a
+    decision is made from means declaring that subject, not reaching for a seam. Nothing
+    in the chain writes, which is why asking it costs the decision after it nothing.
+    """
+    now = sched.view.now()
+    keys = list(request.block_keys)
+    with sched.view.pinned(keys):
+        return await sched._prefill.select(
+            PrefillAsk(
+                request=request,
+                now=now,
+                keys=keys,
+                counts=sched.view.prefix_lengths(keys),
+                peer=await sched._reuse.select(keys, requester),
+            ),
+            requester,
+        )
+
+
 def test_one_answer_names_both_of_a_request_s_hosts():
     """One member, one question, answered before anything runs.
 
@@ -1844,7 +1867,7 @@ def test_one_answer_names_both_of_a_request_s_hosts():
             # The ranking first: committing the decision moves the load the ranking
             # is read off, so asking afterwards would price a different field.
             return (
-                await sched._select_prefill(request, "s0"),
+                await _prefill_ranking(sched, request, "s0"),
                 await sched.decide(request, "s0"),
             )
 
@@ -1997,7 +2020,7 @@ def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
         # ...and all three sensors moved in that one window.
         assert sched.view.cluster.busy_until["s0"] == 5.0
         assert len(sched.view.reserved.pending(0.0)) == 1
-        assert sched.view.routed.claim("s0", ["a"]) == "s1"
+        assert sched.view.routed.peer("s0", ["a"]) == "s1"
 
     try:
         sim.loop.run_until_complete(scenario())
@@ -2020,7 +2043,7 @@ def test_a_run_that_does_not_predict_reserves_nothing():
             sched.view.reserved
         sched.dispatcher.dispatch_sync(_accepted(pull=["a"], source="s1"))
         assert sched.view.cluster.busy_until["s0"] == 5.0
-        assert sched.view.routed.claim("s0", ["a"]) == "s1"
+        assert sched.view.routed.peer("s0", ["a"]) == "s1"
         # And the decode-side prediction is the observed occupancy, untouched by a
         # promise this run never made.
         decode = sim.loop.run_until_complete(

@@ -9,6 +9,8 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
 from proposed import Sensor
 from proposed.dispatch import Fold, Stored
 
+from ._action import Asked
+
 __all__ = ["FanoutSensor"]
 
 
@@ -21,9 +23,10 @@ class FanoutSensor(Sensor):
     (:mod:`dedup_sim.control._answer`).
 
     A :class:`proposed.dispatch.Reducer` on this plane's dispatcher (:attr:`folds`),
-    which is how a landed put reaches it: the action is dispatched once, this writes its
-    own state, and the commit after it is what wakes anybody. Nothing here reads the
-    directory's state, and nothing reads this.
+    which is how the two ends of a debt reach it -- the ask that takes one on and the put
+    that settles it: the action is dispatched once, this writes its own state, and the
+    commit after it is what wakes anybody. Nothing here reads the directory's state, and
+    nothing reads this.
 
     Args:
         fanout_cap: readers one peer may be planned to feed -- 1 a chain, >= 2 a
@@ -47,9 +50,9 @@ class FanoutSensor(Sensor):
         # is routed it OWES that registration. The only thing that makes waiting for
         # a source safe (:func:`~dedup_sim.control._answer.committed`).
         self._promised: Set[Tuple[str, str]] = set()
-        # action type -> the fold that writes this state. One entry, because a landed
-        # put is the only thing it is told (:class:`proposed.dispatch.Reducer`).
-        self._folds: Dict[type, Fold] = {Stored: self._stored}
+        # action type -> the fold that writes this state: a debt taken on, and the same
+        # debt settled (:class:`proposed.dispatch.Reducer`).
+        self._folds: Dict[type, Fold] = {Asked: self._asked, Stored: self._stored}
 
     # -- what it folds ------------------------------------------------------- #
     @property
@@ -60,6 +63,10 @@ class FanoutSensor(Sensor):
         moves it.
         """
         return MappingProxyType(self._folds)
+
+    def _asked(self, action: Asked) -> None:
+        """A reader is about to read these keys through: it owes those puts from now."""
+        self._promised.update((action.requester, key) for key in action.keys)
 
     def _stored(self, action: Stored) -> None:
         """A reader's put has landed: settle the debt it owed.
@@ -134,16 +141,6 @@ class FanoutSensor(Sensor):
             del self._load[source]
 
     # -- the debt ------------------------------------------------------------ #
-    def promise(self, requester: str, keys: Sequence[str]) -> None:
-        """``requester`` is about to read ``keys`` through, so it owes those puts.
-
-        Asking is the promise, and the ranking records it before pricing anybody:
-        that is what makes a requester offered as a peer only after it has promised,
-        and so what bounds the wait on it
-        (:func:`~dedup_sim.control._answer.committed`).
-        """
-        self._promised.update((requester, key) for key in keys)
-
     def owes(self, facts: Iterable[Tuple[str, str]]) -> bool:
         """Is every one of these ``(volume, key)`` publications still owed?"""
         return all(fact in self._promised for fact in facts)

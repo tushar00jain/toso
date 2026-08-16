@@ -2,9 +2,11 @@
 
 A sensor holds facts between calls (:class:`proposed.Sensor`); a view is how a
 decision reaches one (:mod:`dedup_sim.control._view`). One sensor here:
-:class:`FanoutSensor`, the tree and the puts it is owed. No waiting -- that is the
-commit of the action it folds (:meth:`proposed.dispatch.Dispatcher.gate`), and nothing
-holds a record of who is parked.
+:class:`FanoutSensor`, the tree and the puts it is owed, moved by the two actions that
+move a debt: :class:`Asked`, which this plane dispatches to itself as a reader asks, and
+:class:`proposed.dispatch.Stored`, which that reader dispatches once its put lands. No
+waiting -- that is the commit of an action it folds
+(:meth:`proposed.dispatch.Dispatcher.gate`), and nothing holds a record of who is parked.
 
 Nothing reaches it from outside this process, though a host does write it. A reader's
 data plane reports its own landed put, but what arrives is one
@@ -19,6 +21,7 @@ elsewhere would only misprice a candidate.
 Folder-private: what a decision may read is the view, not the sensor behind it.
 """
 
+from ._action import Asked
 from ._fanout import FanoutSensor
 
-__all__ = ["FanoutSensor"]
+__all__ = ["Asked", "FanoutSensor"]

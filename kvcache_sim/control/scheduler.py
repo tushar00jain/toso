@@ -98,8 +98,8 @@ from ._selector import (
     Priced, RoutedPull,
 )
 from ._sensor import (
-    ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
-    ReservationSensor, RoutedPullSensor, SourceLoad,
+    ClusterSensor, Committed, ComputeBusy, DecodeState, FetchAnswered,
+    PrefillFinished, ReservationSensor, RoutedPullSensor, SourceLoad,
 )
 from ._view import ClusterView, KVView
 from .request import Request
@@ -443,8 +443,17 @@ class _Scheduler(ControlPlane):
         Settled before it travels, like any answer this plane gives: neither link
         gates, so there is nothing to wait for, and saying so here is what keeps that
         a property of the ranking rather than of the caller.
+
+        Answering is dispatched, unconditionally and whatever answered
+        (:class:`~kvcache_sim.control._sensor.FetchAnswered`): a fetch a pull was priced
+        for spends that memo, one nothing priced spends nothing, so which link won is
+        never this method's question. Nothing between the chain's answer and the dispatch
+        suspends, so no second fetch of the same keys can read the memo this one answered
+        from.
         """
-        return await (await self._fetch.select(list(keys), requester)).settled()
+        answer = await self._fetch.select(list(keys), requester)
+        self.dispatcher.dispatch_sync(FetchAnswered(requester, tuple(keys)))
+        return await answer.settled()
 
     async def decide(self, request: Request, requester: str) -> Optional[Response]:
         """Where should ``request`` run? Both selections, or ``None`` if refused.
@@ -476,42 +485,11 @@ class _Scheduler(ControlPlane):
         placed = self._placed.pop(request.id, None)
         if placed is not None:
             return placed
-        prefill = await self._select_prefill(request, requester)
-        # The winning plan, read once off the dimension it rides in: both halves of the
-        # answer are formed against the same one.
-        plan: Plan = prefill.key[prefill.head][0]
-        decode = await self._decode.select(plan, requester)
-        return self._admit(request, requester, prefill, plan, decode)
 
-    async def _select_prefill(self, request: Request, requester: str) -> Selection:
-        """Every prefill instance, priced and ordered by the chain, best first.
-
-        This is the **join** the chain cannot do: the reuse chain is asked here and its
-        answer goes down as part of the subject
-        (:class:`~kvcache_sim.control._selector.PrefillAsk`), because a stage measures one
-        source and this is two rankings meeting.
-
-        Every instance comes back, each keyed at its own :class:`Plan`, which is why that
-        chain ends in a :class:`~proposed.selector.Sort` and not a
-        :class:`~proposed.selector.Max`: the answer says what was compared as well as what
-        won.
-
-        Atomic: every read is off one pinned directory snapshot
-        (:meth:`~proposed.view.View.pinned`) and one clock read, so the
-        prices are comparable, and the bookkeeping it writes needs nothing locked.
-        Nothing is reserved while pricing
-        (:class:`~kvcache_sim.control._selector.Priced`), so the winner is chosen after
-        the whole field is known. Both chains are awaited inside the pin and neither
-        suspends, so no second decision can enter it.
-
-        The reuse chain is asked once and tested per candidate: which peers hold this
-        prefix is the same question whoever would prefill it, and only the tests behind it
-        -- is that peer me, is its run worth the transfer -- read the candidate.
-        """
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
-            return await self._prefill.select(
+            prefill = await self._prefill.select(
                 PrefillAsk(
                     request=request,
                     now=now,
@@ -521,6 +499,12 @@ class _Scheduler(ControlPlane):
                 ),
                 requester,
             )
+            # The winning plan, read once off the dimension it rides in: both halves of the
+            # answer are formed against the same one.
+            plan: Plan = prefill.key[prefill.head][0]
+            decode = await self._decode.select(plan, requester)
+
+        return self._admit(request, requester, prefill, plan, decode)
 
     # -- admission -------------------------------------------------------- #
     def _admit(

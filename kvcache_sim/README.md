@@ -280,18 +280,17 @@ kvcache_sim/
                           #     true, and nothing else. One per run, built in
                           #     attach(), written only by the fold it publishes,
                           #     and read by everything that ranks hosts by load
-      _pending.py         #     ReservationSensor / RoutedPullSensor /
-                          #     PlacementSensor: what this plane decided and has
-                          #     not yet seen carried out, all folded from the one
-                          #     Committed action. Each expires on its own terms,
-                          #     when read -- a clock for a reservation, the fetch
-                          #     that claims a pull, the ask from the host a
-                          #     placement names -- so no decision method carries a
-                          #     sweep. Only a run that predicts composes the
+      _pending.py         #     ReservationSensor / RoutedPullSensor: what this
+                          #     plane decided and has not yet seen carried out,
+                          #     both written by the Committed action that took it.
+                          #     Each expires when the thing it stood for happens
+                          #     -- the prefill a host reports landing, the fetch
+                          #     the plane answers -- and a read of the
+                          #     reservations filters at its own clock besides, so
+                          #     nothing is offered that has come true. Only a run
+                          #     that predicts composes the
                           #     reservation sensor, which is the whole of the
-                          #     condition on a reservation. The placement is what
-                          #     makes a rerouted request's second ask an answer
-                          #     rather than a second pricing
+                          #     condition on a reservation
     _view.py              #   KVView: what a decision senses, one class per read
                           #   and each a proposed.View -- prefix runs (a pure
                           #   function of the directory read one routing decision

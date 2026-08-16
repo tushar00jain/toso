@@ -45,17 +45,21 @@ Seven rules, none of which a type system can express:
    control plane it asks and ``dispatch`` on the dispatcher it reports into. **Only
    the first is policed** -- see :func:`_proposed_ports` for why the second is not
    found.
-7. **A selector remembers nothing on itself.** What a decision remembers between
-   calls is a :class:`~proposed.deployment.Sensor`, read through a view and moved
-   by an action somebody dispatched -- which is what makes it observable, foldable
-   and one thing rather than a copy per holder. So a
-   :class:`~proposed.selector.Selector` may write to ``self`` in ``__init__`` and
-   ``attach`` (its knobs and its view) and nowhere else. What this buys is that a
-   ranking is a *value*: two built the same way answer the same, so a plane may
-   build one where it uses it rather than threading one object to every consumer,
-   and nothing has to assert that two references are the same object. It catches
-   the plain case -- ``self.x = ...`` in ``select`` -- and not a container held on
-   the selector and mutated in place; that one is left to review.
+7. **A selector writes nothing.** What a decision remembers between calls is a
+   :class:`~proposed.deployment.Sensor`, read through a view and moved by an action
+   somebody dispatched -- which is what makes it observable, foldable and one thing
+   rather than a copy per holder. So a :class:`~proposed.selector.Selector` may write
+   to ``self`` in ``__init__`` and ``attach`` (its knobs and its view) and nowhere
+   else, and it may not move a sensor either: a ranking that mutated one would be
+   deciding, at a moment no commit names and where the other holders of that sensor
+   cannot see it. What this buys is that a ranking is a *value*: two built the same
+   way answer the same, so a plane may build one where it uses it rather than
+   threading one object to every consumer, and nothing has to assert that two
+   references are the same object. The self half catches the plain case --
+   ``self.x = ...`` in ``select`` -- and not a container held on the selector and
+   mutated in place; that one is left to review. The sensor half reads the callee
+   instead (:func:`_sensor_writers`), so it catches the write however the selector
+   reached the sensor.
 
 Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to be
 public -- it reads "public" off the leading underscore and nothing else. So a
@@ -146,6 +150,7 @@ __all__ = [
     "PUBLIC_ANYWAY",
     "PUBLIC_NAMES",
     "SEND_MODES",
+    "MUTATING_CALLS",
     "sim_packages",
     "check_package_parts",
     "check_private_naming",
@@ -694,20 +699,94 @@ def check_plane_ports(
     return sorted(out)
 
 
+#: How a method moves a container it holds on ``self``, for :func:`_sensor_writers`.
+#: A sensor's state is a dict, a list, a set or a counter, and these are what it calls
+#: on one; a plain rebind or a subscript store is found structurally beside them.
+MUTATING_CALLS = frozenset({
+    "add", "append", "clear", "discard", "extend", "pop", "popitem", "remove",
+    "setdefault", "update",
+})
+
+
+def _sensor_writers(
+    root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS
+) -> Dict[str, str]:
+    """``method name -> the sensor that writes its own state in it``.
+
+    A :class:`~proposed.deployment.Sensor` subclass's methods, kept if the body moves
+    ``self``: rebinding an attribute, storing into or deleting from one, or calling one of
+    :data:`MUTATING_CALLS` on one. That is what a fold does, and what nothing but a fold
+    should -- so the names are exactly what rule 7 forbids a selector to call.
+
+    **What is missing:** a mutation reached through a helper is not followed, and the
+    match is by name, so a *read* sharing a name with some sensor's writer would be
+    reported. Neither costs anything today (no sensor's writer shares a name with a read
+    a decision makes), and the second fails in the safe direction.
+    """
+    found: Dict[str, str] = {}
+    for rel in sorted(_module_map(root, pkgs).values()):
+        tree = ast.parse((root / rel).read_text())
+        for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+            if not any(getattr(b, "id", None) == "Sensor" for b in cls.bases):
+                continue
+            for fn in cls.body:
+                # ``__init__`` builds that state rather than moving it, and no fold or
+                # mutator is a dunder.
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if fn.name.startswith("__"):
+                    continue
+                if any(_moves_self(node) for node in ast.walk(fn)):
+                    found[fn.name] = cls.name
+    return found
+
+
+def _held(node) -> bool:
+    """Is this expression something held on ``self`` (``self.x`` or ``self.x[k]``)?"""
+    if isinstance(node, ast.Subscript):
+        node = node.value
+    return isinstance(node, ast.Attribute) and isinstance(
+        node.value, ast.Name
+    ) and node.value.id == "self"
+
+
+def _moves_self(node) -> bool:
+    """Does this statement move state held on ``self``?"""
+    if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+        targets = (
+            node.targets if isinstance(node, (ast.Assign, ast.Delete))
+            else [node.target]
+        )
+        return any(_held(target) for target in targets)
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in MUTATING_CALLS
+        and _held(node.func.value)
+    )
+
+
 def check_selector_state(
     root: Path = REPO_ROOT, pkgs: Sequence[str] = GRAPH_PKGS
 ) -> List[Violation]:
-    """Rule 7: a selector writes to ``self`` in ``__init__`` / ``attach`` and nowhere else.
+    """Rule 7: a selector writes nothing -- not ``self``, and not a sensor it senses.
 
     Read off the class statement rather than the type: anything whose bases name a
     selector is one, which is what a reader sees too -- followed through the bases
     declared in the same module, since a combinator may derive one of its neighbours
     (``Balance`` is an ``Annotate``) and a rule reading only the immediate base would go
-    quiet on exactly those. Mutating a *sensor* the view carries
-    (``self.view.routed.claim(...)``) is the sanctioned way to remember, and is not a
-    write to the selector.
+    quiet on exactly those.
+
+    The two halves are found differently. A write to ``self`` is read off the assignment.
+    A write to a sensor is read off the *callee*: :func:`_sensor_writers` names the
+    methods a :class:`~proposed.deployment.Sensor` uses to move its own state, and a
+    selector calling one of those is moving state a plane is supposed to dispatch. Matched
+    by name and on any receiver, because the receiver is usually a local
+    (``fanout = self.view.fanout``) and because a ranking has no business calling a
+    sensor's mutator whatever it holds one under.
     """
     out: List[Violation] = []
+    writers = _sensor_writers(root, pkgs)
     for rel in sorted(_module_map(root, pkgs).values()):
         if _is_test(".".join(rel.with_suffix("").parts)):
             continue
@@ -729,6 +808,17 @@ def check_selector_state(
                 if fn.name in ("__init__", "__new__", "attach"):
                     continue
                 for node in ast.walk(fn):
+                    if isinstance(node, ast.Call) and isinstance(
+                        node.func, ast.Attribute
+                    ) and node.func.attr in writers:
+                        out.append(Violation(
+                            str(rel), node.lineno, "selector-writes-a-sensor",
+                            f"{cls.name}.{fn.name} calls {node.func.attr!r}, which "
+                            f"{writers[node.func.attr]} moves its own state with: what a "
+                            f"decision remembers is moved by an action the plane "
+                            f"dispatches, so every holder of that sensor sees one fact "
+                            f"and one commit",
+                        ))
                     targets = (
                         node.targets if isinstance(node, ast.Assign)
                         else [node.target]

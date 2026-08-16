@@ -18,9 +18,9 @@ and a host's report is what keeps each of them true:
 * **decode occupancy** is a per-instance list of estimated finish times, replaced
   wholesale by :class:`~kvcache_sim.control._sensor.DecodeState`.
 
-A prefill this plane has *promised* is neither: no host corrects it, and it expires as
-it is read, so it is a sensor of its own
-(:class:`kvcache_sim.control._sensor.ReservationSensor`).
+A prefill this plane has *promised* is neither -- nothing corrects it, it stands only
+until it lands, and what reads it reads against its own clock -- so it is a sensor of its
+own (:class:`kvcache_sim.control._sensor.ReservationSensor`).
 
 Nothing reaches this sensor from outside the process holding it. A host's report is an
 action dispatched into the plane's :class:`proposed.dispatch.Dispatcher`, which folds it

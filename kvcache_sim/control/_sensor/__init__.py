@@ -7,7 +7,8 @@ separates them is who writes each:
 * :class:`ClusterSensor` -- the predicted prefill queues and observed decode batches,
   moved by what the hosts report;
 * :class:`ReservationSensor` and :class:`RoutedPullSensor` -- what this plane decided
-  and has not yet seen carried out, moved by the decision that took it;
+  and has not yet seen carried out, moved by the decision that took it and by the one
+  that says it has happened;
 * :class:`SourceLoad` -- how much this plane has sent at each source, moved by the same
   decision and read by a ranking that spreads reads over equally good ones.
 
@@ -21,7 +22,9 @@ Folder-private, all four: what a decision may read is the view, not the sensor
 behind it.
 """
 
-from ._action import Committed, ComputeBusy, DecodeState, PrefillFinished
+from ._action import (
+    Committed, ComputeBusy, DecodeState, FetchAnswered, PrefillFinished,
+)
 from ._cluster import ClusterSensor
 from ._load import SourceLoad
 from ._pending import Reservation, ReservationSensor, RoutedPullSensor
@@ -31,6 +34,7 @@ __all__ = [
     "Committed",
     "ComputeBusy",
     "DecodeState",
+    "FetchAnswered",
     "PrefillFinished",
     "Reservation",
     "ReservationSensor",

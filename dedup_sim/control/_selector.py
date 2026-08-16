@@ -79,11 +79,11 @@ class Candidates(KeySelector):
             is priced at little more than its link's latency; a run that knows the size
             can say so, and the bandwidth term then sharpens the ratio between tiers.
 
-    A peer is offered only while it still **owes** the key: from the moment it asks
-    until its read-through lands (:meth:`~dedup_sim.control._sensor.FanoutSensor.owes`).
-    One that published and has since evicted owes nothing and holds nothing, so it
-    simply is not a candidate -- there is no source to retire from a ranking that never
-    named it.
+    A peer is offered only while it still **owes** the key: from the ask that promises it
+    (:class:`~dedup_sim.control._sensor.Asked`) until its read-through lands
+    (:meth:`~dedup_sim.control._sensor.FanoutSensor.owes`). One that published and has
+    since evicted owes nothing and holds nothing, so it simply is not a candidate --
+    there is no source to retire from a ranking that never named it.
     """
 
     name = "candidates"
@@ -102,7 +102,6 @@ class Candidates(KeySelector):
         (:meth:`~dedup_sim.control.routing.Dedup._decide`).
         """
         fanout = self.view.fanout
-        fanout.promise(requester, keys)
         located = self.view.locate(keys)
         holds = set(holders(located, keys[0]))
         for key in keys[1:]:

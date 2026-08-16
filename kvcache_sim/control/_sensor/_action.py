@@ -1,10 +1,10 @@
-"""What this capability dispatches: the four things that happen to a cluster.
+"""What this capability dispatches: the five things that happen to a cluster.
 
 Each is a :class:`proposed.dispatch.Action`, folded by every sensor here that folds
 its type and committed once (:class:`proposed.dispatch.Dispatcher`). Three come from a
-host over the seam in front of that dispatcher and one the scheduler dispatches to
-itself; nothing here says which sensor folds what, because an action does not know who
-folds it.
+host over the seam in front of that dispatcher and two the scheduler dispatches to
+itself, one per question it answers; nothing here says which sensor folds what, because
+an action does not know who folds it.
 
 Frozen values, so they cross a process boundary unchanged and cannot be edited after
 they are handed over.
@@ -19,7 +19,9 @@ from proposed.dispatch import Action
 
 from .._answer import Response
 
-__all__ = ["Committed", "ComputeBusy", "DecodeState", "PrefillFinished"]
+__all__ = [
+    "Committed", "ComputeBusy", "DecodeState", "FetchAnswered", "PrefillFinished",
+]
 
 
 @dataclass(frozen=True)
@@ -60,12 +62,26 @@ class DecodeState(Action):
 
 
 @dataclass(frozen=True)
+class FetchAnswered(Action):
+    """``requester`` has been told which peers serve its fetch of ``keys``.
+
+    Dispatched as the answer is given, whatever answered it: a fetch a decision priced a
+    pull for spends the memo that answered it
+    (:class:`~kvcache_sim.control._sensor.RoutedPullSensor`), and one nothing priced
+    spends nothing, so the plane never has to know which link won.
+    """
+
+    requester: str
+    keys: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Committed(Action):
     """A decision the scheduler accepted: every sensor it moves, in one action.
 
-    The one action control dispatches to itself, and the only one with more than one
-    fold. Dispatched at commit rather than while pricing, so a candidate that lost --
-    or a decision an SLO refused -- leaves nothing behind.
+    The only action here with more than one fold. Dispatched at commit rather than while
+    pricing, so a candidate that lost -- or a decision an SLO refused -- leaves nothing
+    behind.
 
     ``output_tokens`` is the request's, and is here because no sensor can read a
     request: the reservation this holds stands in for a decode that has not started,

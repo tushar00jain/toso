@@ -129,8 +129,9 @@ class ClusterView(SensorView):
 class ReservedView(SensorView):
     """The prefills this plane promised and has not seen land: :attr:`reserved`.
 
-    Written when a decision commits, read when the next one predicts the decode batch
-    it will meet, and self-expiring on that read
+    Written when a decision commits and when a host reports the prefill landing, read in
+    between when the next decision predicts the decode batch it will meet -- against its
+    own clock, so what has come true is not offered
     (:meth:`~kvcache_sim.control._sensor.ReservationSensor.pending`).
     """
 
@@ -140,9 +141,9 @@ class ReservedView(SensorView):
 class RoutedView(SensorView):
     """The pulls this plane has priced against a peer: :attr:`routed`.
 
-    Written by the plane that priced them, read by the one link that answers a fetch
-    from them (:class:`~kvcache_sim.control._selector.RoutedPull`) -- and reading one
-    consumes it (:meth:`~kvcache_sim.control._sensor.RoutedPullSensor.claim`).
+    Written by the plane that priced them and by the answer that spends one, read in
+    between by the one link that answers a fetch from them
+    (:class:`~kvcache_sim.control._selector.RoutedPull`).
     """
 
     routed = Sensed("routed-pull")

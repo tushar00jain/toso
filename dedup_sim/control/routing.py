@@ -23,7 +23,7 @@ from proposed.selector import (
 
 from ._answer import committed
 from ._selector import Candidates, CHAIN, SPREAD
-from ._sensor import FanoutSensor
+from ._sensor import Asked, FanoutSensor
 from ._view import DedupView
 
 __all__ = ["Dedup"]
@@ -149,11 +149,18 @@ class Dedup(ControlPlane):
         alternating rather than reverting to id order. ``spread`` blends the two instead
         (:func:`_soonest`).
 
+        Asking is what makes this requester a peer, so the debt it owes is dispatched
+        first (:class:`~dedup_sim.control._sensor.Asked`) and the ranking is consulted
+        against a fan-out that already holds it -- which is what bounds the wait on
+        whichever source the answer names. Dispatched without suspending, so the debt and
+        the decision priced against it are one turn.
+
         Separate from :meth:`sources` only because the gate is the answer's last step
         and not part of forming it: this is what a caller inspecting a decision it is
         not going to read from can await without parking on a peer's read-through.
         """
         keys = list(keys)
+        self.dispatcher.dispatch_sync(Asked(requester, tuple(keys)))
         ranking = await self._chain.select(keys, requester)
         return committed(
             self.view, self.dispatcher, keys, requester, ranking, self._trace
