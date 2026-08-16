@@ -26,7 +26,7 @@ class Plan:
 
     No order of its own: a plan rides in the key of the pool it was priced into, and
     which of its numbers orders that pool is the fold's to name
-    (:meth:`~kvcache_sim.control.scheduler._Scheduler._select_prefill`). So nothing can
+    (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`). So nothing can
     compare two of these by accident.
 
     One candidate's price and nothing else: which instance this is, and which one

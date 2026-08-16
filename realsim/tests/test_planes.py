@@ -13,14 +13,14 @@ pin the contract each one owes its callers:
    swapped in as the only difference between two runs;
 3. a preference reorders a directory answer to its ranked sources, a selection
    withholds itself until its readiness gate opens and crosses a service boundary
-   without it, and folding one -- ``sort`` / ``max`` -- is the only thing that puts it
-   in an order; the two combinators built on it tell an *abstention* from the *naive
+   without it, and an ordering link -- ``Sort`` / ``Max`` -- is the only thing that puts
+   it in an order; the combinators built on it tell an *abstention* from the *naive
    answer*, carry a wrapped selector's gate, key and prices through, and wake every
    selector they hold -- off the view that selector declared -- whether or not they
    consult it. ``FirstMatch`` picks between alternatives, ``Balance`` appends the load
    on the sources one answer named as a further dimension of its key (what to make of
-   that is the fold's, and the fold is the caller's), and a ranking narrows itself in
-   place (``require``, ``take``);
+   that is the fold ``Folded`` stamps), and a ranking narrows itself in place
+   (``require``, ``take``);
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -52,7 +52,8 @@ from proposed import ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
-    Balance, declares, FirstMatch, NaiveKeySelector, prefer, Selector,
+    Annotate, Balance, Const, declares, FirstMatch, Folded, Max, NaiveKeySelector,
+    prefer, Selector, Sort,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
@@ -443,10 +444,12 @@ def test_a_run_with_no_plane_fronts_nothing():
 # --------------------------------------------------------------------------
 # 3. Selection: what a stage annotates, what a fold makes of it, and readiness.
 # --------------------------------------------------------------------------
+# The ordering links are asked over a ``Const``, which is what a base contributes to a
+# chain: a selection somebody else built, handed on whatever the subject.
 
 
-def test_a_fold_is_the_only_thing_that_puts_a_selection_in_an_order():
-    """A stage keys; ``sort`` orders and ``max`` picks, off the dimensions it left.
+def test_only_an_ordering_link_puts_a_selection_in_an_order():
+    """A stage keys; ``Sort`` orders and ``Max`` picks, off the dimensions it left.
 
     With no fold the dimensions are compared as they stand, which is what a chain of
     stages costs when nothing has to be blended -- and a selection no stage keyed keeps
@@ -454,12 +457,13 @@ def test_a_fold_is_the_only_thing_that_puts_a_selection_in_an_order():
     """
     keyed = Selection.keyed([("v0", (9,)), ("v1", (2,))])
     assert keyed.sources == ("v0", "v1")            # built, not ranked
-    assert keyed.sort().sources == ("v1", "v0")
-    assert keyed.max().sources == ("v1",)
-    assert Selection.priced([("v0", 9), ("v1", 2)]).sort().sources == ("v1", "v0")
+    assert _select(Sort(Const(keyed))).sources == ("v1", "v0")
+    assert _select(Max(Const(keyed))).sources == ("v1",)
+    priced = Const(Selection.priced([("v0", 9), ("v1", 2)]))
+    assert _select(Sort(priced)).sources == ("v1", "v0")
     unkeyed = Selection.of(["v1", "v0"])
-    assert unkeyed.sort() is unkeyed
-    assert unkeyed.max().sources == ("v1",)
+    assert _select(Sort(Const(unkeyed))) is unkeyed
+    assert _select(Max(Const(unkeyed))).sources == ("v1",)
 
 
 def test_a_fold_blends_the_dimensions_the_stages_left():
@@ -470,11 +474,30 @@ def test_a_fold_blends_the_dimensions_the_stages_left():
     is not there, so a fold reaching for it raises instead of comparing whatever landed
     in that position.
     """
-    two = Selection.keyed([("v0", (4, 3)), ("v1", (5, 0))])
-    assert two.sort().sources == ("v0", "v1")                     # 4 < 5
-    assert two.sort(lambda d: d[0] * (1 + d[1])).sources == ("v1", "v0")   # 16 > 5
+    two = Const(Selection.keyed([("v0", (4, 3)), ("v1", (5, 0))]))
+    assert _select(Sort(two)).sources == ("v0", "v1")                     # 4 < 5
+    blended = Folded(two, lambda d: d[0] * (1 + d[1]))
+    assert _select(Sort(blended)).sources == ("v1", "v0")                 # 16 > 5
+    short = Folded(Const(Selection.priced([("v0", 4)])), lambda d: d[0] + d[1])
     with pytest.raises(IndexError):
-        Selection.priced([("v0", 4)]).sort(lambda d: d[0] + d[1])
+        _select(Sort(short))
+
+
+def test_a_fold_rides_on_the_answer_so_nothing_that_orders_it_names_one():
+    """``Folded`` writes the fold; ``Sort`` and ``Max`` read it and take no argument.
+
+    Which is what stops two callers of one ranking folding it two different ways -- and
+    stamping one orders nothing by itself.
+    """
+    ranking = Folded(
+        Const(Selection.keyed([("v0", (4, 3)), ("v1", (5, 0))])),
+        lambda d: d[0] * (1 + d[1]),
+    )
+    stamped = _select(ranking)
+    assert stamped.fold is not None
+    assert stamped.sources == ("v0", "v1")                  # built, not ranked
+    assert _select(Sort(ranking)).sources == ("v1", "v0")
+    assert _select(Max(ranking)).sources == ("v1",)
 
 
 def test_the_id_breaks_every_tie_in_one_place():
@@ -483,25 +506,27 @@ def test_the_id_breaks_every_tie_in_one_place():
     In one place, so a run reproduces however many stages annotated the selection and
     whatever the fold made of them.
     """
-    tied = Selection.keyed([("v1", (5, 1)), ("v0", (5, 1))])
-    assert tied.sort().sources == ("v0", "v1")
-    assert tied.sort(lambda d: 0).sources == ("v0", "v1")
+    tied = Const(Selection.keyed([("v1", (5, 1)), ("v0", (5, 1))]))
+    assert _select(Sort(tied)).sources == ("v0", "v1")
+    assert _select(Sort(Folded(tied, lambda d: 0))).sources == ("v0", "v1")
 
 
-def test_both_empties_survive_a_fold():
+def test_both_empties_survive_an_ordering():
     """Neither names a source, so there is nothing to order and nothing to pick."""
     for empty in (Selection.of([]), Selection()):
-        assert empty.sort() is empty
-        assert empty.max() is empty
+        assert _select(Sort(Const(empty))) is empty
+        assert _select(Max(Const(empty))) is empty
 
 
 def test_max_keeps_the_gate_and_the_winner_s_key():
-    """A plane folds and *then* spends the gate, so the pick has to carry it."""
+    """A plane orders and *then* spends the gate, so the pick has to carry it."""
 
     async def gate() -> None:
         return None
 
-    best = Selection.keyed([("v0", (9,)), ("v1", (2,))], ready=gate).max()
+    best = _select(
+        Max(Const(Selection.keyed([("v0", (9,)), ("v1", (2,))], ready=gate)))
+    )
     assert best.head == "v1"
     assert best.ready is gate
     assert best.key == {"v1": (2,)}      # what the stages measured about the pick
@@ -610,14 +635,18 @@ class _Senses:
     def now(self) -> float:
         return 0.0
 
+    def subset(self, *views: type) -> "_Senses":
+        """Every declaration reaches this same stand-in: there is one read here."""
+        return self
+
 
 def _bounded(bound: int):
     """A fold in which load may cost a source ``bound`` of price and no more.
 
     The knob every caller of this combinator ends up wanting, written where it belongs
-    -- in the caller's own fold, over the two dimensions the pairing leaves: the price,
-    then the load. The raw count rides behind the bounded number, so two sources the
-    bound has levelled keep alternating.
+    -- in a ``Folded`` over the two dimensions the pairing leaves: the price, then the
+    load. The raw count rides behind the bounded number, so two sources the bound has
+    levelled keep alternating.
     """
     def fold(dims):
         price, load = dims
@@ -626,20 +655,18 @@ def _bounded(bound: int):
     return fold
 
 
-def _heads(
-    selector: Selector, *, count: int, moving: bool = True, fold=None
-) -> list:
-    """The winner of ``count`` successive folds, the load moving as each is decided.
+def _heads(selector: Selector, *, count: int, moving: bool = True) -> list:
+    """The winner of ``count`` successive asks, the load moving as each is decided.
 
-    Which is the pairing in production: the stages key, the plane folds and takes one
-    (``Selection.max``), the decision that follows names that source, and the sensor
-    counts it. ``moving=False`` is a load nothing moves.
+    The chain production declares: the stages key, a ``Max`` takes one, the decision that
+    follows names that source, and the sensor counts it. ``moving=False`` is a load
+    nothing moves.
     """
     senses = _Senses()
-    selector.attach(senses)
+    best = Max(selector).attach(senses)
     heads = []
     for _ in range(count):
-        head = _select(selector).max(fold).head
+        head = _select(best).head
         heads.append(head)
         if moving:
             senses.load.sent(head)
@@ -787,6 +814,29 @@ def test_a_chain_takes_its_links_subject_and_refuses_links_that_disagree():
         FirstMatch([_Fixed(), _FixedPlacement()])
 
 
+def test_a_stage_measures_off_the_view_and_the_subject_alone():
+    """The two things a stage may read, and the whole of what ``Annotate`` hands it.
+
+    Which is what keeps a chain declarable: a stage needing a second ranking's answer
+    would need a join, and a join is the plane's -- it does one and hands the result down
+    as part of the subject.
+    """
+    seen = []
+
+    def readings(view, subject):
+        seen.append((view, tuple(subject)))
+        return lambda source: len(source) + view.load.named().get(source, 0)
+
+    senses = _Senses(_Load(v0=3))
+    staged = Annotate(
+        _Fixed(Selection.of(["v0", "v11"])), readings, senses=(LoadView,)
+    )
+    assert staged.sensors == (LoadView,)         # declared, so the view carries the read
+    staged.attach(senses)
+    assert _select(staged).key == {"v0": (5,), "v11": (3,)}
+    assert seen == [(senses, ("K",))]            # once per answer, not once per source
+
+
 def test_balance_appends_a_dimension_and_computes_nothing():
     """What it adds is a reading, behind what the ranking under it said.
 
@@ -826,14 +876,14 @@ def test_balance_reads_a_load_it_does_not_keep():
 
     # ...and the winner follows the load, whoever moved it.
     senses = _Senses(_Load(v0=1))
-    balanced = Balance(_Fixed(equal)).attach(senses)
-    assert _select(balanced).max().head == "v1"
+    best = Max(Balance(_Fixed(equal))).attach(senses)
+    assert _select(best).head == "v1"
     senses.load.sent("v1")
-    assert _select(balanced).max().head == "v0"
+    assert _select(best).head == "v0"
 
 
-def test_a_caller_s_fold_decides_what_load_may_outvote():
-    """The bound is the caller's, in the caller's own units, and so is its absence.
+def test_the_fold_a_chain_is_stamped_with_decides_what_load_may_outvote():
+    """The bound is the application's, in its own units, and so is its absence.
 
     Compared as they stand, the price is the first dimension and a source ahead on it
     wins however loaded it is; folded against a bound wide enough to cover the gap, load
@@ -843,8 +893,8 @@ def test_a_caller_s_fold_decides_what_load_may_outvote():
     """
     apart = Balance(_Fixed(Selection.priced([("v0", 5), ("v1", 9)])))
     assert _heads(apart, count=4) == ["v0"] * 4
-    assert _heads(apart, count=4, fold=_bounded(1)) == ["v0"] * 4
-    assert _heads(apart, count=5, fold=_bounded(4)) == [
+    assert _heads(Folded(apart, _bounded(1)), count=4) == ["v0"] * 4
+    assert _heads(Folded(apart, _bounded(4)), count=5) == [
         "v0", "v0", "v0", "v0", "v1",
     ]
 
@@ -869,9 +919,9 @@ def test_balance_over_a_ranking_that_keys_nothing_is_ordered_by_load_alone():
     the stages before it left, so behind a ranking that named a pool and keyed none of
     it, load is the whole of the order.
     """
-    balanced = Balance(_Fixed(Selection.of(["v0", "v1"])))
-    balanced.attach(_Senses(_Load(v0=2, v1=1)))
-    assert _select(balanced).sort().sources == ("v1", "v0")
+    ranked = Sort(Balance(_Fixed(Selection.of(["v0", "v1"]))))
+    ranked.attach(_Senses(_Load(v0=2, v1=1)))
+    assert _select(ranked).sources == ("v1", "v0")
 
 
 def test_balance_takes_the_subject_of_the_ranking_it_wraps():
@@ -917,11 +967,12 @@ def test_balance_attaches_the_ranking_under_it_and_keeps_what_it_answered():
     base = _Fixed(Selection.priced([("v0", 5), ("v1", 5)], ready=gate))
     balanced = Balance(base)
     senses = _Senses()
-    balanced.attach(senses)
+    best = Max(balanced).attach(senses)
+    ranked = Sort(balanced).attach(senses)
 
     assert base.view is senses                          # brought up by its holder
-    senses.load.sent(_select(balanced).max().head)      # v0 won, and decided on ...
-    second = _select(balanced).sort()                   # ... so v1 leads now
+    senses.load.sent(_select(best).head)                # v0 won, and decided on ...
+    second = _select(ranked)                            # ... so v1 leads now
     assert second.sources == ("v1", "v0")
     assert second.ready is gate
     assert second.head == "v1"

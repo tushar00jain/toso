@@ -33,7 +33,9 @@ from kvcache_sim.data._store import KVStore
 from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
-from proposed.selector import Balance, FirstMatch, Selector
+from proposed.selector import (
+    Balance, Const, FirstMatch, Folded, Max, Selector, Sort,
+)
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector,
 )
@@ -1627,10 +1629,10 @@ def test_the_source_selector_accepts_a_plain_view():
 #     decision that names one) and lets that settle the tie, under a bound that keeps a
 #     genuinely longer prefix winning. What is asserted here is what the pairing does to
 #     *prefix runs*; the combinator's own mechanics are in realsim/tests/test_planes.py.
-def _spread(bound: int = 1):
-    """The opt-in pairing, as the plane holds it: the ranking that keys the prefix run
-    with the recent grants appended, and the fold that docks one by the other."""
-    return Balance(LongestPrefixKeySelector()), by_prefix_and_load(bound)
+def _spread(bound: int = 1) -> Selector:
+    """The opt-in ranking, as the plane declares it: the prefix run with the recent
+    grants appended, stamped with the fold that docks one by the other."""
+    return Folded(Balance(LongestPrefixKeySelector()), by_prefix_and_load(bound))
 
 
 def _replicated(holders, blocks, *, num=4):
@@ -1654,22 +1656,22 @@ def _replicated(holders, blocks, *, num=4):
     return sim, keys
 
 
-def _select_heads(sim, selector, keys, *, count, moving=True, fold=None):
-    """The winner of ``count`` successive folds, the load moving as each is decided.
+def _select_heads(sim, selector, keys, *, count, moving=True):
+    """The winner of ``count`` successive asks, the load moving as each is decided.
 
-    The pairing the run has: the ranking keys, the plane folds and takes one, the
-    decision that follows names that source, and the sensor counts it
+    The chain the run declares: the ranking keys, a :class:`~proposed.selector.Max` takes
+    one, the decision that follows names that source, and the sensor counts it
     (:class:`~kvcache_sim.control._sensor.SourceLoad`). ``moving=False`` is a load
     nothing moves, which is the base ranking's own order.
     """
     load = SourceLoad()
-    selector.attach(sim.view.derived(LoadView, load=load))
+    best = Max(selector).attach(sim.view.derived(LoadView, load=load))
 
     async def scenario():
         heads = []
         with sim.mesh.installed():
             for _ in range(count):
-                head = (await selector.select(keys, "s0")).max(fold).head
+                head = (await best.select(keys, "s0")).head
                 heads.append(head)
                 if moving:
                     load.folds[Committed](_accepted(source=head, pull=list(keys)))
@@ -1681,9 +1683,8 @@ def _select_heads(sim, selector, keys, *, count, moving=True, fold=None):
 def test_spread_reads_rotates_between_equal_prefix_replicas():
     """Three replicas of one prefix, so the ranking has nothing else to go on."""
     sim, keys = _replicated(["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 4})
-    ranking, fold = _spread()
     try:
-        heads = _select_heads(sim, ranking, keys, count=6, fold=fold)
+        heads = _select_heads(sim, _spread(), keys, count=6)
         # ...and the same replicas under the default selector, which cannot spread.
         stuck = _select_heads(sim, LongestPrefixKeySelector(), keys, count=6)
     finally:
@@ -1699,14 +1700,12 @@ def test_spread_reads_still_prefers_a_materially_longer_prefix():
     bounded, so the cost signal can settle a tie but never outvote reuse.
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 2, "s2": 4})
-    ranking, fold = _spread()
-    wider, wide_fold = _spread(bound=4)
     try:
-        heads = _select_heads(sim, ranking, keys, count=5, fold=fold)
+        heads = _select_heads(sim, _spread(), keys, count=5)
         # A bound wide enough to cover the gap does trade reuse away, and only once it
         # has been fully spent -- stated here because it is the knob's meaning, not a
         # defect.
-        wide = _select_heads(sim, wider, keys, count=3, fold=wide_fold)
+        wide = _select_heads(sim, _spread(bound=4), keys, count=3)
     finally:
         sim.loop.close()
     assert heads == ["s2"] * 5
@@ -1717,18 +1716,13 @@ def test_spread_reads_answers_the_base_order_when_nothing_has_been_sent():
     """The ranking reads a load; a load nothing moves leaves the base order alone.
 
     Which is what says the spreading is the observation's and not the wrapper's: the
-    same pairing, asked four times against an unmoved sensor, answers as the ranking
-    under it does.
+    same chain, asked four times against an unmoved sensor, answers as the ranking under
+    it does.
     """
     sim, keys = _replicated(["s1", "s2"], {"s1": 4, "s2": 4})
-    moving_pair, still_pair = _spread(), _spread()
     try:
-        moving = _select_heads(
-            sim, moving_pair[0], keys, count=4, fold=moving_pair[1]
-        )
-        still = _select_heads(
-            sim, still_pair[0], keys, count=4, moving=False, fold=still_pair[1]
-        )
+        moving = _select_heads(sim, _spread(), keys, count=4)
+        still = _select_heads(sim, _spread(), keys, count=4, moving=False)
     finally:
         sim.loop.close()
     assert moving == ["s1", "s2", "s1", "s2"]
@@ -1745,12 +1739,11 @@ def test_spread_reads_ranks_deterministically():
     """
     async def rankings(sim, keys):
         load = SourceLoad()
-        ranking, fold = _spread()
-        selector = ranking.attach(sim.view.derived(LoadView, load=load))
+        selector = Sort(_spread()).attach(sim.view.derived(LoadView, load=load))
         out = []
         with sim.mesh.installed():
             for _ in range(5):
-                ranked = (await selector.select(keys, "s0")).sort(fold).sources
+                ranked = (await selector.select(keys, "s0")).sources
                 out.append(ranked)
                 load.folds[Committed](_accepted(source=ranked[0], pull=list(keys)))
         return out
@@ -1790,14 +1783,17 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     args = parser.parse_args(["--spread-reads"])
 
     aware = scenarios.Hotspot(0).runs(args)[1:]
-    # The flag reaches both planes: each builds the spread ranking for the fetch it
-    # answers, and carries the fold that reads the dimension it appends -- or the load
+    # The flag reaches both planes: each declares the spread ranking for the fetch it
+    # answers, stamped with the fold that reads the dimension it appends -- or the load
     # would be measured and never read.
-    fetched = [run.control._fetch.selectors[-1] for run in aware]
-    assert all(isinstance(p, Balance) and p.fold is not None for p in fetched)
+    fetched = [run.control._fetch.ranking.selectors[-1] for run in aware]
+    assert all(
+        isinstance(p, Folded) and p.fold is not None and isinstance(p.ranking, Balance)
+        for p in fetched
+    )
     # ...and the replicating run prices against one too, so the pull it plans is
     # spread the same way the read that carries it out will be.
-    assert isinstance(aware[-1].control._reuse, Balance)
+    assert isinstance(aware[-1].control._reuse.ranking, Folded)
 
     def pull_sources(result):
         return sorted(
@@ -1867,13 +1863,19 @@ def test_one_answer_names_both_of_a_request_s_hosts():
     assert ranked.key[ranked.head][0].ttft == response.plan.ttft
 
 
-def _plan(*, ttft: float, match_blocks: int = 0) -> Plan:
+def _plan(*, ttft: float, match_blocks: int = 0, done_time: float = 0.0) -> Plan:
     """One priced candidate, as the scheduler keys one into the prefill pool."""
     return Plan(
         match_blocks=match_blocks, cached_tokens=0, uncached_tokens=0,
         reuse_source=None, transfer_bytes=0, queue_wait=0.0, ttft=ttft,
-        done_time=0.0,
+        done_time=done_time,
     )
+
+
+def _ordered(pool: Selection, fold) -> tuple:
+    """``pool`` ordered as the prefill chain orders one: stamped with ``fold``, sorted."""
+    chain = Sort(Folded(Const(pool), fold))
+    return asyncio.run(chain.select(None, "s0")).sources
 
 
 def test_a_plan_in_a_key_is_ordered_only_by_a_fold_that_names_what_it_compares():
@@ -1882,22 +1884,21 @@ def test_a_plan_in_a_key_is_ordered_only_by_a_fold_that_names_what_it_compares()
     A plan has no order of its own, so the fold that ranks a pool of them says which
     figure it compares -- and one that named none raises instead of ordering by
     something meaningless. Two plans that fold alike are left to the instance id, in the
-    one place every tie is settled (:meth:`proposed.selector.Selection.sort`).
+    one place every tie is settled (:class:`proposed.selector.Sort`).
     """
     with pytest.raises(TypeError):
         _plan(ttft=1.0) < _plan(ttft=2.0)
     pool = Selection.keyed([("s1", (_plan(ttft=2.0),)), ("s0", (_plan(ttft=1.0),))])
-    assert pool.sort(_by_ttft).sources == ("s0", "s1")
+    assert _ordered(pool, _by_ttft) == ("s0", "s1")
     with pytest.raises(TypeError):
-        pool.sort()
+        _ordered(pool, None)
 
     tied = Selection.keyed(
         [("s1", (_plan(ttft=1.0),)), ("s0", (_plan(ttft=1.0, match_blocks=9),))]
     )
-    assert tied.sort(_by_ttft).sources == ("s0", "s1")
+    assert _ordered(tied, _by_ttft) == ("s0", "s1")
     # ...and the baseline's fold reads the dimension appended behind the plan instead.
-    queued = tied.annotated({"s0": 9.0, "s1": 1.0})
-    assert queued.sort(_by_queue).sources == ("s1", "s0")
+    assert _ordered(tied.annotated({"s0": 9.0, "s1": 1.0}), _by_queue) == ("s1", "s0")
 
 
 def test_a_refusal_is_a_decision_not_taken():
@@ -2022,7 +2023,10 @@ def test_a_run_that_does_not_predict_reserves_nothing():
         assert sched.view.routed.claim("s0", ["a"]) == "s1"
         # And the decode-side prediction is the observed occupancy, untouched by a
         # promise this run never made.
-        assert sched._predicted_batch("s1", 5.0) == 0
+        decode = sim.loop.run_until_complete(
+            sched._decode.select(_plan(ttft=0.0, done_time=5.0), "s0")
+        )
+        assert decode.key["s1"][0] == 0
     finally:
         sim.loop.close()
 

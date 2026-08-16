@@ -3,11 +3,11 @@
     Selector[Subject].select(subject, requester) -> Selection
 
 The answer is always volume ids, what orders them, and the moment they become usable. A
-selector **annotates**: it appends a dimension to the sort key and leaves the order
-alone, so a chain of them costs one fold rather than one sort per stage, and that fold
-can be greedy over every dimension at once where a re-sort could only take them one at
-a time. Whoever answers folds -- :meth:`Selection.sort`, :meth:`Selection.max` -- and
-those two are the only things here that establish an order.
+stage **annotates**: it appends a dimension to the sort key and leaves the order alone,
+so a chain of them costs one fold rather than one sort per stage, and that fold can be
+greedy over every dimension at once where a re-sort could only take them one at a time.
+Ordering is a link like any other (:class:`Sort`, :class:`Max`), and the only kind that
+touches :attr:`Selection.sources`.
 
 What differs is the **subject**, and every selector names its own in its header::
 
@@ -40,17 +40,22 @@ does not belong in a :class:`Selection` at all. A gate rides *with* one instead 
 a selector that refuses abstains (``Selection.of([])``), and what it would have
 answered is simply not in the ranking.
 
-Selectors compose two ways, both of them one selector holding others:
-:class:`FirstMatch` picks between alternatives -- ask each in order, take the first
-answer. :class:`Balance` annotates one answer -- ask, then append how loaded each source
-it named is as a further dimension. Both hand the subject down untouched and take it
-off what they hold, which is why one ``Balance`` annotates a ranking over keys and one
-over an application's own candidates alike. ``FirstMatch`` checks its links agree on one
-at construction, since a chain hands *one* subject to every link.
+A decision is **declared**: a chain, built where the selector is wired, whose links each
+fill one of four roles -- a **base** makes a :class:`Selection` out of a subject
+(:class:`Const` over a pool the caller already knows, or a capability's own ranking); a
+**stage** appends a dimension (:class:`Annotate`, :class:`Balance`); :class:`Folded` says
+how the key is read; :class:`Sort` and :class:`Max` order or cut. :class:`FirstMatch`
+picks between whole alternatives -- ask each in order, take the first answer -- and checks
+its links agree on one subject at construction, since a chain hands *one* subject to
+every link. Every combinator hands the subject down untouched and takes it off what it
+holds, which is why one :class:`Balance` annotates a ranking over keys and one over an
+application's own candidates alike.
 
-A stage appends behind whatever the stages before it left and orders nothing itself, so
-a fold still reads what each earlier one measured. Behind a ranking that keyed nothing
-it is the whole of the order, which is how a bare pool is ranked by one reading alone.
+A stage measures from the view and the subject alone: it appends behind whatever the
+stages before it left, reads no key and names no source, so a fold still reads what each
+earlier one measured, and behind a ranking that keyed nothing one reading is the whole of
+the order. Two rankings combined into one answer is a **plane's** job, not a chain's: it
+does the join and hands the result down as part of the subject.
 
 Narrowing an answer is not a composition of selectors in this package: a test an
 application owns is applied to the ranking it was given, by whoever has both
@@ -75,7 +80,7 @@ __all__ = [
     "Ready", "Dims", "Fold", "Readings", "Selection", "prefer", "DecisionLog",
     "declared",
     "declares", "Selector", "KeySelector", "NaiveKeySelector",
-    "FirstMatch", "Balance",
+    "FirstMatch", "Const", "Annotate", "Balance", "Folded", "Sort", "Max",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -101,8 +106,8 @@ Dims = Tuple[Any, ...]
 #: How a caller blends one source's dimensions into the single comparable a fold
 #: orders by: ``dims -> comparable``, lower still better. Positional, so a fold reads
 #: ``dims[1]`` and a chain missing that stage raises instead of quietly comparing the
-#: wrong number. ``None`` at a fold is the lexicographic default, which needs no
-#: arithmetic at all (:meth:`Selection.sort`).
+#: wrong number. ``None`` is the lexicographic default, which needs no arithmetic at all
+#: (:class:`Sort`).
 Fold = Callable[[Dims], Any]
 
 #: What one stage appends (:meth:`Selection.annotated`): a reading per source, either
@@ -115,10 +120,9 @@ class Selection:
     """Sources for one subject, what orders them, and when they become usable.
 
     A stage annotates and does not order: it appends to :attr:`key` and leaves
-    :attr:`sources` however it built them. Whoever answers folds -- :meth:`sort` or
-    :meth:`max` -- and there is no flag saying which of the two has happened: a
-    selection's order is whatever its producer left, so a caller that needs one asks
-    for it.
+    :attr:`sources` however it built them. Only :class:`Sort` and :class:`Max` order one,
+    and there is no flag saying that either has: a selection's order is whatever its
+    producer left.
 
     Args:
         sources: volume ids. ``None`` -- the default -- means *every holder, in
@@ -133,11 +137,11 @@ class Selection:
         ready: optional gate, for a selector that routes a requester to a peer which
             has not registered yet. Spent by :meth:`settled` before the answer
             travels, never handed to whoever asked.
-        fold: how to read :attr:`key`, from the stage that knows both the dimensions
-            there are and what they mean together -- so a caller folds without being
-            told how (:meth:`sort`, :meth:`max`), and two callers of one ranking cannot
-            fold it two different ways. ``None`` compares the dimensions as they stand.
-            A closure, so :meth:`settled` drops it as it drops the gate.
+        fold: how to read :attr:`key`, stamped by the link that knows both the dimensions
+            there are and what they mean together (:class:`Folded`) -- so nothing that
+            orders this names a fold, and two callers of one ranking cannot fold it two
+            different ways. ``None`` compares the dimensions as they stand. A closure, so
+            :meth:`settled` drops it as it drops the gate.
     """
 
     sources: Optional[Tuple[VolumeId, ...]] = None
@@ -170,7 +174,7 @@ class Selection:
     ) -> "Selection":
         """``(id, dims)`` pairs: what orders each source, from one sequence.
 
-        The sequence's own order is not a ranking -- :meth:`sort` and :meth:`max` read
+        The sequence's own order is not a ranking -- :class:`Sort` and :class:`Max` read
         the dimensions.
         """
         return cls(
@@ -193,7 +197,7 @@ class Selection:
     def annotated(self, readings: "Readings") -> "Selection":
         """This selection with one reading per source appended as a further dimension.
 
-        What a stage that measures rather than ranks does (:class:`Balance`). Appended
+        What a stage that measures rather than ranks does (:class:`Annotate`). Appended
         behind what the stages before it left, never in place of it, so every fold
         reads a position that does not move.
 
@@ -209,46 +213,6 @@ class Selection:
             source: (*(self.key or {}).get(source, ()), read(source))
             for source in (self.sources or ())
         })
-
-    def _ranked(self, fold: Optional[Fold]) -> Optional[Tuple[VolumeId, ...]]:
-        """These sources best-first, or ``None`` if nothing here says what best is.
-
-        ``fold`` blends one source's dimensions into the comparable to order by, and
-        defaults to the one the answer carries (:attr:`fold`); with neither they are
-        compared as they stand, which is lexicographic over the stages in the order
-        they annotated. Either way the id is the last thing compared, here and nowhere
-        else, so the order is total whatever the stages keyed on and a run reproduces.
-        """
-        if not self.sources or self.key is None:
-            return None
-        fold = fold if fold is not None else self.fold
-        if fold is None:
-            return tuple(sorted(self.sources, key=lambda s: (*self.key[s], s)))
-        return tuple(sorted(self.sources, key=lambda s: (fold(self.key[s]), s)))
-
-    def sort(self, fold: Optional[Fold] = None) -> "Selection":
-        """This selection ordered best-first -- a **new** one, this being frozen.
-
-        Folded by whatever it carries unless a caller says otherwise.
-
-        Both empties pass through, as does a selection no stage keyed: the order a
-        producer left is the answer when there is nothing to beat it.
-        """
-        ranked = self._ranked(fold)
-        return self if ranked is None else self.only(ranked)
-
-    def max(self, fold: Optional[Fold] = None) -> "Selection":
-        """The single best source, with its key and the gate.
-
-        Folded by whatever it carries unless a caller says otherwise.
-
-        What a plane naming one source folds to, and it is still a selection so
-        :meth:`settled` can be spent on it afterwards. Both empties pass through.
-        """
-        if not self.sources:
-            return self
-        ranked = self._ranked(fold)
-        return self.only((ranked or self.sources)[:1])
 
     async def wait(self) -> None:
         """Block until the chosen sources are usable (returns at once if ready)."""
@@ -273,8 +237,8 @@ class Selection:
     def head(self) -> Optional[VolumeId]:
         """The leading source, or ``None`` if this names none in particular.
 
-        The id a caller acts on, and the *best* source once this has been folded
-        (:meth:`sort`, :meth:`max`); what the winning stage measured is
+        The id a caller acts on, and the *best* source once this has been ordered
+        (:class:`Sort`, :class:`Max`); what the winning stage measured is
         ``key[head]``. ``None`` for both empties, which a caller reading the head cannot
         tell apart and does not need to: neither one names a source to act on.
         """
@@ -312,8 +276,8 @@ class Selection:
         All or nothing: filtering the head out would **promote** the source behind it,
         and a ranking need not be in the order ``ok`` measures -- the sources behind the
         head are the ones the ranking preferred *less*, so promoting one on a raw
-        measurement would overrule it from outside. Which is why a caller folds first
-        (:meth:`sort`, :meth:`max`): on an unfolded selection the head this judges is
+        measurement would overrule it from outside. Which is why a ranking is ordered
+        first (:class:`Sort`, :class:`Max`): unordered, the head this judges is
         the producer's build order and nothing more. An abstention is returned
         unchanged, since there is no head to judge.
 
@@ -566,7 +530,97 @@ class FirstMatch(Selector[_S]):
         return Selection.of([])
 
 
-class Balance(Selector[_S]):
+class Const(Selector[Any]):
+    """One fixed :class:`Selection`, whatever the subject.
+
+    The base of a chain over a pool the caller already knows -- the constant function,
+    not the identity: the subject reaches the stages above this and never this.
+    """
+
+    name = "const"
+
+    def __init__(self, selection: Selection) -> None:
+        self.selection = selection
+
+    async def select(self, subject: Any, requester: str) -> Selection:
+        return self.selection
+
+
+class _Link(Selector[_S]):
+    """What every combinator over exactly one ranking shares.
+
+    The subject is read off that ranking rather than declared, so a wrapped ranking is a
+    chain link exactly where the ranking under it would be (:class:`FirstMatch`), and the
+    ranking is wired to the view its own header declared (:func:`declared`) -- reachable
+    only because ``senses`` is declared together with the ranking's own reads
+    (:func:`declares`).
+    """
+
+    def __init__(self, ranking: Selector[_S], senses: Sequence[type] = ()) -> None:
+        self.ranking = ranking
+        self.subject_type = ranking.subject_type
+        self.sensors = declares(senses, ranking)
+
+    def attach(self: _Sel, view: Any) -> _Sel:
+        """Sense through ``view``, and hand the ranking the view it declared."""
+        super().attach(view)
+        self.ranking.attach(declared(view, self.ranking))
+        return self
+
+
+class Annotate(_Link[_S]):
+    """One ranking with a further dimension appended: what ``readings`` measured.
+
+    Args:
+        ranking: the selector asked. Its own dimensions ride through untouched, so a fold
+            reads what it measured beside this one; behind one that keyed nothing, this
+            reading is the whole of the order.
+        readings: ``(view, subject) -> Readings`` -- the measure, taken once per answer
+            (:meth:`Selection.annotated`). A callable because a reading does not exist
+            until there is a subject to take it of and a view to take it through.
+        senses: the views ``readings`` reads, declared beside the ranking's.
+    """
+
+    name = "annotate"
+
+    def __init__(
+        self,
+        ranking: Selector[_S],
+        readings: Callable[[Any, _S], Readings],
+        senses: Sequence[type] = (),
+    ) -> None:
+        super().__init__(ranking, senses)
+        self.readings = readings
+
+    async def select(self, subject: _S, requester: str) -> Selection:
+        """``ranking``'s answer with one reading per source appended to its key.
+
+        Every source is measured, not just whichever one leads, so a caller that folds
+        this and rejects the winner has the rest measured too. Nothing is ordered and
+        nothing is written.
+
+        An answer with no source to measure goes back untouched. Both empties qualify,
+        for the same reason and not by accident: an abstention names nobody, and the
+        default selection names every holder in directory order rather than any source in
+        particular.
+        """
+        ranked = await self.ranking.select(subject, requester)
+        if not ranked.sources:
+            return ranked
+        return ranked.annotated(self.readings(self.view, subject))
+
+
+def _load_at(view: Any, subject: Any) -> Readings:
+    """What each source has lately been sent (:class:`~proposed.view.LoadView`).
+
+    Read once per answer, with nothing awaited between the read and the dimension it
+    becomes, so no decision can land inside one answer. Absent is nothing sent.
+    """
+    load = view.load.named()
+    return lambda source: load.get(source, 0)
+
+
+class Balance(Annotate[_S]):
     """One ranking, annotated with how loaded each source it named is.
 
     Load spreading as a layer over *any* ranking that says what orders it, rather than
@@ -574,80 +628,91 @@ class Balance(Selector[_S]):
     the fold breaks its ties on, so every read goes to the same volume. This puts
     something that changes ahead of that tie-break.
 
-    What it senses, and nothing else: :class:`~proposed.view.LoadView`, whose
-    ``named()`` says what has lately been sent at each source. So this combinator holds
-    no tally of its own -- what it appends is an observation somebody else keeps, moved
-    by the decision that names a source and read here -- and what that number means is
-    stated once, on the view.
+    What it senses, and nothing else: :class:`~proposed.view.LoadView`, whose ``named()``
+    says what has lately been sent at each source. So this combinator holds no tally of
+    its own -- what it appends is an observation somebody else keeps, moved by the
+    decision that names a source -- and what that number means is stated once, on the
+    view.
 
-    **No arithmetic**, so there is nothing here for a caller to supply: it appends the
-    load as one more dimension (:meth:`Selection.annotated`) and whoever folds decides
-    what a busy source costs, which is the application's own trade -- blocks of prefix
-    run against reads routed at a host, seconds of link time against seconds of queue.
-    The base's dimensions ride through untouched, so a fold reads what the *base*
-    measured beside this one.
-
-    Over any subject, because the subject is handed to ``ranking`` untouched and never
-    read here -- one wrapper serves a ranking over keys and one over an application's
-    own candidates alike. Which subject it takes it reads off that ranking, so a
-    balanced ranking is a chain link exactly where the ranking under it would be
-    (:class:`FirstMatch`).
-
-    Determinism: the load is read once per ranking, with nothing awaited between the
-    read and the dimension it appends, so no fold can land inside one answer. Nothing
-    here reads a wall clock or an unseeded RNG, and nothing here decides an order at
-    all (:meth:`Selection.sort`).
+    **No arithmetic**, so there is nothing here for a caller to supply: whoever folds
+    decides what a busy source costs, which is the application's own trade -- blocks of
+    prefix run against reads routed at a host, seconds of link time against seconds of
+    queue (:class:`Folded`).
 
     Args:
-        ranking: the selector asked. Behind one that keyed nothing, the load is the
-            whole of the order -- which is how a bare pool is ranked by load alone.
-            What it senses is declared here too (:func:`declares`).
-        fold: how to read the key this leaves -- the ranking's own dimensions with the
-            load behind them -- stamped on the answer
-            (:attr:`Selection.fold`) rather than applied here, so every caller of one
-            ranking folds it the same way without being handed the arithmetic. This is
-            where it belongs because this is where both halves of the key exist.
-            ``None`` leaves the dimensions compared as they stand, which is the
-            ranking's own order with load breaking its ties.
+        ranking: the selector asked. Behind one that keyed nothing, the load is the whole
+            of the order -- which is how a bare pool is ranked by load alone.
     """
 
     name = "balance"
     sensors = (LoadView,)
 
-    def __init__(
-        self, ranking: Selector[_S], fold: Optional[Fold] = None
-    ) -> None:
-        self.ranking = ranking
-        self.fold = fold
-        #: What it annotates, which is what it takes: the subject is not this
-        #: combinator's, so it is read off the ranking rather than declared.
-        self.subject_type = ranking.subject_type
-        #: Load, and whatever the ranking senses (:func:`declares`).
-        self.sensors = declares((LoadView,), ranking)
+    def __init__(self, ranking: Selector[_S]) -> None:
+        super().__init__(ranking, _load_at, senses=(LoadView,))
 
-    def attach(self, view: Any) -> "Balance[_S]":
-        """Sense through ``view``, and hand the ranking the view it declared."""
-        super().attach(view)
-        self.ranking.attach(declared(view, self.ranking))
-        return self
+
+class Folded(_Link[_S]):
+    """One ranking's answer with ``fold`` stamped on it (:attr:`Selection.fold`).
+
+    Declared where both halves of the key exist -- the dimensions there are, and what
+    they mean together -- so nothing that orders the answer names a fold and two callers
+    of one ranking cannot fold it two different ways. ``None`` leaves the dimensions
+    compared as they stand.
+    """
+
+    name = "folded"
+
+    def __init__(self, ranking: Selector[_S], fold: Optional[Fold]) -> None:
+        super().__init__(ranking)
+        self.fold = fold
 
     async def select(self, subject: _S, requester: str) -> Selection:
-        """``ranking``'s answer with the load at each source appended to its key.
+        return replace(await self.ranking.select(subject, requester), fold=self.fold)
 
-        Every source is annotated, not just whichever one led, so a caller that folds
-        this and rejects the winner has the rest measured too. Nothing is ordered here
-        and nothing is written: the load is an observation, and what moves it is the
-        decision this answer is consulted for. The fold rides along, so folding is one
-        call whoever makes it.
 
-        An answer with no source to measure goes back untouched. Both empties qualify,
-        for the same reason and not by accident: an abstention names nobody, and the
-        default selection names every holder in directory order rather than any source
-        in particular.
-        """
-        ranked = await self.ranking.select(subject, requester)
-        if not ranked.sources:
-            return ranked
-        load = self.view.load.named()
-        annotated = ranked.annotated(lambda source: load.get(source, 0))
-        return annotated if self.fold is None else replace(annotated, fold=self.fold)
+def _ranked(selection: Selection) -> Optional[Tuple[VolumeId, ...]]:
+    """``selection``'s sources best-first, or ``None`` if nothing says what best is.
+
+    The fold it carries (:attr:`Selection.fold`) blends one source's dimensions into the
+    comparable to order by; with none they are compared as they stand, which is
+    lexicographic over the stages in the order they annotated. Either way the id is the
+    last thing compared, here and nowhere else, so the order is total whatever the stages
+    keyed on and a run reproduces.
+    """
+    if not selection.sources or selection.key is None:
+        return None
+    key, fold = selection.key, selection.fold
+    if fold is None:
+        return tuple(sorted(selection.sources, key=lambda s: (*key[s], s)))
+    return tuple(sorted(selection.sources, key=lambda s: (fold(key[s]), s)))
+
+
+class Sort(_Link[_S]):
+    """One ranking's answer, ordered best-first.
+
+    Both empties pass through, as does an answer no stage keyed: the order a producer
+    left is the answer when there is nothing to beat it.
+    """
+
+    name = "sort"
+
+    async def select(self, subject: _S, requester: str) -> Selection:
+        answer = await self.ranking.select(subject, requester)
+        ranked = _ranked(answer)
+        return answer if ranked is None else answer.only(ranked)
+
+
+class Max(_Link[_S]):
+    """The single best source of one ranking's answer, with its key and the gate.
+
+    What a chain naming one source ends in, and it is still a selection, so
+    :meth:`Selection.settled` can be spent on it afterwards. Both empties pass through.
+    """
+
+    name = "max"
+
+    async def select(self, subject: _S, requester: str) -> Selection:
+        answer = await self.ranking.select(subject, requester)
+        if not answer.sources:
+            return answer
+        return answer.only((_ranked(answer) or answer.sources)[:1])

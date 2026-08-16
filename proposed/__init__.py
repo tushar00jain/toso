@@ -16,13 +16,15 @@ simulator, ``proposed`` is the design being argued for.
   instead (which host prefills, which peer a prefix comes from). The default
   :class:`~proposed.selector.NaiveKeySelector` answers with the directory's own order,
   so preferring what it names changes nothing until a real one is written. It,
-  :func:`~proposed.selector.prefer` (what the store does with a preference), the two
-  combinators -- :class:`~proposed.selector.FirstMatch` (try key selectors in order)
-  and :class:`~proposed.selector.Balance` (annotate any one ranking with the load on
-  the sources it named, for whoever folds it) -- and the
-  :class:`~proposed.selector.Selector` base they are typed on are reached through the
-  module rather than re-exported here: what a deployment has to *implement* is the
-  store's own subject above.
+  :func:`~proposed.selector.prefer` (what the store does with a preference), the
+  combinators a decision is declared out of -- :class:`~proposed.selector.FirstMatch`
+  (try selectors in order), :class:`~proposed.selector.Annotate` and its
+  :class:`~proposed.selector.Balance` (append a dimension),
+  :class:`~proposed.selector.Folded` (say how the key is read) and
+  :class:`~proposed.selector.Sort` / :class:`~proposed.selector.Max` (order or cut) --
+  and the :class:`~proposed.selector.Selector` base they are typed on are reached
+  through the module rather than re-exported here: what a deployment has to *implement*
+  is the store's own subject above.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
   directory surface a caller reaches (torchstore names this type but never declares
   it: ``api.py`` annotates the spawned handle as the actor class and ``LocalClient``

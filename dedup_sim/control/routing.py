@@ -17,7 +17,9 @@ from __future__ import annotations
 from typing import Any, Optional, Sequence
 
 from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
-from proposed.selector import Balance, Dims, FirstMatch, Fold, NaiveKeySelector
+from proposed.selector import (
+    Balance, Dims, FirstMatch, Fold, Folded, NaiveKeySelector, Selector, Sort,
+)
 
 from ._answer import committed
 from ._selector import Candidates, CHAIN, SPREAD
@@ -70,15 +72,14 @@ class Dedup(ControlPlane):
         self._cap = fanout_cap
         self._fabric = SPREAD if spread else CHAIN
         #: How the chain's key is read, stamped on its answers by the
-        #: :class:`~proposed.selector.Balance` that appends the last dimension of it,
-        #: so :meth:`_decide` folds without naming one. ``None`` -- the chain preset --
-        #: compares the dimensions as they stand.
+        #: :class:`~proposed.selector.Folded` link :meth:`attach` declares. ``None`` --
+        #: the chain preset -- compares the dimensions as they stand.
         self._fold: Optional[Fold] = _soonest if spread else None
         self._trace = trace
         # All built in attach(), where the ports the chain senses through arrive.
         self.view: Optional[DedupView] = None
         self.dispatcher: Optional[Dispatcher] = None
-        self._chain: Optional[FirstMatch] = None
+        self._chain: Optional[Selector[Sequence[Key]]] = None
 
     def attach(self, view: Any) -> None:
         """Compose this plane's one sensor, and attach the chain that senses it.
@@ -96,23 +97,28 @@ class Dedup(ControlPlane):
         as its reducer: what a landed put moves is this plane's own state, so this is
         what knows to fold it.
 
-        The chain is two links and the second is a tail: one ranking over every volume
-        that could serve the read (:class:`~dedup_sim.control._selector.Candidates`)
-        under a :class:`~proposed.selector.Balance` that appends the readers already
-        routed at each source, and a :class:`~proposed.selector.NaiveKeySelector`
-        behind it so an unroutable ask is the directory's own answer rather than a
-        hole. Holders and peers are priced together rather than asked in turn, so which
-        one wins is arithmetic a caller can read off the score instead of an order it
-        has to know.
+        The whole decision is declared here. Two alternatives, the second a tail: one
+        ranking over every volume that could serve the read
+        (:class:`~dedup_sim.control._selector.Candidates`) under a
+        :class:`~proposed.selector.Balance` that appends the readers already routed at
+        each source, and a :class:`~proposed.selector.NaiveKeySelector` behind it so an
+        unroutable ask is the directory's own answer rather than a hole. Holders and peers
+        are priced together rather than asked in turn, so which one wins is arithmetic a
+        caller can read off the score instead of an order it has to know.
+
+        Ordered rather than cut to the winner (:class:`~proposed.selector.Max`), because
+        what a reader is handed is a preference and it reads down that list: a source the
+        ranking placed behind the head is what serves the read if the head has evicted the
+        key by the time the reader gets there (:func:`~proposed.selector.prefer`).
         """
         sensor = FanoutSensor(fanout_cap=self._cap)
         self.view = view.derived(DedupView, fanout=sensor, load=sensor)
         self.dispatcher = Dispatcher()
         self.dispatcher.compose(sensor)
-        self._chain = FirstMatch([
-            Balance(Candidates(self._fabric), self._fold),
+        self._chain = Sort(FirstMatch([
+            Folded(Balance(Candidates(self._fabric)), self._fold),
             NaiveKeySelector(),
-        ]).attach(self.view)
+        ])).attach(self.view)
 
     # -- what a reader asks -------------------------------------------------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection:
@@ -130,31 +136,25 @@ class Dedup(ControlPlane):
         return await (await self._decide(keys, requester)).settled()
 
     async def _decide(self, keys: Sequence[Key], requester: str) -> Selection:
-        """The whole decision, gate unspent: the chain's scores folded into an order,
-        then what is committed out of it.
+        """The whole decision, gate unspent: the chain's answer, then what is committed
+        out of it.
 
-        The fold is one call, and it is the only ordering in the decision: the chain
-        this plane built in :meth:`attach` keys each source ``(score, queued)`` -- the
-        seconds :class:`~dedup_sim.control._selector.Candidates` priced it at, then the
-        readers :class:`~proposed.selector.Balance` found already routed to it -- and
-        neither link sorts. Compared as they stand (the chain preset), the fabric
-        decides and the queue only settles a tie the score cannot: queueing behind a
-        peer is already in that peer's own wait, so charging it again would price one
-        delay twice, while two replicas of one key keep alternating rather than
-        reverting to id order. ``spread`` blends the two instead (:func:`_soonest`).
-
-        Ordered rather than cut to the winner
-        (:meth:`~proposed.selector.Selection.max`), because what a reader is handed is a
-        preference and it reads down that list: a source the ranking placed behind the
-        head is what serves the read if the head has evicted the key by the time the
-        reader gets there (:func:`~proposed.selector.prefer`).
+        The chain this plane declared in :meth:`attach` keys each source
+        ``(score, queued)`` -- the seconds
+        :class:`~dedup_sim.control._selector.Candidates` priced it at, then the readers
+        :class:`~proposed.selector.Balance` found already routed to it. Compared as they
+        stand (the chain preset), the fabric decides and the queue only settles a tie the
+        score cannot: queueing behind a peer is already in that peer's own wait, so
+        charging it again would price one delay twice, while two replicas of one key keep
+        alternating rather than reverting to id order. ``spread`` blends the two instead
+        (:func:`_soonest`).
 
         Separate from :meth:`sources` only because the gate is the answer's last step
         and not part of forming it: this is what a caller inspecting a decision it is
         not going to read from can await without parking on a peer's read-through.
         """
         keys = list(keys)
-        ranking = (await self._chain.select(keys, requester)).sort()
+        ranking = await self._chain.select(keys, requester)
         return committed(
             self.view, self.dispatcher, keys, requester, ranking, self._trace
         )

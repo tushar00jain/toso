@@ -237,10 +237,11 @@ directory read is control -- it does neither.
 kvcache_sim/
   control/                # DECIDES -- moves nothing, holds no client
     scheduler.py          #   ONE scheduler behind proposed.ControlPlane, the
-                          #   port the data plane calls: prefill placement,
-                          #   pull-vs-recompute, SLO gates, decode placement,
-                          #   every one of them priced against the cluster
-                          #   sensor below. LoadBalance (baseline) and
+                          #   port the data plane calls: it declares the four
+                          #   chains a decision is made of out of the links
+                          #   below, joins the two that meet, and admits --
+                          #   every one of them against the cluster sensor
+                          #   below. LoadBalance (baseline) and
                           #   CacheAware are presets of it -- one choice each
                           #   on the reuse ranking below and on the fold that
                           #   orders the prefill pool, and admission as two
@@ -260,12 +261,14 @@ kvcache_sim/
                           #   proposed.selector.Balance can spread reads over
                           #   equally good replicas, by_prefix_and_load being
                           #   the fold that reads the two dimensions that
-                          #   leaves), LocalOnly, and RoutedPull answering a
-                          #   fetch with the pull already priced for it. A
-                          #   ranking is a selector; an SLO gate and a cost are
-                          #   not --
-                          #   nor is the prefill order, which is the
-                          #   scheduler's own fold over the pool it keyed
+                          #   leaves), LocalOnly, RoutedPull answering a
+                          #   fetch with the pull already priced for it, Priced
+                          #   keying each prefill candidate at what running the
+                          #   request there costs, and DecodeBatch keying the
+                          #   decode hosts at the batch a plan's completion
+                          #   would meet on each. A ranking is a selector,
+                          #   whether it names peers or prices a pool; a
+                          #   verdict -- an SLO gate -- is not
     _sensor/              #   one sensor per kind of fact this plane holds
       _action.py          #     the four actions that move them, each a
                           #     proposed.dispatch.Action: PrefillFinished,

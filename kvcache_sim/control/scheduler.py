@@ -14,7 +14,7 @@ boundary; one plane just reads its own sensor
 (:class:`~kvcache_sim.control._selector.RoutedPull`).
 
 Not a selector, because the decision is made of **two** selections and a selection
-holds one: the prefill hosts this scheduler priced, and the decode hosts it ranked
+holds one: the prefill hosts one chain priced, and the decode hosts another ranked
 against the winner among them. Both rankings are real, and neither leaves this plane --
 what does is the winner of each and the price of the one that won (:class:`Response`),
 since nothing outside asks what lost. A refusal (an SLO miss) is ``None``.
@@ -33,8 +33,8 @@ drops its own coldest keys and tells the directory afterwards
 
 Both names are *presets* of one scheduler, each one choice on each of its two axes --
 reuse, a selector (:mod:`kvcache_sim.control._selector`, where every ranking a decision
-here makes lives), and the winner, the fold that orders the pool this plane keyed
-itself; neither reachable from outside this plane:
+here makes lives), and the winner, the fold the prefill chain is stamped with; neither
+reachable from outside this plane:
 
 * ``LoadBalanceScheduler`` (baseline, ~vLLM) = never pull, least-loaded instance:
   reuse only that instance's **local** cache, whatever a peer may hold.
@@ -78,27 +78,30 @@ each move the executed cost off it.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from proposed import (
-    ControlPlane, Dispatcher, Endpoint, Key, KeySelector, Selection,
+    ControlPlane, Dispatcher, Endpoint, Key, Selection,
 )
-from proposed.selector import Balance, Dims, FirstMatch, Selector
+from proposed.selector import (
+    Annotate, Balance, declared, Dims, FirstMatch, Folded, Max, Readings, Selector,
+    Sort,
+)
 
 from domain import (
     DEFAULT_MODEL, DEFAULT_PROFILE, decode_step_time, MachineProfile, Model,
-    prefill_time,
 )
 
 from ._answer import Plan, Response
 from ._selector import (
-    by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, RoutedPull,
+    by_prefix_and_load, DecodeBatch, LocalOnly, LongestPrefixKeySelector, PrefillAsk,
+    Priced, RoutedPull,
 )
 from ._sensor import (
     ClusterSensor, Committed, ComputeBusy, DecodeState, PrefillFinished,
     ReservationSensor, RoutedPullSensor, SourceLoad,
 )
-from ._view import KVView
+from ._view import ClusterView, KVView
 from .request import Request
 
 __all__ = [
@@ -127,53 +130,36 @@ def _predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
     return simulate_decode and early_rejection == "predict"
 
 
-# -- pull or recompute: a test the reuse ranking's head is held to ----------- #
-
-
-def _worth_pulling(
-    counts: Dict[str, int], inst: str, threshold: float
-) -> Callable[[str], bool]:
-    """Does pulling the head's prefix beat recomputing the gap on ``inst``?
-
-    Its run must be more than ``threshold`` times ``inst``'s own -- the balancing
-    threshold. A pull is charged to the prefill instance's queue, so one that saves
-    little compute still costs the whole wait, and without the threshold every request
-    would chase the longest match onto one instance.
-
-    A test for :meth:`~proposed.selector.Selection.require`, which is what makes it a
-    test of the *head* and not a filter: see there for why the whole ranking goes.
-    """
-    return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
-
-
 def _source_ranking(name: str) -> Selector[Sequence[Key]]:
     """Which peers may serve a prefix, by name -- a fresh one every call.
 
-    ``"spread"`` is the same ranking under a :class:`~proposed.selector.Balance`,
-    carrying the fold that weighs a busy holder against a long match, so every caller
-    of it folds the same way and none of them names a fold.
+    ``"spread"`` is the same ranking under a :class:`~proposed.selector.Balance`, stamped
+    with the fold that weighs a busy holder against a long match, so both chains this
+    goes into fold it the same way and neither names a fold.
     """
     if name == "prefix":
         return LongestPrefixKeySelector()
     if name == "spread":
-        return Balance(LongestPrefixKeySelector(), by_prefix_and_load())
+        return Folded(Balance(LongestPrefixKeySelector()), by_prefix_and_load())
     raise ValueError(
         f"unknown source ranking {name!r}: the choice is 'prefix' or 'spread'"
     )
 
 
 # -- the two winner folds: what each preset compares of a priced pool ------- #
-# Both read the pool :meth:`_Scheduler._select_prefill` keys, and each names the number
-# it orders by, so a plan carries no order of its own and neither preset can pick up the
-# other's (:class:`Plan`).
+# Named here, where the chain that keys that pool is declared (:meth:`_Scheduler.attach`),
+# because a fold reads its dimensions by position and only the chain says how many there
+# are: the plan :class:`~kvcache_sim.control._selector.Priced` appends, and behind it the
+# queue :func:`_queues` appends for one preset alone. Each names the number it orders by,
+# so a plan carries no order of its own and neither preset can pick up the other's
+# (:class:`Plan`).
 
 
 def _by_ttft(dims: Dims) -> float:
     """The cache-aware fold: the whole predicted queue + transfer + prefill.
 
     Why reuse is *priced* rather than preferred: a longer match on a busier instance
-    can still lose. Read off the plan in the leading dimension, which is the plan the
-    caller of this fold priced.
+    can still lose. Read off the plan in the leading dimension.
     """
     return dims[0].ttft
 
@@ -190,8 +176,13 @@ def _by_queue(dims: Dims) -> float:
     return dims[1]
 
 
+def _queues(view: ClusterView, ask: PrefillAsk) -> Readings:
+    """The queue each candidate would join, the dimension :func:`_by_queue` reads."""
+    return view.cluster.busy_until
+
+
 class _Scheduler(ControlPlane):
-    """The pricing, ranking and admission both schedulers share.
+    """The chains, the join and the admission both schedulers share.
 
     A :class:`~proposed.plane.ControlPlane` and nothing more specific: a serving host
     asks it as a service, and its two members (:meth:`decide`, :meth:`sources`) are
@@ -209,14 +200,14 @@ class _Scheduler(ControlPlane):
             answer :meth:`decide` gives. ``reuse`` is a ranking, attached in
             :meth:`attach`: the peers a candidate may pull from -- ``"peers"``, which
             is the ``source`` ranking itself, or ``"none"``, which names nobody; what a
-            peer is *worth* to one candidate is this scheduler's to work out, off the
-            snapshot it read itself (:meth:`_priced_reuse`), so a stage annotating the
-            axis cannot move a price this scheduler compares. ``rank`` is a fold and
-            not a ranking, over the pool this scheduler keyed itself -- ``"ttft"`` by
+            peer is *worth* to one candidate is the pricing stage's to work out
+            (:class:`~kvcache_sim.control._selector.Priced`), so a stage annotating the
+            axis cannot move a price the prefill chain compares. ``rank`` is a fold and
+            not a ranking, over the pool the prefill chain keys -- ``"ttft"`` by
             predicted time to first token (:func:`_by_ttft`), ``"load"`` by what each
             host is already serving (:func:`_by_queue`).
         balance_threshold: how much longer the head's prefix run must be than a
-            candidate's own before pulling beats recomputing (:func:`_worth_pulling`).
+            candidate's own before pulling beats recomputing, handed to that stage.
             Unread when ``reuse`` names nobody.
         source: which holders of a prefix :meth:`sources` answers a fetch with, behind
             the pull it already priced
@@ -224,9 +215,8 @@ class _Scheduler(ControlPlane):
             longest match first, or ``"spread"``, the same ranking
             under a :class:`~proposed.selector.Balance` so a host holding a hot prefix
             does not serve every read of it (:func:`_source_ranking`). The fold that
-            reads its dimensions rides on its answers, since the two have to agree on
-            how many there are, so neither place this ranking is folded names one
-            (:meth:`sources`, :meth:`_select_prefill`).
+            reads its dimensions is stamped on its answers, since the two have to agree
+            on how many there are, so neither of the two chains it goes into names one.
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
@@ -273,8 +263,10 @@ class _Scheduler(ControlPlane):
                 f"source ranking names or from nobody, so the choice is 'peers' or "
                 f"'none'"
             )
-        self._reuse = _source_ranking(source) if reuse == "peers" else LocalOnly()
-        self._fetch = FirstMatch([RoutedPull(), _source_ranking(source)])
+        self._reuse = Max(
+            _source_ranking(source) if reuse == "peers" else LocalOnly()
+        )
+        self._fetch = Sort(FirstMatch([RoutedPull(), _source_ranking(source)]))
         if rank not in ("ttft", "load"):
             raise ValueError(
                 f"unknown winner ranking {rank!r}: what orders the candidates this "
@@ -282,8 +274,8 @@ class _Scheduler(ControlPlane):
                 f"so the choice is 'ttft' or 'load'"
             )
         #: Which of the two folds orders the prefill pool, and with it whether a queue
-        #: dimension is appended for that fold to read -- one name, read in the one
-        #: place both happen (:meth:`_select_prefill`).
+        #: dimension is appended for that fold to read -- one name, spent in the one
+        #: place both happen, the wiring (:meth:`attach`).
         self._rank = rank
         # Built rather than named: not an axis (see the module it comes from).
         self._threshold = balance_threshold
@@ -324,8 +316,11 @@ class _Scheduler(ControlPlane):
         # The caller's argument, not this plane's sensor: attach() spends it composing
         # the view and clears it, so the sensor has one reference here either way.
         self._supplied_cluster: Optional[ClusterSensor] = cluster
-        # All built in attach(), where the sensors they read exist.
+        # All built in attach(), where the sensors they read and the pools they rank
+        # exist.
         self.view: Optional[KVView] = None
+        self._prefill: Optional[Selector[PrefillAsk]] = None
+        self._decode: Optional[Selector[Plan]] = None
         #: :attr:`~proposed.plane.ControlPlane.dispatcher` -- where a host's facts
         #: arrive, and the only thing that writes any sensor here. The run harvests it
         #: after :meth:`attach` to put a service in front of.
@@ -338,12 +333,17 @@ class _Scheduler(ControlPlane):
         Two-phase so a scenario can declare a control plane as an object
         (``MyControl(knobs)``) and let the run hand it the stack afterwards.
 
+        Where all four of this plane's decisions are **declared**, as the chains they
+        are: which peer a pull comes from, which peer serves a fetch, which host prefills,
+        which host decodes. Two of them need a pool this method resolves, and the winner
+        axis is spent here rather than at select time.
+
         The view is composed into a :class:`~kvcache_sim.control._view.KVView` here,
         with the reads this capability's decisions make: prefix runs, the cluster
         sensor, the prefills this plane promised, and the pulls it priced. None of the
         four is the store's notion, so the run supplies none of them. Everything
-        downstream then senses one view -- both axes, the fetch chain -- and nothing is
-        handed a sensor to read.
+        downstream then senses one view -- every chain above -- and nothing is handed a
+        sensor to read.
 
         The run's one :class:`~kvcache_sim.control._sensor.ClusterSensor` is built
         here unless a caller made it first (``cluster``): this is where the
@@ -391,14 +391,37 @@ class _Scheduler(ControlPlane):
         self.decode_ids = (
             sorted(self._decode_pool) if self._decode_pool else self.ids
         )
+        self._decode = Sort(DecodeBatch(
+            self.decode_ids,
+            tbt_enabled=self.tbt_enabled,
+            lookahead=self._lookahead,
+            profile=self.profile,
+            model=self.model,
+        ))
+        priced = Priced(
+            self.prefill_ids,
+            block_tokens=self.B,
+            profile=self.profile,
+            model=self.model,
+            threshold=self._threshold,
+        )
+        if self._rank == "load":
+            # The queue dimension goes on only where that fold reads it: compared as
+            # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
+            # id, and two idle instances holding no prefix do price identically.
+            self._prefill = Sort(Folded(
+                Annotate(priced, _queues, senses=(ClusterView,)), _by_queue
+            ))
+        else:
+            self._prefill = Sort(Folded(priced, _by_ttft))
         # Every ranking senses the view its own header declares
         # (:attr:`~proposed.selector.Selector.sensors`), composed out of the KVView
         # above. Each such subset shares that view's pin
         # (:meth:`~proposed.view.View.subset`), so a ranking consulted inside a routing
         # decision reads the snapshot the decision pinned rather than past it into the
         # live directory.
-        for ranking in (self._fetch, self._reuse):
-            ranking.attach(self.view.subset(*ranking.sensors))
+        for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
+            ranking.attach(declared(self.view, ranking))
 
     # -- what a serving host asks, at the two moments it has a question ------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection:
@@ -411,18 +434,17 @@ class _Scheduler(ControlPlane):
         abstention rule rather than an ``if`` here. ``Selection.of([])`` names nobody,
         which leaves the read to the directory's own order.
 
-        Folded here, by whatever the answer carries, because the links only key what
-        they name: a
-        chain answering with the memo names one peer and has nothing to order, while the
-        ranking behind it keys every holder of the prefix and the caller reads down what
-        this returns (:func:`~proposed.selector.prefer`).
+        Ordered by the chain's own :class:`~proposed.selector.Sort`, by whatever fold the
+        answer carries, because the links only key what they name: a chain answering with
+        the memo names one peer and has nothing to order, while the ranking behind it keys
+        every holder of the prefix and the caller reads down what this returns
+        (:func:`~proposed.selector.prefer`).
 
         Settled before it travels, like any answer this plane gives: neither link
         gates, so there is nothing to wait for, and saying so here is what keeps that
         a property of the ranking rather than of the caller.
         """
-        ranked = (await self._fetch.select(list(keys), requester)).sort()
-        return await ranked.settled()
+        return await (await self._fetch.select(list(keys), requester)).settled()
 
     async def decide(self, request: Request, requester: str) -> Optional[Response]:
         """Where should ``request`` run? Both selections, or ``None`` if refused.
@@ -458,174 +480,49 @@ class _Scheduler(ControlPlane):
         # The winning plan, read once off the dimension it rides in: both halves of the
         # answer are formed against the same one.
         plan: Plan = prefill.key[prefill.head][0]
-        decode = self._select_decode(plan)
+        decode = await self._decode.select(plan, requester)
         return self._admit(request, requester, prefill, plan, decode)
 
     async def _select_prefill(self, request: Request, requester: str) -> Selection:
-        """Every prefill instance, priced and folded into an order, best first.
+        """Every prefill instance, priced and ordered by the chain, best first.
 
-        Each one's :class:`Plan` is the leading dimension of its key, so the answer says
-        what was compared as well as what won -- which is why the fold here is
-        :meth:`~proposed.selector.Selection.sort` and not
-        :meth:`~proposed.selector.Selection.max`.
+        This is the **join** the chain cannot do: the reuse chain is asked here and its
+        answer goes down as part of the subject
+        (:class:`~kvcache_sim.control._selector.PrefillAsk`), because a stage measures one
+        source and this is two rankings meeting.
+
+        Every instance comes back, each keyed at its own :class:`Plan`, which is why that
+        chain ends in a :class:`~proposed.selector.Sort` and not a
+        :class:`~proposed.selector.Max`: the answer says what was compared as well as what
+        won.
 
         Atomic: every read is off one pinned directory snapshot
         (:meth:`~proposed.view.View.pinned`) and one clock read, so the
         prices are comparable, and the bookkeeping it writes needs nothing locked.
-        Pricing a candidate reserves nothing (:meth:`_candidate`), so the losers leave
-        no trace and the winner is chosen after the whole field is known. Both axes are
-        awaited inside the pin and neither suspends, so no second decision can enter it.
+        Nothing is reserved while pricing
+        (:class:`~kvcache_sim.control._selector.Priced`), so the winner is chosen after
+        the whole field is known. Both chains are awaited inside the pin and neither
+        suspends, so no second decision can enter it.
 
-        The reuse ranking is asked once, folded to its best peer once (by the fold its
-        own answer carries, which is why this and :meth:`sources` cannot read one
-        ranking two ways), and tested per
-        candidate: which peers hold this prefix is the same question whoever would
-        prefill it, and only the tests behind it -- is that peer me, is its run worth
-        the transfer -- read the candidate. Folded *before* any candidate is priced,
-        because each test is all-or-nothing on the head
-        (:meth:`~proposed.selector.Selection.require`) and the head of an unfolded answer
-        is whatever order the axis built it in.
-
-        The two winner axes are one dimension apart. Both key the pool at the plan and
-        both name what they compare of it -- the predicted TTFT (:func:`_by_ttft`), or
-        the queue each candidate would join, which the baseline appends first
-        (:func:`_by_queue`). The queue dimension goes on only where that fold reads it:
-        compared as they stand ``(plan, busy)`` would break a TTFT tie by load rather
-        than by id, and two idle instances holding no prefix do price identically.
-
-        Priced as the dimension is appended (:meth:`~proposed.selector.Selection.annotated`
-        takes the measure, not a mapping of it), so the pool is walked once.
+        The reuse chain is asked once and tested per candidate: which peers hold this
+        prefix is the same question whoever would prefill it, and only the tests behind it
+        -- is that peer me, is its run worth the transfer -- read the candidate.
         """
         now = self.view.now()
         keys = list(request.block_keys)
         with self.view.pinned(keys):
-            counts = self.view.prefix_lengths(keys)
-            best = (await self._reuse.select(keys, requester)).max()
+            return await self._prefill.select(
+                PrefillAsk(
+                    request=request,
+                    now=now,
+                    keys=keys,
+                    counts=self.view.prefix_lengths(keys),
+                    peer=await self._reuse.select(keys, requester),
+                ),
+                requester,
+            )
 
-            def priced(inst: str) -> Plan:
-                # A host is not its own peer, and a peer is only worth the transfer if
-                # it holds materially more than this candidate already does.
-                peer = (
-                    best
-                    .require(lambda head, me=inst: head != me)
-                    .require(_worth_pulling(counts, inst, self._threshold))
-                )
-                match, src, pull = self._priced_reuse(counts, keys, inst, peer)
-                return self._candidate(
-                    request, inst, now, match=match, source=src, pull_keys=pull
-                )
-
-            pool = Selection.of(self.prefill_ids).annotated(priced)
-            if self._rank == "load":
-                queued = pool.annotated(self.view.cluster.busy_until)
-                return queued.sort(_by_queue)
-            return pool.sort(_by_ttft)
-
-    @staticmethod
-    def _priced_reuse(
-        counts: Dict[str, int], keys: Sequence[Key], inst: str,
-        peer: Selection,
-    ) -> Tuple[int, Optional[str], Sequence[str]]:
-        """What one peer buys ``inst``: ``(match, source, pull_keys)``.
-
-        Derived here and not in the selector, because ranking peers is where a
-        selector's job ends: how much of this prompt that peer's prefix covers is
-        arithmetic over the snapshot this scheduler already read. A selection naming
-        nobody -- a test having dropped the ranking -- leaves the local match to
-        recompute from.
-        """
-        local = counts.get(inst, 0)
-        src = peer.head
-        if src is None or src == inst:
-            return local, None, ()
-        return counts[src], src, keys[local:counts[src]]
-
-    # -- prediction (no mutation) ---------------------------------------- #
-    def _predict(self, inst: str, now: float, transfer_t: float, prefill_t: float):
-        """Return ``(queue_wait, ttft, done_time)`` without reserving the server."""
-        avail = max(now, self.view.cluster.busy_until[inst])
-        queue_wait = avail - now
-        done = avail + transfer_t + prefill_t
-        return queue_wait, done - now, done
-
-    def _candidate(
-        self,
-        request: Request,
-        inst: str,
-        now: float,
-        *,
-        match: int,
-        source: Optional[str] = None,
-        pull_keys: Sequence[str] = (),
-    ) -> Plan:
-        """Price prefilling ``request`` on ``inst`` reusing ``match`` blocks.
-
-        Reserves nothing and mutates nothing, so a losing candidate leaves no trace
-        (:class:`~kvcache_sim.control._sensor.Committed` records a decision actually
-        taken). Which candidate wins is the winner axis's business
-        (:meth:`_select_prefill`).
-        """
-        cached = min(match * self.B, request.prompt_tokens)
-        uncached = request.prompt_tokens - cached
-        prefill_t = prefill_time(uncached, self.profile, self.model)
-        if source is not None and pull_keys:
-            xbytes = self.model.block_bytes(len(pull_keys), self.B)
-            # The cost model the transport charges, so this prediction is what the
-            # real pull will cost.
-            transfer_t = self.view.transfer_cost(source, inst, xbytes)
-        else:
-            source, xbytes, transfer_t = None, 0, 0.0
-        queue_wait, ttft, done = self._predict(inst, now, transfer_t, prefill_t)
-        plan = Plan(
-            match, cached, uncached, source, xbytes, queue_wait, ttft, done,
-        )
-        plan.prefill_t = prefill_t
-        plan.transfer_t = transfer_t
-        plan.pull_keys = list(pull_keys)
-        return plan
-
-    # -- decode-side TBT prediction / admission -------------------------- #
-    def _predicted_batch(self, d: str, done_time: float) -> int:
-        """Predicted decode batch size on ``d`` seen by a request admitted at
-        ``done_time`` (its prefill completion). Drives TBT prediction.
-
-        The flag that picks between the two readings is the one that decided whether
-        the reservation sensor was composed at all (:func:`_predicts_decode`), so the
-        second reading finds one to read exactly when it takes it.
-        """
-        if not self.tbt_enabled:
-            return 0
-        if not self._lookahead:
-            return self.view.cluster.occupancy(d)
-        n = self.view.cluster.predict_occupancy(d, done_time)
-        # Requests whose prefill has not landed are invisible to the observed
-        # decode state; the outstanding reservations stand in for them.
-        for res in self.view.reserved.pending(self.view.now()):
-            if (
-                res.decode_id == d
-                and res.prefill_done <= done_time
-                and res.prefill_done
-                + max(0, res.output_tokens - 1)
-                * decode_step_time(1, self.profile, self.model)
-                > done_time
-            ):
-                n += 1
-        return n
-
-    def _select_decode(self, plan: Plan) -> Selection:
-        """Decode instances, each keyed at the batch a request admitted at ``plan``'s
-        completion is predicted to meet there -- smallest first, the id breaking a tie.
-
-        Every batch is predicted here, so keying them is the whole of what a ranking
-        would do and this is one expression instead. Nothing suspends in it, which is
-        why it is not a coroutine: the prefill side is, because it asks the reuse axis.
-        With decode unmodelled every candidate keys at zero and the tie-break is the
-        whole of the choice.
-        """
-        return Selection.of(self.decode_ids).annotated(
-            lambda d: self._predicted_batch(d, plan.done_time)
-        ).sort()
-
+    # -- admission -------------------------------------------------------- #
     def _admit(
         self,
         request: Request,
@@ -646,7 +543,7 @@ class _Scheduler(ControlPlane):
         """
         instance = decode.sources[0]
         # The decode answer keys the occupancy, which is what the TBT SLO is judged
-        # on (:meth:`_select_decode`).
+        # on (:class:`~kvcache_sim.control._selector.DecodeBatch`).
         batch = decode.key[instance][0]
         response = Response(
             prefill=prefill.sources[0],

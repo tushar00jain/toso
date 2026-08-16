@@ -21,7 +21,7 @@ from dedup_sim.control._selector import Candidates
 from dedup_sim.control._sensor import FanoutSensor
 from dedup_sim.control._view import DedupView
 from proposed import Endpoint
-from proposed.selector import Balance, FirstMatch
+from proposed.selector import Balance, FirstMatch, Sort
 from proposed.view import View
 
 
@@ -92,10 +92,10 @@ def test_the_ranking_still_senses_the_fanout_under_a_re_ranking():
     fanout.route("r0", "origin")                      # r0 is a peer, and owes W
     fanout.promise("r0", ["K"])
     ranking = Candidates()
-    chain = FirstMatch([Balance(ranking)])
+    chain = Sort(FirstMatch([Balance(ranking)]))
     chain.attach(_view(_Holds("origin"), fanout=fanout, load=fanout))
 
     assert ranking.view.fanout is fanout
-    # Folded here, as the plane folds it: the ranking prices, the re-ranking appends,
-    # and neither orders (:meth:`proposed.selector.Selection.sort`).
-    assert asyncio.run(chain.select(["K"], "r1")).sort().sources == ("r0", "origin")
+    # Ordered by the chain's own last link, as the plane declares it: the ranking prices,
+    # the stage appends, and neither orders.
+    assert asyncio.run(chain.select(["K"], "r1")).sources == ("r0", "origin")

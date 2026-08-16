@@ -700,23 +700,29 @@ def check_selector_state(
     """Rule 7: a selector writes to ``self`` in ``__init__`` / ``attach`` and nowhere else.
 
     Read off the class statement rather than the type: anything whose bases name a
-    selector is one, which is what a reader sees too. Mutating a *sensor* the view
-    carries (``self.view.routed.claim(...)``) is the sanctioned way to remember, and is
-    not a write to the selector.
+    selector is one, which is what a reader sees too -- followed through the bases
+    declared in the same module, since a combinator may derive one of its neighbours
+    (``Balance`` is an ``Annotate``) and a rule reading only the immediate base would go
+    quiet on exactly those. Mutating a *sensor* the view carries
+    (``self.view.routed.claim(...)``) is the sanctioned way to remember, and is not a
+    write to the selector.
     """
     out: List[Violation] = []
     for rel in sorted(_module_map(root, pkgs).values()):
         if _is_test(".".join(rel.with_suffix("").parts)):
             continue
         tree = ast.parse((root / rel).read_text())
+        # In definition order, so a base declared above is already known to be one.
+        selectors: Set[str] = set()
         for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
             bases = {
                 getattr(b, "id", None) or getattr(b, "attr", None)
                 or getattr(getattr(b, "value", None), "id", None)
                 for b in cls.bases
             }
-            if not any(b and "Selector" in b for b in bases):
+            if not any(b and ("Selector" in b or b in selectors) for b in bases):
                 continue
+            selectors.add(cls.name)
             for fn in cls.body:
                 if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
