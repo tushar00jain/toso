@@ -45,7 +45,7 @@ from kvcache_sim.control.scheduler import (
     _by_queue, _by_ttft, _Scheduler,
 )
 from kvcache_sim.workload._serving import scheduler
-from kvcache_sim.workload._generator import _block_keys_for, make_workload
+from kvcache_sim.workload._generator import _extend, make_workload
 from kvcache_sim.tests._run import (
     run,
     run_disaggregation,
@@ -107,16 +107,16 @@ def _request(**kwargs) -> Request:
 
 # 1. Prefix-hash addressing: shared prefixes yield shared keys.
 def test_prefix_hash_chain_shares_prefix():
-    a = _block_keys_for("m0", [0, 1, 7, 9])
-    b = _block_keys_for("m0", [0, 1, 8])
+    a = _extend("m0", [0, 1, 7, 9])
+    b = _extend("m0", [0, 1, 8])
     assert a[:2] == b[:2]         # shared leading segments -> identical keys
     assert a[2] != b[2]           # divergence -> distinct keys
     # different model never aliases:
-    assert _block_keys_for("m1", [0, 1])[0] != _block_keys_for("m0", [0, 1])[0]
+    assert _extend("m1", [0, 1])[0] != _extend("m0", [0, 1])[0]
 
 
 def test_longest_prefix_run():
-    keys = _block_keys_for("m0", [0, 1, 2, 3])
+    keys = _extend("m0", [0, 1, 2, 3])
     present = {keys[0], keys[1], keys[3]}   # a gap at index 2
     assert _longest_prefix_run(keys, present) == 2   # stops at first miss
 
@@ -130,7 +130,7 @@ def test_longest_prefix_run():
 def test_a_request_refuses_a_prompt_that_is_not_the_length_it_claims():
     with pytest.raises(ValueError, match="prompt of 256"):
         Request(
-            id="r0", arrival=0.0, block_keys=_block_keys_for("m0", [0]),
+            id="r0", arrival=0.0, block_keys=_extend("m0", [0]),
             prompt_tokens=BLOCK_TOKENS, output_tokens=1,
             prompt=token_tensor(256),
         )
@@ -217,7 +217,7 @@ def test_the_conversation_stream_is_a_property_of_the_seed_alone():
 #     reason above: there is nothing in a meta token to hash.
 def test_continuation_keys_extend_the_chain_and_cannot_collide_with_a_prompt():
     request = _request(
-        id="r0", arrival=0.0, block_keys=_block_keys_for("m0", [0, 1]),
+        id="r0", arrival=0.0, block_keys=_extend("m0", [0, 1]),
         prompt_tokens=2 * BLOCK_TOKENS, output_tokens=64,
     )
     keys = request.continuation_keys(3)
@@ -273,7 +273,7 @@ async def _evict(deployment, inst: str, keys: list) -> None:
 
 def test_real_directory_prefix_presence_and_eviction():
     topo = _make_topology(2)
-    keys = _block_keys_for("m0", [0, 1, 2, 3])
+    keys = _extend("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
     store = KVStore(sim)
@@ -307,7 +307,7 @@ def test_real_directory_prefix_presence_and_eviction():
 #     inside the pin instead of walking the directory beside it.
 def test_a_pinned_view_serves_one_directory_read_and_releases_it():
     topo = _make_topology(2)
-    keys = _block_keys_for("m0", [0, 1, 2, 3])
+    keys = _extend("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
     store = KVStore(sim)
@@ -341,7 +341,7 @@ def test_a_pinned_view_serves_one_directory_read_and_releases_it():
 #     would charge the request for a reuse it did not get.
 def test_a_fetch_whose_block_vanished_raises_and_moves_nothing():
     topo = _make_topology(2)
-    keys = _block_keys_for("m0", [0, 1])
+    keys = _extend("m0", [0, 1])
 
     sim = Simulation(topo)
     store = KVStore(sim)
@@ -774,7 +774,7 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
         ledger=Metrics(),
     )
     store = KVStore(sim)
-    keys = list(_block_keys_for("m0", [0, 1]))
+    keys = list(_extend("m0", [0, 1]))
     request = _request(
         id="r0", arrival=0.0, block_keys=tuple(keys),
         prompt_tokens=2 * BLOCK_TOKENS, output_tokens=output_tokens,
@@ -1602,7 +1602,7 @@ def test_the_source_selector_accepts_a_plain_view():
 
     topo = _make_topology(2)
     sim = Simulation(topo)
-    keys = _block_keys_for("m0", [0, 1])
+    keys = _extend("m0", [0, 1])
     selector = LongestPrefixKeySelector()
     selector.attach(sim.view)
 
@@ -1643,7 +1643,7 @@ def _replicated(holders, blocks, *, num=4):
     uses, so the prefix runs the selector reads come out of the real directory.
     """
     sim = Simulation(_make_topology(num))
-    keys = _block_keys_for("m0", list(range(max(blocks.values()))))
+    keys = _extend("m0", list(range(max(blocks.values()))))
 
     async def fill():
         with sim.mesh.installed():
@@ -1859,7 +1859,7 @@ def test_one_answer_names_both_of_a_request_s_hosts():
     sim, sched = _scheduler()
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
-        block_keys=tuple(_block_keys_for("m0", [0, 1])),
+        block_keys=tuple(_extend("m0", [0, 1])),
     )
 
     async def scenario():
@@ -1935,7 +1935,7 @@ def test_a_refusal_is_a_decision_not_taken():
     sched.attach(sim.view)
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
-        block_keys=tuple(_block_keys_for("m0", [0, 1])),
+        block_keys=tuple(_extend("m0", [0, 1])),
     )
 
     async def scenario():
@@ -2075,7 +2075,7 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
     never asks it (:class:`~proposed.selector.KeySelector` is the claim it declines to
     make, not the subject it takes).
     """
-    sched = scheduler("cache_aware", _make_topology(2))
+    sched = scheduler("cache_aware")
     assert isinstance(sched, ControlPlane)
     assert not isinstance(sched, KeySelector)   # a plane is asked, not consulted
     assert {"decide", "sources"} <= set(dir(sched))
@@ -2103,7 +2103,7 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     sim, keys = _replicated(["s1"], {"s1": 2}, num=2)
     # Only s0 may prefill, so the prefix it needs is on the other host and a pull is
     # the cheaper half of the trade.
-    sched = scheduler("cache_aware", _make_topology(2), prefill_pool=["s0"])
+    sched = scheduler("cache_aware", prefill_pool=["s0"])
     sched.attach(sim.view)
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=BLOCK_TOKENS * len(keys), output_tokens=1,

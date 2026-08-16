@@ -43,7 +43,6 @@ class Plan:
     ttft: float                  # time-to-first-token (queue + transfer + prefill)
     done_time: float             # absolute sim time prefill completes
     prefill_t: float = 0.0       # prefill compute duration
-    transfer_t: float = 0.0      # predicted remote-pull fetch duration
     pull_keys: List[str] = field(default_factory=list)  # gap blocks to fetch
 
     @property
@@ -68,16 +67,15 @@ class Response:
     Args:
         prefill / decode: the two instances chosen, one from each selection.
         plan: what prefilling on ``prefill`` was priced at.
-        pred_batch / pred_tbt: the decode batch this request was predicted to meet
-            and the inter-token gap that implies. What the TBT SLO is applied to
+        pred_tbt: the inter-token gap the decode batch this request was predicted to
+            meet implies. What the TBT SLO is applied to
             (:meth:`~kvcache_sim.control.scheduler._Scheduler._admit`), which is why
-            they are here and not on the plan -- they are the decode side's.
+            it is here and not on the plan -- it is the decode side's.
     """
 
     prefill: VolumeId
     decode: VolumeId
     plan: Plan
-    pred_batch: int = 0
     pred_tbt: float = 0.0
 
 

@@ -167,7 +167,7 @@ from typing import List, Optional
 
 import torch
 
-from proposed import ControlPlane, DataPlane, Deployment, Dispatcher, routed
+from proposed import ControlPlane, DataPlane, Deployment, routed
 
 from ..control.scheduler import (
     ComputeBusy, DecodeState, Plan, PrefillFinished, Response,
@@ -208,10 +208,10 @@ class ServingHost(DataPlane):
     :meth:`decode`. Both answer with an *address* where the next thing happens
     somewhere else, so nothing here needs a way to reach another host.
 
-    A :class:`~proposed.plane.DataPlane`, so the three things it reaches -- the
-    store, the control plane it asks, the dispatcher it reports into -- arrive together
-    at :meth:`attach` off the one deployment that has them all, rather than being
-    plumbed in by whoever builds the hosts.
+    A :class:`~proposed.plane.DataPlane`, so everything it reaches -- the store, the
+    control plane it asks, the dispatcher it reports into -- arrives at :meth:`attach`
+    as the one deployment that has them all, rather than being plumbed in by whoever
+    builds the hosts.
 
     Args:
         me: this host's instance id -- the only one this object holds. A plan may
@@ -223,8 +223,8 @@ class ServingHost(DataPlane):
             or ``None`` if it does not prefill.
         decode: this host's :class:`~kvcache_sim.data._decode.DecodeEngine`, or
             ``None`` if it does not decode. Whether the two were handed the *same*
-            :class:`~kvcache_sim.data._compute.Accelerator` is whether they
-            contend -- see :attr:`coupled`.
+            :class:`~kvcache_sim.data._compute.Accelerator` is whether they contend,
+            and so whether this host reports its compute timeline at all.
         models_decode: whether this *run* models the request's second half at all.
             Not the same question as whether this host decodes: a prefill-only host
             in a disaggregated run has no decode engine, and its requests still go
@@ -242,37 +242,30 @@ class ServingHost(DataPlane):
         models_decode: bool = False,
     ) -> None:
         self.me = me
-        # Filled by attach(): none of the three exists before the deployment does.
+        # Filled by attach(): neither exists before the deployment does.
+        self.deployment: Optional[Deployment] = None
         self.store: Optional[KVStore] = None
-        self.control: Optional[ControlPlane] = None
-        self.dispatcher: Optional[Dispatcher] = None
         self.trace = trace
         self.metrics = metrics
         self.prefill_engine = prefill
         self.decode_engine = decode
         self.models_decode = models_decode
-        #: Whether a prefill here delays a decode step here -- true exactly when
-        #: both engines run on one accelerator. A run that models two engines on
-        #: one host as *not* contending says so by handing them separate timelines.
-        self.coupled = (
-            prefill is not None
-            and decode is not None
-            and prefill.compute is decode.compute
-        )
-        if self.decode_engine is not None:
-            self.decode_engine.on_finish = self._decode_done
-            self.decode_engine.on_state = self._decode_state
-            # Only worth reporting when a decode step can actually collide with a
-            # prefill, i.e. when both engines were given the same accelerator.
-            if self.coupled:
-                self.decode_engine.on_compute_busy = self._compute_busy
+        if decode is not None:
+            decode.on_finish = self._decode_done
+            decode.on_state = self._decode_state
+            # A prefill here delays a decode step here -- and so is worth reporting
+            # -- exactly when both engines were given the same accelerator. A run
+            # that models two engines on one host as *not* contending says so by
+            # handing them separate timelines.
+            if prefill is not None and prefill.compute is decode.compute:
+                decode.on_compute_busy = self._compute_busy
 
     # -- proposed.DataPlane: the deployment hands over what this host reaches -- #
     def attach(self, deployment: Deployment) -> None:
-        """Take the store, the control plane and the dispatcher off ``deployment``.
+        """Keep the deployment this host reaches its control plane and store through.
 
-        One object rather than three arguments: a host reaching its control plane is
-        reaching *this deployment's* control plane, so whoever builds the hosts has
+        One object rather than a port per service: a host reaching its control plane
+        is reaching *this deployment's* control plane, so whoever builds the hosts has
         nothing to plumb and cannot pair a host with the wrong run's services.
 
         The store is built here, over that same deployment, because
@@ -280,9 +273,8 @@ class ServingHost(DataPlane):
         store's verbs and holds nothing else -- a host per process builds its own,
         and so does each of a simulation's.
         """
+        self.deployment = deployment
         self.store = KVStore(deployment)
-        self.control = deployment.control_plane_handle
-        self.dispatcher = deployment.dispatcher_handle
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
@@ -290,11 +282,15 @@ class ServingHost(DataPlane):
     # -- what this host dispatches about its decode side -------------------- #
     async def _decode_state(self, finishes: List[float]) -> None:
         """Forward a changed decode batch. The engine reports here, not there."""
-        await self.dispatcher.dispatch.call_one(DecodeState(self.me, tuple(finishes)))
+        await self.deployment.dispatcher_handle.dispatch.call_one(
+            DecodeState(self.me, tuple(finishes))
+        )
 
     async def _compute_busy(self, until: float) -> None:
         """Forward this host's occupied compute timeline (coupled only)."""
-        await self.dispatcher.dispatch.call_one(ComputeBusy(self.me, until))
+        await self.deployment.dispatcher_handle.dispatch.call_one(
+            ComputeBusy(self.me, until)
+        )
 
     # -- the request's prefill: decide where it belongs, or serve it -------- #
     @routed(at=lambda prefilled: prefilled.elsewhere)
@@ -318,7 +314,8 @@ class ServingHost(DataPlane):
         comes back even when no address does: every request prefilled here got
         prefilled, and a request that got this far was admitted before any of it ran.
         """
-        response = await self.control.decide.call_one(request, self.me)
+        control: ControlPlane = self.deployment.control_plane_handle
+        response = await control.decide.call_one(request, self.me)
         if response is None:
             self.trace.record(
                 self._now(), "REJECT", f"{request.id} rejected (SLO/overload)"
@@ -408,7 +405,9 @@ class ServingHost(DataPlane):
         # request routed against this host must be priced against a sensor that has
         # already folded this completion, and a report left in flight leaves control
         # answering off a queue it knows to be wrong.
-        await self.dispatcher.dispatch.call_one(PrefillFinished(self.me, self._now()))
+        await self.deployment.dispatcher_handle.dispatch.call_one(
+            PrefillFinished(self.me, self._now())
+        )
         return Prefilled(
             response=response,
             token=first_token,

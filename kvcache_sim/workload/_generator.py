@@ -217,12 +217,21 @@ class Conversation:
 def _extend(prefix: str, segments: Sequence[int]) -> Tuple[str, ...]:
     """Continue a prefix-hash chain from ``prefix`` by ``segments``.
 
-    ``_extend("m0|3", [7, 2])`` -> ``("m0|3|7", "m0|3|7|2")``. The chain's whole
-    property is that a key contains everything before it, so continuing one is
-    appending to the accumulator -- which is also how a *later turn* is built out
-    of an earlier one, and how
+    ``_extend("m0|3", [7, 2])`` -> ``("m0|3|7", "m0|3|7|2")``; from a model id,
+    ``_extend("m0", [3, 7, 2])`` -> ``("m0|3", "m0|3|7", "m0|3|7|2")``, which is how a
+    prompt's whole chain is built. The chain's whole property is that a key contains
+    everything before it, so continuing one is appending to the accumulator -- which
+    is also how a *later turn* is built out of an earlier one, and how
     :meth:`~kvcache_sim.control.request.Request.continuation_keys` builds the
-    generated blocks in between.
+    generated blocks in between. Sharing a leading run of segments yields identical
+    leading keys, which is exactly what makes a shared prefix a single set of entries
+    in the directory; rooting at the model id is what keeps two models from aliasing.
+
+    The "hash" is modelled as the concatenation of the prompt's *segment ids* up to a
+    block -- a deterministic, collision-free stand-in for a real content hash, so the
+    sim never needs Python's (salted) ``hash``. Only a generator of prompts computes
+    these; the planes are handed the finished chain on a
+    :class:`~kvcache_sim.control.request.Request` and treat it as opaque keys.
     """
     keys: List[str] = []
     acc = prefix
@@ -230,24 +239,6 @@ def _extend(prefix: str, segments: Sequence[int]) -> Tuple[str, ...]:
         acc = f"{acc}|{seg}"
         keys.append(acc)
     return tuple(keys)
-
-
-def _block_keys_for(model_id: str, segments: Sequence[int]) -> Tuple[str, ...]:
-    """Build the prefix-hash chain for a prompt made of ``segments``.
-
-    ``_block_keys_for("m0", [3, 7, 2])`` -> ``("m0|3", "m0|3|7", "m0|3|7|2")``.
-    Sharing a leading run of segments yields identical leading keys, which is
-    exactly what makes a shared prefix a single set of entries in the directory.
-    ``model_id`` is included so caches for different models never alias -- it is
-    the root the chain grows from, which is why this is :func:`_extend` from it.
-
-    The "hash" is modelled as the concatenation of the prompt's *segment ids* up
-    to a block -- a deterministic, collision-free stand-in for a real content
-    hash, so the sim never needs Python's (salted) ``hash``. Only a generator of
-    prompts computes these; the planes are handed the finished chain on a
-    :class:`~kvcache_sim.control.request.Request` and treat it as opaque keys.
-    """
-    return _extend(model_id, segments)
 
 
 def _zipf_weights(n: int, s: float) -> List[float]:
@@ -274,9 +265,6 @@ class _Dialogue:
         #: instantly: the dialogue's arrival plus the think time so far.
         self.planned = arrival
         self.turns: List[Turn] = []
-
-    def freeze(self) -> Conversation:
-        return Conversation(self.id, self.arrival, tuple(self.turns))
 
 
 def make_workload(
@@ -379,7 +367,7 @@ def make_workload(
         query = list(range(fresh, fresh + query_blocks))
         fresh += query_blocks
         if not dialogue.turns:
-            keys = _block_keys_for(model_id, opening[c] + query)
+            keys = _extend(model_id, opening[c] + query)
             think = 0.0
         else:
             # ...and here is the whole of multi-turn: the previous turn's entire
@@ -417,7 +405,10 @@ def make_workload(
     # Sorted, though the loop above already produces increasing arrivals: the
     # runner sorts by ``(release_time, id)`` anyway, and a stream that arrives
     # sorted is one less thing a reader has to take on trust.
-    return sorted((d.freeze() for d in built), key=lambda c: (c.arrival, c.id))
+    return sorted(
+        (Conversation(d.id, d.arrival, tuple(d.turns)) for d in built),
+        key=lambda c: (c.arrival, c.id),
+    )
 
 
 def _sample(rng: random.Random, weights: List[float]) -> int:

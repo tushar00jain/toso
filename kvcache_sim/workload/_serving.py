@@ -71,7 +71,6 @@ from realsim.runner import ItemDispatch, WorkItem
 from realsim.simulation import Simulation
 from realsim.run import Workload
 
-from ..control._sensor import ClusterSensor
 from ..control.request import Request
 from ..control.scheduler import CacheAwareScheduler, LoadBalanceScheduler
 from ._accelerator import BLOCK_TOKENS, SimulatedAccelerator
@@ -139,7 +138,6 @@ class KVWorkload(Workload):
 
 def scheduler(
     kind: str,
-    topology: Dict[str, Endpoint],
     *,
     balance_threshold: float = 1.5,
     replicate: bool = True,
@@ -159,9 +157,8 @@ def scheduler(
     rather than a factory the harness must call at the right moment.
 
     One plane, asked where a request should run and, later, which peer serves the
-    fetch that plan implies. Its cluster sensor is built here rather than in
-    ``attach`` for one reason: a scenario may want to hand the same sensor to a test,
-    and the plane accepts one so that stays possible.
+    fetch that plan implies. Its sensors are the plane's own, built where it learns
+    its instances (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`).
 
     ``source`` names which peers a fetch is answered from -- ``"prefix"`` or
     ``"spread"`` -- and the plane builds it, so two runs configured alike still get a
@@ -170,8 +167,6 @@ def scheduler(
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
-    # Over ALL instances: the prefill and decode pools may each be a subset.
-    cluster = ClusterSensor(sorted(topology))
     knobs = dict(
         block_tokens=BLOCK_TOKENS,
         profile=DEFAULT_PROFILE,
@@ -181,7 +176,6 @@ def scheduler(
         prefill_pool=prefill_pool,
         decode_pool=decode_pool,
         early_rejection=early_rejection,
-        cluster=cluster,
         source=source,
     )
     if kind == "cache_aware":

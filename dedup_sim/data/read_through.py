@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
-from proposed import ControlPlane, DataPlane, Deployment, Dispatcher, Stored
+from proposed import ControlPlane, DataPlane, Deployment, Stored
 
 __all__ = ["ReadThroughPlane"]
 
@@ -58,18 +58,15 @@ class ReadThroughPlane(DataPlane):
         # Filled by attach(): neither the readers' clients nor the ports they reach
         # exist before the deployment does.
         self.deployment: Optional[Deployment] = None
-        self.control: Optional[ControlPlane] = None
-        self.dispatcher: Optional[Dispatcher] = None
 
     def attach(self, deployment: Deployment) -> None:
         """Keep the deployment whose clients this plane puts through.
 
-        Two ports off it, which are the two things a host says to control: the question
-        goes to the plane, and the action it commits goes to the dispatcher.
+        Two ports are read off it where they are used, which are the two things a host
+        says to control: the question goes to the plane, and the action it commits goes
+        to the dispatcher.
         """
         self.deployment = deployment
-        self.control = deployment.control_plane_handle
-        self.dispatcher = deployment.dispatcher_handle
 
     async def read_through(self, requester: str, key: Optional[str] = None) -> Any:
         """``requester`` reads ``key``, then keeps what it read; answers with the read.
@@ -80,7 +77,8 @@ class ReadThroughPlane(DataPlane):
         moment it returns and waited on until the action after it is committed.
         """
         key = key if key is not None else self.key
-        selection = await self.control.sources.call_one([key], requester)
+        control: ControlPlane = self.deployment.control_plane_handle
+        selection = await control.sources.call_one([key], requester)
         result = await self.deployment.client_for(
             requester, prefer=selection.sources
         ).get(key)
@@ -91,5 +89,7 @@ class ReadThroughPlane(DataPlane):
         # A second vend, with no preference: a put chooses its own volume (the
         # co-located one), and leaving the read's preference bound would say otherwise.
         await self.deployment.client_for(requester).put(key, self.value)
-        await self.dispatcher.dispatch.call_one(Stored(requester, key))
+        await self.deployment.dispatcher_handle.dispatch.call_one(
+            Stored(requester, key)
+        )
         return result

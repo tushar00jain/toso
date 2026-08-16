@@ -84,7 +84,7 @@ def _configure(label: str, topology, conversations, kind: str, **knobs) -> Run:
         KVWorkload(topology, conversations),
         # One control plane, asked twice per request that pulls: where to run it, and
         # then which peer serves the fetch that plan implies.
-        control=scheduler(kind, topology, **knobs),
+        control=scheduler(kind, **knobs),
         data=serving_plane(
             coupled=coupled,
             simulate_decode=knobs.get("simulate_decode", False),
@@ -110,11 +110,6 @@ def _make_topology(num: int, per_node: int = 2) -> Dict[str, Endpoint]:
         node = f"N{i // per_node}"
         topo[f"s{i}"] = Endpoint(id=f"s{i}", host=f"h{i}", node=node)
     return topo
-
-
-def _subset(topology: Dict[str, Endpoint], ids: List[str]) -> Dict[str, Endpoint]:
-    """Return the sub-topology for ``ids`` (order-stable)."""
-    return {i: topology[i] for i in ids}
 
 
 def _shared_prefix_workload(seed: int = 0):
@@ -391,8 +386,8 @@ class Disaggregation(Scenario):
         return [
             _configure("disaggregated", topo, convs, "cache_aware",
                  prefill_pool=["s0", "s1"], decode_pool=["s2", "s3"], **common),
-            _configure("coupled", _subset(topo, ["s2", "s3"]), convs, "cache_aware",
-                 coupled=True, **common),
+            _configure("coupled", {i: topo[i] for i in ("s2", "s3")}, convs,
+                 "cache_aware", coupled=True, **common),
         ]
 
     def show(self, console: Console, results: Sequence[Result]) -> None:

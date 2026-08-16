@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from types import MappingProxyType
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Set, Tuple
 
 from proposed import Sensor
 from proposed.dispatch import Fold, Stored

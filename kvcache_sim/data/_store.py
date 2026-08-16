@@ -83,9 +83,6 @@ class KVStore:
 
     def __init__(self, deployment: Deployment) -> None:
         self.deployment = deployment
-        #: The control plane a fetch asks which peers should serve it. ``None`` when
-        #: the run stands up none, which is a run whose reads are not routed.
-        self.control: Optional[ControlPlane] = deployment.control_plane_handle
 
     # -- real data-plane ops (presence + fabric cost) --------------------- #
     async def publish(
@@ -142,9 +139,10 @@ class KVStore:
         this caller and does not answer until those peers are usable. ``None`` -- the
         directory's own order -- when the run stands up no control plane.
         """
-        if self.control is None:
+        control: Optional[ControlPlane] = self.deployment.control_plane_handle
+        if control is None:
             return None
-        selection = await self.control.sources.call_one(list(keys), inst)
+        selection = await control.sources.call_one(list(keys), inst)
         return selection.sources
 
     async def fetch(self, inst: str, keys: List[str]) -> List[torch.Tensor]:

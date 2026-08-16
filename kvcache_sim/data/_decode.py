@@ -153,10 +153,6 @@ class DecodeEngine:
         on_state: Optional[Callable[[List[float]], Awaitable[None]]] = None,
     ) -> None:
         self.max_batch = max_batch
-        # Batch=1 baseline step time for the decode-load prediction (each remaining
-        # token is assumed to cost ~one uncontended step). Asked of the accelerator,
-        # so it is this host's answer rather than a constant.
-        self._base_step = compute.step_cost(1)
         # The ACTUAL compute timeline of this host, shared with whatever else runs
         # on it. The control plane keeps its own predicted queue and hears about
         # this one through ``on_compute_busy``.
@@ -180,8 +176,11 @@ class DecodeEngine:
         """
         if self.on_state is None:
             return
+        # Asked of the accelerator, so the baseline step is this host's answer rather
+        # than a constant; hoisted because every active request is priced against it.
+        base_step = self.compute.step_cost(1)
         await self.on_state([
-            a.last_token_time + a.remaining * self._base_step
+            a.last_token_time + a.remaining * base_step
             for a in self.batch + self.pending
         ])
 

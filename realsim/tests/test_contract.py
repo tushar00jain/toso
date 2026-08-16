@@ -433,9 +433,11 @@ def test_plane_port_rule_actually_resolves_the_real_ports():
     }
     ports = check_structure._control_ports(rel, tree, mods, trees)
     assert ports == {"ControlPlane"}, ports
-    # ...and that the plane's field is recognised as holding it.
-    _local, attrs = check_structure._port_names(tree, ports)
-    assert {"control"} <= attrs, attrs
+    # ...and that the name the plane binds it to is recognised as holding it. A
+    # local, because a host holds the deployment and reads the handle off it where
+    # it asks; the annotation is what rule 6 resolves, wherever the name lives.
+    local, _attrs = check_structure._port_names(tree, ports)
+    assert {"control"} <= local, local
     every = check_structure._proposed_ports(
         {d: ast.parse((root / mods[d]).read_text()) for d in mods}
     )

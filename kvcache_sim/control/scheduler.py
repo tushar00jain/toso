@@ -81,11 +81,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence
 
 from proposed import (
-    ControlPlane, Dispatcher, Endpoint, Key, Selection,
+    ControlPlane, Dispatcher, Key, Selection,
 )
 from proposed.selector import (
-    Annotate, Balance, declared, Dims, FirstMatch, Folded, Max, Readings, Selector,
-    Sort,
+    Annotate, Balance, declared, Dims, FirstMatch, Folded, Max, Selector, Sort,
 )
 
 from domain import (
@@ -115,21 +114,6 @@ __all__ = [
 ]
 
 
-def _predicts_decode(simulate_decode: bool, early_rejection: str) -> bool:
-    """Does this run roll decode occupancy forward to prefill completion?
-
-    ``"predict"`` counts the prefills promised that will have landed by then, which
-    moves where decode lands even with no SLO to miss -- a fidelity setting of what a
-    decision senses rather than an admission rule, which is why admission applies the
-    same two SLOs either way.
-
-    Answered once, in :meth:`_Scheduler.__init__`, and it decides two things together:
-    whether a decision records what it promised, and whether the prediction reads
-    those promises.
-    """
-    return simulate_decode and early_rejection == "predict"
-
-
 def _source_ranking(name: str) -> Selector[Sequence[Key]]:
     """Which peers may serve a prefix, by name -- a fresh one every call.
 
@@ -150,7 +134,8 @@ def _source_ranking(name: str) -> Selector[Sequence[Key]]:
 # Named here, where the chain that keys that pool is declared (:meth:`_Scheduler.attach`),
 # because a fold reads its dimensions by position and only the chain says how many there
 # are: the plan :class:`~kvcache_sim.control._selector.Priced` appends, and behind it the
-# queue :func:`_queues` appends for one preset alone. Each names the number it orders by,
+# queue :meth:`_Scheduler.attach` annotates on for one preset alone. Each names the
+# number it orders by,
 # so a plan carries no order of its own and neither preset can pick up the other's
 # (:class:`Plan`).
 
@@ -174,11 +159,6 @@ def _by_queue(dims: Dims) -> float:
     the longer-idle host.
     """
     return dims[1]
-
-
-def _queues(view: ClusterView, ask: PrefillAsk) -> Readings:
-    """The queue each candidate would join, the dimension :func:`_by_queue` reads."""
-    return view.cluster.busy_until
 
 
 class _Scheduler(ControlPlane):
@@ -225,11 +205,6 @@ class _Scheduler(ControlPlane):
         early_rejection: ``"early"`` | ``"predict"`` -- whether the decode occupancy
             the TBT SLO is judged against is the one observed now or the one predicted
             at prefill completion.
-        cluster: the run's one :class:`~kvcache_sim.control._sensor.ClusterSensor`,
-            when a caller has to make it first. ``None`` -- the default -- builds it
-            in :meth:`attach`, where the instances become known. Either way
-            :meth:`attach` composes it into the view and this plane holds it no other
-            way.
     """
 
     def __init__(
@@ -248,7 +223,6 @@ class _Scheduler(ControlPlane):
         slo_tbt: float = float("inf"),
         simulate_decode: bool = False,
         early_rejection: str = "early",
-        cluster: Optional[ClusterSensor] = None,
     ) -> None:
         self.B = block_tokens
         self.profile = profile
@@ -279,8 +253,10 @@ class _Scheduler(ControlPlane):
         self._rank = rank
         # Built rather than named: not an axis (see the module it comes from).
         self._threshold = balance_threshold
-        self._prefill_pool = prefill_pool
-        self._decode_pool = decode_pool
+        #: The pools the prefill and decode chains rank. A preset that named no
+        #: subset leaves them empty until :meth:`attach` knows every instance.
+        self.prefill_ids: List[str] = sorted(prefill_pool) if prefill_pool else []
+        self.decode_ids: List[str] = sorted(decode_pool) if decode_pool else []
         #: Requests this plane has sent to another host, and the answer it sent them
         #: with. Private, because the only thing that reads it is the next ask about
         #: the same request (:meth:`decide`) and this is what wrote it: state with one
@@ -302,20 +278,14 @@ class _Scheduler(ControlPlane):
                 f"unknown early_rejection {early_rejection!r}: the choice is which "
                 f"occupancy the TBT SLO is judged against, 'early' or 'predict'"
             )
-        # The admission mode is spent here and never read again: both modes hold a
-        # decision to the same two SLOs and differ only in what feeds them. This one
-        # answer governs the reservation sensor end to end -- composed in attach(),
-        # written on admission, read by the prediction -- so no two of the three can
-        # disagree about whether this run predicts.
-        self._lookahead = _predicts_decode(simulate_decode, early_rejection)
-        # Filled by attach(): the run knows its servers only once its stack exists.
-        self.topo: Dict[str, Endpoint] = {}
-        self.ids: List[str] = []
-        self.prefill_ids: List[str] = []
-        self.decode_ids: List[str] = []
-        # The caller's argument, not this plane's sensor: attach() spends it composing
-        # the view and clears it, so the sensor has one reference here either way.
-        self._supplied_cluster: Optional[ClusterSensor] = cluster
+        # Does this run roll decode occupancy forward to prefill completion --
+        # counting the prefills promised that will have landed by then? A fidelity
+        # setting of what a decision senses, not an admission rule: both modes hold a
+        # decision to the same two SLOs and differ only in what feeds them. Spent here
+        # and never read again, so this one answer governs the reservation sensor end
+        # to end -- composed in attach(), written on admission, read by the prediction
+        # -- and no two of the three can disagree about whether this run predicts.
+        self._lookahead = simulate_decode and early_rejection == "predict"
         # All built in attach(), where the sensors they read and the pools they rank
         # exist.
         self.view: Optional[KVView] = None
@@ -345,21 +315,16 @@ class _Scheduler(ControlPlane):
         downstream then senses one view -- every chain above -- and nothing is handed a
         sensor to read.
 
-        The run's one :class:`~kvcache_sim.control._sensor.ClusterSensor` is built
-        here unless a caller made it first (``cluster``): this is where the
-        instances become known, and this runs once per run, so nothing else is
-        placed to build a second (empty) one -- and an empty one would report every
-        host idle, which is a run that looks healthy and is wrong. It goes into the
-        view and nowhere else; :attr:`sensor`, which the run harvests to put a
-        service in front of, reads it back from there.
-
-        This plane's own two sensors are built here and never supplied, because one
-        handed to two planes would have each answering for the other's
-        decisions: a second routed-pull sensor would answer every fetch "I decided
-        nothing about this", and a second reservation sensor would leave every
-        predicted batch short. The reservation sensor is composed in only for a run
-        that rolls occupancy forward, so a run that does not predict has no empty
-        one to read (:class:`~kvcache_sim.control._view.ReservedView`).
+        Every sensor is built here and none is ever supplied, because one handed to two
+        planes would have each answering for the other's decisions: a second cluster
+        sensor would report every host idle -- a run that looks healthy and is wrong --
+        a second routed-pull sensor would answer every fetch "I decided nothing about
+        this", and a second reservation sensor would leave every predicted batch short.
+        This is also where the instances become known, and it runs once per run, so
+        nothing else is placed to build any of them. Each goes into the view and
+        nowhere else. The reservation sensor is composed in only for a run that rolls
+        occupancy forward, so a run that does not predict has no empty one to read
+        (:class:`~kvcache_sim.control._view.ReservedView`).
 
         The dispatcher is built here too, with all three sensors as its reducers, and is
         the only thing that writes any of them (:attr:`dispatcher`). Which is where the
@@ -368,12 +333,9 @@ class _Scheduler(ControlPlane):
         a serving decision dispatches reserves nothing -- the flag is spent on the
         wiring, and no fold reads it.
         """
-        self.topo = dict(view.topology)
-        self.ids = sorted(self.topo)
-        cluster, self._supplied_cluster = self._supplied_cluster, None
-        if cluster is None:
-            # Over ALL instances: the prefill and decode pools may each be a subset.
-            cluster = ClusterSensor(self.ids)
+        ids = sorted(view.topology)
+        # Over ALL instances: the prefill and decode pools may each be a subset.
+        cluster = ClusterSensor(ids)
         reserved = ReservationSensor() if self._lookahead else None
         routed = RoutedPullSensor()
         load = SourceLoad()
@@ -385,12 +347,8 @@ class _Scheduler(ControlPlane):
             # ``None`` is a sensor this run does not hold, so nothing folds for it.
             if sensor is not None:
                 self.dispatcher.compose(sensor)
-        self.prefill_ids = (
-            sorted(self._prefill_pool) if self._prefill_pool else self.ids
-        )
-        self.decode_ids = (
-            sorted(self._decode_pool) if self._decode_pool else self.ids
-        )
+        self.prefill_ids = self.prefill_ids or ids
+        self.decode_ids = self.decode_ids or ids
         self._decode = Sort(DecodeBatch(
             self.decode_ids,
             tbt_enabled=self.tbt_enabled,
@@ -410,7 +368,12 @@ class _Scheduler(ControlPlane):
             # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
             # id, and two idle instances holding no prefix do price identically.
             self._prefill = Sort(Folded(
-                Annotate(priced, _queues, senses=(ClusterView,)), _by_queue
+                Annotate(
+                    priced,
+                    lambda view, _ask: view.cluster.busy_until,
+                    senses=(ClusterView,),
+                ),
+                _by_queue,
             ))
         else:
             self._prefill = Sort(Folded(priced, _by_ttft))
@@ -533,7 +496,6 @@ class _Scheduler(ControlPlane):
             prefill=prefill.sources[0],
             decode=instance,
             plan=plan,
-            pred_batch=batch,
             pred_tbt=(
                 decode_step_time(batch + 1, self.profile, self.model)
                 if self.tbt_enabled

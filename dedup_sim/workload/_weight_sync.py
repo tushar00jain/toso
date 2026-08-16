@@ -24,7 +24,7 @@ import torch
 
 from putget_sim.workload.put_get import KEY, DEFAULT_N
 from realsim.runner import WorkItem
-from realsim.seams.transport import Endpoint, TensorDescriptor
+from realsim.seams.transport import Endpoint
 from realsim.simulation import Simulation
 from realsim.run import Workload
 from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
@@ -78,11 +78,9 @@ class WeightSync(Workload):
         super().__init__(_topology(num_trainers, num_generators))
         self.trainer_ids = [f"t{i}" for i in range(num_trainers)]
         self.generator_ids = [f"g{j}" for j in range(num_generators)]
-        self.descriptor = TensorDescriptor(shape=(n,), dtype=dtype)
         # Real tensor, zero storage: the payload's size is modeled, its bytes never
         # move (``docs/realsim_design.md`` s7).
         self.expected: Any = torch.empty(n, dtype=dtype, device="meta")
-        self.put_value = self.expected
 
     @property
     def payload_bytes(self) -> int:
@@ -120,7 +118,7 @@ class WeightSync(Workload):
         for trainer_id in self.trainer_ids:
             trainer = mesh.adapter(trainer_id)
             with trainer.installed():
-                await trainer.client.put(KEY, self.put_value)
+                await trainer.client.put(KEY, self.expected)
         trace.record(
             asyncio.get_running_loop().time(),
             "burst",

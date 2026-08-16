@@ -18,7 +18,7 @@ from typing import Any, Optional, Sequence
 
 from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
 from proposed.selector import (
-    Balance, Dims, FirstMatch, Fold, Folded, NaiveKeySelector, Selector, Sort,
+    Balance, Dims, FirstMatch, Folded, NaiveKeySelector, Selector, Sort,
 )
 
 from ._answer import committed
@@ -70,11 +70,7 @@ class Dedup(ControlPlane):
         trace: Optional[DecisionLog] = None,
     ) -> None:
         self._cap = fanout_cap
-        self._fabric = SPREAD if spread else CHAIN
-        #: How the chain's key is read, stamped on its answers by the
-        #: :class:`~proposed.selector.Folded` link :meth:`attach` declares. ``None`` --
-        #: the chain preset -- compares the dimensions as they stand.
-        self._fold: Optional[Fold] = _soonest if spread else None
+        self._spread = spread
         self._trace = trace
         # All built in attach(), where the ports the chain senses through arrive.
         self.view: Optional[DedupView] = None
@@ -110,13 +106,21 @@ class Dedup(ControlPlane):
         what a reader is handed is a preference and it reads down that list: a source the
         ranking placed behind the head is what serves the read if the head has evicted the
         key by the time the reader gets there (:func:`~proposed.selector.prefer`).
+
+        Both halves of the ``spread`` choice are made here, off the one name that
+        carries it: what the fabric a read occupies is priced at, and the fold stamped
+        on the chain's answers. The chain preset's fold is ``None`` -- compare the
+        dimensions as they stand.
         """
         sensor = FanoutSensor(fanout_cap=self._cap)
         self.view = view.derived(DedupView, fanout=sensor, load=sensor)
         self.dispatcher = Dispatcher()
         self.dispatcher.compose(sensor)
         self._chain = Sort(FirstMatch([
-            Folded(Balance(Candidates(self._fabric)), self._fold),
+            Folded(
+                Balance(Candidates(SPREAD if self._spread else CHAIN)),
+                _soonest if self._spread else None,
+            ),
             NaiveKeySelector(),
         ])).attach(self.view)
 

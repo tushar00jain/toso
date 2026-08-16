@@ -48,7 +48,7 @@ def _read_through(sim, burst) -> ItemDispatch:
     The plane makes both of a reader's store calls itself, so what the runner drives
     is one member and the item carries only who is reading.
     """
-    plane = ReadThroughPlane(KEY, burst.put_value, trace=sim.trace)
+    plane = ReadThroughPlane(KEY, burst.expected, trace=sim.trace)
     plane.attach(sim)
     return ItemDispatch(lambda item: plane.read_through(item.id))
 

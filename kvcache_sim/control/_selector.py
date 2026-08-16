@@ -318,13 +318,10 @@ class Priced(Selector[PrefillAsk]):
         else:
             source, xbytes, transfer_t = None, 0, 0.0
         queue_wait, ttft, done = self._predict(inst, now, transfer_t, prefill_t)
-        plan = Plan(
+        return Plan(
             match, cached, uncached, source, xbytes, queue_wait, ttft, done,
+            prefill_t=prefill_t, pull_keys=list(pull_keys),
         )
-        plan.prefill_t = prefill_t
-        plan.transfer_t = transfer_t
-        plan.pull_keys = list(pull_keys)
-        return plan
 
 
 class DecodeBatch(Selector[Plan]):
@@ -341,9 +338,9 @@ class DecodeBatch(Selector[Plan]):
     Args:
         instances: the decode pool, as the plane resolved it.
         tbt_enabled: whether the run models batched decode at all.
-        lookahead: whether to roll occupancy forward to the plan's completion. The flag
-            that decided whether a reservation sensor was composed at all
-            (:func:`~kvcache_sim.control.scheduler._predicts_decode`), so the second
+        lookahead: whether to roll occupancy forward to the plan's completion. The same
+            flag that decided whether a reservation sensor was composed at all
+            (:meth:`~kvcache_sim.control.scheduler._Scheduler.attach`), so the second
             reading finds one to read exactly when it takes it.
         profile / model: the cost constants a reservation's decode is priced against.
     """
