@@ -33,7 +33,7 @@ from kvcache_sim.data._store import KVStore
 from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
-from proposed.selector import Balance, FirstMatch
+from proposed.selector import Balance, FirstMatch, Selector
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector,
 )
@@ -2043,14 +2043,24 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
     So nothing checks a *plane's* subject -- a run hands it the ports and asks it
     whatever it declares. What is checked is the chain behind the fetch answer, at
     every link, because a link reading those keys as anything else would answer a
-    question it was not asked.
+    question it was not asked. Every ranking this plane holds takes the same subject,
+    ``LocalOnly`` included, which is why it can sit in that chain even though the store
+    never asks it (:class:`~proposed.selector.KeySelector` is the claim it declines to
+    make, not the subject it takes).
     """
     sched = scheduler("cache_aware", _make_topology(2))
     assert isinstance(sched, ControlPlane)
     assert not isinstance(sched, KeySelector)   # a plane is asked, not consulted
     assert {"decide", "sources"} <= set(dir(sched))
-    with pytest.raises(TypeError, match="every link must be a KeySelector"):
-        FirstMatch([LongestPrefixKeySelector(), LocalOnly()])
+    chain = FirstMatch([LongestPrefixKeySelector(), LocalOnly()])
+    assert chain.subject_type == KeySelector.subject_type
+
+    class _OverSomethingElse(Selector[int]):
+        async def select(self, subject, requester):
+            return Selection.of([])
+
+    with pytest.raises(TypeError, match="must select over the same one"):
+        FirstMatch([LongestPrefixKeySelector(), _OverSomethingElse()])
 
 
 def test_one_plane_answers_a_fetch_with_the_pull_it_priced():

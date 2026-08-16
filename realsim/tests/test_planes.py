@@ -48,7 +48,7 @@ from realsim.mesh import Mesh
 from realsim.seams.data_plane_service import DataPlaneService
 from realsim.simulation import Simulation
 from proposed import DataPlane, routed, RoutedPlane
-from proposed import AnySelector, ControlPlane, Key, KeySelector, Selection
+from proposed import ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
@@ -223,22 +223,19 @@ class _Fixed(_Answers, KeySelector):
     """A selector that decides on command -- the store-question kind."""
 
 
-class _FixedPlacement(_Answers, AnySelector):
-    """The same body over an application payload -- the other kind."""
+class _FixedPlacement(_Answers, Selector[Any]):
+    """The same body over an application payload -- the other subject."""
 
 
-def test_the_subtypes_add_a_subject_and_nothing_else():
-    """Each kind is a subject and nothing more -- no second interface.
+def test_the_named_subject_is_a_subject_and_nothing_else():
+    """``KeySelector`` is a subject and nothing more -- no second interface.
 
-    ``KeySelector`` names the one subject the store can hand down; ``AnySelector``
-    leaves it open because this package cannot name a type an application invented.
-    Neither adds behaviour, so the two cannot drift apart.
+    It names the one subject the store can hand down, so it cannot drift from the base.
+    An application's own subject needs no name here, being ``Selector[ThatSubject]``.
     """
-    for kind in (KeySelector, AnySelector):
-        assert kind.__bases__ == (Selector,)
-        assert not vars(kind).keys() & {"select", "attach", "name"}
+    assert KeySelector.__bases__ == (Selector,)
+    assert not vars(KeySelector).keys() & {"select", "attach", "name"}
     assert KeySelector.subject_type == Sequence[Key]
-    assert AnySelector.subject_type is Any
 
 
 def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
@@ -272,16 +269,18 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
     assert _Inherits.subject_type == Sequence[Key]
     assert _Bare.subject_type == Sequence[Key]
     assert _DeclaresItsOwn().subject_type == "computed"
-    # An unbound parameter is not a subject: AnySelector is Selector[_S].
-    assert AnySelector.subject_type is Any
+    # An unbound parameter is not a subject: the base is Generic[_S].
+    assert Selector.subject_type is Any
 
 
 def test_taking_keys_is_not_the_same_claim_as_answering_for_the_store():
-    """Why the kinds are types and not just a ``subject_type`` comparison.
+    """The type says which, and a chain does not ask: it checks the subject.
 
-    A selector can take keys and still not answer for the store: its judgement may be
-    the application's, made while routing, and which volume serves a read is a
-    different question. Reading ``subject_type`` alone could not tell them apart.
+    A selector can take keys and still not answer for the store -- its judgement may be
+    the application's, made while routing, and which volume serves a read is a different
+    question (``kvcache_sim``'s ``LocalOnly``). So the class is what says which claim is
+    being made, while what a chain needs of a link is only that it takes the subject the
+    chain hands down.
     """
 
     class _KeysButNotTheStore(Selector[Sequence[Key]]):
@@ -289,7 +288,8 @@ def test_taking_keys_is_not_the_same_claim_as_answering_for_the_store():
             return Selection.of([])
 
     assert _KeysButNotTheStore.subject_type == KeySelector.subject_type  # same subject
-    assert not isinstance(_KeysButNotTheStore(), (KeySelector, AnySelector))  # neither kind
+    assert not isinstance(_KeysButNotTheStore(), KeySelector)            # other claim
+    FirstMatch([_Fixed(), _KeysButNotTheStore()])                        # a link either way
 
 
 def test_a_plane_declares_whatever_it_wants_told():
@@ -337,7 +337,7 @@ def test_a_selector_is_a_utility_a_plane_holds_and_not_a_plane():
     declare -- ``select`` is what the plane holding it consults. So the thing a run
     takes is the plane, and the plane passes the ports down.
     """
-    for kind in (KeySelector, AnySelector, Selector):
+    for kind in (KeySelector, Selector):
         assert not issubclass(kind, ControlPlane)
     with pytest.raises(TypeError, match="must be a ControlPlane"):
         Simulation(_topology(), control=_Fixed())
@@ -770,19 +770,20 @@ def test_attaching_a_selector_hands_it_back_however_it_is_wrapped():
     assert balanced.attach("a-view") is balanced
 
 
-def test_a_chain_is_a_key_selector_and_refuses_a_link_that_is_not():
-    """The subject a chain hands down is the subject its links must take.
+def test_a_chain_takes_its_links_subject_and_refuses_links_that_disagree():
+    """The subject a chain hands down is the subject every link must take.
 
-    ``select`` passes the keys through untouched, so a link reading them as an
-    application's payload would answer a question it was not asked. Checked at
-    construction, which is what lets the chain claim the kind.
+    ``select`` passes it through untouched, so a link reading it as something else would
+    answer a question it was not asked. Checked at construction, which is what lets the
+    chain take the subject as its own -- and so be a link of a chain itself.
     """
     chain = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"]))])
     assert _select(chain).sources == ("v1",)
-    assert isinstance(chain, KeySelector)
     assert chain.subject_type == Sequence[Key]
+    assert FirstMatch([chain]).subject_type == Sequence[Key]
+    assert FirstMatch([]).subject_type is Any        # nothing to take it from
 
-    with pytest.raises(TypeError, match="every link must be a KeySelector"):
+    with pytest.raises(TypeError, match="must select over the same one"):
         FirstMatch([_Fixed(), _FixedPlacement()])
 
 
@@ -809,7 +810,7 @@ def test_balance_moves_the_tie_between_equally_priced_sources():
     when the price has been levelled.
     """
     balanced = Balance(_Fixed(Selection.priced([("v0", 5), ("v1", 5)])))
-    assert isinstance(balanced, KeySelector)     # so a chain can still hold it
+    assert balanced.subject_type == KeySelector.subject_type   # a chain can hold it
     assert _heads(balanced, count=4) == ["v0", "v1", "v0", "v1"]
 
 
@@ -873,26 +874,23 @@ def test_balance_over_a_ranking_that_keys_nothing_is_ordered_by_load_alone():
     assert _select(balanced).sort().sources == ("v1", "v0")
 
 
-def test_balance_takes_the_kind_of_the_ranking_it_wraps():
-    """One combinator over both subjects, and a chain still refuses the wrong one.
+def test_balance_takes_the_subject_of_the_ranking_it_wraps():
+    """One combinator over both subjects, and a chain still refuses a mismatch.
 
     A combinator asks whatever its ranking asks -- it hands the subject down untouched
-    -- so its own kind cannot be declared once. It has to *be* a type, because that is
-    how a chain checks its links, so it is derived: a balanced key ranking is a chain
-    link, and a balanced application ranking gets the answer that ranking would get by
-    itself.
+    -- so its own subject cannot be declared once; it is read off the ranking. Which is
+    what makes a balanced ranking a chain link exactly where the ranking under it would
+    be, with no second class per combinator.
     """
     over_keys = Balance(_Fixed(Selection.priced([("v0", 5)])))
     over_payload = Balance(_FixedPlacement(Selection.priced([("v0", 5)])))
 
-    assert isinstance(over_keys, KeySelector)
-    assert not isinstance(over_payload, KeySelector)
-    assert isinstance(over_payload, Balance)         # still the combinator
+    assert over_keys.subject_type == KeySelector.subject_type
     assert over_payload.subject_type is Any          # read off the ranking under it
 
-    FirstMatch([over_keys])                          # a link like the ranking it wraps
-    with pytest.raises(TypeError, match="every link must be a KeySelector"):
-        FirstMatch([over_payload])
+    FirstMatch([over_keys, _Fixed()])                # a link like the ranking it wraps
+    with pytest.raises(TypeError, match="must select over the same one"):
+        FirstMatch([over_keys, over_payload])
 
 
 def test_balance_spreads_an_application_ranking_too():

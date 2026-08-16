@@ -451,12 +451,12 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     """Surfaces ``proposed`` declares that a ``data/`` module reaches over a wire.
 
     A port that outlives the simulator lives in ``proposed`` rather than in a
-    capability's ``control/`` -- :class:`proposed.selector.AnySelector` is one. Those
+    capability's ``control/`` -- :class:`proposed.selector.KeySelector` is one. Those
     are found structurally, not by name, on either of two marks:
 
     * it derives :class:`proposed.plane.ControlPlane` -- the deciding half of a
       capability, and nothing else in the package does. Followed transitively,
-      because a surface may be declared one level down: a ``AnySelector`` is a
+      because a surface may be declared one level down: a ``KeySelector`` is a
       ``Selector`` is a ``ControlPlane``, and a rule that read only the direct base
       would go quiet on exactly the subtypes a caller holds;
     * it is declared in :mod:`proposed.deployment` and **every member it declares
@@ -534,7 +534,7 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     A ``Plan``, a ``Completion`` or a ``Request`` crossing the plane boundary is a
     *value* and its fields are meant to be read; those are dataclasses. A port is
     an object living in the other plane, and in this codebase that is a plain
-    class -- ``ControlPlane``, ``KeySelector`` and ``AnySelector`` alike, following
+    class -- ``ControlPlane`` and ``KeySelector`` alike, following
     the same convention
     torchstore uses for ``TorchStoreStrategy``. So the discriminator is the
     dataclass decorator, not a base: it keeps holding when a port stops being a
@@ -543,7 +543,7 @@ def _control_ports(rel: Path, tree: ast.Module, mods: Dict[str, Path],
     Two sources, because a port can outlive the simulator. A capability's own
     ``control/`` declares the capability-specific ones; ``proposed`` declares the
     ones that are part of the upstream ask, and a ``data/`` module reaches those by
-    package import (``from proposed import AnySelector``). Both are policed the
+    package import (``from proposed import KeySelector``). Both are policed the
     same, so moving a port from the first place to the second does not quietly stop
     rule 6 from applying -- which is what would happen if this only looked at
     ``control/``.
@@ -582,7 +582,7 @@ def _port_names(tree: ast.Module, ports: Set[str]) -> tuple:
 
         The whole annotation is walked rather than read as a bare ``Name``, because
         the two shapes a ``data/`` module actually writes are both compound:
-        ``AnySelector[Request]`` names its type parameter, and
+        ``Selector[Request]`` names its type parameter, and
         ``Optional[ControlPlane]`` is a port that is ``None`` until
         :meth:`~proposed.plane.DataPlane.attach`. Reading only the outermost name
         would leave this rule blind to exactly the attributes it exists to police.

@@ -12,17 +12,17 @@ simulator, ``proposed`` is the design being argued for.
   selector is one of the things it works an answer out with. A
   :class:`~proposed.selector.KeySelector` takes *keys* -- which volumes should serve
   this read, the store's own question, and what a data plane hands the store as a
-  source preference. A :class:`~proposed.selector.AnySelector` takes an application's
-  own subject (which host prefills, which peer a prefix comes from). The default
+  source preference. A ``Selector[Subject]`` takes an application's own subject
+  instead (which host prefills, which peer a prefix comes from). The default
   :class:`~proposed.selector.NaiveKeySelector` answers with the directory's own order,
   so preferring what it names changes nothing until a real one is written. It,
   :func:`~proposed.selector.prefer` (what the store does with a preference), the two
   combinators -- :class:`~proposed.selector.FirstMatch` (try key selectors in order)
   and :class:`~proposed.selector.Balance` (annotate any one ranking with the load on
   the sources it named, for whoever folds it) -- and the
-  :class:`~proposed.selector.Selector` base they
-  are typed on are reached through the module rather than re-exported here: what a
-  deployment has to *implement* is one of the two named subjects above.
+  :class:`~proposed.selector.Selector` base they are typed on are reached through the
+  module rather than re-exported here: what a deployment has to *implement* is the
+  store's own subject above.
 * :mod:`proposed.deployment` -- :class:`~proposed.deployment.Controller`, the
   directory surface a caller reaches (torchstore names this type but never declares
   it: ``api.py`` annotates the spawned handle as the actor class and ``LocalClient``
@@ -71,7 +71,7 @@ from .dispatch import Action, Dispatcher, Reducer, Stored
 from .plane import ControlPlane, DataPlane
 from .routed import routed, RoutedPlane
 from .selector import (
-    declared, declares, DecisionLog, AnySelector, KeySelector, Selection,
+    declared, declares, DecisionLog, KeySelector, Selection,
 )
 from .topology import Endpoint, locality, nearest, Tier, TIER_LABEL
 from .view import LoadView, Sensed, SensorView, View
@@ -79,7 +79,6 @@ from .view import LoadView, Sensed, SensorView, View
 __all__ = [
     # the torchstore ask
     "KeySelector",
-    "AnySelector",
     "Selection",
     "Key",
     "VolumeId",

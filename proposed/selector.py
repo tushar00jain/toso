@@ -12,7 +12,7 @@ those two are the only things here that establish an order.
 What differs is the **subject**, and every selector names its own in its header::
 
     class RoutedPull(KeySelector):              # keys, the store's own question
-    class Hosts(AnySelector[Request]):          # an application's own subject
+    class Hosts(Selector[Request]):             # an application's own subject
 
 A selector is a **utility**, not a plane. Nothing outside a capability reaches one:
 a run knows about the capability's :class:`~proposed.plane.ControlPlane`, that plane
@@ -25,14 +25,15 @@ a service boundary is the plane's business (:meth:`Selection.settled`).
 The subject is the one thing a header carries, because what a selector takes is worth
 saying where a reader already looks -- and what it answers with does not vary: a
 :class:`Selection` is ids and their dimensions, and a dimension is whatever the stage
-that appended it measured (:data:`Dims`). The two named subjects are types as well:
+that appended it measured (:data:`Dims`). One subject has a name, because the store
+asks it: :class:`KeySelector` -- ``Sequence[Key]``, which volume serves these bytes.
+``dedup_sim`` wants a reader routed to a *peer* about to hold the key, ``kvcache_sim``
+the peer holding the longest reusable prefix. An application's own subject is
+``Selector[ThatSubject]`` and needs no name here.
 
-* :class:`KeySelector` -- ``Sequence[Key]``: which volume serves these bytes, the
-  store's own question. ``dedup_sim`` wants a reader routed to a *peer* about to
-  hold the key, ``kvcache_sim`` the peer holding the longest reusable prefix.
-* :class:`AnySelector` -- an application's own subject, whatever it is: which of these
-  hosts decodes, say. Its ``subject_type`` stays ``Any`` and a subclass narrows it,
-  since this package cannot name a type an application invented.
+What a check compares is :attr:`Selector.subject_type` and not the class, since
+:pep:`484` erases the parameter and a combinator's subject is the one it was handed
+rather than one it declares.
 
 Admission and SLO gates are neither: an answer that is not a ranked set of sources
 does not belong in a :class:`Selection` at all. A gate rides *with* one instead --
@@ -42,11 +43,10 @@ answered is simply not in the ranking.
 Selectors compose two ways, both of them one selector holding others:
 :class:`FirstMatch` picks between alternatives -- ask each in order, take the first
 answer. :class:`Balance` annotates one answer -- ask, then append how loaded each source
-it named is as a further dimension. Both hand the subject down untouched, which is why
-one ``Balance`` annotates a ranking over keys and one over an application's own
-candidates alike, taking the kind of whichever it wraps. ``FirstMatch`` is over keys
-only, and checks its links are at construction: a chain hands *one* subject to every
-link.
+it named is as a further dimension. Both hand the subject down untouched and take it
+off what they hold, which is why one ``Balance`` annotates a ranking over keys and one
+over an application's own candidates alike. ``FirstMatch`` checks its links agree on one
+at construction, since a chain hands *one* subject to every link.
 
 A stage appends behind whatever the stages before it left and orders nothing itself, so
 a fold still reads what each earlier one measured. Behind a ranking that keyed nothing
@@ -74,7 +74,7 @@ from proposed.view import LoadView, View
 __all__ = [
     "Ready", "Dims", "Fold", "Readings", "Selection", "prefer", "DecisionLog",
     "declared",
-    "declares", "Selector", "KeySelector", "AnySelector", "NaiveKeySelector",
+    "declares", "Selector", "KeySelector", "NaiveKeySelector",
     "FirstMatch", "Balance",
 ]
 
@@ -370,16 +370,14 @@ class DecisionLog(Protocol):
 class Selector(ABC, Generic[_S]):
     """Rank the sources that should serve a subject, and say when they are usable.
 
-    Written with the subject it takes (``AnySelector[Request]``), so ``select``'s
+    Written with the subject it takes (``Selector[Request]``), so ``select``'s
     signature is in the header a reader already looks at; what it answers with is a
     :class:`Selection` whatever the subject.
 
     A utility a control plane consults, and deliberately **not** a
     :class:`~proposed.plane.ControlPlane`: a run never holds one, so it needs no
-    sensor to harvest and no service in front of it. Everything shared by every
-    kind lives here -- ``select``, ``subject_type``, the view -- so
-    :class:`KeySelector` and :class:`AnySelector` cannot drift apart. Implement one
-    of those, or this base directly.
+    sensor to harvest and no service in front of it. Subclass this, or
+    :class:`KeySelector` where the subject is the store's own.
     """
 
     name = "selector"
@@ -454,25 +452,9 @@ class KeySelector(Selector[Sequence[Key]]):
     """A selector whose subject is **keys**: which volume serves these bytes.
 
     The store's own question, and what a control plane answering "which volumes
-    should serve this read" ranks with. A type as well as a :attr:`subject_type`, so
-    that a chain can check its links are all over keys (:class:`FirstMatch`).
-    """
-
-
-
-class AnySelector(Selector[_S]):
-    """A selector whose subject is an **application payload**.
-
-    An application question that happens to be a selection -- which of these hosts
-    decodes, which of these candidates wins. :attr:`subject_type` stays ``Any`` here and
-    a subclass narrows it: this package cannot name a type an application invented.
-    Being this type instead of :class:`KeySelector` says the subject is not the store's,
-    which is worth saying where the ranking looks otherwise identical.
-
-    Part of the proposal that no capability here exercises: a plane ranking a pool it
-    built itself keys that pool and folds it, which needs no selector at all
-    (``kvcache_sim``'s prefill and decode picks). What this is for is a ranking over an
-    application's own subject that something *else* consults.
+    should serve this read" ranks with. A ranking over an application's own subject
+    is ``Selector[ThatSubject]`` and needs no name of its own -- this package cannot
+    name a type an application invented.
     """
 
 
@@ -521,7 +503,7 @@ def declared(view: Any, selector: "Selector[Any]") -> Any:
     return view.subset(*selector.sensors) if selector.sensors else view
 
 
-class FirstMatch(KeySelector):
+class FirstMatch(Selector[_S]):
     """Ask each selector in order; the first one that answers is the answer.
 
     A :class:`Selection` can be empty in two ways, and they mean opposite things:
@@ -538,30 +520,33 @@ class FirstMatch(KeySelector):
     should always answer ends with a :class:`NaiveKeySelector`. The winner is returned
     exactly as built, so a readiness gate rides along untouched.
 
-    Over keys, and so a :class:`KeySelector` itself: the subject goes down every link
-    untouched, so a link reading it as anything else would answer a question it was not
-    asked -- checked at construction rather than trusted. A chain of alternatives over
-    an application's own subject has no caller, and would be this class with ``keys``
-    read as that subject.
+    The subject goes down every link untouched, so a link reading it as anything else
+    would answer a question it was not asked: the links must agree on one
+    :attr:`~Selector.subject_type`, checked at construction rather than trusted, and
+    the chain takes it as its own. Compared as a value and not as a class, because a
+    combinator's subject is the one it was handed rather than one it declares
+    (:class:`Balance`).
 
     Args:
-        selectors: consulted left to right, each a :class:`KeySelector` -- a chain
-            answers as its links do. An empty chain is legal and abstains.
+        selectors: consulted left to right, all over one subject -- a chain answers as
+            its links do. An empty chain is legal and abstains.
     """
 
     name = "first-match"
 
-    def __init__(self, selectors: Sequence[KeySelector]) -> None:
-        self.selectors: Tuple[KeySelector, ...] = tuple(selectors)
-        wrong = [type(s).__name__ for s in self.selectors if not isinstance(s, KeySelector)]
-        if wrong:
+    def __init__(self, selectors: Sequence[Selector[_S]]) -> None:
+        self.selectors: Tuple[Selector[_S], ...] = tuple(selectors)
+        subjects = {s.subject_type for s in self.selectors}
+        if len(subjects) > 1:
             raise TypeError(
-                f"a FirstMatch chain selects over keys, so every link must be a "
-                f"KeySelector; {', '.join(wrong)} "
-                f"{'is' if len(wrong) == 1 else 'are'} not"
+                f"a chain hands one subject to every link, so all of them must select "
+                f"over the same one; these are "
+                f"{', '.join(sorted(str(s) for s in subjects))}"
             )
+        #: The links' own, so a chain is a link of a chain (:func:`declared`).
+        self.subject_type = subjects.pop() if subjects else Any
 
-    def attach(self, view: Any) -> "FirstMatch":
+    def attach(self, view: Any) -> "FirstMatch[_S]":
         """Hand every wrapped selector the view it declared, answering or not.
 
         One that senses through a view of its own must be brought up even if it
@@ -572,10 +557,10 @@ class FirstMatch(KeySelector):
             selector.attach(declared(view, selector))
         return self
 
-    async def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    async def select(self, subject: _S, requester: str) -> Selection:
         """The first non-abstaining answer, or an abstention if there is none."""
         for selector in self.selectors:
-            selection = await selector.select(keys, requester)
+            selection = await selector.select(subject, requester)
             if selection.sources is None or selection.sources:
                 return selection
         return Selection.of([])
@@ -604,7 +589,9 @@ class Balance(Selector[_S]):
 
     Over any subject, because the subject is handed to ``ranking`` untouched and never
     read here -- one wrapper serves a ranking over keys and one over an application's
-    own candidates alike. Which *kind* it is follows what it wraps (:meth:`__new__`).
+    own candidates alike. Which subject it takes it reads off that ranking, so a
+    balanced ranking is a chain link exactly where the ranking under it would be
+    (:class:`FirstMatch`).
 
     Determinism: the load is read once per ranking, with nothing awaited between the
     read and the dimension it appends, so no fold can land inside one answer. Nothing
@@ -626,22 +613,6 @@ class Balance(Selector[_S]):
 
     name = "balance"
     sensors = (LoadView,)
-
-    def __new__(
-        cls, ranking: "Selector[_S]", *args: Any, **kwargs: Any
-    ) -> "Balance[_S]":
-        """Take the kind of the ranking wrapped: over keys, a :class:`KeySelector`.
-
-        A combinator asks whatever question its ranking asks, so the kind cannot be
-        declared once here -- and it has to be a type, because that is how a chain
-        checks its links (:class:`FirstMatch`). So a balanced key ranking is a chain
-        link and a balanced application ranking is refused by one, which is the same
-        answer the ranking itself would get.
-        """
-        return object.__new__(
-            _KeyBalance if cls is Balance and isinstance(ranking, KeySelector)
-            else cls
-        )
 
     def __init__(
         self, ranking: Selector[_S], fold: Optional[Fold] = None
@@ -680,11 +651,3 @@ class Balance(Selector[_S]):
         load = self.view.load.named()
         annotated = ranked.annotated(lambda source: load.get(source, 0))
         return annotated if self.fold is None else replace(annotated, fold=self.fold)
-
-
-class _KeyBalance(Balance[Sequence[Key]], KeySelector):
-    """A :class:`Balance` over keys, and so the store's own question.
-
-    What :class:`Balance` answers with when the ranking it wraps is a
-    :class:`KeySelector`, so such a one is a chain link like the ranking under it.
-    """
