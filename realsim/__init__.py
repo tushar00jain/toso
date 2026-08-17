@@ -43,6 +43,6 @@ is here:
 capability-free fixture (seed a key, then ``m`` clients get it) -- so they
 exercise the whole stack without depending on ``dedup_sim`` or ``kvcache_sim``.
 
-See ``docs/realsim_design.md`` for the full design, including exactly how each
+See ``docs/des_design.md`` for the full design, including how each
 real object is driven off-actor.
 """

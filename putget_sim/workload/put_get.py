@@ -73,8 +73,8 @@ def _dtype_name(dtype: torch.dtype) -> str:
     """Cost-model dtype key for a torch dtype (``torch.float32`` -> ``float32``)."""
     return str(dtype).replace("torch.", "")
 
-# The two allocation-free data-plane carriers (see docs/realsim_design.md
-# section 7). Both drive the *real* client/controller/InMemoryStore round-trip with
+# The two allocation-free data-plane carriers (see docs/des_design.md). Both drive
+# the *real* client/controller/InMemoryStore round-trip with
 # zero real tensor storage:
 #   "meta"     -- the payload is a ``device="meta"`` tensor (a real ``torch.Tensor``
 #                 with zero storage but exact shape/dtype/nbytes). Default.

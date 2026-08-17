@@ -44,7 +44,7 @@ Ordering & determinism (mirrors ``engine.py`` conventions)
   them **strictly FIFO** instead -- the same ``(time, seq)`` total order the
   callback engine (:mod:`sim_common.engine`) uses. So an identical sequence of
   scheduling operations replays identically *and* simultaneous timers fire in
-  scheduling order (this is what ``realsim_design.md`` §5 already describes).
+  scheduling order (see ``docs/des_design.md``).
 * Task names are assigned by *this loop* (``task-1``, ``task-2``, ...) instead of
   asyncio's process-global counter, so names -- and therefore the trace -- are
   byte-identical across runs and independent of other loops in the process.

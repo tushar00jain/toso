@@ -6,7 +6,7 @@ unique byte crosses the fabric once) versus ``m x`` for the naive baseline, the
 fan-out cap shapes a chain/tree, and the trace is byte-identical across runs.
 
 The data plane is allocation-free (meta tensor / descriptor carriers, see
-``docs/realsim_design.md`` s7), so correctness is asserted on
+``docs/des_design.md``), so correctness is asserted on
 shape/dtype/nbytes rather than exact bytes -- the exact-byte reassembly guarantee
 of the real client lives in ``realsim/tests/test_correctness.py``.
 

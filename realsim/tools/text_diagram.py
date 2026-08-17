@@ -95,7 +95,8 @@ def _beside(
         for index, block in enumerate(blocks):
             parts.append(block.lines[row] if row < block.height else " " * block.width)
             if index < len(gap_widths):
-                parts.append(links.get((index, row), "").center(gap_widths[index]))
+                gap_text = links.get((index, row), "").center(gap_widths[index])
+                parts.append(gap_text.replace(" ", "\N{NO-BREAK SPACE}"))
         rows.append("".join(parts))
     return _Block(tuple(rows))
 

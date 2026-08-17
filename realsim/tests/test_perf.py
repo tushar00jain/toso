@@ -1,4 +1,4 @@
-"""Perf guard for the realsim scenario (see ``docs/realsim_design.md`` s12).
+"""Perf guard for the realsim scenario (see ``docs/des_design.md``).
 
 Two invariants are enforced here:
 

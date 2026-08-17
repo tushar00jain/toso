@@ -97,8 +97,8 @@ client/controller/transport), so they depend on the from-source
   `llm.py` reduces the served transformer to flops/token and KV bytes/token, and
   converts token counts into seconds. Both capabilities describe operations on a
   model's tensors, so it belongs to neither of them.
-- [`docs/des_explained.md`](docs/des_explained.md) — how the shared core works and
-  how the two sims differ.
+- [`docs/des_design.md`](docs/des_design.md) — the real-code DES stack, virtual
+  time/cost path, and how the three simulations specialize it.
 
 **3. Live example + TUI** — a real single-host store you can write to and watch.
 
@@ -127,10 +127,9 @@ PYTHONPATH=. .venv/bin/python -m kvcache_sim
 
 See each sim's `README.md` for flags, [`realsim/README.md`](realsim/README.md)
 for the real-code foundation, and the `docs/` design docs for how each capability
-works ([`realsim_design.md`](docs/realsim_design.md),
+works ([`des_design.md`](docs/des_design.md),
 [`torchstore_dedup_design.md`](docs/torchstore_dedup_design.md),
-[`torchstore_kvcache_design.md`](docs/torchstore_kvcache_design.md), and
-[`des_explained.md`](docs/des_explained.md)).
+and [`torchstore_kvcache_design.md`](docs/torchstore_kvcache_design.md)).
 
 ## Building the live example from source
 

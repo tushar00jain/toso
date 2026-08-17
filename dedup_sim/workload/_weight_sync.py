@@ -79,7 +79,7 @@ class WeightSync(Workload):
         self.trainer_ids = [f"t{i}" for i in range(num_trainers)]
         self.generator_ids = [f"g{j}" for j in range(num_generators)]
         # Real tensor, zero storage: the payload's size is modeled, its bytes never
-        # move (``docs/realsim_design.md`` s7).
+        # move (``docs/des_design.md``).
         self.expected: Any = torch.empty(n, dtype=dtype, device="meta")
 
     @property

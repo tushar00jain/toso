@@ -17,9 +17,7 @@ and **allocation-free**: the payload is carried by a `device="meta"` tensor (rea
 tensor, zero storage) or a `(shape, dtype)` descriptor, so no real tensor bytes
 ever move no matter how large the modeled payload.
 
-For how the DES foundation works see
-[`../docs/des_explained.md`](../docs/des_explained.md); for the real-code
-foundation, [`../docs/realsim_design.md`](../docs/realsim_design.md).
+See [`../docs/des_design.md`](../docs/des_design.md) for the DES foundation.
 
 ## What one run exercises
 

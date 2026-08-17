@@ -1,0 +1,165 @@
+<diagrams target="docs/des_design.md">
+  <diagram id="stack">
+    <stack>
+      <row gap="3">
+        <box title="CAPABILITY" width="31">
+          <line>Workload / Scenario</line>
+          <line>ControlPlane + selectors</line>
+          <line>DataPlane</line>
+          <line/>
+          <line>Report</line>
+          <line>only capability-specific code</line>
+        </box>
+        <between>
+          <at row="1">──►</at>
+          <at row="2">──►</at>
+          <at row="3">──►</at>
+          <at row="5">──►</at>
+        </between>
+        <box title="REALSIM" width="35">
+          <line>Runner / Simulation</line>
+          <line>control + dispatcher services</line>
+          <line>Deployment / Mesh</line>
+          <line>volume + transport seams</line>
+          <line>Ledger / Trace</line>
+          <line>assembly, seams, real adapters</line>
+        </box>
+        <between>
+          <at row="1">──►</at>
+          <at row="2">──►</at>
+          <at row="3">──►</at>
+          <at row="4">──►</at>
+        </between>
+        <box title="REAL TORCHSTORE" width="38">
+          <line>Request / tensor metadata</line>
+          <line>Controller directory</line>
+          <line>LocalClient planning</line>
+          <line>StorageVolume / InMemoryStore</line>
+          <line/>
+          <line>production algorithms and types</line>
+        </box>
+      </row>
+      <box title="VIRTUAL MACHINE" width="114">
+        <line>AsyncEngine clock  +  ResourceRegistry  +  MachineProfile costs  +  deterministic Trace</line>
+        <line>sim_common owns time and accounting; it knows no capability vocabulary</line>
+      </box>
+    </stack>
+  </diagram>
+
+  <diagram id="work-item">
+    <stack>
+      <row gap="3">
+        <box title="REQUEST" width="14">
+          <line>WorkItem</line>
+          <line>released at t</line>
+          <line/>
+          <line>Runner</line>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="CONTROL" width="21">
+          <line>View → Selector</line>
+          <line>Selection / Response</line>
+          <line>commit Action</line>
+          <line/>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="DATA" width="18">
+          <line>act on answer</line>
+          <line>ordinary APIs</line>
+          <line>report facts</line>
+          <line/>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="TORCHSTORE" width="25">
+          <line>LocalClient → Controller</line>
+          <line>→ Volume / Transport</line>
+          <line>move + register bytes</line>
+          <line/>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="VIRTUAL TIME" width="23">
+          <line>ResourceRegistry claim</line>
+          <line>asyncio.sleep(cost)</line>
+          <line>Ledger / Trace</line>
+          <line/>
+        </box>
+      </row>
+      <row gap="3">
+        <box title="DIRECTORY TRUTH" width="37">
+          <line>put / delete → key → current holders</line>
+        </box>
+        <box title="SENSOR TRUTH" width="35">
+          <line>Action → Dispatcher → sensor folds</line>
+        </box>
+        <box title="NEXT DECISION" width="36">
+          <line>View reads directory + sensor state</line>
+        </box>
+      </row>
+    </stack>
+  </diagram>
+
+  <diagram id="cost">
+    <stack>
+      <row gap="3">
+        <box title="WORK" width="21">
+          <line>nbytes / flops</line>
+          <line>source + destination</line>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="PROFILE" width="20">
+          <line>latency / bandwidth</line>
+          <line>RAM / storage / GPU</line>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="COST" width="19">
+          <line>network / copy</line>
+          <line>storage / roofline</line>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="RESOURCE" width="19">
+          <line>claim contention</line>
+          <line>ordered completion</line>
+        </box>
+        <between><at row="2">──►</at></between>
+        <box title="CLOCK" width="21">
+          <line>asyncio.sleep</line>
+          <line>advance virtual time</line>
+        </box>
+      </row>
+      <box title="CARRIER" width="114">
+        <line>meta tensor or TensorDescriptor: exact shape / dtype / modeled bytes, zero payload storage</line>
+      </box>
+    </stack>
+  </diagram>
+
+  <diagram id="capabilities">
+    <stack>
+      <row gap="3">
+        <box title="PUTGET" width="29">
+          <line>no ControlPlane</line>
+          <line>no DataPlane</line>
+          <line>every reader pulls origin</line>
+          <line/>
+          <line>baseline: m× fabric</line>
+        </box>
+        <box title="DEDUP" width="29">
+          <line>sources(keys, requester)</line>
+          <line>FanoutSensor + readiness</line>
+          <line>preferred get → local put</line>
+          <line/>
+          <line>goal: 1× origin fabric</line>
+        </box>
+        <box title="KVCACHE" width="30">
+          <line>decide(request) + sources</line>
+          <line>queue / decode / pull sensors</line>
+          <line>fetch → prefill → decode</line>
+          <line/>
+          <line>TTFT / TBT / hit rate / SLO</line>
+        </box>
+      </row>
+      <box title="COMMON FOUNDATION" width="95">
+        <line>real Controller + LocalClient + volumes  |  deterministic engine  |  one cost model and ledger</line>
+      </box>
+    </stack>
+  </diagram>
+</diagrams>

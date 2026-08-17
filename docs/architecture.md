@@ -9,18 +9,18 @@
 ═══ the object itself
 ╌╌╌ a handle to a service
 
-CONTROL (one capability)                        SEAMS                        DATA HOST × N
-┌────────────────────────────────────────────┐  ┌─────────────────────────┐  ┌───────────────────────────────┐
+CONTROL (one capability)                        SEAMS                        DATA HOST × N
+┌────────────────────────────────────────────┐  ┌─────────────────────────┐  ┌───────────────────────────────┐
 │ ControlPlane                               │◄─│ ControlPlaneService     │◄╌│ .control_plane_handle         │
-│                                            │  │ behind a                │  │ DataPlane                     │
-│ selector chains ═══ declared View subsets  │  │ LocalControlPlaneHandle │  │   deployment ═ Simulation     │
-│ capability View ═══ Sensor(s)              │  │                         │  │                               │
+│                                            │  │ behind a                │  │ DataPlane                     │
+│ selector chains ═══ declared View subsets  │  │ LocalControlPlaneHandle │  │   deployment ═ Simulation     │
+│ capability View ═══ Sensor(s)              │  │                         │  │                               │
 │ Dispatcher ═ reducer refs to same Sensor(s)│◄─│ DispatcherService       │◄╌│ .dispatcher_handle            │
-│                                            │  │ behind a                │  │ client / volume calls         │
-│ dedup: FanoutSensor as fanout + load       │  │ LocalDispatcherHandle   │  │ go through Deployment         │
-│ KV: Cluster, Reservation, RoutedPull,      │  │                         │  │                               │
-│     SourceLoad                             │  │                         │  │ holds no control objects      │
-└────────────────────────────────────────────┘  └─────────────────────────┘  └───────────────────────────────┘
+│                                            │  │ behind a                │  │ client / volume calls         │
+│ dedup: FanoutSensor as fanout + load       │  │ LocalDispatcherHandle   │  │ go through Deployment         │
+│ KV: Cluster, Reservation, RoutedPull,      │  │                         │  │                               │
+│     SourceLoad                             │  │                         │  │ holds no control objects      │
+└────────────────────────────────────────────┘  └─────────────────────────┘  └───────────────────────────────┘
                         ▲
                         │ attach(base View)
 ┌────────────────────────────── Simulation = Deployment ───────────────────────────────┐
@@ -61,26 +61,26 @@ ONE REQUEST — dedup and KV-cache
 └────────────────────────────────────────────────────────────────────────────────┘
             ▲ 3. sense                                       │ 5. answer
             │                                                ▼
-┌────────────────── READ-ONLY VIEW ──────────────────┐   ┌────────── DATA PLANE ──────────┐
-│ DIRECTORY READ                                     │   │ 1. request arrives             │
-│   locate(keys): key → current holders              │   │ 2. ask through control handle  │
-│   topology / locality / transfer cost / now        │   │ 5. receive the answer          │
-│                                                    │   │ 6. actuate it                  │
-│ CAPABILITY SENSOR READS                            │   │ 7. store calls move bytes      │
-│   dedup: fan-out tree, owed puts, source load      │   │ 8. compute, if any             │
-│   KV: predicted queues, decode batches,            │   │                                │
-│       reservations, routed pulls, source load      │   │ dedup: preferred get → put     │
-│                                                    │   │ KV: route → fetch/reuse        │
-│ 10. the next decision reads both updated truths    │   │     → prefill → publish        │
-└────────────────────────────────────────────────────┘   │     → decode                   │
-                                                         │ 9. publish and report facts    │
-                                                         └────────────────────────────────┘
+┌────────────────── READ-ONLY VIEW ──────────────────┐   ┌────────── DATA PLANE ──────────┐
+│ DIRECTORY READ                                     │   │ 1. request arrives             │
+│   locate(keys): key → current holders              │   │ 2. ask through control handle  │
+│   topology / locality / transfer cost / now        │   │ 5. receive the answer          │
+│                                                    │   │ 6. actuate it                  │
+│ CAPABILITY SENSOR READS                            │   │ 7. store calls move bytes      │
+│   dedup: fan-out tree, owed puts, source load      │   │ 8. compute, if any             │
+│   KV: predicted queues, decode batches,            │   │                                │
+│       reservations, routed pulls, source load      │   │ dedup: preferred get → put     │
+│                                                    │   │ KV: route → fetch/reuse        │
+│ 10. the next decision reads both updated truths    │   │     → prefill → publish        │
+└────────────────────────────────────────────────────┘   │     → decode                   │
+                                                         │ 9. publish and report facts    │
+                                                         └────────────────────────────────┘
             ▲ store put / eviction    ▲ reported Action
             │                         │
-┌───── DIRECTORY TRUTH ──────┐   ┌───────── DISPATCHER ──────────┐
-│ put / put_batch registers  │   │ one Action folds into every   │
-│ eviction deletes holders   │   │ affected Sensor, then commits │
-└────────────────────────────┘   └───────────────────────────────┘
+┌───── DIRECTORY TRUTH ──────┐   ┌───────── DISPATCHER ──────────┐
+│ put / put_batch registers  │   │ one Action folds into every   │
+│ eviction deletes holders   │   │ affected Sensor, then commits │
+└────────────────────────────┘   └───────────────────────────────┘
 ```
 <!-- text-diagram:request-lifecycle:end -->
 

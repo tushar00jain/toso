@@ -21,6 +21,7 @@ def test_xml_boxes_and_rows_are_rectangular(tmp_path):
     _target, drawings = _load(source)
     drawing = drawings["sample"]
     assert len({len(line) for line in drawing.lines}) == 1
+    assert "\N{NO-BREAK SPACE}" in drawing.lines[0]
 
 
 def test_xml_box_rejects_overflow(tmp_path):
@@ -50,8 +51,11 @@ def test_xml_groups_each_multiline_connector(tmp_path):
     assert drawings["sample"].render() == " ▲ left  │\n │       ▼"
 
 
-def test_sensor_view_document_is_rendered():
-    source = REPO_ROOT / "docs" / "sensor_view_selector_flow.diagram.xml"
+@pytest.mark.parametrize(
+    "name", ["sensor_view_selector_flow", "des_design"]
+)
+def test_diagram_document_is_rendered(name):
+    source = REPO_ROOT / "docs" / f"{name}.diagram.xml"
     target, drawings = _load(source)
     document = (REPO_ROOT / target).read_text()
     assert _render(document, drawings) == document

@@ -4,7 +4,7 @@ The real ``LocalClient`` reaches the transport through a **process-wide module
 global**: it does ``from torchstore.transport import create_transport_buffer`` at
 import time, so the only place a sim can substitute the in-memory transport is
 the bound name on the ``torchstore.client`` module object (see
-``docs/realsim_design.md`` recommendation 2 for the upstream fix).
+``docs/des_design.md`` under fidelity boundaries).
 
 Because that global is process-wide, *every* substitution in this repo must go
 through this module. Three call sites used to patch it independently -- the

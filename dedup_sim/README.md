@@ -15,7 +15,7 @@ ever move no matter how large the modeled payload.
 
 For the capability's design see
 [`../docs/torchstore_dedup_design.md`](../docs/torchstore_dedup_design.md); for how
-the DES foundation works, [`../docs/des_explained.md`](../docs/des_explained.md).
+the DES foundation works, [`../docs/des_design.md`](../docs/des_design.md).
 
 ## How dedup gets to 1x on the real directory
 

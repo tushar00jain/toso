@@ -134,7 +134,7 @@ class RealClientAdapter:
         must either scope each client's operations in its own ``installed()``
         block or, better, share one :class:`realsim.mesh.Mesh` factory that
         resolves the source per operation. Overlapping installs raise (see
-        ``docs/realsim_design.md`` s10 for the recommended upstream fix).
+        ``docs/des_design.md`` under fidelity boundaries).
         """
         with factory.installed(self._transport_factory(), owner=self):
             yield self

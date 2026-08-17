@@ -1,6 +1,6 @@
 """Determinism + invariants for the realsim read-burst on the deterministic engine.
 
-The data plane is allocation-free (see ``docs/realsim_design.md`` s7),
+The data plane is allocation-free (see ``docs/des_design.md``),
 so these DES tests assert only **shape/dtype/nbytes + trace determinism** -- the
 exact-byte reassembly guarantee lives off the sim path in
 ``test_correctness.py`` (tiny real CPU tensors). Both carriers are exercised:

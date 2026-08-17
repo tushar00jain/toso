@@ -16,7 +16,7 @@ and store types that execute are the real ones; only the components being design
 (a routing `KeySelector`, a capability's `DataPlane`) and the actor/RPC boundary are
 substituted with in-process seams.
 
-**See [`../docs/realsim_design.md`](../docs/realsim_design.md) for the full design**
+**See [`../docs/des_design.md`](../docs/des_design.md) for the full design**
 — the concurrency model, how each real object is driven off-actor, the cost model,
 the allocation-free data plane, the control-plane seams, and the concurrency contract.
 
