@@ -139,6 +139,18 @@ so a demo that has not declared its scenarios cannot be constructed, and
 PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.check_structure
 ```
 
+## Text-diagram renderer
+
+`realsim/tools/text_diagram.py` parses a strict XML-like DSL. Its supported elements
+are `diagram`, `stack`, `row`, `box`, `text`, `place-line`, `place-lines`, `line`,
+`between`, and `at`; unknown HTML features fail. The source declares content and
+layout, and the renderer replaces the marked sections in the Markdown document:
+
+```
+PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.text_diagram \
+  docs/sensor_view_selector_flow.diagram.xml
+```
+
 ## Layout
 
 ```
@@ -165,6 +177,7 @@ realsim/
                   one place that executes
   tools/          check_contract.py: the concurrency + plane-separation lint
                   check_structure.py: the shape of a sim package
+                  text_diagram.py: strict XML-like monospaced-diagram renderer
                   parity.py: every run of every scenario over a knob matrix, one
                   diffable line each (fingerprint + headline metrics) -- what says
                   whether a change moved a number, by diffing two checkouts' output

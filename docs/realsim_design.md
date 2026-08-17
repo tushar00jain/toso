@@ -166,6 +166,7 @@ realsim/
   tools/
     check_contract.py         # concurrency-contract lint (AST checker + CLI)
     check_structure.py        # structure lint: a sim package's shape (AST + CLI)
+    text_diagram.py           # strict XML-like monospaced-diagram renderer
   tests/
     test_seams.py             # smoke: put + full get + sliced get round-trip
     test_determinism.py       # byte-identical traces; shape/dtype/nbytes invariants

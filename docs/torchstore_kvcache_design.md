@@ -4,7 +4,7 @@
 routing (prefill/decode serving), layered on the existing TorchStore substrate.
 The reference architecture is the Mooncake paper (arXiv:2407.00079); this doc adapts
 its *concepts* to TorchStore and is concerned only with the design.
-See `architecture.md` for how TorchStore's control plane, data plane, and transport
+See `torchstore.md` for how TorchStore's control plane, data plane, and transport
 work today.
 
 A design for making **TorchStore double as a Mooncake-style KV cache** for LLM
@@ -115,7 +115,7 @@ Reusable pieces (the substrate this design builds on). Most exist today; K5
 | # | Piece | What / where |
 |---|-------|--------------|
 | K1 | **Prefix-hash block addressing** | A KV block's key is a **hash chain**: `block_key[i] = H(block_tokens[i] ‖ block_key[i-1])`. Content-identical prefixes ⇒ identical keys ⇒ **dedup + reuse fall out** for free. **This is a client/connector convention, not a store change** — the serving-engine connector computes the block hash and passes it as the *opaque* object key. The store stays opaque and content-**agnostic**: keys are application-supplied, and the store simply stores each block as a plain tensor under that key. |
-| K2 | **Block-level put/get** | Store/fetch one KV block via the existing `put`/`get` on a volume + transport. A block value is the KV for `B` tokens (e.g. `[2, n_layers, B, n_kv_heads, head_dim]`); the store stays geometry-blind (§9 of architecture.md) — a block is just bytes under a key. |
+| K2 | **Block-level put/get** | Store/fetch one KV block via the existing `put`/`get` on a volume + transport. A block value is the KV for `B` tokens (e.g. `[2, n_layers, B, n_kv_heads, head_dim]`); the store stays geometry-blind (§9 of torchstore.md) — a block is just bytes under a key. |
 | K2b | **Prefix locate** | `locate_volumes(block_keys)` (existing) returns per-block presence; the **longest present run from the front, per volume** = that instance's reusable prefix length. This is the coordinator's core query, computed from the existing directory. |
 | K3 | **Peer-source transfer** | A block resolves to *any* volume holding it, incl. a peer instance's volume; the transport moves it once. This is already indexable in the Controller directory. |
 | K4 | **Read-through population** | After an instance fetches/computes a block, it `put`s the block into its own volume and the controller registers it — so peers can reuse it. Persistent: the block stays cached (no version window). |

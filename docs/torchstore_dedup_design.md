@@ -1,7 +1,7 @@
 # Design: replica-aware weight-transfer dedup on TorchStore
 
 **Status:** draft / proposal · **Scope:** trainer→generator weight sync for RL.
-See `architecture.md` for how TorchStore's control plane and resharding work today.
+See `torchstore.md` for how TorchStore's control plane and resharding work today.
 
 A design for making replica-aware, **deduplicated** weight transfer a capability of
 **TorchStore** itself, rather than something each application re-implements or a separate

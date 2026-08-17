@@ -1,0 +1,152 @@
+<diagrams target="docs/architecture.md">
+  <diagram id="who-holds-what">
+    <stack>
+      <text width="110">
+        <line>═══ the object itself</line>
+        <line>╌╌╌ a handle to a service</line>
+        <line/>
+      </text>
+      <row gap="2">
+        <text width="46"><line>CONTROL (one capability)</line></text>
+        <text width="27"><line>SEAMS</line></text>
+        <text width="33"><line>DATA HOST × N</line></text>
+      </row>
+      <row gap="2">
+        <box width="44">
+          <line>ControlPlane</line>
+          <line/>
+          <line>selector chains ═══ declared View subsets</line>
+          <line>capability View ═══ Sensor(s)</line>
+          <line>Dispatcher ═ reducer refs to same Sensor(s)</line>
+          <line/>
+          <line>dedup: FanoutSensor as fanout + load</line>
+          <line>KV: Cluster, Reservation, RoutedPull,</line>
+          <line>    SourceLoad</line>
+        </box>
+        <between>
+          <at row="1">◄─</at>
+          <at row="5">◄─</at>
+        </between>
+        <box width="25">
+          <line>ControlPlaneService</line>
+          <line>behind a</line>
+          <line>LocalControlPlaneHandle</line>
+          <line/>
+          <line>DispatcherService</line>
+          <line>behind a</line>
+          <line>LocalDispatcherHandle</line>
+          <line/>
+          <line/>
+        </box>
+        <between>
+          <at row="1">◄╌</at>
+          <at row="5">◄╌</at>
+        </between>
+        <box width="31">
+          <line>.control_plane_handle</line>
+          <line>DataPlane</line>
+          <line>  deployment ═ Simulation</line>
+          <line/>
+          <line>.dispatcher_handle</line>
+          <line>client / volume calls</line>
+          <line>go through Deployment</line>
+          <line/>
+          <line>holds no control objects</line>
+        </box>
+      </row>
+      <place-line width="110"><at column="24">▲</at></place-line>
+      <place-line width="110"><at column="24">│ attach(base View)</at></place-line>
+      <box title="Simulation = Deployment" width="86">
+        <line/>
+        <line>Simulation ═══ Mesh</line>
+        <line>           ═══ control_plane_handle</line>
+        <line>           ═══ dispatcher_handle</line>
+        <line/>
+        <line>Mesh ═══ base View ═══ ControllerService + topology + transfer cost</line>
+        <line>         │</line>
+        <line>         └── locate / locality / now / transfer cost</line>
+        <line/>
+        <line>Mesh ═══ ControllerService      the real directory: key → current volume holders</line>
+        <line>     ═══ LocalClient × N        get / put / get_batch / put_batch</line>
+        <line>     ═══ VolumeService × N      resident bytes, capacity, eviction</line>
+      </box>
+    </stack>
+  </diagram>
+
+  <diagram id="request-lifecycle">
+    <stack>
+      <text width="91">
+        <line>ONE REQUEST — dedup and KV-cache</line>
+        <line/>
+      </text>
+      <box title="CONTROL PLANE" width="80">
+        <line>4. decide   selector.select(subject, requester)</line>
+        <line/>
+        <line>     dedup: keys → ranked source volumes + readiness</line>
+        <line>     KV:    request → prefill/decode placement + priced reuse;</line>
+        <line>            fetch keys → the source already priced</line>
+        <line/>
+        <line>   the Selector reads a declared View subset and writes nothing</line>
+        <line>   the plane chooses the answer and commits the decision</line>
+      </box>
+      <place-lines width="91">
+        <at column="12">
+          <line>▲ 3. sense</line>
+          <line>│</line>
+        </at>
+        <at column="61">
+          <line>│ 5. answer</line>
+          <line>▼</line>
+        </at>
+      </place-lines>
+      <row gap="3">
+        <box title="READ-ONLY VIEW" width="52">
+          <line>DIRECTORY READ</line>
+          <line>  locate(keys): key → current holders</line>
+          <line>  topology / locality / transfer cost / now</line>
+          <line/>
+          <line>CAPABILITY SENSOR READS</line>
+          <line>  dedup: fan-out tree, owed puts, source load</line>
+          <line>  KV: predicted queues, decode batches,</line>
+          <line>      reservations, routed pulls, source load</line>
+          <line/>
+          <line>10. the next decision reads both updated truths</line>
+        </box>
+        <box title="DATA PLANE" width="32">
+          <line>1. request arrives</line>
+          <line>2. ask through control handle</line>
+          <line>5. receive the answer</line>
+          <line>6. actuate it</line>
+          <line>7. store calls move bytes</line>
+          <line>8. compute, if any</line>
+          <line/>
+          <line>dedup: preferred get → put</line>
+          <line>KV: route → fetch/reuse</line>
+          <line>    → prefill → publish</line>
+          <line>    → decode</line>
+          <line>9. publish and report facts</line>
+        </box>
+      </row>
+      <place-lines width="91">
+        <at column="12">
+          <line>▲ store put / eviction</line>
+          <line>│</line>
+        </at>
+        <at column="38">
+          <line>▲ reported Action</line>
+          <line>│</line>
+        </at>
+      </place-lines>
+      <row gap="3">
+        <box title="DIRECTORY TRUTH" width="28">
+          <line>put / put_batch registers</line>
+          <line>eviction deletes holders</line>
+        </box>
+        <box title="DISPATCHER" width="31">
+          <line>one Action folds into every</line>
+          <line>affected Sensor, then commits</line>
+        </box>
+      </row>
+    </stack>
+  </diagram>
+</diagrams>

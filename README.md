@@ -9,7 +9,7 @@ TorchStore is a distributed, async KV store for PyTorch tensors built on
 [Monarch](https://github.com/meta-pytorch/monarch) actors. Its headline use case
 is **weight sync between a trainer/learner and a generator in RL**, including
 **resharding** weights across two different device meshes. See
-[`docs/architecture.md`](docs/architecture.md) for how it works today.
+[`docs/torchstore.md`](docs/torchstore.md) for how it works today.
 
 ## What's here
 
@@ -18,7 +18,7 @@ The repo has three independent workstreams.
 **1. Design docs** (`docs/`) — how TorchStore works and two proposed capabilities
 layered on it.
 
-- [`architecture.md`](docs/architecture.md) — a ground-up explanation of
+- [`torchstore.md`](docs/torchstore.md) — a ground-up explanation of
   TorchStore's control plane, data plane, and resharding, with a glossary.
 - [`torchstore_dedup_design.md`](docs/torchstore_dedup_design.md) — replica-aware,
   **deduplicated** trainer→generator weight transfer: a dynamic routing layer that
@@ -26,6 +26,9 @@ layered on it.
 - [`torchstore_kvcache_design.md`](docs/torchstore_kvcache_design.md) — making
   TorchStore double as a **Mooncake-style KV-cache** pool for LLM serving, with a
   cache-aware coordinator, prefix-hash addressing, and eviction.
+- [`architecture.md`](docs/architecture.md) — two diagrams
+  showing who holds each control object and how requests feed directory and sensor
+  changes back through a read-only view into the next selection.
 
 **2. Discrete-event simulations** — each design has a companion deterministic DES
 that exercises the *algorithm* (not performance) on a simulated clock: no
