@@ -16,7 +16,7 @@ from typing import Any, Optional, Sequence
 
 from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
 from proposed.selector import (
-    Balance, Dims, FirstMatch, Folded, NaiveKeySelector, Selector, Sort,
+    Balance, Dims, FirstMatch, Folded, NaiveKeySelector, pipe, Selector, Sort,
 )
 
 from ._answer import committed
@@ -85,14 +85,18 @@ class Dedup(ControlPlane):
         # Which volumes serve a read: every holder of the key and every peer already
         # planned to hold it, priced together in seconds, so which one wins is
         # arithmetic off the score rather than an order the caller has to know.
-        self._chain = Sort(FirstMatch([
-            Folded(
-                Balance(Candidates(SPREAD if self._spread else CHAIN)),
-                _soonest if self._spread else None,
-            ),
-            # Tail: an unroutable ask gets the directory's own answer, not a hole.
-            NaiveKeySelector(),
-        ])).attach(self.view)
+        self._chain = pipe(
+            FirstMatch([
+                pipe(
+                    Candidates(SPREAD if self._spread else CHAIN),
+                    Balance,
+                    Folded(_soonest if self._spread else None),
+                ),
+                # Tail: an unroutable ask gets the directory's own answer, not a hole.
+                NaiveKeySelector(),
+            ]),
+            Sort,
+        ).attach(self.view)
 
     # -- what a reader asks -------------------------------------------------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection:
@@ -106,7 +110,7 @@ class Dedup(ControlPlane):
 
         The chain keys each source ``(score, queued)``: the seconds
         :class:`~dedup_sim.control._selector.Candidates` priced it at, then the readers
-        :class:`~proposed.selector.Balance` found already routed to it. Compared as they
+        :data:`~proposed.selector.Balance` found already routed to it. Compared as they
         stand, the fabric decides and the queue only settles a tie the score cannot:
         queueing behind a peer is already in that peer's own wait, so charging it again
         would price one delay twice. The tie-break keeps two replicas of one key

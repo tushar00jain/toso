@@ -354,7 +354,7 @@ class LoadView(SensorView):
 
     -- a count of decisions, a queue ratio, bytes in flight. The **unit is the
     application's**, since it is the application's sensor reporting it and the
-    application's own fold that reads it (:class:`proposed.selector.Balance` appends this
+    application's own fold that reads it (:data:`proposed.selector.Balance` appends this
     number to the key of a ranking that cannot separate two sources, and what to make of
     it is the fold's). Absent means none.
 

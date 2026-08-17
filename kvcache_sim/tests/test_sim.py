@@ -34,7 +34,7 @@ from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
 from proposed.selector import (
-    Balance, Const, FirstMatch, Folded, Lift, Max, Selector, Sort,
+    Balance, Const, FirstMatch, Folded, Lift, Max, pipe, Selector, Sort,
 )
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk, Priced,
@@ -1633,7 +1633,9 @@ def test_the_source_selector_accepts_a_plain_view():
 def _spread(bound: int = 1) -> Selector:
     """The opt-in ranking, as the plane declares it: the prefix run with the recent
     grants appended, stamped with the fold that docks one by the other."""
-    return Folded(Balance(LongestPrefixKeySelector()), by_prefix_and_load(bound))
+    return pipe(
+        LongestPrefixKeySelector(), Balance, Folded(by_prefix_and_load(bound))
+    )
 
 
 def _replicated(holders, blocks, *, num=4):
@@ -1774,6 +1776,15 @@ def _stamps_a_fold(link) -> bool:
     )
 
 
+def _balances(link) -> bool:
+    """Whether ``link`` is ``Balance`` applied: the stage measuring what it measures.
+
+    ``Balance`` is one ``Annotate`` instance rather than a class, so what identifies it is
+    the measure it holds (:data:`proposed.selector.Balance`).
+    """
+    return getattr(link, "readings", None) is Balance.readings
+
+
 def test_the_spread_reads_flag_reaches_a_scenario_run():
     """The opt-in entry point, exercised from the flag to the ledger.
 
@@ -1797,7 +1808,7 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     # answers, stamped with the fold that reads the dimension it appends -- or the load
     # would be measured and never read.
     fetched = [run.control._fetch.ranking.selectors[-1] for run in aware]
-    assert all(_stamps_a_fold(p) and isinstance(p.ranking, Balance) for p in fetched)
+    assert all(_stamps_a_fold(p) and _balances(p.ranking) for p in fetched)
     # ...and the replicating run prices against one too, so the pull it plans is
     # spread the same way the read that carries it out will be.
     assert _stamps_a_fold(aware[-1].control._reuse.ranking)
@@ -1945,7 +1956,7 @@ def _plan(*, ttft: float, match_blocks: int = 0, done_time: float = 0.0) -> Plan
 
 def _ordered(pool: Selection, fold) -> tuple:
     """``pool`` ordered as the prefill chain orders one: stamped with ``fold``, sorted."""
-    chain = Sort(Folded(Const(pool), fold))
+    chain = pipe(Const(pool), Folded(fold), Sort)
     return chain.select(None, "s0").sources
 
 

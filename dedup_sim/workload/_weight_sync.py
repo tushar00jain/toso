@@ -5,7 +5,7 @@ so either can serve it -- and ``m`` generators each want it. Every trainer is cr
 from every generator and no two are nearer than each other, so locality prices the
 replicas **identically** and a ranking over distance alone sends every generator to
 whichever id sorts first. That is the tie a load term breaks
-(:class:`~proposed.selector.Balance`), and this is the smallest workload where breaking
+(:data:`~proposed.selector.Balance`), and this is the smallest workload where breaking
 it changes who serves whom.
 
 The fixture is ordinary user code, as :class:`~putget_sim.workload.put_get.PutGetBurst`

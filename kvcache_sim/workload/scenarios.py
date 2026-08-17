@@ -274,7 +274,7 @@ class Hotspot(Scenario):
     """Compare (a) baseline, (b) cache-aware no-replication, (c) cache-aware.
 
     ``--spread-reads`` puts the two cache-aware runs' source ranking under a
-    :class:`~proposed.selector.Balance` and folds the two dimensions that leaves with
+    :data:`~proposed.selector.Balance` and folds the two dimensions that leaves with
     :func:`~kvcache_sim.control._selector.by_prefix_and_load`, so longest-prefix-then-id
     becomes longest-prefix-minus-recent-load. This scenario is where it can matter: extreme
     skew replicates one prefix, and every replica of it ranks identically on prefix

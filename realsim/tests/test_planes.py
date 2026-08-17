@@ -476,9 +476,9 @@ def test_a_fold_blends_the_dimensions_the_stages_left():
     """
     two = Const(Selection.keyed([("v0", (4, 3)), ("v1", (5, 0))]))
     assert _select(Sort(two)).sources == ("v0", "v1")                     # 4 < 5
-    blended = Folded(two, lambda d: d[0] * (1 + d[1]))
+    blended = Folded(lambda d: d[0] * (1 + d[1]))(two)
     assert _select(Sort(blended)).sources == ("v1", "v0")                 # 16 > 5
-    short = Folded(Const(Selection.priced([("v0", 4)])), lambda d: d[0] + d[1])
+    short = Folded(lambda d: d[0] + d[1])(Const(Selection.priced([("v0", 4)])))
     with pytest.raises(IndexError):
         _select(Sort(short))
 
@@ -489,9 +489,8 @@ def test_a_fold_rides_on_the_answer_so_nothing_that_orders_it_names_one():
     Which is what stops two callers of one ranking folding it two different ways -- and
     stamping one orders nothing by itself.
     """
-    ranking = Folded(
-        Const(Selection.keyed([("v0", (4, 3)), ("v1", (5, 0))])),
-        lambda d: d[0] * (1 + d[1]),
+    ranking = Folded(lambda d: d[0] * (1 + d[1]))(
+        Const(Selection.keyed([("v0", (4, 3)), ("v1", (5, 0))]))
     )
     stamped = _select(ranking)
     assert stamped.fold is not None
@@ -508,7 +507,7 @@ def test_the_id_breaks_every_tie_in_one_place():
     """
     tied = Const(Selection.keyed([("v1", (5, 1)), ("v0", (5, 1))]))
     assert _select(Sort(tied)).sources == ("v0", "v1")
-    assert _select(Sort(Folded(tied, lambda d: 0))).sources == ("v0", "v1")
+    assert _select(Sort(Folded(lambda d: 0)(tied))).sources == ("v0", "v1")
 
 
 def test_both_empties_survive_an_ordering():
@@ -558,7 +557,7 @@ def test_max_takes_the_winner_in_one_pass_and_sort_would_leave_it_in_front():
     the sources behind that one -- ``n - 1`` comparisons, not ``n log n``.
     """
     pool = Selection.keyed([(f"v{i}", (v,)) for i, v in enumerate([3, 7, 1, 8, 2, 6, 5, 4])])
-    folded = Folded(Const(pool), lambda d: _Counted(d[0]))
+    folded = Folded(lambda d: _Counted(d[0]))(Const(pool))
 
     _Counted.compared = 0
     assert _select(Max(folded)).sources == ("v2",)               # the 1
@@ -910,8 +909,8 @@ def test_a_stage_measures_off_the_view_and_the_subject_alone():
         return lambda source: len(source) + view.load.named().get(source, 0)
 
     senses = _Senses(_Load(v0=3))
-    staged = Annotate(
-        _Fixed(Selection.of(["v0", "v11"])), readings, senses=(LoadView,)
+    staged = Annotate(readings, senses=(LoadView,))(
+        _Fixed(Selection.of(["v0", "v11"]))
     )
     assert staged.sensors == (LoadView,)         # declared, so the view carries the read
     staged.attach(senses)
@@ -975,8 +974,8 @@ def test_the_fold_a_chain_is_stamped_with_decides_what_load_may_outvote():
     """
     apart = Balance(_Fixed(Selection.priced([("v0", 5), ("v1", 9)])))
     assert _heads(apart, count=4) == ["v0"] * 4
-    assert _heads(Folded(apart, _bounded(1)), count=4) == ["v0"] * 4
-    assert _heads(Folded(apart, _bounded(4)), count=5) == [
+    assert _heads(Folded(_bounded(1))(apart), count=4) == ["v0"] * 4
+    assert _heads(Folded(_bounded(4))(apart), count=5) == [
         "v0", "v0", "v0", "v0", "v1",
     ]
 

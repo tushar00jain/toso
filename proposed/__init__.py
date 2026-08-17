@@ -19,8 +19,8 @@ simulator, ``proposed`` is the design being argued for.
   :func:`~proposed.selector.prefer` (what the store does with a preference), the
   combinators a decision is declared out of -- :class:`~proposed.selector.FirstMatch`
   (try selectors in order), :class:`~proposed.selector.Annotate` and its
-  :class:`~proposed.selector.Balance` (append a dimension),
-  :func:`~proposed.selector.Folded` (say how the key is read) and
+  :data:`~proposed.selector.Balance` (append a dimension),
+  :class:`~proposed.selector.Folded` (say how the key is read) and
   :func:`~proposed.selector.Sort` / :func:`~proposed.selector.Max` (order or cut) --
   and the :class:`~proposed.selector.Selector` base they are typed on are reached
   through the module rather than re-exported here: what a deployment has to *implement*

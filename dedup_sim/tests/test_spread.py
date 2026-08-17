@@ -63,7 +63,7 @@ def test_spread_gives_each_generator_a_trainer_of_its_own():
 
     Two generators, two trainers, and each generator reads from a different one --
     which is the tie broken on something that moves: the combinator appends the queue
-    the first decision left behind (:class:`proposed.selector.Balance`) and the plane's
+    the first decision left behind (:data:`proposed.selector.Balance`) and the plane's
     fold reads it.
     """
     spread = _run()[SPREAD]

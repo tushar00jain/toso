@@ -81,7 +81,7 @@ def test_a_composed_fanout_answers_for_itself():
 def test_the_ranking_still_senses_the_fanout_under_a_re_ranking():
     """A combinator narrows the view, and the ranking under it must keep its own read.
 
-    Load spreading is a :class:`~proposed.selector.Balance` over this ranking, so the
+    Load spreading is a :data:`~proposed.selector.Balance` over this ranking, so the
     ranking is attached to whatever that combinator declared. It declares the ranking's
     reads as well as its own (:func:`proposed.selector.declares`), or the ranking would
     be handed a view with no fan-out in it and raise on the first peer it prices.

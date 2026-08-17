@@ -71,7 +71,7 @@ from proposed import (
     ControlPlane, Dispatcher, Key, Selection,
 )
 from proposed.selector import (
-    Annotate, Balance, declared, Dims, FirstMatch, Folded, Max, Selector, Sort,
+    Annotate, Balance, declared, Dims, FirstMatch, Folded, Max, pipe, Selector, Sort,
 )
 
 from domain import (
@@ -140,7 +140,7 @@ def _source_ranking(source: Source) -> Selector[Sequence[Key]]:
     fold with it, so both chains it goes into weigh them the same way.
     """
     if source is Source.SPREAD:
-        return Folded(Balance(LongestPrefixKeySelector()), by_prefix_and_load())
+        return pipe(LongestPrefixKeySelector(), Balance, Folded(by_prefix_and_load()))
     return LongestPrefixKeySelector()
 
 
@@ -216,7 +216,7 @@ class _Scheduler(ControlPlane):
         )
         # Which peer serves a fetch: the one this plane already priced the pull
         # against, else whoever holds the longest prefix.
-        self._fetch = Sort(FirstMatch([RoutedPull(), _source_ranking(source)]))
+        self._fetch = pipe(FirstMatch([RoutedPull(), _source_ranking(source)]), Sort)
         #: Which fold orders the prefill pool, and with it whether the queue is
         #: measured at all (:meth:`attach`).
         self._rank = rank
@@ -287,13 +287,16 @@ class _Scheduler(ControlPlane):
         self.decode_ids = self.decode_ids or ids
         # Which host decodes: whichever instance in the decode pool would hold the
         # smallest batch when this request's prefill lands.
-        self._decode = Max(DecodeBatch(
-            self.decode_ids,
-            tbt_enabled=self.tbt_enabled,
-            lookahead=self._lookahead,
-            profile=self.profile,
-            model=self.model,
-        ))
+        self._decode = pipe(
+            DecodeBatch(
+                self.decode_ids,
+                tbt_enabled=self.tbt_enabled,
+                lookahead=self._lookahead,
+                profile=self.profile,
+                model=self.model,
+            ),
+            Max,
+        )
         # Which host prefills: whichever instance in the prefill pool serving the request
         # costs least -- queue, then transfer, then prefill -- with the peer the reuse
         # ranking named priced in against recomputing.
@@ -312,16 +315,17 @@ class _Scheduler(ControlPlane):
             # The queue dimension goes on only where that fold reads it: compared as
             # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
             # id, and two idle instances holding no prefix do price identically.
-            self._prefill = Max(Folded(
+            self._prefill = pipe(
+                priced,
                 Annotate(
-                    priced,
                     lambda view, _ask: view.cluster.busy_until,
                     senses=(ClusterView,),
                 ),
-                _by_queue,
-            ))
+                Folded(_by_queue),
+                Max,
+            )
         else:
-            self._prefill = Max(Folded(priced, _by_ttft))
+            self._prefill = pipe(priced, Folded(_by_ttft), Max)
 
         for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
             ranking.attach(declared(self.view, ranking))
