@@ -32,29 +32,29 @@ control/data planes are the application code under study.
 
 The layering rule is simple: `proposed` imports nothing; `sim_common` knows only
 simulation primitives; `realsim` assembles the real stack; capability packages
-depend on that foundation. Control decides through a read-only `View`; data moves
-bytes through a `Deployment`.
+depend on that foundation. Control decides from an `Environment` and declared
+sensors; data moves bytes through a `Deployment`.
 
 ## 2. One work item
 
 <!-- text-diagram:work-item:start -->
 ```
 ┌── REQUEST ───┐   ┌────── CONTROL ──────┐   ┌────── DATA ──────┐   ┌────── TORCHSTORE ───────┐   ┌──── VIRTUAL TIME ─────┐
-│ WorkItem     │   │ View → Selector     │   │ act on answer    │   │ LocalClient → Controller│   │ ResourceRegistry claim│
+│ WorkItem     │   │ Sensors → Selector  │   │ act on answer    │   │ LocalClient → Controller│   │ ResourceRegistry claim│
 │ released at t│──►│ Selection / Response│──►│ ordinary APIs    │──►│ → Volume / Transport    │──►│ asyncio.sleep(cost)   │
 │              │   │ commit Action       │   │ report facts     │   │ move + register bytes   │   │ Ledger / Trace        │
 │ Runner       │   │                     │   │                  │   │                         │   │                       │
 └──────────────┘   └─────────────────────┘   └──────────────────┘   └─────────────────────────┘   └───────────────────────┘
-┌────────── DIRECTORY TRUTH ──────────┐   ┌────────── SENSOR TRUTH ───────────┐   ┌────────── NEXT DECISION ───────────┐
-│ put / delete → key → current holders│   │ Action → Dispatcher → sensor folds│   │ View reads directory + sensor state│
-└─────────────────────────────────────┘   └───────────────────────────────────┘   └────────────────────────────────────┘
+┌────────── DIRECTORY TRUTH ──────────┐   ┌────────── SENSOR TRUTH ───────────┐   ┌─────────── NEXT DECISION ───────────┐
+│ put / delete → key → current holders│   │ Action → Dispatcher → sensor folds│   │ Selector reads environment + sensors│
+└─────────────────────────────────────┘   └───────────────────────────────────┘   └─────────────────────────────────────┘
 ```
 <!-- text-diagram:work-item:end -->
 
 The directory and sensors are separate truths. Store puts and evictions change
 residency. Dispatched actions change a capability's queue, reservation, routing,
-or load model. The next decision reads both through its view; selectors mutate
-neither.
+or load model. The next decision reads both through its attached sensors; selectors
+mutate neither.
 
 ## 3. Time and cost
 

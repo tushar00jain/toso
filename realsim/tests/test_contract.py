@@ -202,7 +202,7 @@ def test_structure_lint_flags_a_selector_that_remembers_on_itself(tmp_path):
 def test_structure_lint_accepts_a_selector_that_remembers_in_a_sensor(tmp_path):
     """The same ranking, with the count where it belongs: no finding.
 
-    Writing a sensor the view carries is how a decision remembers -- observable,
+    Writing a declared sensor is how a decision remembers -- observable,
     foldable, and one thing however many rankings read it.
     """
     pkgs = _toy_pkg(tmp_path, {
@@ -211,11 +211,11 @@ def test_structure_lint_accepts_a_selector_that_remembers_in_a_sensor(tmp_path):
         "control/_selector.py": (
             "__all__ = ['RoundRobin']\n\n\n"
             "class RoundRobin(KeySelector):\n"
-            "    def __init__(self):\n"
-            "        self.view = None\n\n"
+            "    sensors = (Turns,)\n\n"
             "    def select(self, keys, requester):\n"
-            "        self.view.turns.taken(requester)\n"
-            "        return self.view.turns.next()\n"
+            "        turns = self.sensor(Turns)\n"
+            "        turns.taken(requester)\n"
+            "        return turns.next()\n"
         ),
         "workload/__init__.py": "",
         "workload/scenarios.py": "from ..control._selector import RoundRobin\n",
@@ -276,17 +276,17 @@ def test_structure_lint_flags_a_public_name_only_its_own_module_uses(tmp_path):
     pkgs = _toy_pkg(tmp_path, {
         "__init__.py": "",
         "workload/__init__.py": "",
-        "control/view.py": (
-            "__all__ = ['View']\n\n\n"
+        "control/prefix.py": (
+            "__all__ = ['Prefix']\n\n\n"
             "def walk(keys):\n    return len(keys)\n\n\n"
-            "class View:\n    def lengths(self, keys):\n        return walk(keys)\n"
+            "class Prefix:\n    def lengths(self, keys):\n        return walk(keys)\n"
         ),
         "tests/__init__.py": "",
-        "tests/test_view.py": "from ..control.view import walk\n",
+        "tests/test_prefix.py": "from ..control.prefix import walk\n",
     })
     violations = check_structure.check_name_privacy(tmp_path, pkgs)
     assert [v.code for v in violations] == ["public-name-no-consumer"]
-    assert violations[0].path.endswith("view.py")
+    assert violations[0].path.endswith("prefix.py")
     assert "walk" in violations[0].message
 
 
@@ -295,17 +295,17 @@ def test_structure_lint_accepts_a_name_another_module_uses(tmp_path):
     common = {
         "__init__.py": "",
         "workload/__init__.py": "",
-        "control/view.py": "__all__ = ['walk']\n\n\ndef walk(keys):\n    return keys\n",
+        "control/prefix.py": "__all__ = ['walk']\n\n\ndef walk(keys):\n    return keys\n",
     }
     direct = _toy_pkg(tmp_path / "a", {
-        **common, "workload/scenarios.py": "from ..control.view import walk\n",
+        **common, "workload/scenarios.py": "from ..control.prefix import walk\n",
     })
     assert check_structure.check_name_privacy(tmp_path / "a", direct) == []
 
     # Published through the package, imported from there: still a consumer.
     reexport = _toy_pkg(tmp_path / "b", {
         **common,
-        "control/__init__.py": "from .view import walk\n",
+        "control/__init__.py": "from .prefix import walk\n",
         "workload/scenarios.py": "from ..control import walk\n",
     })
     assert check_structure.check_name_privacy(tmp_path / "b", reexport) == []
@@ -543,8 +543,8 @@ def test_lint_flags_control_importing_the_mesh_or_a_client():
 def test_lint_allows_what_control_is_supposed_to_use():
     allowed = (
         "from proposed import KeySelector, Selection\n"
-        "from proposed import View\n"
-        "from proposed import TransferCost\n"
+        "from proposed import DirectorySensor, Environment\n"
+        "from proposed import Environment\n"
         "from domain import prefill_time, MachineProfile\n"
         "from ._cache import LRUCache\n"
         "from .request import Request\n"
@@ -577,7 +577,7 @@ def test_workload_may_import_the_planes_it_wires():
 def test_lint_keeps_control_out_of_the_simulator():
     """Estimates come through a protocol; machine facts come from domain."""
     assert "control-imports-execution" in _codes(
-        "from sim_common.cost_model import _get_time\n", path=CONTROL
+        "from sim_common.cost_model import _read_time\n", path=CONTROL
     )
     # Both the module path and the package re-export, since proposed surfaces
     # its whole contract at package level.
@@ -624,7 +624,7 @@ def test_the_proposal_stands_on_its_own():
     """It may use itself and the stdlib -- nothing else, not even sim_common."""
     assert _codes(
         "from proposed import Endpoint, locality, Tier\n"
-        "from ._view import View\n"
+        "from .environment import Environment\n"
         "import asyncio\n",
         path=PROPOSED,
     ) == set()

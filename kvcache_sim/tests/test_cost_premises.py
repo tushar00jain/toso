@@ -41,7 +41,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sim_common.cost_model import DEFAULT_PROFILE, _get_time, MachineProfile
+from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
 from sim_common.topology import Tier
 
 from domain import DEFAULT_MODEL, Model, prefill_time
@@ -111,7 +111,7 @@ def _endpoints():
 def _ratio(model: Model, machine: MachineProfile, src, dst) -> float:
     """recompute-one-block / fetch-one-block. > 1 means reuse pays off."""
     nbytes = model.block_bytes(1, BLOCK_TOKENS)
-    fetch = _get_time(src, dst, nbytes, machine)
+    fetch = machine.read_time(src, dst, nbytes)
     assert fetch > 0.0, "a cross-instance fetch must cost something"
     return prefill_time(BLOCK_TOKENS, machine, model) / fetch
 
@@ -296,7 +296,7 @@ def test_a_block_that_does_not_come_out_whole_is_refused():
     )
 
 
-def test_a_real_pull_costs_what_get_time_predicted():
+def test_a_real_pull_costs_what_profile_read_time_predicted():
     """End to end: the clock advance of a real block pull equals the prediction.
 
     Closes the loop through the actual data plane -- real directory, real
@@ -331,9 +331,9 @@ def test_a_real_pull_costs_what_get_time_predicted():
         advance, nbytes = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    predicted = _get_time(topo[holder], topo[puller], nbytes, DEFAULT_PROFILE)
+    predicted = DEFAULT_PROFILE.read_time(topo[holder], topo[puller], nbytes)
     assert advance > 0.0
     assert math.isclose(advance, predicted, rel_tol=1e-12), (
-        f"a real cross-node pull advanced the clock {advance!r} but _get_time "
+        f"a real cross-node pull advanced the clock {advance!r} but the profile "
         f"predicted {predicted!r}"
     )

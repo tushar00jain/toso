@@ -52,7 +52,7 @@ def test_xml_groups_each_multiline_connector(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "name", ["sensor_view_selector_flow", "des_design"]
+    "name", ["sensor_environment_selector_flow", "des_design"]
 )
 def test_diagram_document_is_rendered(name):
     source = REPO_ROOT / "docs" / f"{name}.diagram.xml"

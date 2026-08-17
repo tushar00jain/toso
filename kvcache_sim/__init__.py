@@ -6,7 +6,7 @@ be compared folder by folder:
 * :mod:`kvcache_sim.control` -- what is **decided**: the serving scheduler
   (prefill placement, pull-vs-recompute, TTFT/TBT gates, decode placement), the
   source :class:`proposed.selector.KeySelector` it delegates "which peer" to, the
-  prefix-run view it senses through, and LRU eviction bookkeeping. Moves nothing,
+  prefix-run calculation over its directory sensor, and LRU eviction bookkeeping. Moves nothing,
   and imports nothing from ``data``;
 * :mod:`kvcache_sim.data` -- what **executes** those decisions on ``realsim``'s
   real objects: the per-request serving loop, the batched decode engine, and the

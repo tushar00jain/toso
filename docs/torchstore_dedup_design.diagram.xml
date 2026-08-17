@@ -6,7 +6,7 @@
           <line>Dedup ControlPlane</line>
           <line>source rank + readiness + load</line>
           <line>FanoutSensor: tree / promises / load</line>
-          <line>reads directory through View</line>
+          <line>reads Environment + Sensors</line>
         </box>
         <between>
           <at row="2">answer</at>

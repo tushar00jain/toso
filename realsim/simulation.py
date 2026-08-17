@@ -5,8 +5,7 @@ supplies only what is capability-specific -- a control plane, a data plane, a
 workload -- and never re-stitches the stack underneath it. Before this existed each capability
 wired its own clock, ledger, mesh and runner, and the shapes drifted apart: one
 made an ``AsyncEngine`` directly and one went through ``run_sim``; one hooked
-transfer accounting and one did not; one built its transfer-cost estimate from the
-same profile and topology as its mesh with nothing holding the two together.
+transfer accounting and one did not; one priced reads outside the stable run facts.
 
     sim = Simulation(topology, control=Dedup())
     results = sim.run(my_workload, plane=my_plane)
@@ -21,10 +20,9 @@ What it builds, top to bottom (compare the stack in the design doc):
   ``create_transport_buffer``;
 * the **control services**: the one ``control`` plane, fronted by a handle a
   caller reaches it through, and the sensor its hosts write, fronted beside it;
-* the **view** the control plane senses through, over that same directory;
-* the **transfer-cost estimate**, from the *same* topology and profile the mesh
-  charges against, so a scheduler cannot predict against one model while the
-  transport charges another.
+* the **directory sensor** the control plane reads;
+* the **environment** holding that topology and the same profile the mesh charges
+  against, so a scheduler cannot predict against another model.
 
 :meth:`Simulation.run` then puts a :class:`~realsim.runner.Runner` over it and
 drives a :class:`~realsim.run.Workload`'s items on the clock. It assembles;
@@ -35,13 +33,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
-from proposed import ControlPlane, Endpoint, View
+from proposed import ControlPlane, DirectorySensor, Endpoint, Environment
 from sim_common import config
 from sim_common.async_engine import AsyncEngine
 from sim_common.cost_model import (
     DEFAULT_PROFILE,
     MachineProfile,
-    ProfileTransferCost,
 )
 from sim_common.report import Ledger
 from sim_common.trace import Trace
@@ -63,7 +60,7 @@ __all__ = ["Simulation"]
 
 
 class Simulation:
-    """One assembled stack: clock, mesh, view, ledger, cost estimate.
+    """One assembled stack: clock, mesh, environment, sensors and ledger.
 
     Args:
         topology: ``node_id -> Endpoint``. The node id is also its storage-volume
@@ -134,15 +131,14 @@ class Simulation:
 
         # What the control plane may look at, and what it may price against --
         # both derived from the objects above rather than rebuilt beside them.
-        self.view: View = self.mesh.view
-        # What a control plane prices with reaches it through the view (Mesh.view
-        # builds one over this same topology and profile). Kept here for the tests
-        # that pin prediction against what the transports charge.
-        self.transfer_cost = ProfileTransferCost(self.mesh.topology, self.profile)
+        self.environment = Environment(
+            topology=self.mesh.topology,
+            profile=self.profile,
+        )
+        self.directory_sensor: DirectorySensor = self.mesh.directory_sensor
 
-        # The plane, attached before any wiring below: attach hands over the view and
-        # the transfer-cost estimate that everything below is derived from, and it
-        # passes them down to whatever it ranks with.
+        # The plane receives the stable environment and the directory sensor before
+        # its service is fronted.
         self.control_plane_handle: Optional[Any] = None
         self.dispatcher_handle: Optional[Any] = None
         # What reaching one of this run's *hosts* costs, and one distance for all of
@@ -158,7 +154,9 @@ class Simulation:
                     f"hands it the stack's ports, which a selector or a bare "
                     f"callable has nowhere to receive"
                 )
-            control.attach(self.view)
+            control.attach(
+                self.environment, {DirectorySensor: self.directory_sensor}
+            )
         # What reaching a control plane costs. Resolved once, here, because this is
         # the one place a run's control services are built -- the same reason
         # ``make_controller_adapter`` resolves the directory's. One distance for both

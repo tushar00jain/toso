@@ -8,7 +8,7 @@ key in the **real** TorchStore directory (``Controller.keys_to_storage_volumes``
 so no separate key type is needed.
 
 Building that chain is the prompt generator's job (``workload/_generator.py``) and
-walking it against a directory snapshot is the view's (``control/_view.py``).
+walking it against a directory snapshot is the selector's (``control/_prefix.py``).
 
 Why are the keys not derived from the prompt?
 ---------------------------------------------

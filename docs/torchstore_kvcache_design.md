@@ -11,7 +11,7 @@ plane that places work using cache and load state, and bounded cache retention.
 
 The reference is Mooncake, *KVCache-centric Disaggregated Architecture for LLM
 Serving* (arXiv:2407.00079). This document maps its ideas onto TorchStore. See
-[`architecture.md`](architecture.md) for the shared control/view/data loop,
+[`architecture.md`](architecture.md) for the shared control/sensor/data loop,
 [`torchstore.md`](torchstore.md) for store internals, and
 [`des_design.md`](des_design.md) for the simulation stack.
 
@@ -56,7 +56,7 @@ one or more volume holders, so existing `locate_volumes`, `put_batch`, `get_batc
 and delete registration supply the storage path.
 
 The KV `ControlPlane` is Mooncake's Conductor analog. It reads directory presence and
-capability sensors through a `View`, selects prefill/decode placement and fetch
+capability sensors directly, selects prefill/decode placement and fetch
 sources, then commits the decision. Serving hosts execute the answer through normal
 clients and report facts through the dispatcher.
 
@@ -144,7 +144,7 @@ For each prefill candidate `p`, the selector estimates:
 
 ```text
 TTFT(p) = queue_wait(p)
-        + transfer_cost(remote_prefix_gap → p)
+        + read_time(remote_prefix_gap → p)
         + prefill_cost(uncached_suffix on p)
 ```
 
@@ -203,7 +203,7 @@ The capability-specific sensor state is:
 - recent source load for spreading reads across equivalent replicas.
 
 Directory residency stays separate from these predictions. Every new decision reads
-both truths through its view.
+both truths through its declared sensors.
 
 ## 6. Retention, eviction, and replication
 

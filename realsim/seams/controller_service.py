@@ -118,7 +118,7 @@ class ControllerService:
         """The real ``locate_volumes`` body, with no preference applied.
 
         :meth:`proposed.deployment.Controller.locate_raw` -- the one member of that
-        surface torchstore does not have, and what a ``View`` reads: not the
+        surface torchstore does not have, and what a directory sensor reads: not the
         preferred order, so a control plane ranks the directory rather than an
         answer somebody has already ranked, and not a coroutine, so forming one
         answer against it cannot be interleaved with forming another.

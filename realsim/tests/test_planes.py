@@ -1,13 +1,14 @@
 """The four shared types every capability plugs into.
 
-:class:`~proposed.view.View` (sense), :class:`~proposed.selector.KeySelector` (decide),
+:class:`~proposed.environment.Environment` and sensors (sense),
+:class:`~proposed.selector.KeySelector` (decide),
 :class:`~proposed.plane.DataPlane` (what follows a transfer) and
 :class:`~realsim.runner.Runner` / :class:`~realsim.runner.ItemDispatch` (drive a run) are the generic half of both capabilities. These tests
 pin the contract each one owes its callers:
 
-1. the view reads the *real* directory and the run's virtual clock, and what it
-   reports is the directory itself -- never an answer already put in some caller's
-   preferred order;
+1. the directory sensor reads the *real* directory and the environment reads the
+   run's virtual clock; the directory sensor reports the directory itself, never an
+   answer already put in some caller's preferred order;
 2. the naive selector is the directory's own answer -- preferring what it names
    changes nothing, byte for byte, which is what lets a capability selector be
    swapped in as the only difference between two runs;
@@ -16,7 +17,7 @@ pin the contract each one owes its callers:
    without it, and an ordering link -- ``Ordered`` / ``Best`` -- is the only thing that puts
    it in an order; the combinators built on it tell an *abstention* from the *naive
    answer*, carry a wrapped selector's gate, key and prices through, and wake every
-   selector they hold -- off the view that selector declared -- whether or not they
+   selector they hold -- with the sensors that selector declared -- whether or not they
    consult it. ``FirstMatch`` picks between alternatives, ``Balance`` appends the load
    on the sources one answer named as a further dimension of its key (what to make of
    that is the fold ``WithFold`` stamps), ``Bounded`` holds the head the chain left in
@@ -59,7 +60,7 @@ from proposed.selector import (
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
 from realsim.seams.transport import Endpoint
-from proposed import locality, LoadView, nearest, Sensed, SensorView, View
+from proposed import Environment, LoadSensor, Sensor, locality, nearest
 from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier
@@ -88,41 +89,39 @@ def _payload():
 
 
 # --------------------------------------------------------------------------
-# 1. View: a real directory read + the virtual clock, no mutation.
+# 1. Environment and directory sensor: stable facts beside a live read.
 # --------------------------------------------------------------------------
 
 
-def test_view_reads_the_real_directory_topology_and_clock():
+def test_environment_and_directory_sensor_read_the_run():
     sim = Simulation(_topology())
-    view = sim.view
+    directory = sim.directory_sensor
 
     async def scenario():
         with sim.mesh.installed():
             sim.mesh.bind_source("a")
             await sim.mesh.client("a").put("W", _payload())
             await asyncio.sleep(2.0)
-            located = view.locate(["W", "absent"])
-            return located, view.now()
+            located = directory.locate(["W", "absent"])
+            return located, sim.environment.now()
 
     (located, now) = _drive(sim, scenario())
     assert list(located["W"]) == ["a"]
-    # Absent keys are simply missing -- a view reports, it does not raise.
+    # Absent keys are simply missing -- a directory sensor reports, it does not raise.
     assert "absent" not in located
     assert now >= 2.0
-    # Distance is arithmetic on the topology the view carries, not a read of it:
+    # Distance is arithmetic on the environment's topology, not a sensor read:
     # b is on a's node, c is not.
-    assert locality(view.topology["a"], view.topology["b"]) is Tier.NVLINK
-    assert locality(view.topology["a"], view.topology["c"]) is Tier.RDMA
-    assert nearest(view.topology, ["c", "b"], "a") == "b"
-    assert view.topology["a"].id == "vola"
-    # One view per mesh, and it is the one the run hands the control plane: a fresh
-    # view per access would carry a pin scope of its own, so a reader holding it would
-    # walk the directory inside a decision that had pinned it (View.pinned).
-    assert sim.mesh.view is sim.mesh.view is view
+    topology = sim.environment.topology
+    assert locality(topology["a"], topology["b"]) is Tier.NVLINK
+    assert locality(topology["a"], topology["c"]) is Tier.RDMA
+    assert nearest(topology, ["c", "b"], "a") == "b"
+    assert topology["a"].id == "vola"
+    assert sim.mesh.directory_sensor is sim.mesh.directory_sensor is directory
 
 
-def test_view_locate_reports_the_directory_and_not_a_preferred_answer():
-    """A view reads what is there, whatever the caller of a read prefers.
+def test_directory_sensor_reports_raw_not_preferred_answers():
+    """The sensor reads what is there, whatever the caller of a read prefers.
 
     A control plane ranks the directory; handed an answer already put in somebody's
     order, it would be ranking its own output back.
@@ -136,7 +135,7 @@ def test_view_locate_reports_the_directory_and_not_a_preferred_answer():
             # A reader that was told to prefer b, and the same directory as sensed.
             sim.mesh.client_for("c", prefer=["b"])
             preferred = await sim.controller_handle.locate_volumes.call_one(["W"])
-            return preferred, sim.view.locate(["W"])
+            return preferred, sim.directory_sensor.locate(["W"])
 
     preferred, sensed = _drive(sim, scenario())
     assert list(preferred["W"]) == ["b"]          # what the caller asked for
@@ -159,8 +158,9 @@ class _Ranks(ControlPlane):
     def __init__(self, selector: Selector) -> None:
         self.selector = selector
 
-    def attach(self, view) -> None:
-        self.selector.attach(view)
+    def attach(self, environment, sensors=None) -> None:
+        super().attach(environment, sensors)
+        self.selector.attach(environment, sensors)
 
     async def sources(self, keys, requester) -> Selection:
         return await self.selector.select(list(keys), requester).settled()
@@ -351,17 +351,15 @@ def test_a_selector_is_a_utility_a_plane_holds_and_not_a_plane():
     assert inner.asked == ["c"]      # the requester reached the utility unchanged
 
 
-def test_a_plane_passes_the_run_s_view_down_to_what_it_ranks_with():
+def test_a_plane_passes_the_run_environment_down_to_what_it_ranks_with():
     """Fronting a plane and attaching it are one act of assembly.
 
-    Which is what lets ``select`` take a subject and a requester and no view: the
-    selector was handed the view when the plane was, by the plane. One never
-    attached would sense through ``None``.
+    Which is what lets ``select`` take a subject and a requester alone: the selector
+    was attached to the environment and sensors when the plane was.
     """
     selector = _Fixed()
     sim = Simulation(_topology(), control=_Ranks(selector))
-    assert selector.view is sim.view
-    assert isinstance(selector.view, View)
+    assert selector.environment is sim.environment
 
 
 # --------------------------------------------------------------------------
@@ -760,8 +758,8 @@ def _select(selector: Selector, keys=("K",), requester="r") -> Selection:
     return selector.select(list(keys), requester)
 
 
-class _Load:
-    """Per-source load, moved by hand: what a ``Balance`` reads off its view."""
+class _Load(LoadSensor):
+    """Per-source load, moved by hand: what a ``Balance`` reads."""
 
     def __init__(self, **counts: int) -> None:
         self.counts = dict(counts)
@@ -775,17 +773,14 @@ class _Load:
 
 
 class _Senses:
-    """The whole of what a ``Balance`` senses: one load sensor, and no directory."""
+    """One load sensor used by selector tests."""
 
     def __init__(self, load: Optional[_Load] = None) -> None:
         self.load = load if load is not None else _Load()
 
-    def now(self) -> float:
-        return 0.0
 
-    def subset(self, *views: type) -> "_Senses":
-        """Every declaration reaches this same stand-in: there is one read here."""
-        return self
+
+_ENV = Environment({})
 
 
 def _bounded(bound: int):
@@ -811,7 +806,7 @@ def _heads(selector: Selector, *, count: int, moving: bool = True) -> list:
     nothing moves.
     """
     senses = _Senses()
-    best = Best(selector).attach(senses)
+    best = Best(selector).attach(_ENV, {_Load: senses.load})
     heads = []
     for _ in range(count):
         head = _select(best).head
@@ -899,59 +894,45 @@ def test_first_match_keeps_the_winner_s_readiness_gate():
     assert _select(chained).ready is gate
 
 
-class _Thing(SensorView):
+class _Thing(Sensor):
     """One sensor, for a link that declares it."""
-
-    thing = Sensed()
 
 
 class _SensesThing(_Fixed):
-    """A link whose header says which view it reads."""
+    """A link whose header says which sensor it reads."""
 
     sensors = (_Thing,)
 
 
-def test_a_combinator_hands_each_link_the_view_that_link_declared():
-    """A combinator declares nothing, so it narrows on each link's own header instead.
-
-    Which is what keeps a chain from being the one place a declaration is not a fact --
-    both of ``dedup_sim``'s links sit inside one. A link declaring nothing is handed
-    what the combinator was given, which is what lets a ranking be wired to a stand-in
-    that is no view at all.
-    """
-    view = View(None, {}).derived(_Thing, thing="sensed")
+def test_a_combinator_resolves_each_link_s_declared_sensors():
+    thing = _Thing()
     senses, plain = _SensesThing(Selection.of([])), _Fixed(Selection.of(["v1"]))
-    FirstMatch([senses, plain]).attach(view)
-    assert senses.view.thing == "sensed"       # composed out of the one it was given
-    assert senses.view is not view
-    assert plain.view is view
+    FirstMatch([senses, plain]).attach(_ENV, {_Thing: thing})
+    assert senses.sensor(_Thing) is thing
+    with pytest.raises(RuntimeError, match="did not declare"):
+        plain.sensor(_Thing)
 
     under = _SensesThing(Selection.priced([("v0", 1)]))
-    Balance(under).attach(view)
-    assert under.view is senses.view           # one view per distinct declaration
-
-
-class _ThingAndLoad(_Thing, LoadView):
-    """A view carrying both reads: the ranking's sensor and the combinator's load."""
+    load = _Load()
+    Balance(under).attach(_ENV, {_Thing: thing, _Load: load})
+    assert under.sensor(_Thing) is thing
 
 
 def test_a_combinator_declares_its_base_s_reads_as_well_as_its_own():
     """Otherwise the narrowing loses the base's sensor, and the base senses nothing.
 
-    A combinator senses load, so it narrows -- and a view is composed of exactly what
-    was declared, so a declaration naming only load would hand the ranking under it a
-    view without the ranking's own sensor, which raises rather than answering quietly.
-    This is the shape it happens in: a balanced ranking as a link of a chain, where what
-    each link is attached to is its own header.
+    A combinator sensing load retains that sensor beside whatever its ranking declared.
+    Naming only load would leave the ranking under it without its own sensor and raise
+    rather than answering quietly.
     """
-    view = View(None, {}).derived(_ThingAndLoad, thing="sensed", load=_Load())
+    thing, load = _Thing(), _Load()
     under = _SensesThing(Selection.priced([("v0", 1)]))
     balanced = Balance(under)
-    assert declares((LoadView,), under) == (LoadView, _Thing) == balanced.sensors
+    assert declares((LoadSensor,), under) == (LoadSensor, _Thing) == balanced.sensors
 
-    FirstMatch([balanced]).attach(view)
-    assert under.view.thing == "sensed"        # the read its header declared
-    assert balanced.view.load.named() == {}    # and the one the combinator declared
+    FirstMatch([balanced]).attach(_ENV, {_Thing: thing, _Load: load})
+    assert under.sensor(_Thing) is thing
+    assert balanced.sensor(LoadSensor).named() == {}
     assert _select(balanced).sources == ("v0",)
 
 
@@ -964,9 +945,9 @@ def test_first_match_attaches_every_selector_even_unconsulted_ones():
     """
     front, behind = _Fixed(Selection.of(["v0"])), _Fixed(Selection.of(["v1"]))
     chained = FirstMatch([front, behind])
-    assert chained.attach("a-view") is chained     # wiring is one expression
+    assert chained.attach(_ENV) is chained
     _select(chained)                      # behind is never asked ...
-    assert front.view is behind.view == "a-view"   # ... but is brought up
+    assert front.environment is behind.environment is _ENV
 
 
 def test_attaching_a_selector_hands_it_back_however_it_is_wrapped():
@@ -976,9 +957,9 @@ def test_attaching_a_selector_hands_it_back_however_it_is_wrapped():
     for the two combinators -- which is where a run does most of its wiring.
     """
     ranking = _Fixed(Selection.priced([("v0", 1)]))
-    assert ranking.attach("a-view") is ranking
+    assert ranking.attach(_ENV) is ranking
     balanced = Balance(ranking)
-    assert balanced.attach("a-view") is balanced
+    assert balanced.attach(_ENV, {_Load: _Load()}) is balanced
 
 
 def test_a_chain_takes_its_links_subject_and_refuses_links_that_disagree():
@@ -1007,18 +988,19 @@ def test_a_stage_measures_off_the_view_and_the_subject_alone():
     """
     seen = []
 
-    def readings(view, subject):
-        seen.append((view, tuple(subject)))
-        return lambda source: len(source) + view.load.named().get(source, 0)
+    def readings(selector, subject):
+        seen.append((selector, tuple(subject)))
+        load = selector.sensor(LoadSensor).named()
+        return lambda source: len(source) + load.get(source, 0)
 
     senses = _Senses(_Load(v0=3))
-    staged = Annotate(readings, senses=(LoadView,))(
+    staged = Annotate(readings, senses=(LoadSensor,))(
         _Fixed(Selection.of(["v0", "v11"]))
     )
-    assert staged.sensors == (LoadView,)         # declared, so the view carries the read
-    staged.attach(senses)
+    assert staged.sensors == (LoadSensor,)
+    staged.attach(_ENV, {_Load: senses.load})
     assert _select(staged).key == {"v0": (5,), "v11": (3,)}
-    assert seen == [(senses, ("K",))]            # once per answer, not once per source
+    assert seen == [(staged, ("K",))]
 
 
 def test_balance_appends_a_dimension_and_computes_nothing():
@@ -1029,7 +1011,7 @@ def test_balance_appends_a_dimension_and_computes_nothing():
     against something of its own without ever reading a weighed figure.
     """
     base = _FixedPlacement(Selection.keyed([("h0", (5,)), ("h1", (9,))]))
-    balanced = Balance(base).attach(_Senses(_Load(h0=2)))
+    balanced = Balance(base).attach(_ENV, {_Load: _Load(h0=2)})
     annotated = _select(balanced)
     assert annotated.key == {"h0": (5, 2), "h1": (9, 0)}
     assert annotated.sources == ("h0", "h1")          # ordered nothing
@@ -1060,7 +1042,7 @@ def test_balance_reads_a_load_it_does_not_keep():
 
     # ...and the winner follows the load, whoever moved it.
     senses = _Senses(_Load(v0=1))
-    best = Best(Balance(_Fixed(equal))).attach(senses)
+    best = Best(Balance(_Fixed(equal))).attach(_ENV, {_Load: senses.load})
     assert _select(best).head == "v1"
     senses.load.sent("v1")
     assert _select(best).head == "v0"
@@ -1091,7 +1073,7 @@ def test_balance_passes_an_answer_with_no_source_to_rank_straight_through():
     """
     for empty in (Selection.of([]), Selection()):
         balanced = Balance(_Fixed(empty))
-        balanced.attach(_Senses())
+        balanced.attach(_ENV, {_Load: _Load()})
         assert _select(balanced) is empty
         assert _select(balanced) is empty
 
@@ -1104,7 +1086,7 @@ def test_balance_over_a_ranking_that_keys_nothing_is_ordered_by_load_alone():
     it, load is the whole of the order.
     """
     ranked = Ordered(Balance(_Fixed(Selection.of(["v0", "v1"]))))
-    ranked.attach(_Senses(_Load(v0=2, v1=1)))
+    ranked.attach(_ENV, {_Load: _Load(v0=2, v1=1)})
     assert _select(ranked).sources == ("v1", "v0")
 
 
@@ -1151,10 +1133,10 @@ def test_balance_attaches_the_ranking_under_it_and_keeps_what_it_answered():
     base = _Fixed(Selection.priced([("v0", 5), ("v1", 5)], ready=gate))
     balanced = Balance(base)
     senses = _Senses()
-    best = Best(balanced).attach(senses)
-    ranked = Ordered(balanced).attach(senses)
+    best = Best(balanced).attach(_ENV, {_Load: senses.load})
+    ranked = Ordered(balanced).attach(_ENV, {_Load: senses.load})
 
-    assert base.view is senses                          # brought up by its holder
+    assert base.environment is _ENV
     senses.load.sent(_select(best).head)                # v0 won, and decided on ...
     second = _select(ranked)                            # ... so v1 leads now
     assert second.sources == ("v1", "v0")

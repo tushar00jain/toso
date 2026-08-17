@@ -63,7 +63,7 @@ COPIED_FROM_UPSTREAM = [
 
 #: Members that are the *ask* -- declared here because torchstore would have to gain
 #: them. ``locate_raw`` is ``locate_volumes`` with no caller's preference applied,
-#: which is what a control plane senses through a ``View``, and it is asked for as a
+#: which is what a control plane senses through a directory sensor, and it is asked for as a
 #: plain **synchronous local method**: a directory read that cannot suspend is what
 #: makes a routing decision atomic without a lock.
 #:
@@ -213,7 +213,7 @@ def test_the_service_implements_the_surface_and_the_handle_refers_to_it():
     every real caller, which is why the two are separate objects.
 
     The handle carries every member a *caller* reaches, and ``locate_raw`` is not
-    one: its only reader is a control plane sensing through a ``View`` built over the
+    one: its only reader is a control plane sensing through a directory sensor over the
     service itself, so nothing crosses the boundary the handle stands for. Which is
     why it is asked for as a plain synchronous method -- see
     :func:`test_the_ask_is_local_and_synchronous`.

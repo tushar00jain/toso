@@ -15,8 +15,8 @@
         <box width="44">
           <line>ControlPlane</line>
           <line/>
-          <line>selector chains ═══ declared View subsets</line>
-          <line>capability View ═══ Sensor(s)</line>
+          <line>selector chains ═══ declared Sensor types</line>
+          <line>Sensing attach ═══ Environment + Sensors</line>
           <line>Dispatcher ═ reducer refs to same Sensor(s)</line>
           <line/>
           <line>dedup: FanoutSensor as fanout + load</line>
@@ -55,16 +55,16 @@
         </box>
       </row>
       <place-line width="110"><at column="24">▲</at></place-line>
-      <place-line width="110"><at column="24">│ attach(base View)</at></place-line>
+      <place-line width="110"><at column="24">│ attach(Environment, Sensors)</at></place-line>
       <box title="Simulation = Deployment" width="86">
         <line/>
         <line>Simulation ═══ Mesh</line>
         <line>           ═══ control_plane_handle</line>
         <line>           ═══ dispatcher_handle</line>
         <line/>
-        <line>Mesh ═══ base View ═══ ControllerService + topology + transfer cost</line>
-        <line>         │</line>
-        <line>         └── locate / locality / now / transfer cost</line>
+        <line>Environment ═══ topology + MachineProfile + clock</line>
+        <line>DirectorySensor ═══ ControllerService</line>
+        <line>                    └── locate / locate_live / pinned</line>
         <line/>
         <line>Mesh ═══ ControllerService      the real directory: key → current volume holders</line>
         <line>     ═══ LocalClient × N        get / put / get_batch / put_batch</line>
@@ -86,7 +86,7 @@
         <line>     KV:    request → prefill/decode placement + priced reuse;</line>
         <line>            fetch keys → the source already priced</line>
         <line/>
-        <line>   the Selector reads a declared View subset and writes nothing</line>
+        <line>   the Selector reads declared Sensors and writes nothing</line>
         <line>   the plane chooses the answer and commits the decision</line>
       </box>
       <place-lines width="91">
@@ -100,11 +100,11 @@
         </at>
       </place-lines>
       <row gap="3">
-        <box title="READ-ONLY VIEW" width="52">
-          <line>DIRECTORY READ</line>
+        <box title="ENVIRONMENT + SENSORS" width="52">
+          <line>DIRECTORY SENSOR</line>
           <line>  locate(keys): key → current holders</line>
-          <line>  topology / locality / transfer cost / now</line>
-          <line/>
+          <line>ENVIRONMENT</line>
+          <line>  topology / read time / now</line>
           <line>CAPABILITY SENSOR READS</line>
           <line>  dedup: fan-out tree, owed puts, source load</line>
           <line>  KV: predicted queues, decode batches,</line>

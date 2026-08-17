@@ -39,9 +39,8 @@ against -- the one observed now (``early``) or the one predicted at prefill comp
 
 What does a decision sense?
 ---------------------------
-Nothing here executes and nothing here is a live read. Every host this plane ranks,
-prices or gates is judged against one :class:`~kvcache_sim.control._view.KVView`: the
-predicted prefill queues and observed decode batches
+Nothing here executes. Every host this plane ranks, prices or gates is judged against
+the directory and the predicted prefill queues and observed decode batches
 (:class:`~kvcache_sim.control._sensor.ClusterSensor`), the prefix runs, the prefills
 promised and not yet seen to land, and the pulls already priced. Every fact in it
 comes from the hosts, dispatched as actions (:attr:`_Scheduler.dispatcher`).
@@ -65,13 +64,13 @@ executed cost off it.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Unpack
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
-    ControlPlane, Dispatcher, Key, Selection,
+    ControlPlane, DirectorySensor, Dispatcher, Environment, Key, Selection, Sensor,
 )
 from proposed.selector import (
-    Annotate, Balance, Best, Bound, Bounded, declared, FirstMatch, Ks, Ordered, pipe,
+    Annotate, Balance, Best, Bound, Bounded, FirstMatch, Ks, Ordered, pipe,
     Readings, Selector, WithFold,
 )
 
@@ -88,7 +87,7 @@ from ._sensor import (
     ClusterSensor, Committed, ComputeBusy, DecodeState, FetchAnswered,
     PrefillFinished, ReservationSensor, RoutedPullSensor, SourceLoad,
 )
-from ._view import ClusterView, KVView
+from ._prefix import prefix_lengths_of
 from .request import Request
 
 __all__ = [
@@ -210,14 +209,14 @@ def _tbt_at_most(
     return lambda dims: _pred_tbt(dims[0], profile, model, enabled=enabled) <= slo_tbt
 
 
-def _busy_at(view: Any, _ask: Any) -> Readings[float]:
-    """When each instance frees up (:class:`~kvcache_sim.control._view.ClusterView`).
+def _busy_at(selector: Selector, _ask: Any) -> Readings[float]:
+    """When each instance frees up (:class:`~kvcache_sim.control._sensor.ClusterSensor`).
 
     Named rather than written inline so the dimension it appends is a float in the
-    header too: read off an untyped view, an inline reading appends nothing a checker
+    header too: read off an untyped selector, an inline reading appends nothing a checker
     knows, and :func:`_by_queue` would then fold a pool of any depth at all.
     """
-    return view.cluster.busy_until.__getitem__
+    return selector.sensor(ClusterSensor).busy_until.__getitem__
 
 
 class _Scheduler(ControlPlane):
@@ -243,6 +242,8 @@ class _Scheduler(ControlPlane):
         early_rejection: :class:`Occupancy` -- which decode occupancy the TBT SLO is
             judged against.
     """
+
+    sensors = (DirectorySensor, ClusterSensor, RoutedPullSensor, SourceLoad)
 
     def __init__(
         self,
@@ -296,9 +297,8 @@ class _Scheduler(ControlPlane):
         #: three places -- composing the reservation sensor, writing it, predicting off
         #: it -- so no two of them can disagree about whether this run predicts.
         self._lookahead = simulate_decode and early_rejection is Occupancy.PREDICT
-        # All built in attach(), where the sensors they read and the pools they rank
-        # exist.
-        self.view: Optional[KVView] = None
+        if self._lookahead:
+            self.sensors = (*self.sensors, ReservationSensor)
         #: Which arity each holds is the preset's (:meth:`attach`): the ranked prefill
         #: pool keys a plan, and the queue behind it only where that fold reads one.
         self._prefill: Optional[Selector[PrefillAsk, Unpack[Tuple[Any, ...]]]] = None
@@ -307,7 +307,11 @@ class _Scheduler(ControlPlane):
         self.dispatcher: Optional[Dispatcher] = None
 
     # -- the stack hands over its ports ----------------------------------- #
-    def attach(self, view) -> None:
+    def attach(
+        self,
+        environment: Environment,
+        sensors: Optional[Mapping[type, Sensor]] = None,
+    ) -> "_Scheduler":
         """Declare this plane's four decisions and build the sensors they read.
 
         The four: which peer a pull comes from, which peer serves a fetch, which host
@@ -324,22 +328,23 @@ class _Scheduler(ControlPlane):
         elsewhere the same :class:`~kvcache_sim.control._sensor.Committed` reserves
         nothing and no fold has an empty sensor to read.
         """
-        ids = sorted(view.topology)
-        # Held here, not read back off the view: a view raises for a sensor this run
-        # composed without, so ``reserved`` could not be tested for ``None`` there.
-        sensors = dict(
-            # Over ALL instances: the prefill and decode pools may each be a subset.
-            cluster=ClusterSensor(ids),
-            reserved=ReservationSensor() if self._lookahead else None,
-            routed=RoutedPullSensor(),
-            load=SourceLoad(),
-        )
-        self.view = view.derived(KVView, **sensors)
+        ids = sorted(environment.topology)
+        available = dict(sensors or {})
+        available.update({
+            type(sensor): sensor
+            for sensor in (
+                # Over ALL instances: the pools may each be a subset.
+                ClusterSensor(ids),
+                RoutedPullSensor(),
+                SourceLoad(),
+                ReservationSensor() if self._lookahead else None,
+            )
+            if sensor is not None
+        })
+        super().attach(environment, available)
         self.dispatcher = Dispatcher()
-        for sensor in sensors.values():
-            # ``None`` is a sensor this run does not hold, so nothing folds for it.
-            if sensor is not None:
-                self.dispatcher.compose(sensor)
+        for sensor in self._sensed.values():
+            self.dispatcher.compose(sensor)
         # Every instance, unless the preset named a subset to rank.
         self.prefill_ids = self.prefill_ids or ids
         self.decode_ids = self.decode_ids or ids
@@ -378,7 +383,7 @@ class _Scheduler(ControlPlane):
             # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
             # id, and two idle instances holding no prefix do price identically.
             self._prefill = pipe(
-                Annotate(_busy_at, senses=(ClusterView,))(priced),
+                Annotate(_busy_at, senses=(ClusterSensor,))(priced),
                 WithFold(_by_queue),
                 Best,
                 Bounded(_ttft_at_most(self.slo_ttft)),
@@ -389,7 +394,8 @@ class _Scheduler(ControlPlane):
             )
 
         for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
-            ranking.attach(declared(self.view, ranking))
+            ranking.attach(environment, self._sensed)
+        return self
 
     # -- what a serving host asks, at the two moments it has a question ------- #
     async def sources(
@@ -437,15 +443,16 @@ class _Scheduler(ControlPlane):
         if placed is not None:
             return placed
 
-        now = self.view.now()
+        now = self.env.now()
+        directory = self.sensor(DirectorySensor)
         keys = list(request.block_keys)
-        with self.view.pinned(keys):
+        with directory.pinned(keys):
             prefill = self._prefill.select(
                 PrefillAsk(
                     request=request,
                     now=now,
                     keys=keys,
-                    counts=self.view.prefix_lengths(keys),
+                    counts=prefix_lengths_of(directory.locate(keys), keys),
                     peer=self._reuse.select(keys, requester),
                 ),
                 requester,

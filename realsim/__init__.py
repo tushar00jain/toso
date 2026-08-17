@@ -33,7 +33,7 @@ is here:
 * the four types every capability plugs into:
   :class:`proposed.selector.KeySelector` (which volume serves these keys for this
   requester, and when -- naive by default, and asked by the data plane before an
-  ordinary read), :class:`proposed.view.View` (the read-only observation a control
+  ordinary read), :class:`proposed.sensors.DirectorySensor` (the raw observation a control
   plane senses through), :class:`proposed.plane.DataPlane` (a capability's executing
   half) and :class:`realsim.runner.Runner`
   (release work items on the virtual clock, install the mesh once, gather) with

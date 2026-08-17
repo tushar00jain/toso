@@ -12,9 +12,12 @@ chain has named a head is :mod:`dedup_sim.control._answer`.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence, Tuple, Unpack
+from typing import Any, Mapping, Optional, Sequence, Tuple, Unpack
 
-from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
+from proposed import (
+    ControlPlane, DecisionLog, DirectorySensor, Dispatcher, Environment, Key,
+    Selection, Sensor,
+)
 from proposed.selector import (
     Balance, FirstMatch, Fold, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
 )
@@ -22,7 +25,6 @@ from proposed.selector import (
 from ._answer import committed
 from ._selector import Candidates, CHAIN, SPREAD
 from ._sensor import Asked, FanoutSensor
-from ._view import DedupView
 
 __all__ = ["Dedup"]
 
@@ -50,6 +52,8 @@ class Dedup(ControlPlane):
             decision. Records only; no metric turns on it.
     """
 
+    sensors = (DirectorySensor, FanoutSensor)
+
     def __init__(
         self,
         *,
@@ -60,13 +64,15 @@ class Dedup(ControlPlane):
         self._cap = fanout_cap
         self._spread = spread
         self._trace = trace
-        # Built in attach().
-        self.view: Optional[DedupView] = None
         self.dispatcher: Optional[Dispatcher] = None
         self._chain: Optional[Selector[Sequence[Key], Unpack[Tuple[Any, ...]]]] = None
 
-    def attach(self, view: Any) -> None:
-        """Compose this plane's one sensor, and attach the chain that senses it.
+    def attach(
+        self,
+        environment: Environment,
+        sensors: Optional[Mapping[type, Sensor]] = None,
+    ) -> "Dedup":
+        """Build this plane's sensor and attach the chain that reads it.
 
         The sensor is built here, never accepted from a caller: two planes sharing one
         would each answer for the other's decisions -- a requester handed a peer the
@@ -77,9 +83,12 @@ class Dedup(ControlPlane):
         before the reader got there.
         """
         sensor = FanoutSensor(fanout_cap=self._cap)
-        self.view = view.derived(DedupView, fanout=sensor, load=sensor)
+        available = dict(sensors or {})
+        available[type(sensor)] = sensor
+        super().attach(environment, available)
         self.dispatcher = Dispatcher()
-        self.dispatcher.compose(sensor)
+        for observed in self._sensed.values():
+            self.dispatcher.compose(observed)
         # Which volumes serve a read: every holder of the key and every peer already
         # planned to hold it, priced together in seconds, so which one wins is
         # arithmetic off the score rather than an order the caller has to know.
@@ -96,7 +105,8 @@ class Dedup(ControlPlane):
                 NaiveKeySelector(),
             ]),
             Ordered,
-        ).attach(self.view)
+        ).attach(environment, self._sensed)
+        return self
 
     # -- what a reader asks -------------------------------------------------- #
     async def sources(
@@ -128,5 +138,12 @@ class Dedup(ControlPlane):
         self.dispatcher.dispatch_sync(Asked(requester, tuple(keys)))
         ranking = self._chain.select(keys, requester)
         return committed(
-            self.view, self.dispatcher, keys, requester, ranking, self._trace
+            self.env,
+            self.sensor(DirectorySensor),
+            self.sensor(FanoutSensor),
+            self.dispatcher,
+            keys,
+            requester,
+            ranking,
+            self._trace,
         )

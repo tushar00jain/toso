@@ -56,11 +56,10 @@ from realsim.seams import factory
 from realsim.seams.transport import Endpoint, InMemoryTransport
 from realsim.seams.volume_handle import LocalVolumeHandle
 from realsim.seams.volume_service import VolumeService
-from proposed import View
+from proposed import DirectorySensor
 from sim_common.cost_model import (
     DEFAULT_PROFILE,
     MachineProfile,
-    ProfileTransferCost,
 )
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
@@ -159,30 +158,9 @@ class Mesh:
 
     # -- accessors ---------------------------------------------------------- #
     @cached_property
-    def view(self) -> View:
-        """A :class:`~proposed.view.View` over this mesh's directory + topology.
-
-        Built here rather than in ``proposed`` so the proposal never has to know
-        what a :class:`Mesh` is.
-
-        Senses through the directory *service*, not the handle in front of it:
-        ``locate_raw`` is the read with no caller's preference folded into it, so a
-        control plane ranks the directory rather than an answer somebody has already
-        ranked. Note what that also means -- a control plane's directory reads do not
-        cross the handle, so they are not charged the hop a real one would pay.
-
-        One per mesh, because a view carries the scope one decision pins its directory
-        read in (:meth:`~proposed.view.View.pinned`): a second view over the same mesh
-        would be a second scope, so a reader holding it would walk the directory again
-        in the middle of a decision that had pinned it. Safe to cache because the ports
-        under it are fixed for the run -- the topology is copied at construction and
-        the directory adapter is built once.
-        """
-        return View(
-            self.directory.service,
-            self.topology,
-            ProfileTransferCost(self.topology, self.profile).get_time,
-        )
+    def directory_sensor(self) -> DirectorySensor:
+        """The raw directory observation shared by every decision in this mesh."""
+        return DirectorySensor(self.directory.service)
 
     def adapter(self, node_id: str) -> RealClientAdapter:
         """The :class:`RealClientAdapter` co-located with ``node_id``."""
@@ -220,7 +198,7 @@ class Mesh:
         """:class:`proposed.deployment.Deployment` -- the directory endpoints.
 
         The one way a *caller* reaches the directory service: every client is built
-        with it. A ``View`` goes to the service behind it instead (see :attr:`view`).
+        with it. :attr:`directory_sensor` reads the service behind it instead.
         """
         return self.directory.handle
 

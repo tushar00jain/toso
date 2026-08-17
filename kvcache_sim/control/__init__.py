@@ -21,9 +21,8 @@
   promised, the pulls it priced -- each expiring when the thing it stood for happens.
   Beside them the actions that move them, since every write here is one dispatched
   action;
-* :mod:`~kvcache_sim.control._view` -- what a decision senses, one class per read:
-  prefix-run lengths (with the prefix walk behind them and the pinned snapshot a
-  decision reads them through) and each sensor above.
+* :mod:`~kvcache_sim.control._prefix` -- prefix-run lengths derived from the pinned
+  directory observation.
 
 Nothing here imports :mod:`kvcache_sim.data`, a deployment or a client, and nothing
 reaches into the simulator -- all checked by the repo's contract lint.

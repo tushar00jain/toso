@@ -59,6 +59,7 @@ from typing import Any, Dict, Optional
 
 from proposed.dispatch import Dispatcher
 from proposed.routed import declared, Where
+from proposed.sensors import Sensing
 
 __all__ = ["ControlPlane", "DataPlane"]
 
@@ -106,7 +107,7 @@ class DataPlane:
         """
 
 
-class ControlPlane:
+class ControlPlane(Sensing):
     """What a capability's *deciding* half looks like to a harness.
 
     The sibling of :class:`DataPlane`, and as capability-agnostic: it says nothing
@@ -116,10 +117,8 @@ class ControlPlane:
     capability that grows a second question changes nothing outside itself.
 
     Construct it with its knobs, and it is handed the stack's ports once those exist
-    -- :meth:`attach` -- because a control plane senses through a
-    :class:`~proposed.view.View` and prices through a
-    :data:`~proposed.cost.TransferCost`, neither of which a caller has before the
-    store is assembled. It passes those ports on to whatever it ranks with
+    -- :meth:`attach` -- because the stable environment and live sensors do not exist
+    before the store is assembled. It passes those ports on to whatever it ranks with
     (:class:`~proposed.selector.Selector`), which is a utility it holds rather than a
     plane of its own.
 
@@ -141,10 +140,3 @@ class ControlPlane:
     #: default -- is a plane whose facts are all its own, so there is nothing to
     #: report and no service to stand up.
     dispatcher: Optional[Dispatcher] = None
-
-    def attach(self, view: Any) -> None:
-        """Receive the view this control plane senses and prices through.
-
-        One argument, the sibling of :meth:`DataPlane.attach`'s: a
-        :class:`~proposed.view.View` carries every run-supplied read there is.
-        """

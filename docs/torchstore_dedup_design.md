@@ -10,7 +10,7 @@ metadata: each asks normally, while a control plane prices present and promised
 sources by readiness, transfer time, fabric cost, and load.
 
 This document covers the capability-specific design. See
-[`architecture.md`](architecture.md) for the shared control/view/data feedback loop,
+[`architecture.md`](architecture.md) for the shared control/sensor/data feedback loop,
 [`torchstore.md`](torchstore.md) for TorchStore internals, and
 [`des_design.md`](des_design.md) for the simulation stack.
 
@@ -38,7 +38,7 @@ optimize the final microseconds of a fused one-hop engine; or change the
 │ Dedup ControlPlane                  │      │ ReadThroughPlane              │      │ Controller: current holders    │
 │ source rank + readiness + load      │answer│ preferred get → local put     │─────►│ LocalClient: slice planning    │
 │ FanoutSensor: tree / promises / load│      │ dispatch Stored               │      │ StorageVolume: resident bytes  │
-│ reads directory through View        │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
+│ reads Environment + Sensors         │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
 └─────────────────────────────────────┘      └───────────────────────────────┘      └────────────────────────────────┘
 ┌──────────────── DIRECTORY TRUTH ─────────────────┐   ┌──────────────────── SENSOR TRUTH ────────────────────┐
 │ local put registers reader as a current holder   │   │ Stored settles the promised copy and wakes dependents│
@@ -48,8 +48,8 @@ optimize the final microseconds of a fused one-hop engine; or change the
 
 The `Controller` remains the authority for current residency. The dedup
 `ControlPlane` holds only the planned fan-out tree, source load, and readiness of
-copies that have not registered yet. Its selectors read both through a `View`; they
-move no bytes.
+copies that have not registered yet. Its selectors read the directory and fan-out
+sensors directly; they move no bytes.
 
 The data plane executes an ordinary preferred `get`, writes the result into the
 reader's co-located volume, and reports `Stored`. The put changes directory truth;
@@ -108,7 +108,7 @@ For every requested region, one ranking considers:
 
 - current holders from `Controller.locate_volumes`;
 - readers already routed to fetch the region, while they still owe their local put;
-- locality and transfer cost from the shared topology view;
+- locality and read cost from the shared environment;
 - planned load and the fan-out cap.
 
 The useful cost is expressed in seconds, not abstract topology tiers:

@@ -24,7 +24,7 @@ own (:class:`kvcache_sim.control._sensor.ReservationSensor`).
 
 Nothing reaches this sensor from outside the process holding it: a host's report
 arrives as a dispatched action, and the control plane reads the result through
-:class:`kvcache_sim.control._view.ClusterView`.
+:class:`kvcache_sim.control._selector.Priced` and decode ranking.
 """
 
 from __future__ import annotations

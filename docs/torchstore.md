@@ -439,7 +439,7 @@ The `TensorSlice` TorchStore records for each rank (offsets are `(row, col)` in 
 | 2 | `(1,0)` | `(2,0)` | `(2,2)` | `(4,4)` | `(2,2)` |
 | 3 | `(1,1)` | `(2,2)` | `(2,2)` | `(4,4)` | `(2,2)` |
 
-So with `LocalRankStrategy` the store holds (control-plane view):
+So with `LocalRankStrategy` the directory reports:
 
 ```
 Controller index for key "W":

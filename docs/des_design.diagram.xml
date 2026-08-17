@@ -57,7 +57,7 @@
         </box>
         <between><at row="2">──►</at></between>
         <box title="CONTROL" width="21">
-          <line>View → Selector</line>
+          <line>Sensors → Selector</line>
           <line>Selection / Response</line>
           <line>commit Action</line>
           <line/>
@@ -91,8 +91,8 @@
         <box title="SENSOR TRUTH" width="35">
           <line>Action → Dispatcher → sensor folds</line>
         </box>
-        <box title="NEXT DECISION" width="36">
-          <line>View reads directory + sensor state</line>
+        <box title="NEXT DECISION" width="37">
+          <line>Selector reads environment + sensors</line>
         </box>
       </row>
     </stack>

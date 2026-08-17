@@ -66,7 +66,7 @@ shortened. Check with `python -m realsim.tools.prose_budget`.
 - **argument for the code** — no defending a signature, no praising the design, no
   "which is the point". A rejected alternative gets one clause with its cost, or a
   `TODO:`.
-- **machinery** — how `attach`, a `View`, a `Dispatcher`, a base class or a
+- **machinery** — how `attach`, `Sensing`, a `Dispatcher`, a base class or a
   `proposed/` helper works. Document it once, where it is implemented.
 - **glue** — "which is what/why…", "and that is the whole of it", one idea restated
   three ways.

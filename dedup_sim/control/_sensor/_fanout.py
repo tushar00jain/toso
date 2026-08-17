@@ -6,7 +6,7 @@ from collections import Counter
 from types import MappingProxyType
 from typing import Dict, Iterable, Mapping, Optional, Set, Tuple
 
-from proposed import Sensor
+from proposed import LoadSensor
 from proposed.dispatch import Fold, Stored
 
 from ._action import Asked
@@ -14,7 +14,7 @@ from ._action import Asked
 __all__ = ["FanoutSensor"]
 
 
-class FanoutSensor(Sensor):
+class FanoutSensor(LoadSensor):
     """Who is folded in behind whom and which puts are owed. Nobody's wait is here.
 
     Two actions move it: the ask that takes a debt on, and the put that settles it. The

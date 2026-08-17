@@ -1,6 +1,6 @@
-# Sensor, view, and selector flow
+# Sensor, environment, and selector flow
 
-<!-- Generated from sensor_view_selector_flow.diagram.xml by realsim.tools.text_diagram. -->
+<!-- Generated from sensor_environment_selector_flow.diagram.xml by realsim.tools.text_diagram. -->
 
 ## 1. Who holds what
 
@@ -13,8 +13,8 @@ CONTROL (one capability)                        SEAMS                       �
 ┌────────────────────────────────────────────┐  ┌─────────────────────────┐  ┌───────────────────────────────┐
 │ ControlPlane                               │◄─│ ControlPlaneService     │◄╌│ .control_plane_handle         │
 │                                            │  │ behind a                │  │ DataPlane                     │
-│ selector chains ═══ declared View subsets  │  │ LocalControlPlaneHandle │  │   deployment ═ Simulation     │
-│ capability View ═══ Sensor(s)              │  │                         │  │                               │
+│ selector chains ═══ declared Sensor types  │  │ LocalControlPlaneHandle │  │   deployment ═ Simulation     │
+│ Sensing attach ═══ Environment + Sensors   │  │                         │  │                               │
 │ Dispatcher ═ reducer refs to same Sensor(s)│◄─│ DispatcherService       │◄╌│ .dispatcher_handle            │
 │                                            │  │ behind a                │  │ client / volume calls         │
 │ dedup: FanoutSensor as fanout + load       │  │ LocalDispatcherHandle   │  │ go through Deployment         │
@@ -22,16 +22,16 @@ CONTROL (one capability)                        SEAMS                       �
 │     SourceLoad                             │  │                         │  │ holds no control objects      │
 └────────────────────────────────────────────┘  └─────────────────────────┘  └───────────────────────────────┘
                         ▲
-                        │ attach(base View)
+                        │ attach(Environment, Sensors)
 ┌────────────────────────────── Simulation = Deployment ───────────────────────────────┐
 │                                                                                      │
 │ Simulation ═══ Mesh                                                                  │
 │            ═══ control_plane_handle                                                  │
 │            ═══ dispatcher_handle                                                     │
 │                                                                                      │
-│ Mesh ═══ base View ═══ ControllerService + topology + transfer cost                  │
-│          │                                                                           │
-│          └── locate / locality / now / transfer cost                                 │
+│ Environment ═══ topology + MachineProfile + clock                                    │
+│ DirectorySensor ═══ ControllerService                                                │
+│                     └── locate / locate_live / pinned                                │
 │                                                                                      │
 │ Mesh ═══ ControllerService      the real directory: key → current volume holders     │
 │      ═══ LocalClient × N        get / put / get_batch / put_batch                    │
@@ -40,8 +40,8 @@ CONTROL (one capability)                        SEAMS                       �
 ```
 <!-- text-diagram:who-holds-what:end -->
 
-The capability View and every declared subset carry the same Sensor objects.
-Selectors read those views; Dispatcher reducer bindings are the write side.
+The control plane and its selectors resolve the same sensor objects by declared type.
+Selectors read them; Dispatcher reducer bindings are the write side.
 
 ## 2. One generic request lifecycle
 
@@ -56,16 +56,16 @@ ONE REQUEST — dedup and KV-cache
 │      KV:    request → prefill/decode placement + priced reuse;                 │
 │             fetch keys → the source already priced                             │
 │                                                                                │
-│    the Selector reads a declared View subset and writes nothing                │
+│    the Selector reads declared Sensors and writes nothing                      │
 │    the plane chooses the answer and commits the decision                       │
 └────────────────────────────────────────────────────────────────────────────────┘
             ▲ 3. sense                                       │ 5. answer
             │                                                ▼
-┌────────────────── READ-ONLY VIEW ──────────────────┐   ┌────────── DATA PLANE ──────────┐
-│ DIRECTORY READ                                     │   │ 1. request arrives             │
+┌────────────── ENVIRONMENT + SENSORS ───────────────┐   ┌────────── DATA PLANE ──────────┐
+│ DIRECTORY SENSOR                                   │   │ 1. request arrives             │
 │   locate(keys): key → current holders              │   │ 2. ask through control handle  │
-│   topology / locality / transfer cost / now        │   │ 5. receive the answer          │
-│                                                    │   │ 6. actuate it                  │
+│ ENVIRONMENT                                        │   │ 5. receive the answer          │
+│   topology / read time / now                       │   │ 6. actuate it                  │
 │ CAPABILITY SENSOR READS                            │   │ 7. store calls move bytes      │
 │   dedup: fan-out tree, owed puts, source load      │   │ 8. compute, if any             │
 │   KV: predicted queues, decode batches,            │   │                                │

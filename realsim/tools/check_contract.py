@@ -40,7 +40,7 @@ drove them. The rule that makes the leak impossible is an import-direction one:
 
     ``*/control/`` may not import ``*/data/``, the mesh, or a store client.
 
-Control receives a :class:`~proposed.view.View` and returns a decision; anything
+Control receives an environment and sensors and returns a decision; anything
 that moves bytes reaches it as an *observation*, never as a handle. That is
 mechanically checkable, so it is checked here rather than left to review.
 Importing in the other direction is fine and expected: the data plane is handed
@@ -155,13 +155,12 @@ WALLCLOCK_READS: Dict[str, str] = {
 # A module is banned if it equals one of these or starts with it plus a dot.
 CONTROL_FORBIDDEN: Dict[str, str] = {
     "torchstore": "a real store client (control decides; it never calls the store)",
-    "realsim.mesh": "the mesh (control gets a View, not the objects behind it)",
+    "realsim.mesh": "the mesh (control gets an environment and sensors)",
     "realsim.adapters": "a real client/controller adapter",
     "realsim.seams": "the store seams (transport, volumes, controller handle)",
     "proposed.plane": "the DataPlane interface (that is the executing half)",
     "realsim.runner": "the Runner (releasing work is execution, not decision)",
-    "sim_common": "simulation internals -- take estimates through a protocol "
-                  "(proposed.cost) and machine facts from domain",
+    "sim_common": "simulation internals -- take machine facts from domain",
 }
 
 # What a capability's ``data/`` may not import. It is application code: it calls

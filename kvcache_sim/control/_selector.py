@@ -28,15 +28,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Unpack
 
-from proposed import Key, KeySelector, Selection
+from proposed import DirectorySensor, Key, KeySelector, Selection
 from proposed.selector import Fold, Ks, Selector
 
 from domain import decode_step_time, MachineProfile, Model, prefill_time
 
 from ._answer import Plan
-from ._view import (
-    ClusterView, prefix_lengths_of, PrefixView, ReservedView, RoutedView,
-)
+from ._sensor import ClusterSensor, ReservationSensor, RoutedPullSensor
+from ._prefix import prefix_lengths_of
 from .request import Request
 
 __all__ = [
@@ -63,7 +62,7 @@ class LongestPrefixKeySelector(KeySelector[int]):
     ``python -m kvcache_sim hotspot --spread-reads``.
     """
 
-    sensors = (PrefixView,)
+    sensors = (DirectorySensor,)
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection[int]:
         """Instances holding a leading run of ``keys``, keyed at the **negated** run.
@@ -76,14 +75,13 @@ class LongestPrefixKeySelector(KeySelector[int]):
         return Selection.keyed([(inst, (-run,)) for inst, run in counts.items()])
 
     def _prefix_runs(self, keys: Sequence[Key]) -> Dict[str, int]:
-        """Per-instance prefix runs, off whichever view this selector was attached to.
+        """Per-instance prefix runs, off the declared directory sensor.
 
-        A prefix run is a KV-cache notion the store has no reason to know, so a view
-        carrying none is allowed and the run is derived instead.
+        A prefix run is a KV-cache notion the store has no reason to know, so it is
+        derived from the raw directory observation.
         """
-        if isinstance(self.view, PrefixView):
-            return self.view.prefix_lengths(keys)
-        return prefix_lengths_of(self.view.locate(keys), keys)
+        directory = self.sensor(DirectorySensor)
+        return prefix_lengths_of(directory.locate(keys), keys)
 
 
 def by_prefix_and_load(bound: int = 1) -> Fold[int, int]:
@@ -135,12 +133,12 @@ class RoutedPull(KeySelector[Unpack[Tuple[()]]]):
     so a memo ranked down is a pull served by a volume nothing charged for.
     """
 
-    sensors = (RoutedView,)
+    sensors = (RoutedPullSensor,)
 
     def select(
         self, keys: Sequence[Key], requester: str
     ) -> Selection[Unpack[Tuple[()]]]:
-        peer = self.view.routed.peer(requester, keys)
+        peer = self.sensor(RoutedPullSensor).peer(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
 
@@ -192,7 +190,7 @@ class Priced(Selector[PrefillAsk, Plan]):
             before pulling beats recomputing (:func:`_worth_pulling`).
     """
 
-    sensors = (ClusterView,)
+    sensors = (ClusterSensor,)
 
     def __init__(
         self,
@@ -245,7 +243,7 @@ class Priced(Selector[PrefillAsk, Plan]):
 
     def _predict(self, inst: str, now: float, transfer_t: float, prefill_t: float):
         """Return ``(queue_wait, ttft, done_time)`` without reserving the server."""
-        avail = max(now, self.view.cluster.busy_until[inst])
+        avail = max(now, self.sensor(ClusterSensor).busy_until[inst])
         queue_wait = avail - now
         done = avail + transfer_t + prefill_t
         return queue_wait, done - now, done
@@ -273,7 +271,7 @@ class Priced(Selector[PrefillAsk, Plan]):
             xbytes = self.model.block_bytes(len(pull_keys), self.B)
             # The cost model the transport charges, so this prediction is what the
             # real pull will cost.
-            transfer_t = self.view.transfer_cost(source, inst, xbytes)
+            transfer_t = self.env.read_time(source, inst, xbytes)
         else:
             source, xbytes, transfer_t = None, 0, 0.0
         queue_wait, ttft, done = self._predict(inst, now, transfer_t, prefill_t)
@@ -302,8 +300,6 @@ class DecodeBatch(Selector[Plan, int]):
         profile / model: the cost constants a reservation's decode is priced against.
     """
 
-    sensors = (ClusterView, ReservedView)
-
     def __init__(
         self,
         instances: Sequence[str],
@@ -318,6 +314,7 @@ class DecodeBatch(Selector[Plan, int]):
         self.lookahead = lookahead
         self.profile = profile
         self.model = model
+        self.sensors = (ClusterSensor,) + ((ReservationSensor,) if lookahead else ())
 
     def select(self, plan: Plan, requester: str) -> Selection[int]:
         """Every instance in the pool, keyed at its predicted batch."""
@@ -330,11 +327,11 @@ class DecodeBatch(Selector[Plan, int]):
         if not self.tbt_enabled:
             return 0
         if not self.lookahead:
-            return self.view.cluster.occupancy(d)
-        n = self.view.cluster.predict_occupancy(d, done_time)
+            return self.sensor(ClusterSensor).occupancy(d)
+        n = self.sensor(ClusterSensor).predict_occupancy(d, done_time)
         # Requests whose prefill has not landed are invisible to the observed decode
         # state; the outstanding reservations stand in for them.
-        for res in self.view.reserved.pending(self.view.now()):
+        for res in self.sensor(ReservationSensor).pending(self.env.now()):
             if (
                 res.decode_id == d
                 and res.prefill_done <= done_time

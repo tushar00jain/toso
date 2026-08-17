@@ -7,8 +7,8 @@ simulation a roofline and an ``asyncio.sleep``
 (:class:`kvcache_sim.workload._accelerator.SimulatedAccelerator`), in a deployment the
 model's forward pass with measured durations.
 
-The compute counterpart of :data:`proposed.cost.TransferCost`, which only predicts:
-fabric cost is *incurred* by the client call the data plane already makes, while
+Fabric cost is predicted through the run's environment and incurred by the client
+call the data plane already makes, while
 nothing else makes a GPU busy, so this both predicts and incurs.
 
 What the port hands back

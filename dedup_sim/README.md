@@ -139,7 +139,7 @@ through, so a generator that has finished is a holder like any other -- which is
 third generator is folded in behind a peer rather than becoming a third trainer hop.
 
 What the load number does *not* say is on
-[`proposed.view.LoadView`](../proposed/view.py): it counts requesters currently routed
+[`proposed.sensors.LoadSensor`](../proposed/sensors.py): it counts requesters currently routed
 to a source, not bytes in flight, so it comes down when a route is retired but not when
 a read finishes.
 
@@ -169,7 +169,7 @@ folded in behind a peer.
 ## Module layout
 
 Split by plane: `control/` decides, `data/` executes, and neither imports the
-simulator — `control/` takes a read-only `View`, `data/` calls torchstore APIs
+simulator — `control/` takes an `Environment` and typed sensors, `data/` calls torchstore APIs
 against a `Deployment` (enforced by `realsim/tools/check_contract.py`).
 
 ```
@@ -194,8 +194,6 @@ dedup_sim/
                           #     puts are owed, who waits on them -- a
                           #     proposed.Sensor, the plane's one record, and the
                           #     proposed.dispatch.Reducer that folds a landed put
-    _view.py              #   FanoutView / DedupView: that sensor as the two reads a
-                          #   decision makes of it -- the tree, and the load on it
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- ask, read,
                           #   put, commit one Stored action, over the Deployment's
@@ -224,7 +222,7 @@ visible from which folders exist and how thick they are:
 
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
-| `control/` — what is decided | `routing.py`: one plane, `sources` + `_selector.py` (the chain behind it) + `_sensor/`/`_view.py` (the fan-out it senses, and folds a landed put into) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_view.py` (prefix runs) |
+| `control/` — what is decided | `routing.py`: one plane, `sources` + `_selector.py` (the chain behind it) + `_sensor/` (the fan-out it senses, and folds a landed put into) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_prefix.py` (prefix runs) |
 | `data/` — what executes | `read_through.py`: one member — ask, get, local put, commit | `serving.py` (the per-request lifecycle) + `_decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |

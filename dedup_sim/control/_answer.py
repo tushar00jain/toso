@@ -19,9 +19,11 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Dict, Hashable, List, Optional, Sequence
 
-from proposed import DecisionLog, Dispatcher, Key, Selection
+from proposed import (
+    DecisionLog, DirectorySensor, Dispatcher, Environment, Key, Selection,
+)
 
-from ._view import FanoutView
+from ._sensor import FanoutSensor
 
 __all__ = ["committed", "holders"]
 
@@ -32,7 +34,9 @@ def holders(located: Dict[str, Dict[str, Any]], key: str) -> List[str]:
 
 
 def committed(
-    view: FanoutView,
+    environment: Environment,
+    directory: DirectorySensor,
+    fanout: FanoutSensor,
     commits: Dispatcher,
     keys: Sequence[Key],
     requester: str,
@@ -54,20 +58,19 @@ def committed(
     source = ranking.head
     if source is None:
         return ranking
-    fanout = view.fanout
     if fanout.planned(requester) != source:
         # Skipped when re-asked and unmoved: no route changed, nothing to trace.
         fanout.route(requester, source)
         if trace is not None:
-            trace.record(view.now(), "route", f"{requester} <- {source}")
+            trace.record(environment.now(), "route", f"{requester} <- {source}")
     facts = [(source, key) for key in keys]
     if fanout.owes(facts):
         # Owes every key: the wait is bounded by its read-through. Still gated on a
         # directory read, since it may already hold a key it is about to republish.
         return replace(ranking, ready=commits.gate(
-            lambda: len(_registered(view, facts)) == len(facts)
+            lambda: len(_registered(directory, facts)) == len(facts)
         ))
-    if len(_registered(view, facts)) == len(facts):
+    if len(_registered(directory, facts)) == len(facts):
         # A pre-existing holder, the ordinary case: usable now, and owing nothing it
         # would never record the facts a gate here waited on.
         return ranking
@@ -76,18 +79,20 @@ def committed(
     # being a source and this requester gets the directory's own answer.
     fanout.retire(requester, source)
     if trace is not None:
-        trace.record(view.now(), "retire", f"{source} holds nothing")
+        trace.record(environment.now(), "retire", f"{source} holds nothing")
     return Selection()
 
 
-def _registered(view: FanoutView, facts: Sequence[Hashable]) -> List[Hashable]:
+def _registered(
+    directory: DirectorySensor, facts: Sequence[Hashable]
+) -> List[Hashable]:
     """Which of these ``(volume, key)`` pairs the directory holds *now*.
 
     Read live, and re-read at every commit a parked requester wakes on: volumes evict,
     so a peer that registered the key and later dropped it is one the next requester
     waits for again. A gate opened against a read taken before the registration landed
     parks forever."""
-    located = view.locate_live([key for _volume, key in facts])
+    located = directory.locate_live([key for _volume, key in facts])
     return [
         (volume, key)
         for volume, key in facts

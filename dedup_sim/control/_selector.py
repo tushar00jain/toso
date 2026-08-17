@@ -13,7 +13,7 @@ different kind of source, only one whose copy has not arrived yet::
     hop  = what the transfer to the requester costs over the link between them
 
 Both terms are seconds off the run's own cost model
-(:meth:`~proposed.view.View.transfer_cost`): no tier arithmetic, and no units to
+(:meth:`~proposed.environment.Environment.read_time`): no tier arithmetic, and no units to
 reconcile.
 
 ``fabric`` is the one weight, and it is dimensionless: what a second of the link this
@@ -40,10 +40,10 @@ from __future__ import annotations
 
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from proposed import Key, KeySelector, Selection, VolumeId
+from proposed import DirectorySensor, Key, KeySelector, Selection, VolumeId
 
 from ._answer import holders
-from ._view import FanoutView
+from ._sensor import FanoutSensor
 
 __all__ = ["Candidates", "CHAIN", "SPREAD"]
 
@@ -70,7 +70,7 @@ class Candidates(KeySelector[float]):
     candidate.
     """
 
-    sensors = (FanoutView,)
+    sensors = (DirectorySensor, FanoutSensor)
 
     def __init__(self, fabric: float = CHAIN, payload_bytes: int = 1) -> None:
         self.fabric = fabric
@@ -78,8 +78,8 @@ class Candidates(KeySelector[float]):
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
         """Everything that could serve every one of ``keys``, scored; else abstain."""
-        fanout = self.view.fanout
-        located = self.view.locate(keys)
+        fanout = self.sensor(FanoutSensor)
+        located = self.sensor(DirectorySensor).locate(keys)
         holds = set(holders(located, keys[0]))
         for key in keys[1:]:
             holds &= set(holders(located, key))
@@ -106,7 +106,7 @@ class Candidates(KeySelector[float]):
                 # only thing the cap does. A holder has no such limit; its price is
                 # what keeps readers off it.
                 continue
-            hop = self.view.transfer_cost(volume, requester, self.payload_bytes)
+            hop = self.env.read_time(volume, requester, self.payload_bytes)
             priced.append((volume, wait + hop + self.fabric * hop))
         if not priced:
             return Selection.abstain()
@@ -135,7 +135,7 @@ class Candidates(KeySelector[float]):
         Every volume the walk passes is answered on the way back down (``waits``), so a
         chain of ``m`` readers costs ``m`` steps in total, not ``m`` per reader.
         """
-        fanout = self.view.fanout
+        fanout = self.sensor(FanoutSensor)
         branch: List[VolumeId] = []
         while True:
             # Priced by an earlier candidate's walk.
@@ -164,7 +164,7 @@ class Candidates(KeySelector[float]):
             if wait is None:
                 waits[node] = None
                 continue
-            wait += self.view.transfer_cost(volume, node, self.payload_bytes)
+            wait += self.env.read_time(volume, node, self.payload_bytes)
             waits[node] = wait
             volume = node
         return waits[branch[0]] if branch else wait

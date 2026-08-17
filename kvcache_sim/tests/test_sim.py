@@ -21,7 +21,7 @@ import pytest
 from sim_common import config
 from sim_common.async_engine import AsyncEngine
 
-from kvcache_sim.control._view import KVView, _longest_prefix_run
+from kvcache_sim.control._prefix import _longest_prefix_run, prefix_lengths_of
 from kvcache_sim.workload._accelerator import (
     BLOCK_TOKENS, SimulatedAccelerator, TOKEN_DTYPE, token_tensor,
 )
@@ -34,14 +34,18 @@ from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data._store import KVStore
 from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
-from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
+from proposed import (
+    ControlPlane, DirectorySensor, Dispatcher, KeySelector, Selection,
+)
 from proposed.selector import (
     Balance, Const, FirstMatch, WithFold, Lift, Best, pipe, Selector, Ordered,
 )
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk, Priced,
 )
-from kvcache_sim.control._sensor import Committed, SourceLoad
+from kvcache_sim.control._sensor import (
+    ClusterSensor, Committed, ReservationSensor, RoutedPullSensor, SourceLoad,
+)
 from kvcache_sim.control.scheduler import (
     ComputeBusy, DecodeState, LoadBalanceScheduler, Occupancy, Plan, PrefillFinished,
     Response,
@@ -280,17 +284,17 @@ def test_real_directory_prefix_presence_and_eviction():
 
     sim = Simulation(topo)
     store = KVStore(sim)
-    view = sim.view.derived(KVView)
+    directory = sim.directory_sensor
 
     async def scenario():
-        # The data plane publishes/evicts; the control-plane view reads back.
+        # The data plane publishes/evicts; the directory sensor reads back.
         with sim.mesh.installed():
             await store.publish("s0", list(keys[:3]), _kv(3))  # s0: 3 leading blocks
             await store.publish("s1", list(keys[:1]), _kv(1))  # s1 holds 1
-            counts = view.prefix_lengths(list(keys))
+            counts = prefix_lengths_of(directory.locate(keys), keys)
             assert counts == {"s0": 3, "s1": 1}
             await _evict(sim.mesh, "s0", [keys[1]])    # break s0's run at index 1
-            counts2 = view.prefix_lengths(list(keys))
+            counts2 = prefix_lengths_of(directory.locate(keys), keys)
             assert counts2 == {"s0": 1, "s1": 1}
         return True
 
@@ -304,34 +308,33 @@ def test_real_directory_prefix_presence_and_eviction():
 # 2a. One decision, one directory. A routing decision reads the prefix runs once
 #     for its own candidate loop and again from every selector it consults, and
 #     all of those must see the same directory or the prices are not comparable.
-#     The pin is scoped state on the view because that is what those selectors sense
-#     through, so it has to be visible for the decision and gone after it -- and it
-#     belongs to the ROOT, so a view derived separately from the same root reads
-#     inside the pin instead of walking the directory beside it.
+#     The pin is scoped state on the shared DirectorySensor, so every selector in the
+#     decision reads the same answer and later decisions return to the live directory.
 def test_a_pinned_view_serves_one_directory_read_and_releases_it():
     topo = _make_topology(2)
     keys = _extend("m0", [0, 1, 2, 3])
 
     sim = Simulation(topo)
     store = KVStore(sim)
-    view = sim.view.derived(KVView)
-    beside = sim.view.derived(KVView)
+    directory = sim.directory_sensor
 
     async def scenario():
         with sim.mesh.installed():
             await store.publish("s0", list(keys), _kv(len(keys)))
-            with view.pinned(list(keys)):
-                pinned = view.prefix_lengths(list(keys))
+            with directory.pinned(list(keys)):
+                pinned = prefix_lengths_of(directory.locate(keys), keys)
                 await _evict(sim.mesh, "s0", [keys[1]])
-                held = view.prefix_lengths(list(keys))
-                escaped = beside.prefix_lengths(list(keys))
-            return pinned, held, escaped, view.prefix_lengths(list(keys))
+                held = prefix_lengths_of(directory.locate(keys), keys)
+                escaped = prefix_lengths_of(directory.locate(keys), keys)
+            return pinned, held, escaped, prefix_lengths_of(
+                directory.locate(keys), keys
+            )
 
     try:
         pinned, held, escaped, after = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    # The pinned read, not the eviction under it -- through either view.
+    # The pinned read, not the eviction under it.
     assert pinned == held == escaped == {"s0": 4}
     assert after == {"s0": 1}            # ...and the live directory once released
 
@@ -803,10 +806,11 @@ def _decode_leg(*, output_tokens: int = 6, prefill: str = "s0",
                 request, _answer(request, prefill=prefill, decode="s1")
             )
             if probe is not None:
-                view = sim.view.derived(KVView)
-                probe["chain"] = view.prefix_lengths(keys)
-                probe["generated"] = view.prefix_lengths(
-                    list(request.continuation_keys(1))
+                directory = sim.directory_sensor
+                probe["chain"] = prefix_lengths_of(directory.locate(keys), keys)
+                generated = list(request.continuation_keys(1))
+                probe["generated"] = prefix_lengths_of(
+                    directory.locate(generated), generated
                 )
             return asyncio.get_running_loop().time(), tokens
 
@@ -1592,14 +1596,12 @@ def test_a_pull_is_served_by_the_peer_that_was_priced():
     assert _unplanned_edges(replicated) == 0
 
 
-# 18. The source selector serves either view it can be attached to.
-#     The scheduler attaches a KVView, whose snapshot one routing decision pins; a
-#     run installing this selector on its own can only attach the plain View the mesh
-#     built, because a prefix run is a KV-cache notion the store has no reason to
-#     know. The ranking branch is the only place the two differ, and a
+# 18. The source selector derives prefix runs from the directory sensor it declares.
+#     A scheduler and a standalone selector receive the same observation; the
+#     prefix run remains a KV-cache calculation rather than a directory method. A
 #     controller-side call carries an already-chosen source and short-circuits
-#     before reaching it -- so nothing but this test holds the plain view up.
-def test_the_source_selector_accepts_a_plain_view():
+#     before reaching it.
+def test_the_source_selector_accepts_the_directory_sensor():
     from kvcache_sim.control._selector import LongestPrefixKeySelector
     from realsim.simulation import Simulation
 
@@ -1607,7 +1609,7 @@ def test_the_source_selector_accepts_a_plain_view():
     sim = Simulation(topo)
     keys = _extend("m0", [0, 1])
     selector = LongestPrefixKeySelector()
-    selector.attach(sim.view)
+    selector.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
 
     async def scenario():
         with sim.mesh.installed():
@@ -1670,7 +1672,10 @@ def _select_heads(sim, selector, keys, *, count, moving=True):
     nothing moves, which is the base ranking's own order.
     """
     load = SourceLoad()
-    best = Best(selector).attach(sim.view.derived(LoadView, load=load))
+    best = Best(selector).attach(
+        sim.environment,
+        {DirectorySensor: sim.directory_sensor, SourceLoad: load},
+    )
 
     heads = []
     with sim.mesh.installed():
@@ -1741,7 +1746,10 @@ def test_spread_reads_ranks_deterministically():
     """
     def rankings(sim, keys):
         load = SourceLoad()
-        selector = Ordered(_spread()).attach(sim.view.derived(LoadView, load=load))
+        selector = Ordered(_spread()).attach(
+            sim.environment,
+            {DirectorySensor: sim.directory_sensor, SourceLoad: load},
+        )
         out = []
         with sim.mesh.installed():
             for _ in range(5):
@@ -1854,10 +1862,10 @@ class _Watched:
 
 
 def _scheduler(n: int = 2):
-    """A scheduler attached to a real mesh view, ready to be asked things."""
+    """A scheduler attached to a real environment and directory sensor."""
     sim = Simulation(_make_topology(n))
     sched = LoadBalanceScheduler(block_tokens=512)
-    sched.attach(sim.view)
+    sched.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
     return sim, sched
 
 
@@ -1869,15 +1877,16 @@ def _prefill_ranking(sched, request, requester):
     decision is made from means declaring that subject, not reaching for a seam. Nothing
     in the chain writes, which is why asking it costs the decision after it nothing.
     """
-    now = sched.view.now()
+    now = sched.env.now()
+    directory = sched.sensor(DirectorySensor)
     keys = list(request.block_keys)
-    with sched.view.pinned(keys):
+    with directory.pinned(keys):
         return sched._prefill.select(
             PrefillAsk(
                 request=request,
                 now=now,
                 keys=keys,
-                counts=sched.view.prefix_lengths(keys),
+                counts=prefix_lengths_of(directory.locate(keys), keys),
                 peer=sched._reuse.select(keys, requester),
             ),
             requester,
@@ -1899,15 +1908,16 @@ def _pool(chain):
 def _priced_pool(sched, request, requester) -> tuple:
     """Every candidate the prefill ranking priced (:func:`_pool`)."""
     base = _pool(sched._prefill)
-    now = sched.view.now()
+    now = sched.env.now()
+    directory = sched.sensor(DirectorySensor)
     keys = list(request.block_keys)
-    with sched.view.pinned(keys):
+    with directory.pinned(keys):
         return base.select(
             PrefillAsk(
                 request=request,
                 now=now,
                 keys=keys,
-                counts=sched.view.prefix_lengths(keys),
+                counts=prefix_lengths_of(directory.locate(keys), keys),
                 peer=sched._reuse.select(keys, requester),
             ),
             requester,
@@ -2019,7 +2029,7 @@ def test_a_refusal_is_a_decision_not_taken():
     """
     sim = Simulation(_make_topology(2))
     sched = LoadBalanceScheduler(block_tokens=512, slo_ttft=0.0)
-    sched.attach(sim.view)
+    sched.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
         block_keys=tuple(_extend("m0", [0, 1])),
@@ -2047,7 +2057,7 @@ def test_a_ttft_refusal_is_taken_before_the_decode_pool_is_ranked():
         block_tokens=512, slo_ttft=0.0, simulate_decode=True,
         early_rejection=Occupancy.PREDICT,
     )
-    sched.attach(sim.view)
+    sched.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
     asked = []
     ranking = sched._decode
     sched._decode = _Watched(ranking, asked)
@@ -2080,7 +2090,7 @@ def test_the_tbt_slo_is_spent_on_the_decode_ranking_too():
         block_tokens=512, simulate_decode=True,
         slo_tbt=decode_step_time(1, DEFAULT_PROFILE) / 2,
     )
-    sched.attach(sim.view)
+    sched.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
         block_keys=tuple(_extend("m0", [0, 1])),
@@ -2094,7 +2104,7 @@ def test_the_tbt_slo_is_spent_on_the_decode_ranking_too():
         response = sim.loop.run_until_complete(scenario())
         assert response is None
         # A refusal books nothing, so the queue it would have joined never moved.
-        assert sched.view.cluster.busy_until["s0"] == 0.0
+        assert sched.sensor(ClusterSensor).busy_until["s0"] == 0.0
     finally:
         sim.loop.close()
 
@@ -2113,12 +2123,12 @@ def test_dispatch_folds_each_action_and_answers_nothing():
 
     async def scenario():
         assert await handle.dispatch.call_one(ComputeBusy("s0", 7.0)) is None
-        assert sched.view.cluster.busy_until["s0"] == 7.0
+        assert sched.sensor(ClusterSensor).busy_until["s0"] == 7.0
         assert await handle.dispatch.call_one(DecodeState("s1", (1.0, 2.0))) is None
-        assert sched.view.cluster.occupancy("s1") == 2
+        assert sched.sensor(ClusterSensor).occupancy("s1") == 2
         # A completion raises the tail and never lowers it.
         await handle.dispatch.call_one(PrefillFinished("s0", 3.0))
-        assert sched.view.cluster.busy_until["s0"] == 7.0
+        assert sched.sensor(ClusterSensor).busy_until["s0"] == 7.0
 
     try:
         sim.loop.run_until_complete(scenario())
@@ -2154,13 +2164,17 @@ def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
     sched = LoadBalanceScheduler(
         block_tokens=512, simulate_decode=True, early_rejection=Occupancy.PREDICT,
     )
-    sched.attach(sim.view)
+    sched.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
     assert not inspect.iscoroutinefunction(Dispatcher.dispatch_sync)
     decides = ast.parse(textwrap.dedent(inspect.getsource(_Scheduler.decide)))
     assert not [
         node for node in ast.walk(decides) if isinstance(node, (ast.Await, ast.AsyncWith))
     ], "decide suspends somewhere: a second decision could interleave with this one"
-    for sensor in (sched.view.cluster, sched.view.reserved, sched.view.routed):
+    for sensor in (
+        sched.sensor(ClusterSensor),
+        sched.sensor(ReservationSensor),
+        sched.sensor(RoutedPullSensor),
+    ):
         assert not any(
             inspect.iscoroutinefunction(fold) for fold in sensor.folds.values()
         ), f"{type(sensor).__name__} folds with a coroutine"
@@ -2173,9 +2187,9 @@ def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
         sched.dispatcher.dispatch_sync(_accepted(pull=["a"], source="s1"))
         assert ran == [], "the commit suspended: the loop ran something else"
         # ...and all three sensors moved in that one window.
-        assert sched.view.cluster.busy_until["s0"] == 5.0
-        assert len(sched.view.reserved.pending(0.0)) == 1
-        assert sched.view.routed.peer("s0", ["a"]) == "s1"
+        assert sched.sensor(ClusterSensor).busy_until["s0"] == 5.0
+        assert len(sched.sensor(ReservationSensor).pending(0.0)) == 1
+        assert sched.sensor(RoutedPullSensor).peer("s0", ["a"]) == "s1"
 
     try:
         sim.loop.run_until_complete(scenario())
@@ -2194,11 +2208,10 @@ def test_a_run_that_does_not_predict_reserves_nothing():
     sim, sched = _scheduler()
     try:
         assert sched._lookahead is False
-        with pytest.raises(RuntimeError, match="without a reservation sensor"):
-            sched.view.reserved
+        assert ReservationSensor not in sched.sensors
         sched.dispatcher.dispatch_sync(_accepted(pull=["a"], source="s1"))
-        assert sched.view.cluster.busy_until["s0"] == 5.0
-        assert sched.view.routed.peer("s0", ["a"]) == "s1"
+        assert sched.sensor(ClusterSensor).busy_until["s0"] == 5.0
+        assert sched.sensor(RoutedPullSensor).peer("s0", ["a"]) == "s1"
         # And the decode-side prediction is the observed occupancy, untouched by a
         # promise this run never made -- read off the pool, since the stages above it
         # keep only the host it named (:func:`_pool`).
@@ -2258,7 +2271,7 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     # Only s0 may prefill, so the prefix it needs is on the other host and a pull is
     # the cheaper half of the trade.
     sched = scheduler("cache_aware", prefill_pool=["s0"])
-    sched.attach(sim.view)
+    sched.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
     request = _request(
         id="r0", arrival=0.0, prompt_tokens=BLOCK_TOKENS * len(keys), output_tokens=1,
         block_keys=tuple(keys),
@@ -2276,5 +2289,3 @@ def test_one_plane_answers_a_fetch_with_the_pull_it_priced():
     assert response.plan.reuse_source == "s1", "no pull was priced -- nothing to answer"
     assert memo.head == "s1"      # the peer the pull was priced against
     assert ranked.head == "s1"    # the memo spent, and the ranking agrees
-
-

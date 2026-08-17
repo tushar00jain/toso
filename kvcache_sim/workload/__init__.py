@@ -23,7 +23,7 @@
   the one definition of what a token id is, which both ends of a request use.
 - ``_serving.py`` -- ``KVWorkload`` (one work item per conversation, a
   ``realsim.run.Workload``) and ``serving_plane``, the factory that wires the
-  store, view, scheduler and serving plane onto an assembled stack. The client it
+  store, scheduler and serving plane onto an assembled stack. The client it
   builds stands in for the user as well as the SDK: it walks a dialogue's turns
   one at a time, because turn N+1 contains turn N's answer.
 - ``scenarios.py`` -- the comparisons, each a list of ``realsim.run.Run`` values

@@ -46,9 +46,9 @@ from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
 
-from dedup_sim.control._view import DedupView
+from dedup_sim.control._sensor import FanoutSensor
 from dedup_sim.control.routing import Dedup
-from proposed import Stored
+from proposed import DirectorySensor, Endpoint, Environment, Stored
 from dedup_sim.data.read_through import ReadThroughPlane
 
 #: The version that displaces ``W`` in a one-deep reader volume.
@@ -213,7 +213,7 @@ def test_the_fabric_is_1x_per_read_for_any_fanout_cap():
 # --------------------------------------------------------------------------
 
 
-class Directory(DedupView):
+class Directory:
     """The reads a chain makes, over a ``key -> volumes`` map a test controls.
 
     Waiting is the part of routing that fails by *not* happening, and the two
@@ -223,50 +223,27 @@ class Directory(DedupView):
     says what the chain is being asked; arranging for a burst to produce it says
     considerably less.
 
-    A view itself, so what the plane composes its sensor onto is this object
-    (:meth:`derived`) and the links sense the real one. What writes it is
-    :meth:`publish`, called where a run's put would have registered: before the action
+    It supplies both the raw directory read and staged read pricing. What writes it is
+    :meth:`publish`, called where a run's put would have registered, before the action
     announcing it is dispatched.
     """
 
     def __init__(self, **holders: str) -> None:
-        # No ports: every read below is staged here rather than sensed off a run.
-        super().__init__(None, {}, None)
         self.by_key = {key: set(vols.split()) for key, vols in holders.items()}
 
-    def transfer_cost(self, src_id: str, dst_id: str, nbytes: int) -> float:
+    def read_time(self, src: Endpoint, dst: Endpoint, nbytes: int) -> float:
         """The origin far, the peers near -- the shape a chain forms in, staged.
 
         A ranking in seconds needs a price for a hop, and these tests are about the tree
         rather than the topology, so this is the coarsest price that still makes a peer
         worth reading from: ten seconds off the origin, one off anybody else.
         """
-        if src_id == dst_id:
+        if src.id == dst.id:
             return 0.0
-        return 10.0 if src_id == "p" else 1.0
+        return 10.0 if src.id == "p" else 1.0
 
-    # -- the View surface Dedup uses -------------------------------------- #
-    def derived(self, cls: type, **sensors: Any) -> "Directory":
-        """Compose ``sensors`` onto this view, where the real one builds a fresh view.
-
-        A fresh instance of ``cls`` would sense a run's ports, and the reads here are
-        staged rather than sensed -- so the sensor goes onto this object, which is
-        already a view.
-        """
-        # A subset of several views is a class made on the spot, so what this can be
-        # asked to stand in for is what that class was made of.
-        wanted = cls.__bases__ if "+" in cls.__name__ else (cls,)
-        missing = [v.__name__ for v in wanted if not isinstance(self, v)]
-        assert not missing, f"{type(self).__name__} is not a {', '.join(missing)}"
-        self._sensors.update(sensors)
-        return self
-
-    def locate_live(self, keys):
-        """The port read staged, so :meth:`~proposed.view.View.locate` is the real one."""
+    def locate_raw(self, keys, missing_ok: bool = False):
         return {k: {v: None for v in sorted(self.by_key.get(k, ()))} for k in keys}
-
-    def now(self) -> float:
-        return 0.0
 
     # -- what the volumes do to it ------------------------------------------ #
     def publish(self, volume: str, key: str) -> None:
@@ -290,7 +267,12 @@ def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
     onto the dispatcher it builds, and that state is the only thing a landed put folds.
     """
     plane = Dedup(fanout_cap=fanout_cap)
-    plane.attach(directory)
+    ids = {"p", *(f"r{i}" for i in range(10))}
+    topology = {v: Endpoint(id=v, host=v, node=v) for v in ids}
+    plane.attach(
+        Environment(topology, directory),
+        {DirectorySensor: DirectorySensor(directory)},
+    )
     return plane
 
 
@@ -395,7 +377,7 @@ def test_a_peer_never_feeds_more_than_the_cap():
         # no volume has a copy on the way, and the next ask is the directory's answer.
         directory.evict("p", KEY)
         last = await plane._decide([KEY], "r4")
-        return Counter(plane.view.fanout.routes().values()), last.sources
+        return Counter(plane.sensor(FanoutSensor).routes().values()), last.sources
 
     served, last = run_sim(_fanout_across_a_retire())[0]
     assert served["r0"] == cap        # never a slot more, before the retire or after
@@ -414,7 +396,7 @@ def test_the_sensor_remembers_no_registrations():
     (:meth:`proposed.dispatch.Dispatcher.gate`).
     """
     result, plane = _run()
-    fanout = plane.view.fanout
+    fanout = plane.sensor(FanoutSensor)
     assert fanout._promised == set(), "a put owed by a run that finished"
     assert set(fanout._route) == set(result.workload.reader_ids)
     assert not hasattr(fanout, "_ready"), "the waiting is the commit, and is nobody's"

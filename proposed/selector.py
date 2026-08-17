@@ -18,7 +18,7 @@ selector names both in its header::
 A selector is a **utility**, not a plane. Nothing outside a capability reaches one: a run
 knows about the capability's :class:`~proposed.plane.ControlPlane`, that plane declares the
 questions its callers may ask, and a selector is one of the things it may work the answer
-out with. So a selector needs no lifecycle beyond the view it ranks against
+out with. So a selector needs no lifecycle beyond the environment and sensors it ranks against
 (:meth:`Selector.attach`), and a ranking that never leaves the plane that built it may hold
 whatever it likes, gate and all. What crosses a service boundary is the plane's business
 (:meth:`Selection.settled`).
@@ -55,7 +55,7 @@ combinator hands the subject down untouched and takes it off what it holds, whic
 the same :data:`Balance` annotates a ranking over keys and one over an application's own
 candidates alike.
 
-Annotating measures from the view and the subject alone: it appends behind whatever is
+Annotating measures from the attached sensors and the subject alone: it appends behind whatever is
 already there, reads no key and names no source, so a fold still reads what each earlier one
 measured, and over a ranking that keyed nothing one reading is the whole of the order. Two
 rankings combined into one answer is a **plane's** job: it joins them and hands the result
@@ -67,7 +67,7 @@ where one may be applied. In a chain that is :func:`Bounded`, over the dimension
 hands of whoever holds a ranking it is that ranking's own (:meth:`Selection.take`,
 :meth:`Selection.only`, :meth:`Selection.require`, which takes the head's id and so reaches
 what the key does not hold -- the pool a decision was priced against, say). A capability
-writing a combinator of its own needs only :func:`declares` and :func:`declared` from here.
+writing a combinator of its own needs only :func:`declares` from here.
 """
 
 from __future__ import annotations
@@ -79,12 +79,12 @@ from typing import (
     Tuple, TypeVar, TypeVarTuple, Unpack, get_args, get_origin,
 )
 
-from proposed.deployment import Key, VolumeId
-from proposed.view import LoadView, View
+from proposed.deployment import Key, Sensor, VolumeId
+from proposed.environment import Environment
+from proposed.sensors import LoadSensor, Sensing
 
 __all__ = [
     "Ready", "Ks", "Fold", "Readings", "Selection", "prefer", "DecisionLog",
-    "declared",
     "declares", "Selector", "KeySelector", "NaiveKeySelector", "Stage", "pipe",
     "FirstMatch", "Const", "Annotate", "Balance", "Lift", "WithFold", "Ordered", "Best",
     "Bound", "Bounded",
@@ -403,7 +403,7 @@ class DecisionLog(Protocol):
         ...
 
 
-class Selector(ABC, Generic[_S, Unpack[Ks]]):
+class Selector(Sensing, ABC, Generic[_S, Unpack[Ks]]):
     """Rank the sources that should serve a subject, and say when they are usable.
 
     Written with the subject it takes and the arity it answers at
@@ -449,29 +449,6 @@ class Selector(ABC, Generic[_S, Unpack[Ks]]):
                 cls.subject_type = subject
             return
 
-    #: What this selector senses through: ``None`` until :meth:`attach`, and never
-    #: read by one that ranks only what it is handed.
-    view: Optional[View] = None
-
-    #: The views this selector reads, as :class:`~proposed.view.View` subclasses. What
-    #: it is attached to composes exactly these (:meth:`~proposed.view.View.subset`),
-    #: so the header says what a ranking senses and an undeclared read raises instead
-    #: of quietly working. ``()`` -- the default -- is the whole view, which is also
-    #: what a ranking sensing nothing is handed.
-    sensors: Tuple[type, ...] = ()
-
-    def attach(self: _Sel, view: Any) -> _Sel:
-        """Keep the view this selector senses and prices through, and return it.
-
-        The one the plane holding it was handed
-        (:meth:`proposed.plane.ControlPlane.attach`), passed straight down: one selector, one
-        view, whoever asks -- never a per-call argument::
-
-            source = Balance(LongestPrefixKeySelector()).attach(view)
-        """
-        self.view = view
-        return self
-
     @abstractmethod
     def select(self, subject: _S, requester: str) -> Selection[Unpack[Ks]]:
         """Rank the sources that should serve ``subject`` for ``requester``.
@@ -515,27 +492,10 @@ def declares(
 ) -> Tuple[type, ...]:
     """What a combinator senses: ``own``, plus whatever ``base`` does, each named once.
 
-    A view is composed of exactly what a selector declared (:attr:`Selector.sensors`), so a
-    combinator declaring only its own read would attach its base to a view missing the
-    base's, and an undeclared read raises (:class:`~proposed.view.Sensed`). One that senses
-    nothing declares nothing and hands the whole view down (:class:`FirstMatch`); ``()``
-    from ``base`` is the whole view, and every view carries the directory, so a base that
-    declared nothing loses nothing by being handed a narrower one.
+    A combinator declaring only its own read would leave its base without the sensor
+    types that base needs. One that senses nothing declares nothing.
     """
     return tuple(dict.fromkeys(tuple(own) + tuple(base.sensors)))
-
-
-def declared(
-    view: Any, selector: "Selector[Any, Unpack[Tuple[Any, ...]]]"
-) -> Any:
-    """The view ``selector`` declared, out of the one a combinator was handed.
-
-    What a combinator narrows to for a selector it holds is that selector's own header,
-    otherwise a chain would be the one place a declaration is not a fact -- and both of
-    ``dedup_sim``'s links sit inside one. Something that is no view at all is handed on
-    untouched, which only a selector declaring nothing can be attached to anyway.
-    """
-    return view.subset(*selector.sensors) if selector.sensors else view
 
 
 #: One operation on a ranking that **interprets** what is already measured, leaving the
@@ -599,15 +559,15 @@ class FirstMatch(Selector[_S, Unpack[Tuple[Any, ...]]]):
         #: The links' own, so a chain is a link of a chain (:func:`declared`).
         self.subject_type = subjects.pop() if subjects else Any
 
-    def attach(self, view: Any) -> "FirstMatch[_S]":
-        """Hand every wrapped selector the view it declared, answering or not.
-
-        One that senses through a view of its own must be brought up even if it
-        never answers, so a link behind an earlier answer is still sensing when its
-        turn comes.
-        """
+    def attach(
+        self,
+        environment: Environment,
+        sensors: Optional[Mapping[type, Sensor]] = None,
+    ) -> "FirstMatch[_S]":
+        """Attach every alternative to the same environment and sensor map."""
+        super().attach(environment, sensors)
         for selector in self.selectors:
-            selector.attach(declared(view, selector))
+            selector.attach(environment, sensors)
         return self
 
     def select(self, subject: _S, requester: str) -> Selection[Unpack[Tuple[Any, ...]]]:
@@ -644,8 +604,8 @@ class _Link(Selector[_S, Unpack[Ks]]):
 
     The subject is read off that ranking rather than declared, so a wrapped ranking is a
     chain link exactly where the ranking under it would be (:class:`FirstMatch`), and the
-    ranking is wired to the view its own header declared (:func:`declared`), reachable only
-    because ``senses`` is declared with the ranking's own reads (:func:`declares`).
+    ranking is wired to the sensor types in its own header, reachable because
+    ``senses`` includes the ranking's reads (:func:`declares`).
     """
 
     def __init__(
@@ -655,10 +615,14 @@ class _Link(Selector[_S, Unpack[Ks]]):
         self.subject_type = ranking.subject_type
         self.sensors = declares(senses, ranking)
 
-    def attach(self, view: Any) -> "_Link[_S, Unpack[Ks]]":
-        """Sense through ``view``, and hand the ranking the view it declared."""
-        super().attach(view)
-        self.ranking.attach(declared(view, self.ranking))
+    def attach(
+        self,
+        environment: Environment,
+        sensors: Optional[Mapping[type, Sensor]] = None,
+    ) -> "_Link[_S, Unpack[Ks]]":
+        """Attach this link and its ranking to one sensor map."""
+        super().attach(environment, sensors)
+        self.ranking.attach(environment, sensors)
         return self
 
 
@@ -666,17 +630,17 @@ class _Link(Selector[_S, Unpack[Ks]]):
 class Annotate(Generic[_R]):
     """A further dimension appended to whatever ranking this is applied to.
 
-    It holds the measure -- no ranking, view or subject -- so one may be shared by every
+    It holds the measure -- no ranking or subject -- so one may be shared by every
     chain wanting it (:data:`Balance`), and is written at what it measures: ``Annotate[int]``
     over a ``Selector[S, Plan]`` answers ``Selector[S, Plan, int]``.
 
     Args:
-        readings: ``(view, subject) -> Readings[_R]`` -- the measure, taken once per
+        readings: ``(selector, subject) -> Readings[_R]`` -- the measure, taken once per
             answer (:meth:`Selection.annotated`). A callable because a reading does not
-            exist until there is a subject and a view to take it through. Annotate it at
+            exist until there is a subject and attached sensors to take it through. Annotate it at
             its reading type, or the dimension erases and a fold above compares clean
             against anything.
-        senses: the views ``readings`` reads, declared beside the ranking's.
+        senses: the sensor types ``readings`` reads, declared beside the ranking's.
     """
 
     readings: Callable[[Any, Any], Readings[_R]]
@@ -722,20 +686,20 @@ class _Annotated(_Link[_S, Unpack[Ks]]):
         ranked = self.ranking.select(subject, requester)
         if not ranked.sources:
             return ranked
-        return ranked.annotated(self.readings(self.view, subject))
+        return ranked.annotated(self.readings(self, subject))
 
 
-def _load_at(view: Any, subject: Any) -> Readings[int]:
-    """What each source has lately been sent (:class:`~proposed.view.LoadView`).
+def _load_at(selector: Selector[Any, Unpack[Tuple[Any, ...]]], subject: Any) -> Readings[int]:
+    """What each source has lately been sent.
 
     Read once per answer, with nothing awaited between the read and the dimension it
     becomes, so no decision can land inside one answer. Absent is nothing sent.
     """
-    load = view.load.named()
+    load = selector.sensor(LoadSensor).named()
     return lambda source: load.get(source, 0)
 
 
-#: :class:`Annotate` partially applied at the load view: ``Balance(ranking)`` is that
+#: :class:`Annotate` partially applied at the load sensor: ``Balance(ranking)`` is that
 #: ranking annotated with how loaded each source it named is. A preset, not an operation of
 #: its own, so there is one of it for the whole process.
 #:
@@ -745,16 +709,16 @@ def _load_at(view: Any, subject: Any) -> Readings[int]:
 #: that changes ahead of that tie-break. Behind a ranking that keyed nothing the load is
 #: the whole of the order, which is how a bare pool is ranked by load alone.
 #:
-#: What it senses, and nothing else: :class:`~proposed.view.LoadView`, whose ``named()``
+#: What it senses, and nothing else: :class:`~proposed.sensors.LoadSensor`, whose ``named()``
 #: says what has lately been sent at each source. So this holds no tally of its own --
 #: what it appends is an observation somebody else keeps, moved by the decision that
-#: names a source -- and what that number means is stated once, on the view.
+#: names a source.
 #:
 #: **No arithmetic**, so there is nothing here for a caller to supply: whoever folds
 #: decides what a busy source costs, which is the application's own trade -- blocks of
 #: prefix run against reads routed at a host, seconds of link time against seconds of
 #: queue (:class:`WithFold`).
-Balance = Annotate(_load_at, senses=(LoadView,))
+Balance = Annotate(_load_at, senses=(LoadSensor,))
 
 
 def _comparable(

@@ -15,8 +15,7 @@ one payload-free notification at it.
 
 Which is the rule that makes the order they run in irrelevant, stated here and nowhere
 else: **a reducer writes its own state and reads nothing else.** A fold reaching for
-another's would be deciding, and deciding belongs in the plane that senses them all at
-once (:class:`proposed.view.View`).
+another's would be deciding, and deciding belongs in the plane that holds the sensors.
 
 The vocabulary is Redux's, minus one word: a *selector* here ranks sources
 (:mod:`proposed.selector`), so a read of committed state is called a read.

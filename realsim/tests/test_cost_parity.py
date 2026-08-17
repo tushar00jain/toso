@@ -1,6 +1,6 @@
 """The charge and the prediction of a ``get`` must stay one formula.
 
-:func:`sim_common.cost_model._get_time` is the single definition of what serving a
+:meth:`sim_common.cost_model.MachineProfile.read_time` is the single definition of what serving a
 get costs (``storage read + host-RAM staging + fabric``). Two very different
 consumers depend on it:
 
@@ -76,19 +76,19 @@ def _measure_get_advance(collapse: bool) -> tuple[float, int]:
     return advance, served[0]
 
 
-def test_transport_get_charge_equals_get_time():
-    """A real get advances the clock by exactly ``get_time`` for its bytes."""
+def test_transport_get_charge_equals_profile_read_time():
+    """A real get advances the clock by exactly the profile's read time."""
     advance, nbytes = _measure_get_advance(collapse=False)
     # Through the stack's own estimator -- the value a scheduler would be handed.
     expected = Simulation(
         _topology(), profile=DEFAULT_PROFILE
-    ).transfer_cost.get_time("srv", "cli", nbytes)
+    ).environment.read_time("srv", "cli", nbytes)
     assert nbytes == N * 4  # float32
     # Compared with a tolerance, not bit-exactly: the advance is a difference of
     # two absolute clock readings, so its last bit depends on what the clock had
     # already accumulated, while get_time sums the three terms from zero.
     assert math.isclose(advance, expected, rel_tol=1e-12), (
-        f"transport charged {advance!r} for a {nbytes}B get but get_time says "
+        f"transport charged {advance!r} for a {nbytes}B get but read_time says "
         f"{expected!r} -- the charge and the prediction have drifted apart"
     )
 
@@ -97,7 +97,7 @@ def test_collapsed_get_charges_the_same_total():
     """``collapse_charges`` merges the sleeps but must not change the total.
 
     The flag is documented as advancing the clock by the exact same amount, so it
-    must agree with ``get_time`` too -- otherwise turning it on would silently
+    must agree with profile pricing too -- otherwise turning it on would silently
     reprice every fetch.
     """
     per_component, nbytes_a = _measure_get_advance(collapse=False)
@@ -111,7 +111,7 @@ def test_a_colocated_get_is_not_free():
 
     Only the *fabric* term of a get is zero when server and client coincide --
     reading your own pool is not free. This is the case a well-meaning
-    "optimization" would short-circuit to ``0.0`` inside ``_get_time``, which would
+    "optimization" would short-circuit to ``0.0`` inside profile pricing, which would
     silently break its agreement with the transport; the cross-node tests above
     would not catch that, so pin it explicitly.
     """
@@ -135,11 +135,11 @@ def test_a_colocated_get_is_not_free():
         advance, nbytes = sim.loop.run_until_complete(scenario())
     finally:
         sim.loop.close()
-    # Priced through the stack's own estimator, not a parallel call to _get_time:
+    # Priced through the stack's own environment, not a parallel composition:
     # the point is that what a scheduler is handed matches what it is charged.
-    expected = sim.transfer_cost.get_time("solo", "solo", nbytes)
+    expected = sim.environment.read_time("solo", "solo", nbytes)
     assert expected > 0.0, "a co-located get must still cost storage + RAM"
     assert network_time(ep, ep, nbytes, DEFAULT_PROFILE) == 0.0  # only fabric is free
     assert math.isclose(advance, expected, rel_tol=1e-12), (
-        f"co-located get advanced the clock {advance!r}, get_time says {expected!r}"
+        f"co-located get advanced the clock {advance!r}, read_time says {expected!r}"
     )

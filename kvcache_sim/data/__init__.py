@@ -22,7 +22,7 @@
   port: a simulated run's meta tensors, a deployment's attention output and sampler.
 
 The test for what belongs here: does it advance the clock or move bytes? A directory
-*read* does neither, so it is a control-plane view. Nor does *submitting* a request and
+*read* does neither, so it is a control-plane sensor read. Nor does *submitting* a request and
 following the redirects it comes back with: which host it lands on belongs to a load
 balancer and walking the chain belongs to a client
 (:class:`kvcache_sim.workload._serving._Client`).

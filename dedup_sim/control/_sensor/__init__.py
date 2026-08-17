@@ -10,7 +10,7 @@ The sensor is written only by dispatching, and has no service of its own: a seco
 for the same fact would not be ordered against the directory's, and a stale fan-out is a
 readiness gate nothing opens.
 
-Folder-private: what a decision may read is the view, not the sensor behind it.
+Folder-private: selectors declare the sensor type rather than importing it outside control.
 """
 
 from ._action import Asked

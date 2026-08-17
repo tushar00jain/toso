@@ -29,8 +29,8 @@ the allocation-free data plane, the control-plane seams, and the concurrency con
 - **Real** `MonarchRPCTransportBuffer` + `InMemoryStore` put/get lifecycle.
 - **Model:** the four types a capability plugs into — `KeySelector` (which volume
   serves these keys for this requester, and when; a service the data plane asks
-  before it reads, naive by default), `View` (the read-only observation a control
-  plane senses through), `DataPlane` (a capability's executing half) and
+  before it reads, naive by default), `Environment` plus typed sensors (stable run
+  facts beside evolving observations), `DataPlane` (a capability's executing half) and
   `Runner` + `ItemDispatch` (release work items on the virtual clock, install the
   mesh once, gather).
 - **Virtual clock:** every resource cost advances time via `asyncio.sleep` on
@@ -148,7 +148,7 @@ layout, and the renderer replaces the marked sections in the Markdown document:
 
 ```
 PYTHONPATH=<repo-root> <repo-root>/.venv/bin/python -m realsim.tools.text_diagram \
-  docs/sensor_view_selector_flow.diagram.xml
+  docs/sensor_environment_selector_flow.diagram.xml
 ```
 
 ## Layout
@@ -194,10 +194,9 @@ proposed/       every contract that outlives the simulator; imports nothing
                   they are usable. Naive is all holders in directory order. The
                   data plane asks it and passes the answer to an ordinary read
                   (prefer(): what the store does with a preference)
-  view.py         View -- read-only observation: locate, topology and locality,
-                  the clock. Built over a Controller, and reads it through
-                  locate_raw alone -- once per decision that pins it (pinned),
-                  or live (locate_live) for a caller needing the directory now
+  environment.py  Environment -- topology, profile, transfer pricing and clock
+  sensors.py      DirectorySensor -- locate_raw once per pinned decision, or live;
+                  LoadSensor -- the common load reading used by Balance
   deployment.py   Deployment -- how data-plane code reaches its store, the one
                   control plane it asks (control_plane_handle, whatever that plane
                   declares) and another node's data plane (plane_handle, for whoever
@@ -208,7 +207,7 @@ proposed/       every contract that outlives the simulator; imports nothing
   dispatch.py     Dispatcher -- where a host's facts arrive, and one action, every
                   reducer that folds its type, one commit, and one payload-free
                   wake at it. Holds no state itself
-  plane.py        ControlPlane -- attach(view) + dispatcher, the one a run puts a
+  plane.py        ControlPlane -- attach(environment, sensors) + dispatcher, the one a run puts a
                   service in front of; DataPlane -- attach(deployment), routes,
                   and no verbs: what a capability does is its own to name
   routed.py       routed() -- a data plane declaring that a member may answer with
@@ -216,7 +215,8 @@ proposed/       every contract that outlives the simulator; imports nothing
                   answer it is; RoutedPlane -- a caller that calls the member again
                   there, over plane_handle, so nobody writes the following and no
                   host holds a peer (peerless)
-  cost.py         TransferCost -- what a fetch is predicted to cost
+  environment.py  topology + MachineProfile-backed read pricing + clock
+  sensors.py      pinned directory reads and the common load observation
   topology.py     Endpoint / Tier / locality -- where a volume is
 domain/
   llm.py          Model -- a transformer reduced to what a sim charges against

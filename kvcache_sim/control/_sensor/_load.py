@@ -10,7 +10,7 @@ the action every accepted decision already dispatches
 (:class:`~kvcache_sim.control._sensor.Committed`), so a source's load rises where the
 pull it was priced for was decided.
 
-What it does *not* observe is stated on :class:`proposed.view.LoadView`.
+It implements the shared :class:`proposed.sensors.LoadSensor` reading.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import Dict, Mapping
 
-from proposed import Sensor, VolumeId
+from proposed import LoadSensor, VolumeId
 from proposed.dispatch import Fold
 
 from ._action import Committed
@@ -26,11 +26,10 @@ from ._action import Committed
 __all__ = ["SourceLoad"]
 
 
-class SourceLoad(Sensor):
+class SourceLoad(LoadSensor):
     """Per-volume count of the decisions that named it as a source.
 
-    Read through the scheduler's view (:class:`proposed.view.LoadView`), where the
-    number's meaning and its limits are stated.
+    Read through the selector's declared :class:`proposed.sensors.LoadSensor`.
 
     Counts only a decision that priced a pull: one that recomputes the gap sends nothing
     to anybody, and counting it would load a volume nobody is going to read.

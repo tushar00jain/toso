@@ -78,7 +78,7 @@ def test_both_generators_still_read_through_under_spread():
     *and* every generator when the run ends.
     """
     spread = _run()[SPREAD]
-    holders = spread.sim.view.locate_live(["W"])["W"]
+    holders = spread.sim.directory_sensor.locate_live(["W"])["W"]
     assert set(holders) == {"t0", "t1", "g0", "g1"}
 
 

@@ -37,8 +37,8 @@ eviction: the entry would go and the bytes would stay
 (``realsim.seams._retention``).
 
 **Reading the directory is not here either.** A ``locate`` decides nothing and moves
-nothing, so per-instance prefix presence is a control-plane view
-(:class:`kvcache_sim.control._view.KVView`) -- including re-reading it to see whether a
+nothing, so per-instance prefix presence is a control-plane sensor
+(:class:`proposed.sensors.DirectorySensor`) -- including re-reading it to see whether a
 planned pull is still available. :meth:`KVStore.fetch` asks for what it was told to and
 lets the store answer.
 

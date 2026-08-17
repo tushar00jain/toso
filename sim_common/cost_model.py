@@ -40,7 +40,6 @@ __all__ = [
     "storage_time",
     "storage_rate",
     "compute_time",
-    "ProfileTransferCost",
 ]
 
 # Device families the compute roofline understands. Anything in ``_GPU_DEVICES``
@@ -119,6 +118,10 @@ class MachineProfile:
 
     h2d_bandwidth: float = 0.0
     d2h_bandwidth: float = 0.0
+
+    def read_time(self, src, dst, nbytes: int) -> float:
+        """Total storage, RAM and fabric time for one read."""
+        return _read_time(src, dst, nbytes, self)
 
 
 # Illustrative demo profile -- plausible *relative* magnitudes only, NOT measured
@@ -223,7 +226,7 @@ def storage_time(nbytes: int, kind: str, profile: MachineProfile) -> float:
     return profile.storage_latency + nbytes / bw
 
 
-def _get_time(src, dst, nbytes: int, profile: MachineProfile) -> float:
+def _read_time(src, dst, nbytes: int, profile: MachineProfile) -> float:
     """Total time to serve one ``get`` of ``nbytes`` from ``src`` to ``dst``.
 
     The **canonical composition** of a read: the serving side reads the payload
@@ -298,22 +301,3 @@ def compute_time(
         mem_term = nbytes / _mem_bandwidth(device, profile)
 
     return max(compute_term, mem_term)
-
-
-class ProfileTransferCost:
-    """A :data:`proposed.cost.TransferCost` backed by a profile + topology.
-
-    The simulator's implementation: prices a transfer with :func:`_get_time`,
-    the sum of the same three terms the transport seam charges one at a time, so
-    a scheduler's prediction and the clock advance it causes cannot drift apart
-    (``realsim/tests/test_cost_parity.py`` holds the two to each other).
-    """
-
-    def __init__(self, topology, profile: MachineProfile = DEFAULT_PROFILE) -> None:
-        self._topology = dict(topology)
-        self._profile = profile
-
-    def get_time(self, src_id: str, dst_id: str, nbytes: int) -> float:
-        return _get_time(
-            self._topology[src_id], self._topology[dst_id], nbytes, self._profile
-        )

@@ -47,8 +47,8 @@ class ReservationSensor(Sensor):
     completed: they are invisible to the observed decode state and would otherwise be
     predicted as absent.
 
-    Read through the scheduler's view
-    (:class:`~kvcache_sim.control._view.ReservedView`): the decision that promises a
+    Read by the scheduler's decode selector
+    (:class:`ReservationSensor`): the decision that promises a
     prefill and the host that finishes one write it, the decode-side prediction in
     between reads it.
 
@@ -109,7 +109,7 @@ class RoutedPullSensor(Sensor):
     host that fetches asks who should serve it. This is the note that answers with the
     decision already made rather than a second, differently derived one.
 
-    Read through the scheduler's view (:class:`~kvcache_sim.control._view.RoutedView`):
+    Read directly by the selector that declares :class:`RoutedPullSensor`:
     the decision that prices a pull writes it and the answer that spends one writes it
     again; the link that answers a fetch from it only reads.
     """

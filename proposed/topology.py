@@ -65,7 +65,7 @@ def nearest(
 ) -> Optional[str]:
     """The closest of ``candidates`` to ``to``: locality first, id as the tie-break.
 
-    Over the topology map rather than off a :class:`~proposed.view.View`, because
+    Over the topology map rather than a live sensor, because
     distance is arithmetic on endpoints and needs no directory read. ``None`` for no
     candidates. The id tie-break is what makes the answer total, hence reproducible.
     """

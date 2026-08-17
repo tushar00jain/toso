@@ -48,7 +48,9 @@ def _asked_of(control: Any) -> Tuple[str, ...]:
     ``attach`` and ``cluster`` are the lifecycle a *run* drives, and a host reaching
     those would be holding the plane rather than asking it.
     """
-    lifecycle = set(vars(ControlPlane))
+    lifecycle = {
+        name for base in ControlPlane.__mro__ for name in vars(base)
+    }
     return tuple(sorted(
         name for name in dir(type(control))
         if not name.startswith("_")

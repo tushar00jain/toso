@@ -214,7 +214,7 @@ for the question (a `Request`) and `Dispatcher.dispatch` for the facts
 are deliberately all a serving host may touch: control holds every instance's
 queue, cache and decode occupancy, so it runs as a service, not here. Everything crossing is a value, which is what lets the in-process call
 become an actor endpoint without either side changing shape. The scheduler only
-ever *decides*: it reads the real directory through a view (`locate_volumes`),
+ever *decides*: it reads the real directory through a `DirectorySensor`,
 returns a plan, and is told the outcome. Remote-prefix pulls
 (`client.get_batch`), publishing (`client.put_batch`) and eviction
 (`notify_delete_batch`) are the data plane's, layered over the existing
@@ -223,8 +223,8 @@ returns a plan, and is told the outcome. Remote-prefix pulls
 ## Layout
 
 Split by plane: `control/` decides, `data/` executes, and neither imports the
-simulator — `control/` takes a `View` (which carries the run's `TransferCost`) and
-machine facts from `domain`; `data/` calls torchstore APIs against a `Deployment`. Both are enforced
+simulator — `control/` takes an `Environment` and a typed sensor map;
+`data/` calls torchstore APIs against a `Deployment`. Both are enforced
 by `realsim/tools/check_contract.py`, which also forbids either of them from
 importing `workload/` -- that is the run's scaffolding and has no counterpart in
 production, so a type all three planes pass (`Request`) belongs in `control/`.
@@ -291,15 +291,9 @@ kvcache_sim/
                           #     that predicts composes the
                           #     reservation sensor, which is the whole of the
                           #     condition on a reservation
-    _view.py              #   KVView: what a decision senses, one class per read
-                          #   and each a proposed.View -- prefix runs (a pure
-                          #   function of the directory read one routing decision
-                          #   pins, View.pinned, so nothing here holds a snapshot
-                          #   of its own) and each sensor above: the cluster, the
-                          #   prefills promised (composed in only by a run that
-                          #   predicts decode occupancy forward) and the routed
-                          #   pulls, so what ranks or gates reads the view it
-                          #   needs and is handed no sensor of its own
+    _prefix.py            #   prefix run calculation, derived from the pinned
+                          #   DirectorySensor; selectors declare concrete sensor
+                          #   types for cluster, reservations and routed pulls
                           #   (underscored: the coordinator builds its own, so
                           #   nothing outside control/ names this)
     request.py            #   inference Request, carrying its prompt (a
@@ -384,8 +378,8 @@ The async engine, the cost model, the topology/`Endpoint` skeleton, the `Trace`
 recorder and the `Ledger`/report helpers live in the repo-root `sim_common/`; the
 served model's flop terms, KV block bytes and token→time conversions live in
 `domain/llm.py` (both planes call them: control predicts, data charges); the real
-client/controller/transport seams + adapters, the `Mesh`, the `KeySelector` / `View` /
-`DataPlane` / `Runner` / `ItemDispatch` types live in `realsim/`. This package holds only the
+client/controller/transport seams + adapters, the `Mesh`, the `Environment` / sensors /
+`KeySelector` / `DataPlane` / `Runner` / `ItemDispatch` types live in `realsim/`. This package holds only the
 KV-cache decisions and the three directory verbs (`publish` / `fetch` / `evict`)
 plus the prefix-run read that express KV caching on a mesh.
 

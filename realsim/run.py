@@ -26,7 +26,7 @@ kind, ...)``).
 
 :class:`Simulation` deliberately does *not* take a ``Run``. It is constructible
 from a topology alone, and a dozen tests do exactly that to get an assembled
-stack -- mesh, view, transfer-cost estimate -- with nothing to run on it. A
+stack -- mesh, environment and sensors -- with nothing to run on it. A
 ``Run`` requires a ``Workload``, so demanding one would make those tests invent
 work they do not perform. :meth:`Run.execute` is the seam between the two: it is
 where a capability's declaration becomes the stack's constructor arguments.

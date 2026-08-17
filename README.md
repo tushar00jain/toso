@@ -25,17 +25,18 @@ experiment:
 Capabilities share one feedback loop:
 
 ```text
-data-plane facts -> Dispatcher -> Sensors -> read-only View -> Selectors
-        ^                                                  |
-        +---------- execute the control-plane answer <-----+
+data-plane facts -> Dispatcher -> Sensors -> Selectors
+        ^                                      |
+        +------ execute the control-plane answer <---------+
 ```
 
 Sensors fold application facts such as promised replicas, queue occupancy,
-reservations, and routed pulls. A View combines those sensors with directory,
-topology, time, and transfer-cost reads. Selectors rank without mutating state; the
-control plane commits a choice, and the data plane executes it through ordinary
-TorchStore clients and reports the resulting facts. New capabilities supply only
-their sensors, view subsets, selector chains, questions, and execution steps.
+reservations, and routed pulls. An `Environment` supplies topology, time, and read
+pricing; a `DirectorySensor` supplies coherent residency reads. Selectors declare and
+resolve only the sensor types they read, without mutating them. The control plane
+commits a choice, and the data plane executes it through ordinary TorchStore clients
+and reports the resulting facts. New capabilities supply only their sensors, selector
+chains, questions, and execution steps.
 
 ## Deterministic simulation framework
 

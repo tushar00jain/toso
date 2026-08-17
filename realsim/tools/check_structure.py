@@ -22,8 +22,7 @@ Seven rules, none of which a type system can express:
 4. **Every module declares its surface.** A module with public top-level
    definitions declares ``__all__``, it names only things that exist, and it
    names all of them. Before this, roughly a third of the modules had one and
-   the rest did not, four of the lists were incomplete (``sim_common.cost_model``
-   omitted ``ProfileTransferCost``, which ``realsim.simulation`` imports), and
+   the rest did not, four of the lists were incomplete, and
    nothing said which was intended. ``__init__.py`` is exempt -- a package's
    ``__all__`` is a curated re-export list, not a mirror of its own contents --
    and so is ``__main__.py``.
@@ -46,10 +45,10 @@ Seven rules, none of which a type system can express:
    the first is policed** -- see :func:`_proposed_ports` for why the second is not
    found.
 7. **A selector writes nothing.** What a decision remembers between calls is a
-   :class:`~proposed.deployment.Sensor`, read through a view and moved by an action
+   :class:`~proposed.deployment.Sensor`, resolved by type and moved by an action
    somebody dispatched -- which is what makes it observable, foldable and one thing
    rather than a copy per holder. So a :class:`~proposed.selector.Selector` may write
-   to ``self`` in ``__init__`` and ``attach`` (its knobs and its view) and nowhere
+   to ``self`` in ``__init__`` and ``attach`` (its knobs and sensed state) and nowhere
    else, and it may not move a sensor either: a ranking that mutated one would be
    deciding, at a moment no commit names and where the other holders of that sensor
    cannot see it. What this buys is that a ranking is a *value*: two built the same
@@ -65,7 +64,7 @@ Rule 4 checks that ``__all__`` is *complete*, not that each name *deserves* to b
 public -- it reads "public" off the leading underscore and nothing else. So a
 function could be dead, exported, and green: ``longest_prefix_run`` sat in
 ``kvcache_sim/control/request.py`` with no caller but a test while
-``KVView.prefix_lengths`` carried its own copy of the same walk, and every rule
+the KV prefix reader carried its own copy of the same walk, and every rule
 above passed. Rule 5 is the answer, narrowed until it was worth enforcing:
 
 * over *all* public names it is unenforceable -- 78 hits, mostly correct as they
@@ -472,7 +471,7 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
       process that holds it. Followed transitively for this mark too, so a surface
       declared one level down is still caught.
 
-    So a ``View``, a ``Selection`` or a ``Deployment`` is not a port -- each has a
+    So an ``Environment``, a ``Selection`` or a ``Deployment`` is not a port -- each has a
     member a caller invokes here and now, and reading a field off a value the other
     plane handed over is exactly what values are for. That is what keeps the answer
     a selector gives readable: a ``Selection`` crossed the wire, so the sources it
@@ -782,7 +781,7 @@ def check_selector_state(
     methods a :class:`~proposed.deployment.Sensor` uses to move its own state, and a
     selector calling one of those is moving state a plane is supposed to dispatch. Matched
     by name and on any receiver, because the receiver is usually a local
-    (``fanout = self.view.fanout``) and because a ranking has no business calling a
+    (``fanout = self.sensor(FanoutSensor)``) and because a ranking has no business calling a
     sensor's mutator whatever it holds one under.
     """
     out: List[Violation] = []
@@ -832,7 +831,7 @@ def check_selector_state(
                                 str(rel), node.lineno, "selector-keeps-state",
                                 f"{cls.name}.{fn.name} writes self.{target.attr}: a "
                                 f"ranking is a value, and what a decision remembers "
-                                f"between calls is a sensor the view carries, not a "
+                                f"between calls is a declared sensor, not a "
                                 f"field on the selector",
                             ))
     return sorted(out)

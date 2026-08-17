@@ -28,7 +28,7 @@ surface declares the methods, which is where the signatures are.
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
 
 __all__ = [
     "Controller", "Deployment", "Key", "Sensor", "StorageFull",
@@ -104,7 +104,7 @@ class Controller(Protocol):
         """``{key -> {volume_id -> StorageInfo}}``, with nothing applied to it.
 
         A controller implementing this proposal needs both reads. This is the one a
-        control plane senses through, via a :class:`~proposed.view.View`: what it
+        control plane senses through a :class:`~proposed.sensors.DirectorySensor`: what it
         sees has to be the directory as it *is*, not an answer already reordered
         for somebody.
 
@@ -115,8 +115,8 @@ class Controller(Protocol):
         read-modify-write with no lock (``dedup_sim.control._selector``) and lets a
         set of priced candidates be comparable
         (``kvcache_sim.control.scheduler``). It is a plain local method for the same
-        reason it can be one: the caller is a control plane sensing through a view
-        built over the directory in its own process, so nothing crosses a boundary
+        reason it can be one: the caller's directory sensor is in the same process,
+        so nothing crosses a boundary
         and there is nothing to wait for.
         """
 
@@ -181,11 +181,9 @@ class Sensor(ABC):
     queue is, who is working and until when, what has been promised and not yet
     done.
 
-    No members, because what may be read off one is the application's own
-    vocabulary: a queue tail and a decode occupancy belong to whoever decides
-    against them, and :class:`~proposed.view.View` -- which carries the store's
-    reads -- cannot see load at all. A capability declares those reads on its own
-    sensor and exposes it through a view (:meth:`proposed.view.View.derived`).
+    Sensor reads are the application's own vocabulary: a queue tail and a decode
+    occupancy belong to whoever decides against them. A selector declares the sensor
+    types it reads. :attr:`folds` is empty until a sensor accepts reported actions.
 
     Nothing reaches one from outside the process that holds it. A fact a host
     reports is an action, dispatched into the one
@@ -194,6 +192,8 @@ class Sensor(ABC):
     written by the folds it publishes and read by the decisions above it, and neither
     is a surface.
     """
+
+    folds: Mapping[type, Callable[[Any], None]] = {}
 
 
 class StorageVolume(Protocol):

@@ -6,9 +6,9 @@ Two separate things, deliberately:
   :class:`~realsim.runner.WorkItem` per conversation at its first turn's arrival
   time. It builds no store, no scheduler and no plane;
 * :func:`scheduler` and :func:`serving_plane` are the *capability wiring*, one per
-  plane: the control plane over the view, and the store plus one
+  plane: the control plane over its environment and sensors, and the store plus one
   :class:`~kvcache_sim.data.serving.ServingHost` per instance over it. Both are
-  factories because they reach for the view, the mesh and the ledger, none of
+  factories because they reach for the environment, the mesh and the ledger, none of
   which exists before the stack does.
 
 Three things a deployment would not need are built here, because in a deployment
@@ -164,8 +164,8 @@ def scheduler(
 
     ``source`` (:class:`~kvcache_sim.control.scheduler.Source`) names which peers a
     fetch is answered from, and the plane builds it, so two runs configured alike still
-    get a ranking each: one object attached twice senses only the view it was attached
-    to last, and neither run would reproduce alone.
+    get a ranking each: one object attached twice retains only its latest environment
+    and sensors, and neither run would reproduce alone.
     """
     if kind not in ("cache_aware", "load_balance"):
         raise ValueError(f"unknown scheduler kind {kind!r}")
