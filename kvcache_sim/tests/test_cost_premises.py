@@ -41,7 +41,6 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE, _get_time, MachineProfile
 from sim_common.topology import Tier
 

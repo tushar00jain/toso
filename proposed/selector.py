@@ -215,7 +215,7 @@ class Selection(Generic[Unpack[Ks]]):
         """
         return Selection(
             sources=_named_once(tuple(i for i, _d in candidates)),
-            key={i: tuple(dims) for i, dims in candidates},
+            key=dict(candidates),
             ready=ready,
         )
 
@@ -255,7 +255,7 @@ class Selection(Generic[Unpack[Ks]]):
         checker cannot tie up is here -- the ``()`` a ranking that keyed nothing spreads back
         is not its ``Selection[()]``.
         """
-        return replace(self, key={
+        return replace(self, key={  # type: ignore[return-value]
             source: (*(self.key or {}).get(source, ()), readings(source))
             for source in (self.sources or ())
         })
@@ -435,7 +435,8 @@ class Selector(ABC, Generic[_S, Unpack[Ks]]):
         if "subject_type" in vars(cls):
             return
         for base in cls.__dict__.get("__orig_bases__", ()):
-            if _S not in getattr(get_origin(base) or base, "__parameters__", ()):
+            bound = getattr(get_origin(base) or base, "__parameters__", ())
+            if _S not in bound:  # type: ignore[misc]  # a TypeVar object, not a type here
                 continue
             subject = get_args(base)[0]
             if not isinstance(subject, TypeVar):
@@ -648,7 +649,7 @@ class _Link(Selector[_S, Unpack[Ks]]):
         self.subject_type = ranking.subject_type
         self.sensors = declares(senses, ranking)
 
-    def attach(self: _Sel, view: Any) -> _Sel:
+    def attach(self, view: Any) -> "_Link[_S, Unpack[Ks]]":
         """Sense through ``view``, and hand the ranking the view it declared."""
         super().attach(view)
         self.ranking.attach(declared(view, self.ranking))

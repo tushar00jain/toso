@@ -14,7 +14,7 @@ from typing import Dict, Tuple
 
 from proposed import Endpoint, locality, Tier, TIER_LABEL
 
-__all__ = ["transfer_time"]
+__all__ = ["Endpoint", "Tier", "TIER_LABEL", "locality", "transfer_time"]
 
 
 def transfer_time(src, dst, nbytes: int, tiers: Dict[Tier, Tuple[float, float]]) -> float:

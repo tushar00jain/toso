@@ -44,7 +44,7 @@ from __future__ import annotations
 import argparse
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from sim_common import config
 from sim_common.report import configure_logging, section

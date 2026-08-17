@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from dataclasses import replace
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List
 
 from putget_sim.workload.put_get import DEFAULT_N, KEY, PutGetBurst
 from realsim.run import Result, Run

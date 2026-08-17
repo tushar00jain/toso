@@ -129,9 +129,10 @@ class RoutedPlane:
             answered = await getattr(reference, member).call_one(*args)
             if where is None or answered is None:
                 return answered  # nothing to read an address out of
-            host = where(answered)
-            if host is None:
+            sent_on = where(answered)
+            if sent_on is None:
                 return answered
+            host = sent_on
         raise RuntimeError(
             f"{member!r} is still being sent on after {self.max_hops} hops: nothing in "
             f"that chain answered without an address"

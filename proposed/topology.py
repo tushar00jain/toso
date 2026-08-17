@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, Optional, Sequence, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 __all__ = ["Endpoint", "Tier", "TIER_LABEL", "locality", "nearest"]
 

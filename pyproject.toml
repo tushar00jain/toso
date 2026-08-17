@@ -28,3 +28,31 @@ override-dependencies = ["torchmonarch"]
 # deps (setuptools-rust, wheel, numpy, torch) must already be installed — that
 # ordering is what build_from_source.sh handles.
 no-build-isolation-package = ["torchmonarch", "torchstore"]
+
+[dependency-groups]
+# Not needed to run a sim, only to run the two checks in
+# realsim/tests/test_contract.py, which skip when these are absent. The floors are the
+# versions those checks were measured against.
+lint = ["mypy>=2.3", "ruff>=0.16"]
+
+[tool.mypy]
+# proposed/ alone. It is variadic-generic, so the arity of a ``Selection[*Ks]`` and the
+# one dimension ``annotated`` appends *are* the design, and no bespoke lint reads them.
+# The sim packages are out of scope on purpose: 195 errors there, none a defect --
+# sim_common.async_engine subclasses asyncio's loop and reads its privates,
+# check_structure narrows ``ast`` nodes past what mypy follows, a View's sensors are
+# descriptors on its subclasses, and a Selector's view is Optional until attach().
+# Widening the scope buys blanket ignores, not checks.
+files = ["proposed"]
+mypy_path = "."
+
+[tool.ruff.lint]
+# Pyflakes only -- undefined names, dead imports, redefinitions -- over every file,
+# which is the half mypy cannot reach given the scope above.
+#
+# Not the default set: 413 rules, 939 findings here, 91% of them import
+# modernisation (UP006/UP035/UP045 rewriting ``List`` to ``list``). That is a
+# mechanical sweep to take or leave on its own terms, not a check. B and SIM are out
+# for a concrete reason: B015/B018 flag every ``with pytest.raises(...): obj.attr``,
+# which is how these tests state that a sensor nobody composed raises.
+select = ["F"]

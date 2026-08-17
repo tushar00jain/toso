@@ -27,8 +27,7 @@ import torch
 from realsim.simulation import Simulation
 from realsim.seams.transport import Endpoint
 from sim_common import config
-from sim_common.async_engine import run_sim
-from sim_common.cost_model import DEFAULT_PROFILE, _get_time, network_time
+from sim_common.cost_model import DEFAULT_PROFILE, network_time
 
 KEY = "W"
 N = 4096  # float32 elements -> a payload big enough that every term is non-zero

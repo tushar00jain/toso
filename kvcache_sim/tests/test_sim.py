@@ -17,7 +17,7 @@ import inspect
 import pytest
 
 from sim_common import config
-from sim_common.async_engine import AsyncEngine, run_sim
+from sim_common.async_engine import AsyncEngine
 
 from kvcache_sim.control._view import KVView, _longest_prefix_run
 from kvcache_sim.workload._accelerator import (

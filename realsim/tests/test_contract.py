@@ -16,13 +16,24 @@ surface.
 
 See ``realsim/tools/check_contract.py`` and ``check_structure.py`` for the full
 contracts and their rationale.
+
+The last two tests run the two off-the-shelf checks the repo keeps: mypy over
+``proposed/``, and ruff's pyflakes rules over every file. ``pyproject.toml`` holds the
+whole of both -- which scope, which rules, and why not more.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+
+import pytest
+
 from realsim.tools.check_contract import (
     format_violations,
     is_control_module,
+    REPO_ROOT,
     resolve_module,
     scan_default,
     scan_source,
@@ -124,7 +135,6 @@ def test_public_defs_sees_classes_functions_and_constants_but_not_privates():
 def test_every_module_in_scope_actually_declares_its_surface():
     """The rule would be vacuous if it matched nothing; it covers ~50 modules."""
     import ast as _ast
-    from pathlib import Path as _Path
 
     checked = 0
     for pkg in check_structure.GRAPH_PKGS:
@@ -621,3 +631,39 @@ def test_the_proposal_stands_on_its_own():
     assert "proposed-imports-simulator" in _codes(
         "from sim_common.topology import Endpoint\n", path=PROPOSED
     )
+
+
+# --------------------------------------------------------------------------
+# The two off-the-shelf checks. Their whole configuration is in pyproject.toml.
+# --------------------------------------------------------------------------
+
+
+def _tool(module: str, *args: str) -> subprocess.CompletedProcess:
+    """Run ``python -m <module>`` at the repo root, taking its whole scope from config.
+
+    No rule or path flags: passing them would split the configuration in two. Skips when
+    the tool is missing, since both are in the ``lint`` group and not the runtime deps.
+    """
+    pytest.importorskip(module)
+    return subprocess.run(
+        [sys.executable, "-m", module, *args],
+        cwd=str(REPO_ROOT),
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_the_shared_dsl_type_checks():
+    """``proposed/`` must be clean, so a fold reading a position nothing keyed is an
+    error at the call and not an ``IndexError`` in a run."""
+    proc = _tool("mypy")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_no_module_carries_a_dead_or_undefined_name():
+    """Every file must be clean. A module re-exporting on purpose says so in
+    ``__all__``, which rule 4 above reads too."""
+    proc = _tool("ruff", "check")
+    assert proc.returncode == 0, proc.stdout + proc.stderr

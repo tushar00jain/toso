@@ -31,7 +31,7 @@ import io
 import sys
 import tokenize
 from pathlib import Path
-from typing import Dict, Iterable, List, NamedTuple, Set
+from typing import Iterable, List, NamedTuple, Set
 
 from realsim.tools.check_contract import REPO_ROOT
 

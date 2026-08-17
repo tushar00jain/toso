@@ -199,8 +199,6 @@ def test_deterministic_across_runs(mode):
 
 
 if __name__ == "__main__":  # pragma: no cover
-    import itertools
-
     # Expand the parametrized cases manually for the script runner.
     cases = []
     for name, fn in sorted(globals().items()):

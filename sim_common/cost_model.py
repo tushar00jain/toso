@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, Tuple
+from typing import Mapping, Tuple
 
 from sim_common.topology import locality, Tier, transfer_time
 

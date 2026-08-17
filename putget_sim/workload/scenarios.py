@@ -11,14 +11,14 @@ Unlike the other two sims, this scenario's shape comes from the command line
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
 from realsim.demo import Console, Scenario
 from realsim.run import Result, Run
-from sim_common.cost_model import DEFAULT_PROFILE, MachineProfile
+from sim_common.cost_model import DEFAULT_PROFILE
 
 from ..report.summary import BurstReport
-from .put_get import DEFAULT_N, MODE_META, PutGetBurst
+from .put_get import PutGetBurst
 
 __all__ = ["NUM_READERS", "PROFILE", "Burst"]
 

@@ -33,7 +33,7 @@ the workload supplies the work; :meth:`realsim.run.Run.execute` pairs the two.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from proposed import ControlPlane, Endpoint, View
 from sim_common import config
