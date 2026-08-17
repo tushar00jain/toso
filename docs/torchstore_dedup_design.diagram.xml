@@ -1,0 +1,74 @@
+<diagrams target="docs/torchstore_dedup_design.md">
+  <diagram id="shape">
+    <stack>
+      <row gap="3">
+        <box title="CONTROL" width="37">
+          <line>Dedup ControlPlane</line>
+          <line>source rank + readiness + load</line>
+          <line>FanoutSensor: tree / promises / load</line>
+          <line>reads directory through View</line>
+        </box>
+        <between>
+          <at row="2">answer</at>
+          <at row="4">◄─────</at>
+        </between>
+        <box title="DATA" width="31">
+          <line>ReadThroughPlane</line>
+          <line>preferred get → local put</line>
+          <line>dispatch Stored</line>
+          <line>moves bytes through Deployment</line>
+        </box>
+        <between>
+          <at row="2">─────►</at>
+          <at row="4">─────►</at>
+        </between>
+        <box title="TORCHSTORE" width="32">
+          <line>Controller: current holders</line>
+          <line>LocalClient: slice planning</line>
+          <line>StorageVolume: resident bytes</line>
+          <line>transport: peer / origin copy</line>
+        </box>
+      </row>
+      <row gap="3">
+        <box title="DIRECTORY TRUTH" width="50">
+          <line>local put registers reader as a current holder</line>
+        </box>
+        <box title="SENSOR TRUTH" width="54">
+          <line>Stored settles the promised copy and wakes dependents</line>
+        </box>
+      </row>
+    </stack>
+  </diagram>
+
+  <diagram id="burst">
+    <stack>
+      <row gap="3">
+        <box title="ROUTES" width="47">
+          <line>t0 and t1 both hold A and B</line>
+          <line/>
+          <line>A: expensive trainer fabric</line>
+          <line>t0 ──► g0 ──► g1</line>
+          <line>         └──► g2</line>
+          <line/>
+          <line>B: cheap direct path from t1</line>
+          <line>t1 ──► g0′ ──► g1′</line>
+          <line> └───────────► g2′</line>
+        </box>
+        <box title="WHY EACH EDGE WINS" width="48">
+          <line>A first pull: t0 wins the stable tie</line>
+          <line>B first pull: t1 wins after t0 is reserved</line>
+          <line/>
+          <line>g1: wait(g0) + peer hop &lt; direct t0 hop</line>
+          <line>g2: g0 has a slot; sibling keeps depth at 2</line>
+          <line/>
+          <line>g1′: promised g0′ beats direct t1</line>
+          <line>g2′: direct t1 hop &lt; peer wait + hop</line>
+          <line>     so B starts a second shallow root</line>
+        </box>
+      </row>
+      <box title="RESULT" width="101">
+        <line>one burst balances trainers and tree depth: A moves 1× from origin; B moves 2× when latency wins</line>
+      </box>
+    </stack>
+  </diagram>
+</diagrams>

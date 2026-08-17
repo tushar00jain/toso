@@ -1,486 +1,312 @@
-# Design: Mooncake-style KV-cache serving on TorchStore
+# Mooncake-style KV-cache serving on TorchStore
 
-**Status:** draft / proposal · **Scope:** LLM inference KV-cache pool + cache-aware
-routing (prefill/decode serving), layered on the existing TorchStore substrate.
-The reference architecture is the Mooncake paper (arXiv:2407.00079); this doc adapts
-its *concepts* to TorchStore and is concerned only with the design.
-See `torchstore.md` for how TorchStore's control plane, data plane, and transport
-work today.
+<!-- Generated from torchstore_kvcache_design.diagram.xml by realsim.tools.text_diagram. -->
 
-A design for making **TorchStore double as a Mooncake-style KV cache** for LLM
-serving — a disaggregated, prefix-reusing KVCache pool with a cache-aware
-scheduler — *without* forking the store. The claim is
-that **almost everything such a cache needs already exists in TorchStore's data plane
-and transport; what's missing is a new control-plane selector** (a cache-aware
-coordinator), a **key-naming convention** (prefix-hash block ids), and one
-data-plane capability the weight-sync path never needed (**eviction**).
+**Status:** proposal · **Scope:** shared LLM KV cache, cache-aware routing, and
+prefill/decode serving.
 
-Mooncake (arXiv:2407.00079, *KVCache-centric Disaggregated Architecture for LLM
-Serving*, ToS 2025) is the serving platform for Kimi. Its four moving parts are a
-**KVCache pool** (paged KV blocks spread over the cluster's spare CPU/DRAM/SSD), a
-**Transfer Engine** ("Messenger", GPUDirect-RDMA block movement), a global
-**Conductor** scheduler (cache-aware prefill/decode routing under TTFT/TBT SLOs),
-and **prefill/decode disaggregation**. This doc maps each concept onto TorchStore.
+TorchStore already provides the byte pool, directory, clients, and transports needed
+by a distributed KV cache. The capability adds prefix-addressed blocks, a control
+plane that places work using cache and load state, and bounded cache retention.
 
----
+The reference is Mooncake, *KVCache-centric Disaggregated Architecture for LLM
+Serving* (arXiv:2407.00079). This document maps its ideas onto TorchStore. See
+[`architecture.md`](architecture.md) for the shared control/view/data loop,
+[`torchstore.md`](torchstore.md) for store internals, and
+[`des_design.md`](des_design.md) for the simulation stack.
 
-## 1. Goals / non-goals
+## 1. Boundary
 
-**Goals**
-- Let a serving engine (vLLM / SGLang / a custom rollout worker) use TorchStore as a
-  **shared, cross-instance KV cache**: store paged KV blocks once, **reuse a matched
-  prefix** on any instance, and move a block across the fabric **once** when a remote
-  instance needs it.
-- Provide a **cache-aware location + routing service** (the Conductor analog): given a
-  request's prompt, tell the caller which instance has the longest reusable prefix and
-  what the predicted TTFT is, so requests land where reuse is highest without
-  overloading a hot instance.
-- Support a **bounded, long-lived cache**: real **eviction** (LRU/LFU/length-aware) and
-  optional **DRAM→SSD tiering**, because an inference cache is unbounded and persistent,
-  unlike the versioned, burst-scoped weight-sync cache.
-- Be **additive**: the geometry-addressed `put`/`get`/`*_state_dict` weight-sync path
-  keeps working unchanged. KV-cache mode is a *different
-  control-plane selector over the same volumes and transport*.
+The design must:
 
-**Non-goals**
-- **Not** an inference engine. TorchStore stores, locates, and moves KV blocks; it does
-  **not** run attention, chunked/layer-wise prefill compute, or decode. Those stay in
-  the serving engine (the paper's Chunked Pipeline Parallelism and layer-wise prefill
-  overlap are engine concerns; TorchStore only needs to expose async load/store so the
-  engine *can* overlap).
-- **Not** owning prefill/decode **compute disaggregation** itself. TorchStore is the
-  KVCache pool + transfer + location service that *makes* disaggregation cheap; which
-  GPU runs prefill vs decode is the engine/orchestrator's call.
-- **Not** re-implementing the Transfer Engine. TorchStore's transport (Monarch RDMA /
-  TorchComms RDMA / shm / Gloo) already *is* Messenger; we reuse it.
-- **Not** a full SLO admission controller in v1. The store exposes the *signals*
-  (per-instance prefix-match length, load, predicted TTFT); prediction-based early
-  rejection is an optional selector on top (§5.7), not a store primitive.
+- reuse a prompt prefix across serving instances, but never across incompatible model
+  identities;
+- choose prefill and decode hosts using prefix residency, queue state, transfer cost,
+  and TTFT/TBT limits;
+- keep the long-lived cache within capacity through eviction and optional tiering;
+- leave ordinary TorchStore weight and object APIs unchanged.
 
----
+TorchStore does not run attention, implement chunked or layer-wise prefill, own the
+serving engine, or replace its transport with a separate Messenger. It exposes the
+storage and scheduling seams that let an engine perform those operations. Full SLO
+admission can remain an optional selector.
 
-## 2. Background: what exists today, mapped to the reference architecture
+## 2. What is reused and what is added
 
-TorchStore already has three of Mooncake's four parts. The table is the crux of the
-"we only need a control plane" answer:
-
-| Reference component | TorchStore equivalent (today) | Gap |
-|--------------------|-------------------------------|-----|
-| **KVCache pool** — objects over spare CPU/DRAM/SSD | `StorageVolume` / `InMemoryStore` (`storage_volume.py`), one per rank/host; already a distributed byte pool | add **eviction** + optional **SSD tier** |
-| **Transfer Engine** — RDMA block movement, multi-NIC device selection | Transport layer (`transport/*`): shm → Monarch RDMA → TorchComms RDMA → Gloo → RPC, auto-selected per transfer | **none** — reuse as-is; the primitives line up 1:1 |
-| **Metadata master** — global directory, no data flow | `Controller` directory `key → {volume_id → StorageInfo}` + prefix `Trie` (`controller.py`) | **none** — reuse; blocks are just keys |
-| **Client + transfer submitter** | `LocalClient` (`client.py`) driving `put`/`get` over the transport | one **optional source preference** on the read path: `locate_volumes(keys, prefer=...)` applies a caller-supplied volume ranking to its own answer before the client picks a holder per key (§5.2). The store consults nothing; whoever asked the coordinator did so itself |
-| **KV-cache event feed** — stored/removed event stream | *(nothing)* — Controller has no stored/removed event stream | **NEW seam** (optional): Controller emits stored/removed events the coordinator subscribes to (§4) |
-| **Conductor** — cache-aware prefill/decode scheduler | *(nothing)* | **NEW control plane**: a `CacheCoordinator` layered in front of the `Controller` (a selector actor over the dumb directory) |
-| **Prefix-hash block id** — computed in the serving-engine connector, not the store | opaque string keys (any scheme allowed) | **naming convention** only, no code change |
-| **Prefix matching** | `Controller.locate_volumes([keys])` / `keys(prefix)` on the trie | adapt: walk the block-key chain |
-| **Eviction / replication selector** | `delete` / `notify_delete` exist; no *selector*, no replica config | **NEW data-plane selector** |
-| **Hot-block replication / swap** | read-through population + peer-source fan-out (K4/K3 below) | **reuse the pattern**, drive it by access frequency instead of a burst |
-
-So: **data plane ✓, transport ✓, directory ✓.** The genuinely new work is (a) a
-cache-aware **coordinator** (control plane — the Conductor analog), (b) a prefix-hash
-**key convention** (a connector concern, §5.1), and (c) **eviction** (a data-plane selector
-the weight-sync path never needed).
-
-Three control-plane mechanisms from the reference architecture worth adopting:
-
-- **2-phase commit on writes.** A write begins, streams, then commits (or is revoked on
-  failure), so readers never observe a half-written object — the same role as
-  TorchStore's `MAPPING` commit marker. Eviction and reads both skip objects not yet
-  marked complete.
-- **Scheduler-facing capacity query.** The directory should expose per-segment
-  `(capacity, used)` so the coordinator has the load/capacity signal it needs (§5.3).
-- **Sharded directory.** Under a high request rate, metadata can be split across shards
-  routed by `hash(key)`, which answers this doc's open question about sharding the
-  coordinator (§5.9, §7).
-
-Two facts from the existing store make this fit cleanly:
-
-- **Volumes are already a reusable, addressable byte pool.** Under `LocalRankStrategy`
-  every rank owns a volume; under `HostStrategy` every host owns one. A KV block is just
-  a `put(block_key, kv_tensor)` into a volume, and the controller indexes where it lives
-  — the same directory that answers `locate_volumes` for weights answers "which instances
-  cache this prefix block."
-- **The controller is metadata-only and already prefix-structured.** Its `Trie` gives
-  cheap prefix listing; `locate_volumes` already returns per-key, per-volume presence.
-  That is exactly the query the coordinator needs.
-
----
-
-## 3. Shared substrate (what KV-cache mode depends on)
-
-Reusable pieces (the substrate this design builds on). Most exist today; K5
-(eviction) is the main new data-plane selector.
-
-| # | Piece | What / where |
-|---|-------|--------------|
-| K1 | **Prefix-hash block addressing** | A KV block's key is a **hash chain**: `block_key[i] = H(block_tokens[i] ‖ block_key[i-1])`. Content-identical prefixes ⇒ identical keys ⇒ **dedup + reuse fall out** for free. **This is a client/connector convention, not a store change** — the serving-engine connector computes the block hash and passes it as the *opaque* object key. The store stays opaque and content-**agnostic**: keys are application-supplied, and the store simply stores each block as a plain tensor under that key. |
-| K2 | **Block-level put/get** | Store/fetch one KV block via the existing `put`/`get` on a volume + transport. A block value is the KV for `B` tokens (e.g. `[2, n_layers, B, n_kv_heads, head_dim]`); the store stays geometry-blind (§9 of torchstore.md) — a block is just bytes under a key. |
-| K2b | **Prefix locate** | `locate_volumes(block_keys)` (existing) returns per-block presence; the **longest present run from the front, per volume** = that instance's reusable prefix length. This is the coordinator's core query, computed from the existing directory. |
-| K3 | **Peer-source transfer** | A block resolves to *any* volume holding it, incl. a peer instance's volume; the transport moves it once. This is already indexable in the Controller directory. |
-| K4 | **Read-through population** | After an instance fetches/computes a block, it `put`s the block into its own volume and the controller registers it — so peers can reuse it. Persistent: the block stays cached (no version window). |
-| K5 | **Eviction selector** | Per-volume LRU (default; the paper found LRU best on their traces) / LFU / length-aware, driven by access recency the coordinator observes on the request stream. Evicting a block = `delete(block_key)` on that volume + `notify_delete`. **New** relative to weight-sync (which pins within a version window). |
-| K6 | **Locality cost model** | Rank sources/instances by locality: shm > NVLink peer > cross-node RDMA. These tiers drive which instance's prefix is "cheap" to reuse and whether to transfer vs recompute. |
-| K7 | **Client-side local hot cache** (optional) | A per-client hot cache admitted by frequency: only keys whose access count clears a threshold are cached locally, so repeat fetches of very hot blocks short-circuit before reaching the coordinator. An optional client-side tier in front of the coordinator. |
-
-K1+K2b+K3+K4 are the reusable core (mostly existing); K5 is the new data-plane selector;
-the coordinator (§5) adds cache-aware routing on top.
-
----
-
-## 4. Layered controllers (the key structural change)
-
-The key structural move: **split selector from storage.** Keep the
-existing `Controller` as a dumb directory; add a **`CacheCoordinator`** actor in front
-that owns prefix matching, cache-aware routing, replication, and eviction selector. It
-**delegates** block-location lookups to the `Controller` and only *instructs* clients —
-KV bytes still move client↔volume over the existing transport.
-
+<!-- text-diagram:mapping:start -->
 ```
-   serving instance i                   NEW LAYER                      EXISTING
- ┌───────────────────────┐     ┌──────────────────────────┐   ┌───────────────────┐
- │ schedule(request):    │route│    CacheCoordinator       │   │  Controller       │
- │  prompt -> block_keys │────▶│  (Conductor analog):      │──▶│  (block directory:│
- │                       │◀────│   prefix-match + TTFT      │   │   key→{vol→info}, │
- │  prefill uncached     │(p,d)│   routing + replication    │   │   trie)           │
- │  suffix, put blocks   │     │   + eviction selector        │   └───────────────────┘
- │  (K4), decode         │     │  — one actor, serialized   │            │
- └──────────┬────────────┘     └──────────────────────────┘            ▼
-            └────────── KV block transfer (existing transport) ──▶┌───────────────────┐
-                                                                  │  StorageVolume(s) │
-                                                                  │  (KV block pool)  │
-                                                                  └───────────────────┘
+┌─────────── REUSE TORCHSTORE ───────────┐   ┌─────────── ADD KV CAPABILITY ───────────┐
+│ Controller: key → current holders      │   │ connector: prefix-hash block keys       │
+│ StorageVolume: DRAM byte pool          │   │ ControlPlane: route + admission         │
+│ LocalClient: put/get/delete batches    │   │ Sensors: queues / batches / reservations│
+│ transport: local / peer / RDMA fallback│   │ eviction + replication selectors        │
+└────────────────────────────────────────┘   └─────────────────────────────────────────┘
+┌────────────────────────────── SERVING ENGINE KEEPS ───────────────────────────────┐
+│ attention and paged KV layout                                                     │
+│ prefill / decode compute  +  batching / streaming  +  request lifecycle           │
+└───────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────── MOONCAKE MAPPING ─────────────────────────────────┐
+│ KVCache pool + Messenger + metadata = TorchStore; Conductor = KV ControlPlane     │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+<!-- text-diagram:mapping:end -->
+
+The `Controller` remains a metadata-only directory. A KV block is an opaque key with
+one or more volume holders, so existing `locate_volumes`, `put_batch`, `get_batch`,
+and delete registration supply the storage path.
+
+The KV `ControlPlane` is Mooncake's Conductor analog. It reads directory presence and
+capability sensors through a `View`, selects prefill/decode placement and fetch
+sources, then commits the decision. Serving hosts execute the answer through normal
+clients and report facts through the dispatcher.
+
+Directory presence can be read synchronously for each decision. If that becomes the
+hot path, `notify_put` and `notify_delete` may emit stored/removed events into a
+coordinator-owned prefix index. The event feed is an optimization; the directory
+remains the source of truth.
+
+## 3. Prefix-addressed blocks
+
+A connector chunks a prompt into `B`-token blocks and hashes a chain:
+
+```text
+k[0] = H(model_id, weight_version, dtype, quantization, tokens[0:B])
+k[i] = H(k[i-1], tokens[i*B:(i+1)*B])
 ```
 
-- **Controller (unchanged):** block-location index, prefix trie, presence. No selector.
-- **CacheCoordinator (new):** answers "for this prompt, which instance has the longest
-  reusable prefix, what's the predicted TTFT on each, where should this request run, and
-  should I replicate a hot block?" Owns the routing/replication/eviction selector. This is
-  precisely the role of Mooncake's **Conductor** — a global scheduler that maintains a
-  prefix table and routes requests. The `CacheCoordinator` is TorchStore's in-tree
-  equivalent.
-- **Fallback:** with no coordinator, the store is the plain geometry-addressed KV store;
-  the weight-sync path is unaffected (KV-cache mode is a *different* selector over the
-  same volumes).
+Requests with the same first `n` blocks produce the same first `n` keys. Deduplication
+and prefix reuse therefore follow from ordinary key equality; TorchStore never parses
+tokens or hashes content itself.
 
-**Integration seam — how the coordinator learns block locations.** Two options:
+For a request's ordered keys, `locate_volumes(keys)` supplies per-block presence. The
+longest consecutive run from the first key on each volume is that instance's reusable
+prefix. A strong hash and all representation-changing fields must participate in the
+chain so different models, weights, or precisions cannot alias.
 
-- **(a) Synchronous directory query** (what §5.4 describes): each `schedule` calls
-  `Controller.locate_volumes(block_keys)` inline. Simplest; the coordinator reads
-  presence on demand.
-- **(b) KV-event feed** (decouples the router): the Controller emits **stored/removed**
-  events, and the `CacheCoordinator` subscribes and maintains its own prefix index, so
-  routing no longer blocks on a directory round-trip. **This requires TorchStore's
-  Controller to grow an event-emit hook** on `notify_put`/`notify_delete` — a small,
-  additive change. Start with (a); adopt (b) when the synchronous query becomes the
-  bottleneck.
+A value is the KV tensor for one block, for example
+`[2, layers, B, kv_heads, head_dim]`. The store treats it as bytes under a key; block
+geometry belongs to the serving connector.
 
----
+## 4. One serving request
 
-## 5. The CacheCoordinator (Conductor analog)
-
-### 5.1 Prefix-hash addressing (K1), precisely
-
-A prompt of `T` tokens is chunked into blocks of `B` tokens (paper uses `B=512`). Block
-`i`'s key encodes the whole prefix up to `i`:
-
+<!-- text-diagram:lifecycle:start -->
 ```
-block_key[0] = H(model_id ‖ tokens[0:B])
-block_key[i] = H(block_key[i-1] ‖ tokens[i*B:(i+1)*B])
+┌─────────── CONTROL ───────────┐    ┌─────── PREFILL HOST ────────┐       ┌────────── DECODE HOST ──────────┐
+│ 1 locate prefix holders       │    │ 5 fetch remote gap          │       │ 9 fetch complete KV chain       │
+│ 2 price prefill candidates    │    │ 6 reuse local prefix        │       │ 10 join decode batch            │
+│ 3 choose decode + admit       │plan│ 7 prefill uncached suffix   │address│ 11 generate remaining tokens    │
+│ 4 commit route + pull source  │    │ 8 publish fresh KV + report │       │ 12 publish generated KV + report│
+└───────────────────────────────┘    └─────────────────────────────┘       └─────────────────────────────────┘
+┌─────────────── DIRECTORY FEEDBACK ────────────────┐   ┌──────────────────── SENSOR FEEDBACK ─────────────────────┐
+│ publish / eviction change current prefix residency│   │ actions change queues, reservations, batches and load    │
+└───────────────────────────────────────────────────┘   └──────────────────────────────────────────────────────────┘
 ```
+<!-- text-diagram:lifecycle:end -->
 
-Two requests sharing the first `k` blocks produce **identical** `block_key[0..k-1]`, so
-their shared prefix is one set of entries in the store — automatic dedup and reuse
-(the paper's "share prefix caching for the first 12·512 = 6144 tokens" is exactly a
-12-key run match). Keys are opaque to the store, so this needs **no store change** — it's
-a convention the **client/connector layer** computes and passes as an opaque object key,
-while the store itself stays content-agnostic. Attributing the hashing to the connector
-*reinforces* "no store change needed" — TorchStore's client library owns K1, the
-volumes/directory are untouched.
-
-### 5.2 API
-
-Three coordinator endpoints, plus ordinary block `put`/`get` underneath:
+The serving surface can stay small:
 
 ```python
-# 1) locate + route: the Conductor query
-plan = await cache.schedule(request)     # request = (model_id, prompt_tokens, out_len, slos)
-# plan -> (prefill_instance, decode_instance, prefix_match_len,
-#          reuse_source_instance_or_None, gap_block_keys, predicted_ttft)  |  Reject(429)
-
-# 2) which peers serve this pull, as a source preference for the read
-srcs = await cache.sources(plan.gap_block_keys, plan.prefill_instance)
-await client.get_batch(plan.gap_block_keys, prefer=srcs)
-
-# 3) after prefill, the instance publishes the blocks it computed (read-through, K4)
-await cache.publish(prefill_instance, new_block_keys)   # -> notify_put_batch under the hood
+response = await control.decide(request, requester)
+kv = await store.fetch(response.prefill, response.plan.pull_keys)
+fresh_kv = await engine.prefill(request, kv)
+await store.publish(response.prefill, fresh_keys, fresh_kv)
+await dispatcher.dispatch(PrefillFinished(...))
 ```
 
-The serving engine calls `schedule`, fetches the **gap** — the matched blocks the picked
-instance does not already hold — runs prefill on `plan.prefill_instance` for the
-**uncached suffix only**, then `publish`es the blocks it produced.
+`decide` returns both prefill and decode placement before work begins, or rejects the
+request. A request sent to another host is rerouted by address, not forwarded through
+the first host. The client follows that address, and the chosen host receives the same
+booked decision rather than pricing the request again against state that its own
+booking changed.
 
-`sources` is what makes the priced peer the peer that serves: a `get` picks whichever
-holder the directory lists first, so with a replicated hot block the peer §5.4 measured
-its TTFT against and the peer that answers are different volumes at different locality
-tiers. The coordinator answers the pull from the routing decision it already made, and
-the store applies that ranking to its own directory answer (`locate_volumes(...,
-prefer=)`, §2) without consulting anybody. Deciding twice would not even agree — routing
-ranks over the request's whole block chain, the pull names only the gap.
+The remote fetch names only the **gap** between the chosen host's local prefix and the
+remote reusable prefix. After prefill, fresh blocks are published locally. A separate
+decode host fetches the complete chain through the same store, making disaggregation's
+KV handoff cost explicit.
 
-### 5.3 Coordinator state
+## 5. Cache-aware placement
 
+<!-- text-diagram:scheduling:start -->
 ```
-# delegated to Controller (existing): block_key -> {volume_id -> present}
-# owned by CacheCoordinator:
-access_recency[volume][block_key]   : clock          # for LRU eviction (K5)
-capacity[volume]                    : int (blocks)   # per-instance cache budget
-load[instance]                      : queue of pending prefill (predicted busy-until)
-decode_load[decode_instance]        : batch occupancy (for TBT SLO / early reject)
-replicas[block_key]                 : set[volume]    # for hot-block spreading (§5.6)
+┌──────────── READ ────────────┐     ┌────── PRICE EACH PREFILL HOST ───────┐     ┌─────────── COMMIT ────────────┐
+│ prefix runs by instance      │     │ queue wait                           │     │ best prefill host             │
+│ prefill queues + reservations│     │ + transfer gap or local recompute    │     │ best decode host at completion│
+│ decode batches               │────►│ + uncached-suffix prefill            │────►│ priced pull source            │
+│ topology + transfer costs    │     │ = predicted TTFT                     │     │ or reject before compute      │
+└──────────────────────────────┘     └──────────────────────────────────────┘     └───────────────────────────────┘
+┌──────────────────────────────────────────── NEXT REQUEST ─────────────────────────────────────────────┐
+│ committed reservations affect the next decision; completion replaces prediction with observation      │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+<!-- text-diagram:scheduling:end -->
 
-`access_recency` and `capacity` drive eviction; `load`/`decode_load` drive TTFT/TBT
-prediction and admission.
+For each prefill candidate `p`, the selector estimates:
 
-### 5.4 Per-request algorithm (cache-aware scheduling — Mooncake Algorithm 1)
-
-Runs to completion per request (serialized actor mailbox). Mirrors the
-paper's Algorithm 1:
-
-```
-on schedule(request):                          # runs atomically
-  block_keys   = prefix_hash(request.prompt, B)             # K1
-  presence     = controller.locate_volumes(block_keys)      # K2b (existing directory)
-  best_len, best_inst = global_longest_prefix(presence)     # blocks matched cluster-wide
-
-  best_ttft, pick, src = +inf, None, None
-  for p in prefill_instances:
-    local_len = longest_prefix_on(p, presence)              # p's own reusable prefix
-    T_queue   = predicted_busy_until(p) - now               # from load[p]
-    if best_len / max(local_len,1) < balance_threshold:     # local reuse good enough
-        uncached = request.T - local_len*B
-        T_prefill = prefill_cost(uncached)                  # cost model (offline-fit)
-        ttft, from_src = T_queue + T_prefill, None
-    else:                                                    # remote prefix worth pulling
-        transfer_len = (best_len - local_len) * B
-        uncached     = request.T - best_len*B
-        ttft = transfer_cost(transfer_len, best_inst→p) + T_queue + prefill_cost(uncached)
-        from_src = best_inst
-    if ttft < best_ttft: best_ttft, pick, src = ttft, p, from_src
-
-  d, tbt = select_decode_instance(decode_load)              # load-balanced decode pick
-  if best_ttft > SLO_ttft or tbt > SLO_tbt:  return Reject(429)   # §5.7
-  if best_len / prefix_on(pick) > balance_threshold:        # §5.6 hot-block migration
-      schedule_replicate(best_inst, pick, block_keys[prefix_on(pick):best_len])
-  load[pick].add(best_ttft); decode_load[d].add(...)
-  gap = block_keys[prefix_on(pick):best_len] if src else []   # what pick must pull (§5.6)
-  return Plan(prefill=pick, decode=d, prefix_match_len=..., reuse_source=src,
-              gap_block_keys=gap, ttft=best_ttft)
+```text
+TTFT(p) = queue_wait(p)
+        + transfer_cost(remote_prefix_gap → p)
+        + prefill_cost(uncached_suffix on p)
 ```
 
-`prefill_cost` / `transfer_cost` are offline-fit predictors — the paper notes prefill
-time is very predictable (regular Transformer compute) while transfer time is noisier
-(depends on live congestion), which is *why* it prefers replicating hot blocks over
-always pulling (§5.6).
+### 5.1 Per-request reference algorithm (serial)
 
-### 5.5 Eviction & tiering (K5) — the piece weight-sync never needed
+```text
+on decide(request):                            # one control-plane turn
+  keys = prefix_hash(request); presence = locate(keys)
+  best_peer, best_len = longest_prefix(presence)
 
-The weight-sync path needs no eviction — its cache is bounded and short-lived (blocks
-are pinned within a version window). An inference cache is neither, so eviction is
-mandatory. Plain LRU is the baseline, but a richer scheme pays off:
+  for p in prefill_pool:
+    local = prefix_on(p, presence)
+    reuse = best_len if remote_worth_it(best_len, local) else local
+    pull = keys[local:reuse]
+    ttft = queue[p] + transfer(best_peer, p, pull) + prefill(tokens_after(reuse))
+    plans[p] = Plan(host=p, pull=pull, ttft=ttft, done_time=now + ttft)
 
-- **Watermark-triggered batch eviction (approximate LRU).** Rather than evicting on every
-  `put`, an eviction pass triggers at a **high watermark** (e.g. ~95% of capacity) and
-  frees a batch (e.g. ~5%) in one pass. Eviction is **metadata-only** — evicted objects
-  are just *marked deleted* + `notify_delete`, no data move. This avoids per-put LRU
-  churn. LRU remains the recency order (the paper found LRU best on their traces:
-  "temporal proximity in request utilization"); a near-LRU two-pass scan prefers objects
-  with the least remaining protection.
-- **Leases — the concrete "never evict a block being read."** Every successful presence
-  check / fetch grants or refreshes a per-object lease (e.g. TTL ~5s); while active, the
-  object is protected from deletion/eviction. Objects not yet marked complete by the
-  commit marker are likewise skipped. The coordinator grants a lease on each
-  `schedule`/fetch so a block cannot be evicted out from under an in-flight read.
-- **Soft pin / hard pin — protection tiers above LRU.** *Soft pin* marks important,
-  frequently-used objects (e.g. system prompts): evicted only as a last resort when no
-  unpinned object is eligible, and the pin auto-expires after a TTL (e.g. ~30 min) if
-  untouched. *Hard pin* is never evicted (e.g. weights). Both are set at put time. This
-  turns §5.5 from plain LRU into **LRU + soft/hard-pin protection tiers**: the first
-  eviction pass skips soft-pinned objects; a second pass may touch them only under
-  pressure.
-- **Hit-ratio vs capacity** is the key tuning curve (paper: ~30% hit @ 1k blocks →
-  ~50% @ 50k, then plateau; >50% of blocks unused, a few accessed tens-of-thousands of
-  times → heavy skew). The sim (§ below) reproduces this shape so capacity can be sized
-  before deployment.
-- **DRAM→SSD tiering.** A spill tier plus promotion-on-hit: a demoted block stays in the
-  directory with a tier tag so `locate` still finds it (slower fetch), and a hit promotes
-  it back to DRAM. v1 can ship a single DRAM tier + evict; tiering is a data-plane
-  extension, not a control-plane change.
+  plan = min(plans, key=(ttft, prefill_load, id))
+  decode = min(decode_pool, key=predicted_batch_at(plan.done_time))
+  if plan.ttft > SLO_ttft or predicted_tbt(decode) > SLO_tbt: reject
+  commit(plan, decode, routed_pull=(best_peer, plan.pull)); return plan, decode
 
-### 5.6 Hot-block replication / swap (peer-source + read-through, K3/K4)
-
-A single instance holding a very hot prefix becomes a serving bottleneck (the paper's
-motivation for hot-spot migration). The coordinator replicates on demand, driven by the
-`balance_threshold` heuristic: **if the best remote prefix match is more than
-`threshold`× the picked instance's local match, forward the block location so the picked
-instance pulls and stores it locally** (read-through, K4) — otherwise prefer local
-recompute. This reuses the peer-source + read-through pattern (K3/K4), triggered by
-*access skew over time*, and the replica **persists**
-in the cache (subject to eviction) rather than living only for one version window.
-
-The pull names the **gap** only — the matched blocks the picked instance is not already
-holding — so read-through replication cannot make a request re-fetch what it has. That
-also bounds what a stale plan costs: between routing and the pull, this very mechanism
-changes who holds what, and a source that has since evicted a gap block simply fails to
-serve it. The picked instance then recomputes the gap on top of the prefix it does hold,
-which is a cache miss and not an error (§5.9) — no second directory round trip, and no
-wasted prefill.
-
-Make replication **config- and strategy-driven** rather than an ad-hoc heuristic: a
-per-block replica target plus a pluggable **placement strategy**. Two useful strategies:
-local-preference random, and a free-ratio-first pick that samples several candidate
-segments and chooses those with the highest free ratio (a best-of-N load-spreading
-pick). Replication is best-effort with slice-level placement guarantees (each replica's
-slices in different segments). The coordinator should also mark a genuinely hot prefix
-**soft-pinned** (§5.5) so replicas survive eviction pressure.
-
-### 5.7 Overload / prediction-based early rejection (optional selector)
-
-The store exposes the load signals; the rejection *selector* is a thin layer:
-
-- **SLO as load measure:** compare predicted max TTFT (prefill) and TBT (decode) against
-  `l_ttft` / `l_tbt`; reject (429) when unachievable — the `schedule` return above.
-- **Early rejection:** assess **decode** load *before* committing prefill (route on the
-  greater of prefill/decode pool load), so we don't burn prefill compute on a request
-  the decode pool can't sustain.
-- **Prediction-based (anti-oscillation):** naive early rejection oscillates (prefill and
-  decode loads swing anti-phase because decode load is predicted before prefill
-  finishes). The paper's fix predicts decode load *after* the incoming request's prefill
-  stage (system-level: assume uniform decode time, roll the batch forward, compare
-  average TBT ratio to `l_tbt`). v1 can ship SLO-reject only and add prediction later.
-
-**How the design accounts for TBT (batched decode).** TTFT is a prefill-side cost;
-**TBT (time-between-tokens)** is a decode-side cost, and it is not a fixed per-request
-number — it is set by *batching*. A decode instance generates one token per step for
-**every** request in its batch, so the step's wall time is the TBT every batched
-request observes for that token, and it **rises with the batch size** (more concurrent
-requests ⇒ more KV attended per step). This is the tension the TBT SLO bounds
-(Mooncake arXiv:2407.00079 §4.2): a larger batch lifts MFU/throughput but pushes TBT
-up, so the sweet spot is a small-but-nonzero batch. Two levers set a served request's
-TBT:
-
-- **VRAM cap on the batch.** Aggregated KVCache is bounded, so a decode instance's
-  batch can only grow so far; requests over the cap queue, and that wait counts
-  against their TBT. VRAM pressure therefore shows up as TBT violations — which is why
-  admission must reason about a *predicted* batch, not accept blindly.
-- **Prefill/decode disaggregation.** If prefill and decode share an instance's compute,
-  a long prefill delays the next decode step and spikes that token's TBT. **Placing
-  decode on its own pool** (its own compute timeline) means a prefill can never stall a
-  decode step — the central Mooncake result, and the reason disaggregation protects
-  served-request TBT even at identical admitted load.
-
-The **early-rejection** selector above (§5.7) is exactly the admission decision that
-keeps TBT in SLO without burning prefill: reject *before* prefill on the decode load
-**predicted at prefill completion** (including in-flight prefills that will have landed
-by then), rather than late-checking *after* prefill (a wasted prefill) or gating on a
-stale *current*-occupancy snapshot (which slow prefills leave reading empty, so decode
-piles onto one instance and blows the SLO). The `../kvcache_sim/` DES now models all of
-this — a batched `DecodeEngine` (per-step TBT rising with batch size, a `max_batch`
-VRAM cap, coupled vs. disaggregated compute timelines), a TBT SLO/target on the
-worst per-request inter-token gap, and both admission modes (`early`/`predict`) — in
-its `disaggregation` and `early_rejection` scenarios (§5.8). Late-checking after the
-prefill is the behaviour this section argues against, so the DES does not implement
-it: every admission decision is taken at `schedule`, where a refusal costs nothing.
-
-### 5.8 Sequence (two requests sharing a system prompt)
-
-```
-B=512. Req1: 3 blocks (system[0], userA[1..2]). Req2: 3 blocks (system[0], userB[1..2]).
-t=0  schedule Req1: nothing cached -> pick p0 (least load); prefix_match=0
-     p0 prefills 3 blocks, publish(p0, [k0,k1,k2])              (compute 1536 tok)
-t=..  schedule Req2: block_keys=[k0,k1',k2']; locate -> k0 present on p0 (len=1 block)
-     best_len=1 (system prompt hot). local on p0 also 1. route p0 (same reuse, low load)
-     p0 reuses k0 (512 tok cached), prefills only k1',k2'  (compute 1024 tok, saved 512)
-     publish(p0, [k1',k2'])
- => system prompt computed ONCE; Req2's TTFT drops by the prefill of 512 cached tokens.
-    If p0 were overloaded, the coordinator routes Req2 to p1 and (if k0 match ≫ p1's) pulls
-    k0 from p0 over NVLink once (K3) instead of recomputing it.
+on sources(pull_keys, requester):
+  return recorded_routed_pull(...) or rank_holders(pull_keys, locality, load)
 ```
 
-(A discrete-event simulation of exactly this — cache-aware vs round-robin routing,
-eviction-capacity sweeps, hot-block replication under load, and the decode-side TBT
-model above (batched decode, prefill/decode disaggregation, and off/early/predict
-early rejection) — lives in `../kvcache_sim/`; run `python -m kvcache_sim`.)
+`prefix_hash` builds the request's block-key chain, and `locate` reads its current
+holders. `longest_prefix` and `prefix_on` measure consecutive cached blocks;
+`remote_worth_it` applies the reuse threshold. `transfer`, `prefill`,
+`predicted_batch_at`, and `predicted_tbt` use the shared cost model. `tokens_after`
+selects the uncached suffix, and `Plan` stores one candidate's host, pull, and times.
+`commit` records the placement and reservation. `recorded_routed_pull` returns that
+decision's source; `rank_holders` is the fallback ordering of current holders by
+prefix coverage, locality, source load, and stable id.
 
-**Fidelity note (sim vs. this design).** The `../kvcache_sim/` DES models the
-**cache-aware router** — the routing decision this design's `CacheCoordinator` owns. It
-deliberately **abstracts the cache-lifecycle mechanisms** that §5.5/§5.6 describe: the
-sim approximates eviction as **per-instance LRU at a capacity bound**, and does *not*
-model leases, watermark+batch eviction, soft/hard pins, or DRAM↔SSD offload/promotion.
-Those are faithfully *described* here but simplified in the sim to keep the routing study
-tractable; treat the sim as a router/capacity-sizing tool, not a storage-fidelity model.
+The remote-prefix term is used only when the best cluster-wide match is sufficiently
+longer than `p`'s local match. `balance_threshold` prevents a congestion-sensitive
+transfer from replacing a similar local recompute. Offline model and machine profiles
+provide the prefill and transfer estimates.
 
-### 5.9 Failure modes / costs
-- **Coordinator hot path:** every request serializes through one actor doing O(#blocks)
-  directory ops. Cheap, but a very high request rate could back-pressure — shard the
-  coordinator by prefix-hash (the first block key) if needed. Sharding metadata by
-  `hash(key)` is a standard mitigation.
-- **Stale directory after eviction:** if a volume evicts a block but the `notify_delete`
-  races a concurrent `locate`, a reader could be routed to a now-empty volume. The fetch
-  must fall back (re-locate or recompute) — the coordinator treats a missed fetch as a
-  cache miss, not an error. A **lease** granted on read closes most of this race: it
-  blocks eviction of a block being read, and a lease that expires mid-fetch fails the
-  read rather than returning torn data. Pairing eviction with leases (§5.5) plus a
-  miss-tolerant fetch removes the corruption window.
-- **Transfer-time misprediction:** the paper flags transfer time as congestion-sensitive
-  and hard to predict; over-eager remote-prefix pulls can miss TTFT. The
-  `balance_threshold` and preferring local recompute when matches are close mitigate it.
-- **Eviction thrash under skew:** a too-small capacity on a hot instance evicts blocks
-  that are immediately re-requested. The capacity sweep (§5.5, sim) sizes this.
-- **Correctness of dedup by hash:** two distinct prefixes must never collide to the same
-  `block_key`. Use a strong hash and include `model_id` (and dtype/quantization) in the
-  chain so caches from different models/precisions never alias.
+The winning prefill plan is then paired with the decode host whose predicted batch at
+prefill completion best satisfies the TBT limit. The control plane commits both
+choices together, so later requests see their reservations immediately.
 
----
+The routing decision also records the peer whose transfer it priced. When the data
+plane later asks `sources(pull_keys)`, `RoutedPullSensor` returns that peer before the
+generic longest-prefix ranking. Pricing the whole prefix chain and selecting a holder
+for an isolated fetch are different questions; recording the decision prevents them
+from disagreeing.
 
-## 6. Recommendation & phasing
+The capability-specific sensor state is:
 
-**Recommendation:** build KV-cache mode as a **second layered controller** over the
-existing substrate, reusing volumes + transport + directory. It's a natural fit: the
-store is already a distributed, RDMA-connected, metadata-indexed byte pool — precisely
-the KVCache pool + Transfer Engine + global metadata the reference architecture calls
-for. Only the *selector* is new.
+- predicted prefill queues and observed decode batches;
+- reservations for prefills that will affect future decode occupancy;
+- routed pulls waiting for their matching fetch;
+- recent source load for spreading reads across equivalent replicas.
 
-**Phasing (each independently shippable):**
-1. **K1 + K2/K2b (prefix-hash blocks + prefix locate)** — a client-side key convention
-   plus a `locate`-based prefix-match query. Enables *local* prefix reuse (vLLM-parity)
-   and cross-instance *discovery* with no new actor.
-2. **K3 + K4 (peer-source fetch + read-through)** — a matched
-   prefix on a peer is fetched once and republished. Cross-instance reuse works.
-3. **`CacheCoordinator` (cache-aware routing)** — the Conductor: TTFT-predicting,
-   prefix-maximizing routing (§5.4). The headline throughput win.
-4. **K5 (eviction)** — LRU + capacity; makes the cache long-lived and bounded. Ship with
-   the capacity-sizing sim.
-5. **§5.6 hot-block replication** — access-skew-driven spreading.
-6. **§5.7 early rejection / SLO admission** — overload handling (SLO-reject first,
-   prediction-based later).
-7. **DRAM→SSD tiering** — data-plane spill tier (future).
+Directory residency stays separate from these predictions. Every new decision reads
+both truths through its view.
 
-## 7. Open questions
-- **Coordinator placement/sharding** for high request rates (one actor vs. prefix-hash
-  sharded). Sharding the directory by `hash(key)` is the standard answer; the open
-  question is mostly *when* to shard, not *how*.
-- **Block granularity `B`** and whether it should match the engine's paged-attention
-  page size (avoids a repack on load/store).
-- **Cost-model fidelity:** how much offline profiling to fit `prefill_cost` /
-  `transfer_cost`, and per-model vs. per-cluster fits.
-- **Eviction coordination:** per-volume-local LRU (simple, may evict a globally-hot block
-  that only that volume holds) vs. coordinator-aware eviction (avoid evicting the last
-  replica of a hot block). Start local, revisit.
-- **Interaction with weight sync on the same store:** a serving instance is often *also*
-  a generator being weight-synced (RL). Do KV-cache keys and weight keys share a store
-  (separate namespaces) or separate stores? Namespacing is cheapest.
-- **Consistency across model versions:** a weight update (new selector in RL) invalidates
-  the KV cache. Tie KV `block_key`s to the weight `version` (MAPPING marker) so a sync
-  bump auto-invalidates stale KV.
+## 6. Retention, eviction, and replication
+
+<!-- text-diagram:retention:start -->
+```
+┌────────── WRITE ───────────┐     ┌────────── RESIDENT ───────────┐     ┌─────────── PRESSURE ───────────┐
+│ stream block               │     │ lease: in-flight read         │     │ high watermark starts a batch  │
+│ commit registration        │────►│ hard pin: never evict         │────►│ evict to low watermark         │
+│ incomplete blocks invisible│     │ soft pin: last-resort eviction│     │ or demote DRAM → SSD           │
+└────────────────────────────┘     │ ordinary: LRU ordered         │     │ notify directory per holder    │
+                                   └───────────────────────────────┘     └────────────────────────────────┘
+┌─────────────────────────────────────────── HOT PREFIX ────────────────────────────────────────────┐
+│ remote reuse publishes another replica; placement spreads failure domains and source load         │
+└───────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+<!-- text-diagram:retention:end -->
+
+Only committed blocks are visible. A write begins, streams its value, then registers
+completion; an aborted write is revoked. Reads grant a short lease so eviction cannot
+delete a block while it is being fetched.
+
+The baseline policy is watermark-triggered batch LRU: crossing a high watermark
+selects enough old blocks to return to a low watermark, reducing per-put churn.
+Eviction deletes the local holder and notifies the directory; another replica may
+remain. Per-volume `(capacity, used)` is exposed to placement and eviction selectors.
+A local prefix hit explicitly touches its blocks because no transport read occurs to
+refresh their recency.
+
+Protection tiers sit above LRU:
+
+- an active lease or incomplete write is never eligible;
+- a hard pin is never evicted;
+- a soft pin is skipped on the first pass and expires without renewed use;
+- ordinary blocks follow recency order.
+
+DRAM-to-SSD demotion is an optional later tier. The directory retains a tier tag, a
+hit promotes the block, and source pricing includes the slower tier. A client-local
+frequency-admitted hot cache may sit in front of the shared pool without changing the
+control plane.
+
+A hot prefix can bottleneck on one holder. When remote reuse repeatedly wins, the
+chosen instance pulls the missing gap and keeps it locally. Replica placement should
+be policy-driven: choose distinct failure/locality domains, prefer free capacity, and
+soft-pin genuinely hot prefixes. Replication is best effort and remains subject to
+eviction.
+
+If a planned source evicts before serving, the fetch is a cache miss, not corruption.
+The host may re-locate or recompute the missing gap. Leases make this race uncommon;
+commit markers prevent torn data.
+
+## 7. Decode load and admission
+
+TTFT is dominated by queueing, transfer, and prefill. TBT is a decode-batch property:
+each step emits one token per batch member, and step time rises with the KV attended.
+A VRAM cap bounds the batch; excess requests queue and can violate TBT.
+
+Prefill/decode disaggregation protects decode steps from long prefills by giving the
+decode pool a separate compute timeline. It also adds a full-chain KV transfer and
+duplicates residency on the decode host. The placement decision must price both
+effects.
+
+Admission compares predicted TTFT and TBT with their SLOs before prefill begins. A
+simple early gate reads current decode occupancy. A predictive gate rolls occupancy
+forward to the candidate's prefill completion and includes already reserved prefills.
+The latter avoids admitting many slow prefills against an apparently empty decode
+pool. Rejection after prefill is excluded because it burns compute without serving a
+request.
+
+## 8. Correctness and failure handling
+
+- **Identity:** prefix keys include model representation and weight version.
+- **Visibility:** only committed blocks appear in location results.
+- **Read safety:** leases protect in-flight fetches; a miss falls back without returning
+  partial data.
+- **Bounded storage:** capacity enforcement eventually reaches the low watermark
+  unless every resident block is leased or hard-pinned.
+- **One decision:** rerouted hosts consume the recorded placement; they do not book the
+  request twice.
+- **One priced source:** a routed pull is spent by exactly one matching fetch.
+- **Determinism:** stable ids break equal-cost ties.
+
+Control-plane work is `O(number of prompt blocks × candidate instances)`. Very high
+request rates can shard metadata and control by the first prefix key, provided a
+request's chain and reservations remain on one shard. Transfer-time error is handled
+by the pull/recompute threshold; eviction thrash is handled by capacity sizing and
+replication policy.
+
+## 9. Delivery order
+
+1. Add connector-side prefix keys and longest-prefix location queries.
+2. Add peer-preferred fetch and read-through publication.
+3. Add cache-aware prefill/decode placement and routed-pull recording.
+4. Add capacity, leases, and LRU eviction.
+5. Add hot-prefix replication and load-spread source ranking.
+6. Add TTFT/TBT admission with predictive decode occupancy.
+7. Add DRAM-to-SSD tiering if the capacity curve warrants it.
+
+Open choices are block size, model-specific cost fitting, local versus globally aware
+eviction, coordinator sharding thresholds, and whether KV and weight namespaces share
+one store. Weight version must be part of the KV key so a weight update naturally
+invalidates incompatible cache entries.
+
+The executable routing and serving model lives in
+[`kvcache_sim`](../kvcache_sim/README.md). It models bounded per-instance LRU and the
+serving lifecycle; leases, pin tiers, batch-watermark eviction, and SSD promotion
+remain storage-design details rather than simulation fidelity.

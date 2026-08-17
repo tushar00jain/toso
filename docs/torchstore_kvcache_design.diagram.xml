@@ -1,0 +1,121 @@
+<diagrams target="docs/torchstore_kvcache_design.md">
+  <diagram id="mapping">
+    <stack>
+      <row gap="3">
+        <box title="REUSE TORCHSTORE" width="40">
+          <line>Controller: key → current holders</line>
+          <line>StorageVolume: DRAM byte pool</line>
+          <line>LocalClient: put/get/delete batches</line>
+          <line>transport: local / peer / RDMA fallback</line>
+        </box>
+        <box title="ADD KV CAPABILITY" width="41">
+          <line>connector: prefix-hash block keys</line>
+          <line>ControlPlane: route + admission</line>
+          <line>Sensors: queues / batches / reservations</line>
+          <line>eviction + replication selectors</line>
+        </box>
+      </row>
+      <box title="SERVING ENGINE KEEPS" width="83">
+          <line>attention and paged KV layout</line>
+          <line>prefill / decode compute  +  batching / streaming  +  request lifecycle</line>
+      </box>
+      <box title="MOONCAKE MAPPING" width="83">
+        <line>KVCache pool + Messenger + metadata = TorchStore; Conductor = KV ControlPlane</line>
+      </box>
+    </stack>
+  </diagram>
+
+  <diagram id="lifecycle">
+    <stack>
+      <row gap="3">
+        <box title="CONTROL" width="31">
+          <line>1 locate prefix holders</line>
+          <line>2 price prefill candidates</line>
+          <line>3 choose decode + admit</line>
+          <line>4 commit route + pull source</line>
+        </box>
+        <between><at row="3">plan</at></between>
+        <box title="PREFILL HOST" width="29">
+          <line>5 fetch remote gap</line>
+          <line>6 reuse local prefix</line>
+          <line>7 prefill uncached suffix</line>
+          <line>8 publish fresh KV + report</line>
+        </box>
+        <between><at row="3">address</at></between>
+        <box title="DECODE HOST" width="33">
+          <line>9 fetch complete KV chain</line>
+          <line>10 join decode batch</line>
+          <line>11 generate remaining tokens</line>
+          <line>12 publish generated KV + report</line>
+        </box>
+      </row>
+      <row gap="3">
+        <box title="DIRECTORY FEEDBACK" width="51">
+          <line>publish / eviction change current prefix residency</line>
+        </box>
+        <box title="SENSOR FEEDBACK" width="58">
+          <line>actions change queues, reservations, batches and load</line>
+        </box>
+      </row>
+    </stack>
+  </diagram>
+
+  <diagram id="scheduling">
+    <stack>
+      <row gap="3">
+        <box title="READ" width="30">
+          <line>prefix runs by instance</line>
+          <line>prefill queues + reservations</line>
+          <line>decode batches</line>
+          <line>topology + transfer costs</line>
+        </box>
+        <between><at row="3">────►</at></between>
+        <box title="PRICE EACH PREFILL HOST" width="38">
+          <line>queue wait</line>
+          <line>+ transfer gap or local recompute</line>
+          <line>+ uncached-suffix prefill</line>
+          <line>= predicted TTFT</line>
+        </box>
+        <between><at row="3">────►</at></between>
+        <box title="COMMIT" width="31">
+          <line>best prefill host</line>
+          <line>best decode host at completion</line>
+          <line>priced pull source</line>
+          <line>or reject before compute</line>
+        </box>
+      </row>
+      <box title="NEXT REQUEST" width="103">
+        <line>committed reservations affect the next decision; completion replaces prediction with observation</line>
+      </box>
+    </stack>
+  </diagram>
+
+  <diagram id="retention">
+    <stack>
+      <row gap="3">
+        <box title="WRITE" width="28">
+          <line>stream block</line>
+          <line>commit registration</line>
+          <line>incomplete blocks invisible</line>
+        </box>
+        <between><at row="2">────►</at></between>
+        <box title="RESIDENT" width="31">
+          <line>lease: in-flight read</line>
+          <line>hard pin: never evict</line>
+          <line>soft pin: last-resort eviction</line>
+          <line>ordinary: LRU ordered</line>
+        </box>
+        <between><at row="2">────►</at></between>
+        <box title="PRESSURE" width="32">
+          <line>high watermark starts a batch</line>
+          <line>evict to low watermark</line>
+          <line>or demote DRAM → SSD</line>
+          <line>notify directory per holder</line>
+        </box>
+      </row>
+      <box title="HOT PREFIX" width="99">
+        <line>remote reuse publishes another replica; placement spreads failure domains and source load</line>
+      </box>
+    </stack>
+  </diagram>
+</diagrams>
