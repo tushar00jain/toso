@@ -3,7 +3,7 @@
 One fact can move several owners' state at once: an admitted request moves the
 scheduler's reservation, the routed record and the pending map
 (``kvcache_sim.control._sensor``), and written one at a time their order is a caller's
-problem. Folded from one :class:`Action` and committed together, it is nobody's. A
+problem. Combined from one :class:`Action` and committed together, it is nobody's. A
 capability with one owner per fact gets the commit and the wake instead --
 ``dedup_sim`` folds :class:`Stored` in one place and parks its readers on the commit.
 

@@ -18,10 +18,10 @@ simulator, ``proposed`` is the design being argued for.
   so preferring what it names changes nothing until a real one is written. It,
   :func:`~proposed.selector.prefer` (what the store does with a preference), the
   combinators a decision is declared out of -- :class:`~proposed.selector.FirstMatch`
-  (try selectors in order), :class:`~proposed.selector.Annotate` and its
+  (try selectors in order), :class:`~proposed.selector.Annotate` and
   :class:`~proposed.selector.Balance` (append a dimension),
-  :class:`~proposed.selector.Folded` (say how the key is read) and
-  :class:`~proposed.selector.Sort` / :class:`~proposed.selector.Max` (order or cut) --
+  :class:`~proposed.selector.WithFold` (say how the key is read), and
+  :class:`~proposed.selector.Ordered` / :class:`~proposed.selector.Best` (order or cut) --
   and the :class:`~proposed.selector.Selector` base they are typed on are reached
   through the module rather than re-exported here: what a deployment has to *implement*
   is the store's own subject above.

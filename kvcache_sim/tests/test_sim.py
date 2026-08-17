@@ -34,7 +34,7 @@ from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import Abstain, ControlPlane, Dispatcher, KeySelector, LoadView, Selection
 from proposed.selector import (
-    Balance, Const, FirstMatch, Folded, Max, Selector, Sort,
+    Balance, Best, Const, FirstMatch, Ordered, pipe, Selector, WithFold,
 )
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk,
@@ -1623,7 +1623,7 @@ def test_the_source_selector_accepts_a_plain_view():
     assert ranked.sources == ("s1",)            # ...and now the holder is ranked
 
 
-# 19. Spreading reads: the prefix ranking under a Balance breaks its tie on load.
+# 19. Spreading reads: the prefix ranking under ``Balance`` breaks its tie on load.
 #     Reuse value is a property of the prefix, so replicas of a hot prefix rank
 #     identically and the id tie-break sends every read to the same host. The
 #     combinator reads how much each source has been sent (SourceLoad, moved by the
@@ -1633,7 +1633,9 @@ def test_the_source_selector_accepts_a_plain_view():
 def _spread(bound: int = 1) -> Selector:
     """The opt-in ranking, as the plane declares it: the prefix run with the recent
     grants appended, stamped with the fold that docks one by the other."""
-    return Folded(Balance(LongestPrefixKeySelector()), by_prefix_and_load(bound))
+    return pipe(
+        LongestPrefixKeySelector(), Balance, WithFold(by_prefix_and_load(bound))
+    )
 
 
 def _replicated(holders, blocks, *, num=4):
@@ -1660,18 +1662,18 @@ def _replicated(holders, blocks, *, num=4):
 def _select_heads(sim, selector, keys, *, count, moving=True):
     """The winner of ``count`` successive asks, the load moving as each is decided.
 
-    The chain the run declares: the ranking keys, a :class:`~proposed.selector.Max` takes
+    The chain the run declares: the ranking keys, :class:`~proposed.selector.Best` takes
     one, the decision that follows names that source, and the sensor counts it
     (:class:`~kvcache_sim.control._sensor.SourceLoad`). ``moving=False`` is a load
     nothing moves, which is the base ranking's own order.
     """
     load = SourceLoad()
-    best = Max(selector).attach(sim.view.derived(LoadView, load=load))
+    ranking = pipe(selector, Best).attach(sim.view.derived(LoadView, load=load))
 
     heads = []
     with sim.mesh.installed():
         for _ in range(count):
-            head = best.select(keys, "s0").head
+            head = ranking.select(keys, "s0").head
             heads.append(head)
             if moving:
                 load.folds[Committed](_accepted(source=head, pull=list(keys)))
@@ -1737,7 +1739,9 @@ def test_spread_reads_ranks_deterministically():
     """
     def rankings(sim, keys):
         load = SourceLoad()
-        selector = Sort(_spread()).attach(sim.view.derived(LoadView, load=load))
+        selector = pipe(_spread(), Ordered).attach(
+            sim.view.derived(LoadView, load=load)
+        )
         out = []
         with sim.mesh.installed():
             for _ in range(5):
@@ -1786,12 +1790,12 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     # would be measured and never read.
     fetched = [run.control._fetch.ranking.selectors[-1] for run in aware]
     assert all(
-        isinstance(p, Folded) and p.fold is not None and isinstance(p.ranking, Balance)
+        p.name == "with-fold" and p.fold is not None and isinstance(p.ranking, Balance)
         for p in fetched
     )
     # ...and the replicating run prices against one too, so the pull it plans is
     # spread the same way the read that carries it out will be.
-    assert isinstance(aware[-1].control._reuse.ranking, Folded)
+    assert aware[-1].control._reuse.ranking.name == "with-fold"
 
     def pull_sources(result):
         return sorted(
@@ -1893,7 +1897,7 @@ def _plan(*, ttft: float, match_blocks: int = 0, done_time: float = 0.0) -> Plan
 
 def _ordered(pool: Selection, fold) -> tuple:
     """``pool`` ordered as the prefill chain orders one: stamped with ``fold``, sorted."""
-    chain = Sort(Folded(Const(pool), fold))
+    chain = pipe(Const(pool), WithFold(fold), Ordered)
     return chain.select(None, "s0").sources
 
 
@@ -1903,7 +1907,7 @@ def test_a_plan_in_a_key_is_ordered_only_by_a_fold_that_names_what_it_compares()
     A plan has no order of its own, so the fold that ranks a pool of them says which
     figure it compares -- and one that named none raises instead of ordering by
     something meaningless. Two plans that fold alike are left to the instance id, in the
-    one place every tie is settled (:class:`proposed.selector.Sort`).
+    one place every tie is settled (:class:`proposed.selector.Ordered`).
     """
     with pytest.raises(TypeError):
         _plan(ttft=1.0) < _plan(ttft=2.0)

@@ -774,7 +774,7 @@ def check_selector_state(
     Read off the class statement rather than the type: anything whose bases name a
     selector is one, which is what a reader sees too -- followed through the bases
     declared in the same module, since a combinator may derive one of its neighbours
-    (``Balance`` is an ``Annotate``) and a rule reading only the immediate base would go
+    (``Balance`` is an ``_Annotate``) and a rule reading only the immediate base would go
     quiet on exactly those.
 
     The two halves are found differently. A write to ``self`` is read off the assignment.

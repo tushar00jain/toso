@@ -16,7 +16,7 @@ from typing import Any, Optional, Sequence
 
 from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection, settle
 from proposed.selector import (
-    Balance, Dims, FirstMatch, Folded, NaiveKeySelector, Selector, Sort,
+    Balance, Dims, FirstMatch, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
 )
 
 from ._answer import committed
@@ -85,14 +85,18 @@ class Dedup(ControlPlane):
         # Which volumes serve a read: every holder of the key and every peer already
         # planned to hold it, priced together in seconds, so which one wins is
         # arithmetic off the score rather than an order the caller has to know.
-        self._chain = Sort(FirstMatch([
-            Folded(
-                Balance(Candidates(SPREAD if self._spread else CHAIN)),
-                _soonest if self._spread else None,
-            ),
-            # Tail: an unroutable ask gets the directory's own answer, not a hole.
-            NaiveKeySelector(),
-        ])).attach(self.view)
+        self._chain = pipe(
+            FirstMatch([
+                pipe(
+                    Candidates(SPREAD if self._spread else CHAIN),
+                    Balance,
+                    WithFold(_soonest if self._spread else None),
+                ),
+                # Tail: an unroutable ask gets the directory's own answer, not a hole.
+                NaiveKeySelector(),
+            ]),
+            Ordered,
+        ).attach(self.view)
 
     # -- what a reader asks -------------------------------------------------- #
     async def sources(self, keys: Sequence[Key], requester: str) -> Selection:

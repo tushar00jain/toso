@@ -65,7 +65,7 @@ class KVCacheDemo(Demo):
         parser.add_argument(
             "--spread-reads", action="store_true",
             help="put the hotspot scenario's cache-aware source ranking under a "
-            "Balance and fold the load it appends, so a replica recently routed to "
+            "Append and fold load, so a replica recently routed to "
             "is ranked down and one replica of a hot prefix does not serve every "
             "read of it. Off by "
             "default: it changes which replica answers, so it is not "

@@ -19,7 +19,7 @@ from dedup_sim.control._selector import Candidates
 from dedup_sim.control._sensor import Asked, FanoutSensor
 from dedup_sim.control._view import DedupView
 from proposed import Endpoint
-from proposed.selector import Balance, FirstMatch, Sort
+from proposed.selector import Balance, FirstMatch, Ordered, pipe
 from proposed.view import View
 
 
@@ -90,7 +90,7 @@ def test_the_ranking_still_senses_the_fanout_under_a_re_ranking():
     fanout.route("r0", "origin")                      # r0 is a peer, and owes W
     fanout.folds[Asked](Asked("r0", ("K",)))
     ranking = Candidates()
-    chain = Sort(FirstMatch([Balance(ranking)]))
+    chain = pipe(FirstMatch([pipe(ranking, Balance)]), Ordered)
     chain.attach(_view(_Holds("origin"), fanout=fanout, load=fanout))
 
     assert ranking.view.fanout is fanout
