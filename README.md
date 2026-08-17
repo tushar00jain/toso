@@ -1,123 +1,85 @@
-# toso — TorchStore designs, simulations, and examples
+# toso 🫖
 
-A workspace for exploring [TorchStore](https://github.com/meta-pytorch/torchstore):
-its architecture, proposed new capabilities, deterministic simulations of those
-capabilities, and a runnable live example with a terminal UI to inspect a real
-store.
+Application-level caching, control planes, deterministic simulations, and live
+inspection for [TorchStore](https://github.com/meta-pytorch/torchstore), a
+distributed PyTorch tensor store built on
+[Monarch](https://github.com/meta-pytorch/monarch).
 
-TorchStore is a distributed, async KV store for PyTorch tensors built on
-[Monarch](https://github.com/meta-pytorch/monarch) actors. Its headline use case
-is **weight sync between a trainer/learner and a generator in RL**, including
-**resharding** weights across two different device meshes. See
-[`docs/torchstore.md`](docs/torchstore.md) for how it works today.
+TorchStore provides the directory, tensor transport, storage volumes, and
+resharding path. Toso stays separate because it adds experimental application
+policy rather than storage mechanisms, without expanding TorchStore's API for each
+experiment:
 
-## What's here
+- **Deduplicated weight transfer:** bounded peer fan-out, read-through replicas,
+  `1×` origin traffic, and load spreading across copies.
+- **Cache-aware LLM serving:** global prefix reuse, pull-versus-recompute pricing,
+  prefill/decode placement, load balancing, and TTFT/TBT admission.
+- **Reusable selection policy:** a typed selector algebra composes candidates,
+  measurements, load annotations, folds, ordering, bounds, and fallbacks. The same
+  `KeySelector` ranks sources for dedup and KV caching.
+- **Live inspection:** a real SPMD workload and Rust TUI for topology, keys, DTensor
+  shards, health, and bounded tensor statistics.
 
-The repo has three independent workstreams.
+## Capability pattern
 
-**1. Design docs** (`docs/`) — how TorchStore works and two proposed capabilities
-layered on it.
+Capabilities share one feedback loop:
 
-- [`torchstore.md`](docs/torchstore.md) — a ground-up explanation of
-  TorchStore's control plane, data plane, and resharding, with a glossary.
-- [`torchstore_dedup_design.md`](docs/torchstore_dedup_design.md) — replica-aware,
-  **deduplicated** trainer→generator weight transfer: a dynamic routing layer that
-  turns a synchronized read burst into a 1× fabric transfer with no barrier.
-- [`torchstore_kvcache_design.md`](docs/torchstore_kvcache_design.md) — making
-  TorchStore double as a **Mooncake-style KV-cache** pool for LLM serving, with a
-  cache-aware coordinator, prefix-hash addressing, and eviction.
-- [`architecture.md`](docs/architecture.md) — two diagrams
-  showing who holds each control object and how requests feed directory and sensor
-  changes back through a read-only view into the next selection.
+```text
+data-plane facts -> Dispatcher -> Sensors -> read-only View -> Selectors
+        ^                                                  |
+        +---------- execute the control-plane answer <-----+
+```
 
-**2. Discrete-event simulations** — each design has a companion deterministic DES
-that exercises the *algorithm* (not performance) on a simulated clock: no
-wall-clock, no threads, no randomness in timekeeping; same input ⇒ byte-identical
-trace. All three run the **real** TorchStore code (real
-client/controller/transport), so they depend on the from-source
-`torchstore`/`torch`/`monarch` build — not stdlib-only.
+Sensors fold application facts such as promised replicas, queue occupancy,
+reservations, and routed pulls. A View combines those sensors with directory,
+topology, time, and transfer-cost reads. Selectors rank without mutating state; the
+control plane commits a choice, and the data plane executes it through ordinary
+TorchStore clients and reports the resulting facts. New capabilities supply only
+their sensors, view subsets, selector chains, questions, and execution steps.
 
-- [`realsim/`](realsim/) — the **real-code** cooperative DES foundation: it drives
-  the **real** TorchStore client planning core, controller directory, and
-  in-memory transport/store off-actor on a deterministic virtual clock. It models
-  only what a capability plugs in, through four shared types: `ControlPlane` (one per
-  capability, asked whatever it declares — which volumes serve this read, where this
-  request runs — and fronted as a service), `KeySelector` (the ranking such a plane
-  answers a source question with: which volume serves these keys, naive by default),
-  `View` (the read-only observation a control plane senses through), `DataPlane` (a
-  capability's executing half) and `Runner` + `ItemDispatch` (release work on the
-  clock, install the mesh once, gather). `Mesh` is the
-  multi-client wiring the capability sims build on — per-node volumes + real
-  clients, one directory, one resource registry, and the single shared transport
-  factory — so a capability package holds only capability code. It runs
-  **allocation-free** (zero-storage meta tensors / metadata-only descriptors, so a
-  modeled payload of any size costs no memory) and charges **every** resource —
-  network, storage, RAM, CPU, and GPU/compute — as analytic functions of a
-  *target-machine* `MachineProfile`, never measured on the box running the sim.
-  It is the foundation only: it has no scenario and no demo of its own.
-- [`putget_sim/`](putget_sim/) — the unrouted put/get burst: seed one key, then
-  `m` clients get it, with **no control plane and no data plane**, so every reader pulls
-  the origin and fabric is *m×* the payload. The smallest thing that exercises
-  the whole real stack while deciding nothing, and the baseline `dedup_sim`
-  measures against.
-- [`dedup_sim/`](dedup_sim/) — the dedup capability **on the real directory**: a
-  control plane that routes each reader to a peer and does not answer until that
-  peer's read-through put registers, plus the one-method data plane that asks it,
-  reads from what it named, puts, and reports the put. The scenario is `putget_sim`'s
-  ordinary put/get fixture, unchanged — adding the two planes is the whole difference
-  between *m×* and 1× fabric.
-- [`kvcache_sim/`](kvcache_sim/) — the cache-aware KV-cache capability **on the
-  real directory**: one control plane holding the compute decisions (prefill
-  placement, pull-vs-recompute, SLO gates, decode placement) *and* the answer to
-  "which peer serves this prefix gap", which it ranks with the same `KeySelector`
-  dedup's plane uses; the serving loop and the batched decode engine drive real
-  fetches via `realsim`'s `Mesh`/client/engine/cost model.
+## Deterministic simulation framework
 
-  All three sim packages are split the same way, **by plane** — `control/`
-  decides, `data/` executes, plus `workload/` (what is simulated) and `report/`
-  (outcome metrics). `putget_sim` simply has no `control/` or `data/`, which is
-  what makes it the baseline. Two lints hold the shape:
-  `realsim/tools/check_contract.py` (a `control/` module may not import `data/`,
-  the mesh, or a client) and `check_structure.py` (a sim package's parts, the
-  underscore on a folder-private module or an unused public function, and a
-  README layout block that matches the tree). Each sim declares itself with the same four types — `Workload`,
-  `Run`, `Report`, `Demo` — so none of them wires a stack of its own. The test
-  for which folder something belongs in: *does it advance the clock or move
-  bytes?* The comparison is tabulated in
-  [`dedup_sim/README.md`](dedup_sim/README.md#comparison-with-kvcache_sim).
-- [`sim_common/`](sim_common/) — the shared building blocks all three sims use:
-  the deterministic virtual-clock `AsyncEngine` (the sim path; the original
-  callback engine `engine.py` is kept as a reference and imported by nothing),
-  the locality/topology skeleton, an analytic resource cost model
-  (`cost_model.py`: `MachineProfile` +
-  network/RAM/storage/CPU/GPU functions), a trace recorder, and the reporting
-  helpers including `Ledger` (transfer edges, byte counters, outcome rows and the
-  aggregations every report computes over them).
-- [`domain/`](domain/) — domain facts rather than simulator machinery:
-  `llm.py` reduces the served transformer to flops/token and KV bytes/token, and
-  converts token counts into seconds. Both capabilities describe operations on a
-  model's tensors, so it belongs to neither of them.
-- [`docs/des_design.md`](docs/des_design.md) — the real-code DES stack, virtual
-  time/cost path, and how the three simulations specialize it.
+`realsim` runs the real TorchStore client, controller, volume, transport-buffer, and
+store paths under a deterministic virtual clock. In-process seams replace actor RPC,
+not the production planning and storage logic.
 
-**3. Live example + TUI** — a real single-host store you can write to and watch.
+- Identical inputs produce byte-identical traces; seeded scheduling explores
+  repeatable alternative interleavings.
+- A target-machine profile analytically charges network, storage, RAM, CPU, and GPU
+  resources instead of measuring the host running the simulation.
+- Metadata-only tensors model large payloads without allocating their bytes.
+- Shared workload, runner, ledger, trace, and report types make baseline and
+  capability runs directly comparable.
 
-- [`live_example.py`](live_example.py) — an SPMD (`torchrun`) async-RL workload
-  (trainers + generators + aggregator, one role per rank) that writes to a real
-  store and serves a JSON query protocol over a socket.
-- [`toso_store_reader.py`](toso_store_reader.py) — turns the store's introspection
-  endpoints into that protocol's JSON.
-- [`tui/`](tui/) — a read-only [`ratatui`](https://ratatui.rs) terminal UI that
-  reads the same protocol, live over TCP or from bundled JSON fixtures. See
-  [`tui/README.md`](tui/README.md) to run it and
-  [`docs/tui_design.md`](docs/tui_design.md) for its design.
+This makes algorithm changes fast to test, reproducible, and independent of host
+noise while still exercising the real TorchStore path.
 
-## Running the simulations
+## Where to look
 
-All three sims drive the **real** TorchStore code, so they need the from-source
-build below (`torchstore`/`torch`/`monarch` in the repo-root `.venv`). Once built,
-run from the repo directory with the venv interpreter and the repo on
-`PYTHONPATH`:
+- Designs: [TorchStore overview](docs/torchstore.md),
+  [dedup](docs/torchstore_dedup_design.md),
+  [KV cache](docs/torchstore_kvcache_design.md),
+  [DES](docs/des_design.md), and [control flow](docs/architecture.md).
+- Simulations: [`putget_sim/`](putget_sim/), [`dedup_sim/`](dedup_sim/),
+  [`kvcache_sim/`](kvcache_sim/), and their [`realsim/`](realsim/) foundation.
+- Live inspection: [`live_example.py`](live_example.py), [`tui/`](tui/), and the
+  [TUI design](docs/tui_design.md).
+
+## Setup
+
+The simulations and live example use editable source builds of TorchStore and
+Monarch. Place `toso/`, `torchstore/`, and `monarch/` beside one another, then run:
+
+```bash
+cd toso
+./build_from_source.sh
+```
+
+The first build needs Rust and network access. It builds a CPU-only environment in
+`.venv`. Python source edits are immediately visible; Monarch Rust edits require
+`./rebuild_monarch.sh`.
+
+## Run the simulations
 
 ```bash
 PYTHONPATH=. .venv/bin/python -m putget_sim
@@ -125,67 +87,30 @@ PYTHONPATH=. .venv/bin/python -m dedup_sim
 PYTHONPATH=. .venv/bin/python -m kvcache_sim
 ```
 
-See each sim's `README.md` for flags, [`realsim/README.md`](realsim/README.md)
-for the real-code foundation, and the `docs/` design docs for how each capability
-works ([`des_design.md`](docs/des_design.md),
-[`torchstore_dedup_design.md`](docs/torchstore_dedup_design.md),
-and [`torchstore_kvcache_design.md`](docs/torchstore_kvcache_design.md)).
+Each package README documents its scenarios and flags.
 
-## Building the live example from source
+## Run the live store and TUI
 
-The live example depends on `torchstore` and `torchmonarch`, both **built from the
-in-repo source** (editable installs) so you can edit either and iterate. Check out
-`torchstore` and `monarch` next to this repo, then build from the repo root:
+Start two trainers, two generators, and one query aggregator:
 
 ```bash
-# layout: a parent dir holding toso/, torchstore/, and monarch/ side by side
-cd toso
-./build_from_source.sh
+uv run --no-sync torchrun --standalone --nnodes=1 --nproc-per-node=5 \
+  live_example.py --port 8099
 ```
 
-Monarch has a Rust native extension, so the first build needs a Rust toolchain and
-network access and compiles Monarch's full Rust workspace (~800 crates) — slow.
-Later rebuilds are incremental:
-
-- **Python edits** (Monarch or TorchStore) are live — just re-run.
-- **Rust edits** (Monarch) need `./rebuild_monarch.sh`, which reuses a pinned
-  `CARGO_TARGET_DIR` and only recompiles what you touched.
-
-It builds CPU-only (`USE_TENSOR_ENGINE=0 MONARCH_GPU_PLATFORM=none`) — enough for
-this gloo example.
-
-> Why from source? `initialize_spmd` needs a Monarch symbol that landed after the
-> newest published `torchmonarch-nightly` wheel, so no wheel has it yet. Building
-> from the in-repo source gets the current code and lets you modify it.
-
-## Running the live example + TUI
-
-Launch the store under `torchrun` (one role per rank), then point the TUI at the
-aggregator socket:
+In another shell:
 
 ```bash
-# shell 1 — 2 trainers + 2 generators + 1 aggregator
-uv run --no-sync torchrun --standalone --nnodes=1 --nproc-per-node=5 live_example.py --port 8099
-
-# shell 2 — the live TUI (re-polls every 2s)
 cd tui
-cargo run --offline --bin toso-tui -- --aggregator 127.0.0.1:8099 --refresh 2
+cargo run --offline --bin toso-tui -- \
+  --aggregator 127.0.0.1:8099 --refresh 2
 ```
 
-The TUI can also read the bundled `tui/fixtures/` directly with no Python or store
-at all (`--fixtures fixtures/`), covering states a single-host store can't produce
-(partial DTensors, multiple hosts, unreachable volumes).
-[`tui/README.md`](tui/README.md) has the full launch matrix and a tour of the
-pages.
+The TUI can run without TorchStore by loading its fixtures:
 
-## SPMD vs Monarch-actor
+```bash
+cd tui
+cargo run --offline --bin toso-tui -- --fixtures fixtures/
+```
 
-TorchStore has two entry points; the live example uses the first:
-
-- **SPMD** (`ts.initialize_spmd()` + `torchrun`) — the classic `torch.distributed`
-  model: `torchrun` launches N identical ranks, each calls
-  `dist.init_process_group(...)`, and TorchStore attaches to that process group.
-  This is the shape for dropping TorchStore into an existing torchrun training job.
-- **Monarch-actor** (`ts.initialize()` + `spawn_actors`) — a driver process asks
-  Monarch to spawn worker actors and `ts.*` runs inside actor endpoints, launched
-  with a plain `python …`. This is the shape for a Monarch-native application.
+See [`tui/README.md`](tui/README.md) for the full launch matrix and UI tour.
