@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
-from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
+from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection, settle
 from proposed.selector import (
     Balance, Dims, FirstMatch, Folded, NaiveKeySelector, Selector, Sort,
 )
@@ -99,7 +99,7 @@ class Dedup(ControlPlane):
         """Which volumes serve ``keys`` for ``requester``, once they are usable."""
         # The wait is spent here, not handed back: a caller that read before these
         # sources held the key would go to a volume with nothing to serve.
-        return await (await self._decide(keys, requester)).settled()
+        return await settle(await self._decide(keys, requester))
 
     async def _decide(self, keys: Sequence[Key], requester: str) -> Selection:
         """The whole decision with the gate unspent, awaitable without parking.

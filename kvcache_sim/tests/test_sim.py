@@ -32,7 +32,7 @@ from kvcache_sim.data._decode import DecodeEngine
 from kvcache_sim.data._store import KVStore
 from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
-from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
+from proposed import Abstain, ControlPlane, Dispatcher, KeySelector, LoadView, Selection
 from proposed.selector import (
     Balance, Const, FirstMatch, Folded, Max, Selector, Sort,
 )
@@ -2079,7 +2079,7 @@ def test_a_run_declares_one_plane_and_its_fetch_ranking_selects_over_keys():
 
     class _OverSomethingElse(Selector[int]):
         def select(self, subject, requester):
-            return Selection.of([])
+            return Abstain()
 
     with pytest.raises(TypeError, match="must select over the same one"):
         FirstMatch([LongestPrefixKeySelector(), _OverSomethingElse()])

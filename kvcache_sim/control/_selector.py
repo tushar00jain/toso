@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
-from proposed import Key, KeySelector, Selection
+from proposed import Abstain, Key, KeySelector, Selection
 from proposed.selector import Dims, Fold, Selector
 
 from domain import decode_step_time, MachineProfile, Model, prefill_time
@@ -73,7 +73,7 @@ class LongestPrefixKeySelector(KeySelector):
         """
         counts = self._prefix_runs(list(keys))
         if not counts:
-            return Selection.of([])
+            return Abstain()
         return Selection.keyed([(inst, (-run,)) for inst, run in counts.items()])
 
     def _prefix_runs(self, keys: Sequence[Key]) -> Dict[str, int]:
@@ -108,7 +108,7 @@ def by_prefix_and_load(bound: int = 1) -> Fold:
 class LocalOnly(Selector[Sequence[Key]]):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
-    An abstention, so the caller recomputes the gap -- not ``Selection()``, which would
+    An abstention, so the caller recomputes the gap -- not ``DirectoryDefault()``, which would
     be a decision naming every holder in directory order.
     """
 
@@ -116,7 +116,7 @@ class LocalOnly(Selector[Sequence[Key]]):
     sensors = ()
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection:
-        return Selection.of([])
+        return Abstain()
 
 
 class RoutedPull(KeySelector):
@@ -138,7 +138,7 @@ class RoutedPull(KeySelector):
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection:
         peer = self.view.routed.peer(requester, keys)
-        return Selection.of([peer] if peer is not None else [])
+        return Selection.of([peer]) if peer is not None else Abstain()
 
 
 @dataclass(frozen=True)

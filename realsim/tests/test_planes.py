@@ -49,7 +49,10 @@ from realsim.mesh import Mesh
 from realsim.seams.data_plane_service import DataPlaneService
 from realsim.simulation import Simulation
 from proposed import DataPlane, routed, RoutedPlane
-from proposed import ControlPlane, Key, KeySelector, Selection
+from proposed import (
+    Abstain, ControlPlane, DirectoryDefault, Key, KeySelector, Ranked, Selection,
+    settle,
+)
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
@@ -163,7 +166,7 @@ class _Ranks(ControlPlane):
         self.selector.attach(view)
 
     async def sources(self, keys, requester) -> Selection:
-        return await self.selector.select(list(keys), requester).settled()
+        return await settle(self.selector.select(list(keys), requester))
 
 
 def _burst_trace(selector) -> str:
@@ -181,7 +184,7 @@ def _burst_trace(selector) -> str:
                 chosen = (
                     await sim.control_plane_handle.sources.call_one(["W"], reader)
                     if sim.control_plane_handle is not None
-                    else Selection()
+                    else DirectoryDefault()
                 )
                 await sim.client_for(reader, prefer=chosen.sources).get("W")
         return True
@@ -196,7 +199,7 @@ def test_preferring_the_naive_answer_changes_nothing():
 
 def test_no_preference_leaves_a_directory_answer_untouched():
     located = {"K": {"v1": "info1", "v0": "info0"}}
-    assert prefer(located, Selection().sources) is located
+    assert prefer(located, DirectoryDefault().sources) is located
 
 
 # --------------------------------------------------------------------------
@@ -213,7 +216,7 @@ class _Answers:
     """
 
     def __init__(self, selection: Selection | None = None) -> None:
-        self.selection = selection if selection is not None else Selection()
+        self.selection = selection if selection is not None else DirectoryDefault()
         self.asked: list[str] = []
 
     def select(self, subject, requester):
@@ -250,14 +253,14 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
 
     class _Parameterised(Selector[Sequence[Key]]):
         def select(self, keys, requester):
-            return Selection()
+            return DirectoryDefault()
 
     class _Inherits(_Parameterised):        # narrows behaviour, not the subject
         pass
 
     class _Bare(KeySelector):               # binds nothing, so it inherits the subject
         def select(self, keys, requester):
-            return Selection()
+            return DirectoryDefault()
 
     class _DeclaresItsOwn(Selector):
         @property
@@ -265,7 +268,7 @@ def test_a_subject_is_written_once_as_the_parameter_and_read_back_as_a_value():
             return "computed"
 
         def select(self, subject, requester):
-            return Selection()
+            return DirectoryDefault()
 
     assert _Parameterised.subject_type == Sequence[Key]
     assert _Inherits.subject_type == Sequence[Key]
@@ -287,7 +290,7 @@ def test_taking_keys_is_not_the_same_claim_as_answering_for_the_store():
 
     class _KeysButNotTheStore(Selector[Sequence[Key]]):
         def select(self, subject, requester):
-            return Selection.of([])
+            return Abstain()
 
     assert _KeysButNotTheStore.subject_type == KeySelector.subject_type  # same subject
     assert not isinstance(_KeysButNotTheStore(), KeySelector)            # other claim
@@ -306,7 +309,7 @@ def test_a_plane_declares_whatever_it_wants_told():
 
     class _Hears(ControlPlane):
         async def sources(self, keys, requester):
-            return Selection()
+            return DirectoryDefault()
 
         async def published(self, requester, keys):
             heard.append((requester, tuple(keys)))
@@ -449,6 +452,23 @@ def test_a_run_with_no_plane_fronts_nothing():
 # chain: a selection somebody else built, handed on whatever the subject.
 
 
+def test_selection_has_three_explicit_variants():
+    with pytest.raises(TypeError, match="DirectoryDefault, Abstain, or Ranked"):
+        Selection()
+    assert isinstance(DirectoryDefault(), DirectoryDefault)
+    assert isinstance(Selection.of([]), Abstain)
+    assert isinstance(Selection.of(["v0"]), Ranked)
+
+
+def test_a_ranked_selection_enforces_its_source_key_invariant():
+    with pytest.raises(ValueError, match="at least one"):
+        Ranked(())
+    with pytest.raises(ValueError, match="twice"):
+        Ranked(("v0", "v0"))
+    with pytest.raises(ValueError, match="cover exactly"):
+        Ranked(("v0", "v1"), key={"v0": (1,)})
+
+
 def test_only_an_ordering_link_puts_a_selection_in_an_order():
     """A stage keys; ``Sort`` orders and ``Max`` picks, off the dimensions it left.
 
@@ -514,7 +534,7 @@ def test_the_id_breaks_every_tie_in_one_place():
 
 def test_both_empties_survive_an_ordering():
     """Neither names a source, so there is nothing to order and nothing to pick."""
-    for empty in (Selection.of([]), Selection()):
+    for empty in (Abstain(), DirectoryDefault()):
         assert _select(Sort(Const(empty))) is empty
         assert _select(Max(Const(empty))) is empty
 
@@ -575,7 +595,7 @@ def test_a_settled_selection_has_waited_and_carries_no_gate():
 
     async def scenario():
         answer = asyncio.get_running_loop().create_task(
-            Selection.priced([("v0", 7)], ready=gate).settled()
+            settle(Selection.priced([("v0", 7)], ready=gate))
         )
         await asyncio.sleep(0)
         assert not answer.done(), "answered before the source was usable"
@@ -596,7 +616,7 @@ def test_selection_withholds_until_its_gate_opens():
         await opened.wait()
 
     async def waiter():
-        await Selection.of(["v0"], ready=gate).wait()
+        await settle(Selection.of(["v0"], ready=gate))
         order.append("released")
 
     async def opener():
@@ -696,19 +716,19 @@ def test_first_match_takes_the_first_answer_and_stops():
 
 
 def test_first_match_falls_through_an_empty_ranking():
-    """``Selection.of([])`` names nobody, so it is the abstention."""
-    abstains, answers = _Fixed(Selection.of([])), _Fixed(Selection.of(["v1"]))
+    """``Abstain()`` names nobody, so it is the abstention."""
+    abstains, answers = _Fixed(Abstain()), _Fixed(Selection.of(["v1"]))
     assert _select(FirstMatch([abstains, answers])).sources == ("v1",)
     assert answers.asked == ["r"]
 
 
 def test_first_match_stops_at_the_naive_answer():
-    """``Selection()`` is a decision -- the directory's -- not silence.
+    """``DirectoryDefault()`` is a decision -- the directory's -- not silence.
 
     The opposite of the test above, and the distinction the combinator is built
     on: an empty *ranking* names nobody, while ``sources=None`` names everybody.
     """
-    naive, behind = _Fixed(Selection()), _Fixed(Selection.of(["v1"]))
+    naive, behind = _Fixed(DirectoryDefault()), _Fixed(Selection.of(["v1"]))
     assert _select(FirstMatch([naive, behind])).sources is None
     assert behind.asked == []
 
@@ -716,10 +736,10 @@ def test_first_match_stops_at_the_naive_answer():
 def test_an_exhausted_chain_abstains_so_chains_nest():
     """Running out is not a decision, which is what keeps chaining associative."""
     assert _select(FirstMatch([])).sources == ()
-    assert _select(FirstMatch([_Fixed(Selection.of([]))])).sources == ()
+    assert _select(FirstMatch([_Fixed(Abstain())])).sources == ()
 
     last = _Fixed(Selection.of(["v2"]))
-    inner = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of([]))])
+    inner = FirstMatch([_Fixed(Abstain()), _Fixed(Abstain())])
     assert _select(FirstMatch([inner, last])).sources == ("v2",)
 
 
@@ -727,7 +747,7 @@ def test_first_match_keeps_the_winner_s_readiness_gate():
     async def gate() -> None:
         return None
 
-    chained = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"], ready=gate))])
+    chained = FirstMatch([_Fixed(Abstain()), _Fixed(Selection.of(["v1"], ready=gate))])
     assert _select(chained).ready is gate
 
 
@@ -752,7 +772,7 @@ def test_a_combinator_hands_each_link_the_view_that_link_declared():
     that is no view at all.
     """
     view = View(None, {}).derived(_Thing, thing="sensed")
-    senses, plain = _SensesThing(Selection.of([])), _Fixed(Selection.of(["v1"]))
+    senses, plain = _SensesThing(Abstain()), _Fixed(Selection.of(["v1"]))
     FirstMatch([senses, plain]).attach(view)
     assert senses.view.thing == "sensed"       # composed out of the one it was given
     assert senses.view is not view
@@ -820,7 +840,7 @@ def test_a_chain_takes_its_links_subject_and_refuses_links_that_disagree():
     answer a question it was not asked. Checked at construction, which is what lets the
     chain take the subject as its own -- and so be a link of a chain itself.
     """
-    chain = FirstMatch([_Fixed(Selection.of([])), _Fixed(Selection.of(["v1"]))])
+    chain = FirstMatch([_Fixed(Abstain()), _Fixed(Selection.of(["v1"]))])
     assert _select(chain).sources == ("v1",)
     assert chain.subject_type == Sequence[Key]
     assert FirstMatch([chain]).subject_type == Sequence[Key]
@@ -921,7 +941,7 @@ def test_balance_passes_an_answer_with_no_source_to_rank_straight_through():
     Returned as they were built, and nothing is read off the load either: there is no
     source to measure.
     """
-    for empty in (Selection.of([]), Selection()):
+    for empty in (Abstain(), DirectoryDefault()):
         balanced = Balance(_Fixed(empty))
         balanced.attach(_Senses())
         assert _select(balanced) is empty
@@ -1018,15 +1038,22 @@ def test_require_drops_the_whole_ranking_not_just_the_head():
 def test_require_leaves_an_abstention_alone_and_refuses_the_naive_answer():
     """The two empties again, and they behave as oppositely here as in a chain.
 
-    ``Selection.of([])`` names nobody, so there is no head to judge and nothing to do.
-    ``Selection()`` is the directory's whole answer: narrowing it would quietly return
+    ``Abstain()`` names nobody, so there is no head to judge and nothing to do.
+    ``DirectoryDefault()`` is the directory's whole answer: narrowing it would quietly return
     an unnarrowed ranking, so it is a wiring error and says so.
     """
-    abstained = Selection.of([])
+    abstained = Abstain()
     assert abstained.require(lambda head: False) is abstained
 
     with pytest.raises(ValueError, match="no head"):
-        Selection().require(lambda head: True)
+        DirectoryDefault().require(lambda head: True)
+
+
+def test_narrowing_refuses_the_default_and_cannot_introduce_a_source():
+    with pytest.raises(ValueError, match="no explicit sources"):
+        DirectoryDefault().take(1)
+    with pytest.raises(ValueError, match="cannot introduce"):
+        Selection.of(["v0"]).only(["v1"])
 
 
 def test_a_narrowed_selection_keeps_its_gate_and_the_keys_it_kept():
@@ -1047,8 +1074,8 @@ def test_head_is_the_leading_source_and_what_was_measured_is_under_it():
     """Both empties read as ``None``: neither names a source to act on."""
     ranked = Selection.priced([("v0", 7), ("v1", 9)])
     assert (ranked.head, ranked.key[ranked.head]) == ("v0", (7,))
-    assert Selection.of([]).head is None
-    assert Selection().head is None
+    assert Abstain().head is None
+    assert DirectoryDefault().head is None
 
 
 # --------------------------------------------------------------------------

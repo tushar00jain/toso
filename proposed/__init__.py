@@ -73,7 +73,8 @@ from .dispatch import Action, Dispatcher, Reducer, Stored
 from .plane import ControlPlane, DataPlane
 from .routed import routed, RoutedPlane
 from .selector import (
-    declared, declares, DecisionLog, KeySelector, Selection,
+    Abstain, declared, declares, DecisionLog, DirectoryDefault, KeySelector, Ranked,
+    Selection, settle,
 )
 from .topology import Endpoint, locality, nearest, Tier, TIER_LABEL
 from .view import LoadView, Sensed, SensorView, View
@@ -82,6 +83,10 @@ __all__ = [
     # the torchstore ask
     "KeySelector",
     "Selection",
+    "DirectoryDefault",
+    "Abstain",
+    "Ranked",
+    "settle",
     "Key",
     "VolumeId",
     "DecisionLog",

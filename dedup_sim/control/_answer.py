@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Dict, Hashable, List, Optional, Sequence
 
-from proposed import DecisionLog, Dispatcher, Key, Selection
+from proposed import DecisionLog, DirectoryDefault, Dispatcher, Key, Selection
 
 from ._view import FanoutView
 
@@ -77,7 +77,7 @@ def committed(
     fanout.retire(requester, source)
     if trace is not None:
         trace.record(view.now(), "retire", f"{source} holds nothing")
-    return Selection()
+    return DirectoryDefault()
 
 
 def _registered(view: FanoutView, facts: Sequence[Hashable]) -> List[Hashable]:

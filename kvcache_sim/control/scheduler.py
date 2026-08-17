@@ -68,7 +68,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
 
 from proposed import (
-    ControlPlane, Dispatcher, Key, Selection,
+    ControlPlane, Dispatcher, Key, Selection, settle,
 )
 from proposed.selector import (
     Annotate, Balance, declared, Dims, FirstMatch, Folded, Max, Selector, Sort,
@@ -328,7 +328,7 @@ class _Scheduler(ControlPlane):
 
         The pull :meth:`decide` already priced for this caller
         (:class:`~kvcache_sim.control._selector.RoutedPull`), else whoever holds the
-        longest prefix. ``Selection.of([])`` names nobody, leaving the read to the
+        longest prefix. ``Abstain()`` names nobody, leaving the read to the
         directory's order.
 
         Answering is dispatched unconditionally, whichever link answered
@@ -339,7 +339,7 @@ class _Scheduler(ControlPlane):
         """
         answer = self._fetch.select(list(keys), requester)
         self.dispatcher.dispatch_sync(FetchAnswered(requester, tuple(keys)))
-        return await answer.settled()
+        return await settle(answer)
 
     async def decide(self, request: Request, requester: str) -> Optional[Response]:
         """Where should ``request`` run? Both selections, or ``None`` if refused.

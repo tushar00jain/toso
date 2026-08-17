@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from proposed import Key, KeySelector, Selection, VolumeId
+from proposed import Abstain, Key, KeySelector, Selection, VolumeId
 
 from ._answer import holders
 from ._view import FanoutView
@@ -110,7 +110,7 @@ class Candidates(KeySelector):
             hop = self.view.transfer_cost(volume, requester, self.payload_bytes)
             priced.append((volume, wait + hop + self.fabric * hop))
         if not priced:
-            return Selection.of([])
+            return Abstain()
         return Selection.priced(priced)
 
     def _wait(

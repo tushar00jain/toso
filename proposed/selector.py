@@ -20,7 +20,7 @@ declares the questions its callers may ask, and a selector is one of the things 
 may work the answer out with. So a selector needs no lifecycle beyond the view it
 ranks against (:meth:`Selector.attach`), and a ranking that never leaves the plane
 that built it may hold whatever it likes -- including a readiness gate. What crosses
-a service boundary is the plane's business (:meth:`Selection.settled`).
+a service boundary is the plane's business (:func:`settle`).
 
 The subject is the one thing a header carries, because what a selector takes is worth
 saying where a reader already looks -- and what it answers with does not vary: a
@@ -37,7 +37,7 @@ rather than one it declares.
 
 Admission and SLO gates are neither: an answer that is not a ranked set of sources
 does not belong in a :class:`Selection` at all. A gate rides *with* one instead --
-a selector that refuses abstains (``Selection.of([])``), and what it would have
+a selector that refuses abstains (``Abstain()``), and what it would have
 answered is simply not in the ranking.
 
 A decision is **declared**: a chain, built where the selector is wired, whose links each
@@ -67,7 +67,7 @@ behind it, say -- needs only :func:`declares` and :func:`declared` from here.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import (
     Any, Awaitable, Callable, Dict, Generic, List, Mapping, NamedTuple, Optional,
     Protocol, Sequence, Tuple, TypeVar, Union, get_args, get_origin,
@@ -77,7 +77,8 @@ from proposed.deployment import Key, VolumeId
 from proposed.view import LoadView, View
 
 __all__ = [
-    "Ready", "Dims", "Fold", "Readings", "Selection", "prefer", "DecisionLog",
+    "Ready", "Dims", "Fold", "Readings", "Selection", "DirectoryDefault",
+    "Abstain", "Ranked", "settle", "prefer", "DecisionLog",
     "declared",
     "declares", "Selector", "KeySelector", "NaiveKeySelector",
     "FirstMatch", "Const", "Annotate", "Balance", "Folded", "Sort", "Max",
@@ -91,6 +92,9 @@ Ready = Callable[[], Awaitable[None]]
 #: binds, which :meth:`Selector.__init_subclass__` reads back into ``subject_type``.
 _S = TypeVar("_S")
 
+#: The positional key schema carried by one selection.
+_K = TypeVar("_K", bound=Tuple[Any, ...])
+
 #: The selector :meth:`Selector.attach` hands back: whatever it was called on, so a
 #: wired chain is still a chain and a wired combinator still a combinator.
 _Sel = TypeVar("_Sel", bound="Selector[Any]")
@@ -103,51 +107,37 @@ _Sel = TypeVar("_Sel", bound="Selector[Any]")
 #: fold that named no figure raises rather than ordering by something meaningless.
 Dims = Tuple[Any, ...]
 
+
+class _Comparable(Protocol):
+    """A value that supplies the ordering operation a rank needs."""
+
+    def __lt__(self, other: Any, /) -> bool:
+        ...
+
 #: How a caller blends one source's dimensions into the single comparable a fold
 #: orders by: ``dims -> comparable``, lower still better. Positional, so a fold reads
 #: ``dims[1]`` and a chain missing that stage raises instead of quietly comparing the
 #: wrong number. ``None`` is the lexicographic default, which needs no arithmetic at all
 #: (:class:`Sort`).
-Fold = Callable[[Dims], Any]
+Fold = Callable[[Dims], _Comparable]
 
 #: What one stage appends (:meth:`Selection.annotated`): a reading per source, either
 #: measured already or measurable on demand.
 Readings = Union[Mapping[VolumeId, Any], Callable[[VolumeId], Any]]
 
 
-@dataclass(frozen=True)
-class Selection:
-    """Sources for one subject, what orders them, and when they become usable.
+class Selection(Generic[_K]):
+    """One of directory default, abstention, or an explicit ranking."""
 
-    A stage annotates and does not order: it appends to :attr:`key` and leaves
-    :attr:`sources` however it built them. Only :class:`Sort` and :class:`Max` order one,
-    and there is no flag saying that either has: a selection's order is whatever its
-    producer left.
+    sources: Optional[Tuple[VolumeId, ...]]
+    key: Optional[Mapping[VolumeId, _K]]
+    ready: Optional[Ready]
+    fold: Optional[Fold]
 
-    Args:
-        sources: volume ids. ``None`` -- the default -- means *every holder, in
-            directory order*, which is what the real directory returns on its own, so
-            a ``None`` selection leaves the store's answer untouched (:func:`prefer`).
-        key: ``source id -> the dimensions that order it`` (:data:`Dims`), one per
-            stage that measured it. What a stage *holds* about a source rides here as a
-            dimension too -- a plan, a score -- so a ranking cannot come apart from what
-            produced it, and a caller reads it back by position
-            (``key[head][0]``). ``None`` for a producer with nothing to say about the
-            order.
-        ready: optional gate, for a selector that routes a requester to a peer which
-            has not registered yet. Spent by :meth:`settled` before the answer
-            travels, never handed to whoever asked.
-        fold: how to read :attr:`key`, stamped by the link that knows both the dimensions
-            there are and what they mean together (:class:`Folded`) -- so nothing that
-            orders this names a fold, and two callers of one ranking cannot fold it two
-            different ways. ``None`` compares the dimensions as they stand. A closure, so
-            :meth:`settled` drops it as it drops the gate.
-    """
-
-    sources: Optional[Tuple[VolumeId, ...]] = None
-    key: Optional[Mapping[VolumeId, Dims]] = None
-    ready: Optional[Ready] = None
-    fold: Optional[Fold] = None
+    def __new__(cls, *args: Any, **kwargs: Any):
+        if cls is Selection:
+            raise TypeError("construct DirectoryDefault, Abstain, or Ranked")
+        return super().__new__(cls)
 
     @classmethod
     def of(
@@ -155,7 +145,7 @@ class Selection:
         sources: Sequence[VolumeId],
         *,
         ready: Optional[Ready] = None,
-    ) -> "Selection":
+    ) -> "Selection[Dims]":
         """``sources`` as they are given, keyed by nothing.
 
         The three builders are the three kinds of producer: this one for a selector
@@ -163,7 +153,8 @@ class Selection:
         of the order, :meth:`keyed` for one that gives the dimensions itself -- an
         order that negates what it measured, or more dimensions than one.
         """
-        return cls(sources=tuple(sources), ready=ready)
+        named = tuple(sources)
+        return Ranked(named, ready=ready) if named else Abstain(ready=ready)
 
     @classmethod
     def keyed(
@@ -171,15 +162,18 @@ class Selection:
         candidates: Sequence[Tuple[VolumeId, Dims]],
         *,
         ready: Optional[Ready] = None,
-    ) -> "Selection":
+    ) -> "Selection[Dims]":
         """``(id, dims)`` pairs: what orders each source, from one sequence.
 
         The sequence's own order is not a ranking -- :class:`Sort` and :class:`Max` read
         the dimensions.
         """
-        return cls(
-            sources=tuple(i for i, _d in candidates),
-            key={i: tuple(dims) for i, dims in candidates},
+        pairs = tuple(candidates)
+        if not pairs:
+            return Abstain(ready=ready)
+        return Ranked(
+            sources=tuple(i for i, _d in pairs),
+            key={i: tuple(dims) for i, dims in pairs},
             ready=ready,
         )
 
@@ -189,12 +183,12 @@ class Selection:
         candidates: Sequence[Tuple[VolumeId, Any]],
         *,
         ready: Optional[Ready] = None,
-    ) -> "Selection":
+    ) -> "Selection[Dims]":
         """``(id, price)`` pairs, that price standing as the one dimension: cheapest is
         best."""
         return cls.keyed([(i, (p,)) for i, p in candidates], ready=ready)
 
-    def annotated(self, readings: "Readings") -> "Selection":
+    def annotated(self, readings: "Readings") -> "Selection[Dims]":
         """This selection with one reading per source appended as a further dimension.
 
         What a stage that measures rather than ranks does (:class:`Annotate`). Appended
@@ -208,30 +202,18 @@ class Selection:
         One call per stage: the whole key mapping is rebuilt here, so a call per source
         would cost a walk per source.
         """
-        read = readings if callable(readings) else readings.__getitem__
-        return replace(self, key={
-            source: (*(self.key or {}).get(source, ()), read(source))
-            for source in (self.sources or ())
-        })
-
-    async def wait(self) -> None:
-        """Block until the chosen sources are usable (returns at once if ready)."""
-        if self.ready is not None:
-            await self.ready()
-
-    async def settled(self) -> "Selection":
-        """This selection with its gate spent: awaited, then dropped.
-
-        What a plane reached as a service answers with. :attr:`ready` is a closure,
-        so it cannot cross the boundary a handle stands for -- the ranking and its
-        key can, being values. Awaiting it here is also what makes the answer
-        true when it arrives: the caller is about to read from these sources, and
-        a ranking released early names a volume holding nothing yet.
-        """
-        await self.wait()
-        if self.ready is None and self.fold is None:
+        if not isinstance(self, Ranked):
             return self
-        return replace(self, ready=None, fold=None)
+        read = readings if callable(readings) else readings.__getitem__
+        return Ranked(
+            self.sources,
+            key={
+                source: (*(self.key or {}).get(source, ()), read(source))
+                for source in self.sources
+            },
+            ready=self.ready,
+            fold=self.fold,
+        )
 
     @property
     def head(self) -> Optional[VolumeId]:
@@ -246,27 +228,31 @@ class Selection:
             return None
         return self.sources[0]
 
-    def only(self, sources: Sequence[VolumeId]) -> "Selection":
+    def only(self, sources: Sequence[VolumeId]) -> "Selection[_K]":
         """This selection cut down to ``sources``, in the order given.
 
         The readiness gate rides along and each kept source keeps its key, so one
         selection narrowed by somebody else still answers for whoever built it.
         """
+        if isinstance(self, DirectoryDefault):
+            raise ValueError("the directory default has no explicit sources to narrow")
         kept = tuple(sources)
-        return Selection(
-            sources=kept,
-            key=None if self.key is None else {
-                s: self.key[s] for s in kept if s in self.key
-            },
+        if any(source not in (self.sources or ()) for source in kept):
+            raise ValueError("a narrowing cannot introduce a source")
+        if not kept:
+            return Abstain(ready=self.ready, fold=self.fold)
+        return Ranked(
+            kept,
+            key=None if self.key is None else {s: self.key[s] for s in kept},
             ready=self.ready,
             fold=self.fold,
         )
 
-    def take(self, n: int) -> "Selection":
+    def take(self, n: int) -> "Selection[_K]":
         """The leading ``n`` sources, key and gate intact."""
         return self.only((self.sources or ())[:n])
 
-    def require(self, ok: Callable[[VolumeId], bool]) -> "Selection":
+    def require(self, ok: Callable[[VolumeId], bool]) -> "Selection[_K]":
         """This selection if its head satisfies ``ok``, else the abstention.
 
         The narrowing a caller does *to* a ranking, as a method on the ranking, so a
@@ -285,14 +271,71 @@ class Selection:
             ValueError: on the default selection (every holder in directory order),
                 which names no head and so cannot be narrowed.
         """
-        if self.sources is None:
+        if isinstance(self, DirectoryDefault):
             raise ValueError(
                 "a selection naming every holder in directory order has no head to "
                 "require anything of: narrow one that ranks"
             )
         if not self.sources or ok(self.sources[0]):
             return self
-        return Selection.of([])
+        return Abstain()
+
+    def with_fold(self, fold: Optional[Fold]) -> "Selection[_K]":
+        """This explicit ranking with its key interpreter; other variants unchanged."""
+        if not isinstance(self, Ranked):
+            return self
+        return replace(self, fold=fold)
+
+    def without_runtime(self) -> "Selection[_K]":
+        """This answer without closures that cannot cross a service boundary."""
+        if self.ready is None and self.fold is None:
+            return self
+        return replace(self, ready=None, fold=None)
+
+
+@dataclass(frozen=True)
+class DirectoryDefault(Selection[Dims]):
+    """Every holder in directory order."""
+
+    sources: None = field(default=None, init=False)
+    key: None = field(default=None, init=False)
+    ready: None = field(default=None, init=False)
+    fold: None = field(default=None, init=False)
+
+
+@dataclass(frozen=True)
+class Abstain(Selection[_K], Generic[_K]):
+    """No source named, so a choice may continue behind this answer."""
+
+    ready: Optional[Ready] = None
+    fold: Optional[Fold] = None
+    sources: Tuple[()] = field(default=(), init=False)
+    key: None = field(default=None, init=False)
+
+
+@dataclass(frozen=True)
+class Ranked(Selection[_K], Generic[_K]):
+    """One nonempty explicit source ranking."""
+
+    sources: Tuple[VolumeId, ...]
+    key: Optional[Mapping[VolumeId, _K]] = None
+    ready: Optional[Ready] = None
+    fold: Optional[Fold] = None
+
+    def __post_init__(self) -> None:
+        if not self.sources:
+            raise ValueError("a Ranked selection must name at least one source")
+        if len(set(self.sources)) != len(self.sources):
+            raise ValueError("a Ranked selection cannot name one source twice")
+        if self.key is not None and set(self.key) != set(self.sources):
+            raise ValueError("a Ranked key must cover exactly its sources")
+
+
+async def settle(selection: Selection[_K]) -> Selection[_K]:
+    """Spend one answer's readiness gate and drop its runtime-only closures."""
+    if selection.ready is not None:
+        await selection.ready()
+    return selection.without_runtime()
 
 
 def prefer(
@@ -413,7 +456,7 @@ class Selector(ABC, Generic[_S]):
         Synchronous, so a whole chain is one turn: nothing can be decided between the
         readings a ranking prices against and the answer they produce. A ranking that
         must wait says so with a gate on the answer instead (:attr:`Selection.ready`),
-        which is spent where the answer crosses a boundary (:meth:`Selection.settled`).
+        which is spent where the answer crosses a boundary (:func:`settle`).
         """
 
 
@@ -438,7 +481,7 @@ class NaiveKeySelector(KeySelector):
     name = "naive"
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection:
-        return Selection()
+        return DirectoryDefault()
 
 
 def declares(
@@ -477,10 +520,10 @@ class FirstMatch(Selector[_S]):
 
     A :class:`Selection` can be empty in two ways, and they mean opposite things:
 
-    * ``Selection()`` -- ``sources is None`` -- is *every holder, in directory
+    * ``DirectoryDefault()`` -- ``sources is None`` -- is *every holder, in directory
       order*, the decision :class:`NaiveKeySelector` makes. It **wins the chain**, and
       the selectors behind it are never consulted.
-    * ``Selection.of([])`` names nobody. That is the **abstention**, and it falls
+    * ``Abstain()`` names nobody. That is the **abstention**, and it falls
       through.
 
     An exhausted chain abstains in turn, which keeps chaining associative:
@@ -530,9 +573,9 @@ class FirstMatch(Selector[_S]):
         """The first non-abstaining answer, or an abstention if there is none."""
         for selector in self.selectors:
             selection = selector.select(subject, requester)
-            if selection.sources is None or selection.sources:
+            if not isinstance(selection, Abstain):
                 return selection
-        return Selection.of([])
+        return Abstain()
 
 
 class Const(Selector[Any]):
@@ -610,7 +653,7 @@ class Annotate(_Link[_S]):
         particular.
         """
         ranked = self.ranking.select(subject, requester)
-        if not ranked.sources:
+        if not isinstance(ranked, Ranked):
             return ranked
         return ranked.annotated(self.readings(self.view, subject))
 
@@ -672,12 +715,12 @@ class Folded(_Link[_S]):
         self.fold = fold
 
     def select(self, subject: _S, requester: str) -> Selection:
-        return replace(self.ranking.select(subject, requester), fold=self.fold)
+        return self.ranking.select(subject, requester).with_fold(self.fold)
 
 
 def _order_key(selection: Selection) -> Optional[Callable[[VolumeId], Any]]:
     """The total key this selection orders by, or ``None`` when it has none."""
-    if not selection.sources or selection.key is None:
+    if not isinstance(selection, Ranked) or selection.key is None:
         return None
     key, fold = selection.key, selection.fold
     if fold is None:
@@ -697,7 +740,7 @@ def _ranked(selection: Selection) -> Optional[Tuple[VolumeId, ...]]:
     order_key = _order_key(selection)
     if order_key is None:
         return None
-    return tuple(sorted(selection.sources or (), key=order_key))
+    return tuple(sorted(selection.sources, key=order_key))
 
 
 class Sort(_Link[_S]):
@@ -719,7 +762,7 @@ class Max(_Link[_S]):
     """The single best source of one ranking's answer, with its key and the gate.
 
     What a chain naming one source ends in, and it is still a selection, so
-    :meth:`Selection.settled` can be spent on it afterwards. Both empties pass through.
+    :func:`settle` can be spent on it afterwards. Both non-ranked variants pass through.
     """
 
     name = "max"
