@@ -53,7 +53,7 @@ CHAIN = 10.0
 SPREAD = 0.0
 
 
-class Candidates(KeySelector):
+class Candidates(KeySelector[float]):
     """Holders and planned peers as one pool, each priced in seconds.
 
     Args:
@@ -76,7 +76,7 @@ class Candidates(KeySelector):
         self.fabric = fabric
         self.payload_bytes = payload_bytes
 
-    def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
         """Everything that could serve every one of ``keys``, scored; else abstain."""
         fanout = self.view.fanout
         located = self.view.locate(keys)
@@ -109,7 +109,7 @@ class Candidates(KeySelector):
             hop = self.view.transfer_cost(volume, requester, self.payload_bytes)
             priced.append((volume, wait + hop + self.fabric * hop))
         if not priced:
-            return Selection.of([])
+            return Selection.abstain()
         return Selection.priced(priced)
 
     def _wait(

@@ -1634,7 +1634,7 @@ def _spread(bound: int = 1) -> Selector:
     """The opt-in ranking, as the plane declares it: the prefix run with the recent
     grants appended, stamped with the fold that docks one by the other."""
     return pipe(
-        LongestPrefixKeySelector(), Balance, WithFold(by_prefix_and_load(bound))
+        Balance(LongestPrefixKeySelector()), WithFold(by_prefix_and_load(bound))
     )
 
 

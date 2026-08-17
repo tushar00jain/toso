@@ -65,13 +65,14 @@ executed cost off it.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
     ControlPlane, Dispatcher, Key, Selection,
 )
 from proposed.selector import (
-    Annotate, Balance, Best, declared, FirstMatch, Ordered, pipe, Selector, WithFold,
+    Annotate, Balance, Best, declared, FirstMatch, Ordered, pipe, Readings, Selector,
+    WithFold,
 )
 
 from domain import (
@@ -133,14 +134,24 @@ class Occupancy(Enum):
     PREDICT = "predict"  # the one predicted at prefill completion
 
 
-def _source_ranking(source: Source) -> Selector[Sequence[Key]]:
+def _source_ranking(
+    source: Source,
+) -> Selector[Sequence[Key], Unpack[Tuple[Any, ...]]]:
     """Which peers may serve a prefix -- a fresh one every call.
 
     :attr:`Source.SPREAD` weighs a busy holder against a long match, and carries that
     fold with it, so both chains it goes into weigh them the same way.
+
+    The two presets key a different number of dimensions -- one the prefix run, the other
+    that run and the load -- so a runtime choice between them has no one arity and the
+    answer is typed at none. What that costs is nothing here: the fold that reads two
+    dimensions is named inside the branch that annotates the second, where it is checked,
+    and both callers only order or chain the result.
     """
     if source is Source.SPREAD:
-        return pipe(LongestPrefixKeySelector(), Balance, WithFold(by_prefix_and_load()))
+        return pipe(
+            Balance(LongestPrefixKeySelector()), WithFold(by_prefix_and_load())
+        )
     return LongestPrefixKeySelector()
 
 
@@ -163,6 +174,16 @@ def _by_ttft(dims: Tuple[Plan]) -> float:
 def _by_queue(dims: Tuple[Plan, float]) -> float:
     """The baseline's fold: the queue a candidate would join, and nothing else."""
     return dims[1]
+
+
+def _busy_at(view: Any, _ask: Any) -> Readings[float]:
+    """When each instance frees up (:class:`~kvcache_sim.control._view.ClusterView`).
+
+    Named rather than written inline so the dimension it appends is a float in the
+    header too: read off an untyped view, an inline reading appends nothing a checker
+    knows, and :func:`_by_queue` would then fold a pool of any depth at all.
+    """
+    return view.cluster.busy_until.__getitem__
 
 
 class _Scheduler(ControlPlane):
@@ -243,8 +264,10 @@ class _Scheduler(ControlPlane):
         # All built in attach(), where the sensors they read and the pools they rank
         # exist.
         self.view: Optional[KVView] = None
-        self._prefill: Optional[Selector[PrefillAsk]] = None
-        self._decode: Optional[Selector[Plan]] = None
+        #: Which arity each holds is the preset's (:meth:`attach`): the ranked prefill
+        #: pool keys a plan, and the queue behind it only where that fold reads one.
+        self._prefill: Optional[Selector[PrefillAsk, Unpack[Tuple[Any, ...]]]] = None
+        self._decode: Optional[Selector[Plan, int]] = None
         #: Where a host's facts arrive, and the only thing that writes any sensor here.
         self.dispatcher: Optional[Dispatcher] = None
 
@@ -316,11 +339,7 @@ class _Scheduler(ControlPlane):
             # they stand ``(plan, busy)`` would break a TTFT tie by load rather than by
             # id, and two idle instances holding no prefix do price identically.
             self._prefill = pipe(
-                priced,
-                Annotate(
-                    lambda view, _ask: view.cluster.busy_until.__getitem__,
-                    senses=(ClusterView,),
-                ),
+                Annotate(_busy_at, senses=(ClusterView,))(priced),
                 WithFold(_by_queue),
                 Best,
             )
@@ -331,7 +350,9 @@ class _Scheduler(ControlPlane):
             ranking.attach(declared(self.view, ranking))
 
     # -- what a serving host asks, at the two moments it has a question ------- #
-    async def sources(self, keys: Sequence[Key], requester: str) -> Selection:
+    async def sources(
+        self, keys: Sequence[Key], requester: str
+    ) -> Selection[Unpack[Tuple[Any, ...]]]:
         """Which peers should serve ``requester``'s fetch of ``keys``, best first.
 
         The pull :meth:`decide` already priced for this caller

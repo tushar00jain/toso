@@ -599,23 +599,25 @@ def test_lifting_an_endomorphism_composes_and_carries_the_identity():
     assert _select(Lift(ranking, lambda a: a)) == _select(ranking)
 
 
-def test_a_selection_refuses_a_key_that_does_not_cover_what_it_names():
-    """The three ways a ranking can fail to mean anything, refused where it is built.
+def test_a_selection_refuses_a_source_it_could_not_order():
+    """What the producers and a cut refuse, so a key covering its sources is structural.
 
     A cut that dropped a source's key would otherwise raise a ``KeyError`` inside
-    whichever ordering link read it, a frame away from the narrowing that lost it.
+    whichever ordering link read it, a frame away from the narrowing that lost it. A cut
+    keeps only what was named and keys everything it keeps, so no such selection exists
+    to check for.
     """
     with pytest.raises(ValueError, match="names each source once"):
         Selection.of(["v0", "v0"])
-    with pytest.raises(ValueError, match="covers exactly the sources named"):
-        Selection(sources=("v0", "v1"), key={"v0": (1,)})
-    with pytest.raises(ValueError, match="names no source to key"):
-        Selection(key={"v0": (1,)})
+    with pytest.raises(ValueError, match="names each source once"):
+        Selection.keyed([("v0", (1,)), ("v0", (2,))])
     with pytest.raises(ValueError, match="only keep sources this selection named"):
         Selection.of(["v0"]).only(["v1"])
     # A cut to what is there, and to nothing at all, are both fine.
     assert Selection.of(["v0", "v1"]).only(["v1"]).sources == ("v1",)
-    assert Selection.universe().take(2).abstains
+    assert Selection.of(["v0"]).take(0).abstains
+    kept = Selection.keyed([("v0", (1,)), ("v1", (2,))]).only(["v1"])
+    assert kept.key == {"v1": (2,)}      # every source kept is keyed
 
 
 def test_a_preference_reorders_a_directory_answer_to_its_ranked_sources():
@@ -1132,6 +1134,25 @@ def test_require_leaves_an_abstention_alone_and_refuses_the_naive_answer():
 
     with pytest.raises(ValueError, match="no head"):
         Selection().require(lambda head: True)
+
+
+def test_all_three_narrowings_refuse_the_naive_answer():
+    """The directory default is not narrowable by any of the three, and agreeing matters.
+
+    Cutting it answers with *nobody*, and the two empties mean opposite things: ⊤ leaves
+    the store's own order alone, ⊥ decides nothing and falls through a chain. A narrowing
+    that silently turned one into the other would make a wiring mistake look like a
+    deliberate abstention.
+    """
+    for narrow in (
+        lambda sel: sel.only(()),
+        lambda sel: sel.only(["v0"]),
+        lambda sel: sel.take(1),
+        lambda sel: sel.take(0),
+        lambda sel: sel.require(lambda head: True),
+    ):
+        with pytest.raises(ValueError):
+            narrow(Selection.universe())
 
 
 def test_a_narrowed_selection_keeps_its_gate_and_the_keys_it_kept():

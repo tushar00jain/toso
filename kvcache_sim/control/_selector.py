@@ -26,10 +26,10 @@ compares, so a rank is total and a run reproduces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Unpack
 
 from proposed import Key, KeySelector, Selection
-from proposed.selector import Fold, Selector
+from proposed.selector import Fold, Ks, Selector
 
 from domain import decode_step_time, MachineProfile, Model, prefill_time
 
@@ -50,7 +50,7 @@ __all__ = [
 ]
 
 
-class LongestPrefixKeySelector(KeySelector):
+class LongestPrefixKeySelector(KeySelector[int]):
     """Rank instances by how much of the requested block prefix they hold.
 
     Longest contiguous run first once folded, the instance id breaking that tie there.
@@ -65,14 +65,14 @@ class LongestPrefixKeySelector(KeySelector):
 
     sensors = (PrefixView,)
 
-    def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection[int]:
         """Instances holding a leading run of ``keys``, keyed at the **negated** run.
 
         Negated because a fold takes the lowest and a longer run is the better source.
         """
         counts = self._prefix_runs(list(keys))
         if not counts:
-            return Selection.of([])
+            return Selection.abstain()
         return Selection.keyed([(inst, (-run,)) for inst, run in counts.items()])
 
     def _prefix_runs(self, keys: Sequence[Key]) -> Dict[str, int]:
@@ -86,7 +86,7 @@ class LongestPrefixKeySelector(KeySelector):
         return prefix_lengths_of(self.view.locate(keys), keys)
 
 
-def by_prefix_and_load(bound: int = 1) -> Fold:
+def by_prefix_and_load(bound: int = 1) -> Fold[int, int]:
     """Fold a prefix run against the reads lately routed at the host holding it.
 
     A source is docked one block of prefix run per read routed at it, up to ``bound``
@@ -95,7 +95,8 @@ def by_prefix_and_load(bound: int = 1) -> Fold:
 
     Dimension 0 is the negated run and dimension 1 the load, so docking is an
     *addition*, and keeping the raw count behind the bound leaves two levelled replicas
-    alternating instead of reverting to id order.
+    alternating instead of reverting to id order. Two dimensions, so this goes only over a
+    prefix ranking a load stage has annotated and not over the bare one.
     """
     def fold(dims: Tuple[int, int]) -> Tuple[int, int]:
         run, load = dims
@@ -104,20 +105,23 @@ def by_prefix_and_load(bound: int = 1) -> Fold:
     return fold
 
 
-class LocalOnly(Selector[Sequence[Key]]):
+class LocalOnly(Selector[Sequence[Key], Unpack[Ks]]):
     """Name nobody, ever -- the baseline reuses only what a host already holds.
 
     An abstention, so the caller recomputes the gap -- not ``Selection()``, which would
     be a decision naming every holder in directory order.
+
+    Any arity, because it keys nothing at any: this stands where a prefix ranking would,
+    and a chain that would have folded that ranking's dimensions folds none of these.
     """
 
     sensors = ()
 
-    def select(self, keys: Sequence[Key], requester: str) -> Selection:
-        return Selection.of([])
+    def select(self, keys: Sequence[Key], requester: str) -> Selection[Unpack[Ks]]:
+        return Selection.abstain()
 
 
-class RoutedPull(KeySelector):
+class RoutedPull(KeySelector[Unpack[Tuple[()]]]):
     """The peer a fetch's pull was already priced against, or an abstention.
 
     Deciding twice would not even agree: routing ranks over the request's whole block
@@ -133,7 +137,9 @@ class RoutedPull(KeySelector):
 
     sensors = (RoutedView,)
 
-    def select(self, keys: Sequence[Key], requester: str) -> Selection:
+    def select(
+        self, keys: Sequence[Key], requester: str
+    ) -> Selection[Unpack[Tuple[()]]]:
         peer = self.view.routed.peer(requester, keys)
         return Selection.of([peer] if peer is not None else [])
 
@@ -155,8 +161,9 @@ class PrefillAsk:
     #: Per-instance prefix run over ``keys``.
     counts: Dict[str, int]
     #: What the reuse ranking named, ordered already, so a per-candidate test applies
-    #: to a head that means something.
-    peer: Selection
+    #: to a head that means something. Read at its head alone, so the dimensions the
+    #: preset's ranking keyed are nobody's business here.
+    peer: Selection[Unpack[Tuple[Any, ...]]]
 
 
 def _worth_pulling(
@@ -172,7 +179,7 @@ def _worth_pulling(
     return lambda head: counts.get(head, 0) > counts.get(inst, 0) * threshold
 
 
-class Priced(Selector[PrefillAsk]):
+class Priced(Selector[PrefillAsk, Plan]):
     """Every instance in the prefill pool, keyed at what running this request on it costs.
 
     The dimension is that candidate's whole :class:`~kvcache_sim.control._answer.Plan`, so
@@ -202,7 +209,7 @@ class Priced(Selector[PrefillAsk]):
         self.model = model
         self.threshold = threshold
 
-    def select(self, ask: PrefillAsk, requester: str) -> Selection:
+    def select(self, ask: PrefillAsk, requester: str) -> Selection[Plan]:
         """Priced as the dimension is appended, so the pool is walked once."""
         return Selection.of(self.instances).annotated(
             lambda inst: self._plan(ask, inst)
@@ -220,7 +227,10 @@ class Priced(Selector[PrefillAsk]):
 
     @staticmethod
     def _priced_reuse(
-        counts: Dict[str, int], keys: Sequence[Key], inst: str, peer: Selection,
+        counts: Dict[str, int],
+        keys: Sequence[Key],
+        inst: str,
+        peer: Selection[Unpack[Tuple[Any, ...]]],
     ) -> Tuple[int, Optional[str], Sequence[str]]:
         """What one peer buys ``inst``: ``(match, source, pull_keys)``.
 
@@ -273,7 +283,7 @@ class Priced(Selector[PrefillAsk]):
         )
 
 
-class DecodeBatch(Selector[Plan]):
+class DecodeBatch(Selector[Plan, int]):
     """Decode instances, keyed at the batch a request admitted at a plan's completion is
     predicted to meet there -- smallest best, the id breaking a tie.
 
@@ -309,7 +319,7 @@ class DecodeBatch(Selector[Plan]):
         self.profile = profile
         self.model = model
 
-    def select(self, plan: Plan, requester: str) -> Selection:
+    def select(self, plan: Plan, requester: str) -> Selection[int]:
         """Every instance in the pool, keyed at its predicted batch."""
         return Selection.of(self.instances).annotated(
             lambda d: self._predicted_batch(d, plan.done_time)

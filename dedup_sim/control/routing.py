@@ -12,11 +12,11 @@ chain has named a head is :mod:`dedup_sim.control._answer`.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Tuple, Unpack
 
 from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
 from proposed.selector import (
-    Balance, FirstMatch, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
+    Balance, FirstMatch, Fold, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
 )
 
 from ._answer import committed
@@ -63,7 +63,7 @@ class Dedup(ControlPlane):
         # Built in attach().
         self.view: Optional[DedupView] = None
         self.dispatcher: Optional[Dispatcher] = None
-        self._chain: Optional[Selector[Sequence[Key]]] = None
+        self._chain: Optional[Selector[Sequence[Key], Unpack[Tuple[Any, ...]]]] = None
 
     def attach(self, view: Any) -> None:
         """Compose this plane's one sensor, and attach the chain that senses it.
@@ -83,12 +83,14 @@ class Dedup(ControlPlane):
         # Which volumes serve a read: every holder of the key and every peer already
         # planned to hold it, priced together in seconds, so which one wins is
         # arithmetic off the score rather than an order the caller has to know.
+        # ``None`` names no arity to read off it, so the key this leaves alone is said
+        # here: the score Candidates prices, then the readers Balance counts.
+        fold: Optional[Fold[float, int]] = _soonest if self._spread else None
         self._chain = pipe(
             FirstMatch([
                 pipe(
-                    Candidates(SPREAD if self._spread else CHAIN),
-                    Balance,
-                    WithFold(_soonest if self._spread else None),
+                    Balance(Candidates(SPREAD if self._spread else CHAIN)),
+                    WithFold(fold),
                 ),
                 # Tail: an unroutable ask gets the directory's own answer, not a hole.
                 NaiveKeySelector(),
@@ -97,13 +99,17 @@ class Dedup(ControlPlane):
         ).attach(self.view)
 
     # -- what a reader asks -------------------------------------------------- #
-    async def sources(self, keys: Sequence[Key], requester: str) -> Selection:
+    async def sources(
+        self, keys: Sequence[Key], requester: str
+    ) -> Selection[Unpack[Tuple[Any, ...]]]:
         """Which volumes serve ``keys`` for ``requester``, once they are usable."""
         # The wait is spent here, not handed back: a caller that read before these
         # sources held the key would go to a volume with nothing to serve.
         return await (await self._decide(keys, requester)).settled()
 
-    async def _decide(self, keys: Sequence[Key], requester: str) -> Selection:
+    async def _decide(
+        self, keys: Sequence[Key], requester: str
+    ) -> Selection[Unpack[Tuple[Any, ...]]]:
         """The whole decision with the gate unspent, awaitable without parking.
 
         The chain keys each source ``(score, queued)``: the seconds
