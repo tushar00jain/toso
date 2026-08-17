@@ -10,9 +10,11 @@ per-instance clients on the shared deterministic async engine.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 from collections import Counter
 import inspect
+import textwrap
 
 import pytest
 
@@ -1835,6 +1837,22 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
 # --------------------------------------------------------------------------
 
 
+class _Watched:
+    """One ranking, with every subject it was asked about recorded in ``asked``.
+
+    Stands in for a chain the plane holds, so what is measured is whether the plane asked
+    at all -- not whether the ranking answered anything.
+    """
+
+    def __init__(self, ranking, asked: list) -> None:
+        self.ranking = ranking
+        self.asked = asked
+
+    def select(self, subject, requester):
+        self.asked.append((subject, requester))
+        return self.ranking.select(subject, requester)
+
+
 def _scheduler(n: int = 2):
     """A scheduler attached to a real mesh view, ready to be asked things."""
     sim = Simulation(_make_topology(n))
@@ -1866,16 +1884,25 @@ def _prefill_ranking(sched, request, requester):
         )
 
 
-def _priced_pool(sched, request, requester) -> tuple:
-    """Every candidate the prefill ranking priced, under the ``Best`` that cuts to one.
+def _pool(chain):
+    """The base under a chain's stages: what it ranked, before anything cut or refused.
 
-    The chain answers with the winner alone, so the pool it chose from is read off the
-    ranking beneath it -- which is where "every instance, priced" is a property.
+    A chain answers with the winner alone -- or with nobody, where a bound refused it -- so
+    "every instance, and what each was keyed at" is a property of the base and of no link
+    above it.
     """
+    while hasattr(chain, "ranking"):
+        chain = chain.ranking
+    return chain
+
+
+def _priced_pool(sched, request, requester) -> tuple:
+    """Every candidate the prefill ranking priced (:func:`_pool`)."""
+    base = _pool(sched._prefill)
     now = sched.view.now()
     keys = list(request.block_keys)
     with sched.view.pinned(keys):
-        return sched._prefill.ranking.select(
+        return base.select(
             PrefillAsk(
                 request=request,
                 now=now,
@@ -2009,6 +2036,69 @@ def test_a_refusal_is_a_decision_not_taken():
     assert response is None
 
 
+def test_a_ttft_refusal_is_taken_before_the_decode_pool_is_ranked():
+    """The TTFT bound reads the prefill ranking alone, so it is spent on that ranking.
+
+    A decode ranking costs a walk of the pool, and under lookahead a walk of the
+    outstanding reservations per instance, all of it for a request no host may run.
+    """
+    sim = Simulation(_make_topology(2))
+    sched = LoadBalanceScheduler(
+        block_tokens=512, slo_ttft=0.0, simulate_decode=True,
+        early_rejection=Occupancy.PREDICT,
+    )
+    sched.attach(sim.view)
+    asked = []
+    ranking = sched._decode
+    sched._decode = _Watched(ranking, asked)
+    request = _request(
+        id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
+        block_keys=tuple(_extend("m0", [0, 1])),
+    )
+
+    async def scenario():
+        with sim.mesh.installed():
+            return await sched.decide(request, "s0")
+
+    try:
+        response = sim.loop.run_until_complete(scenario())
+    finally:
+        sim.loop.close()
+    assert response is None
+    assert asked == [], "the decode pool was ranked for a request already refused"
+
+
+def test_the_tbt_slo_is_spent_on_the_decode_ranking_too():
+    """The other bound, on the other chain: no answer is assembled for a decision that
+    cannot stand, and nothing is booked for it.
+
+    ``slo_tbt`` below one step's own time refuses every batch, so what is exercised is the
+    bound and not a particular occupancy.
+    """
+    sim = Simulation(_make_topology(2))
+    sched = LoadBalanceScheduler(
+        block_tokens=512, simulate_decode=True,
+        slo_tbt=decode_step_time(1, DEFAULT_PROFILE) / 2,
+    )
+    sched.attach(sim.view)
+    request = _request(
+        id="r0", arrival=0.0, prompt_tokens=1024, output_tokens=1,
+        block_keys=tuple(_extend("m0", [0, 1])),
+    )
+
+    async def scenario():
+        with sim.mesh.installed():
+            return await sched.decide(request, "s0")
+
+    try:
+        response = sim.loop.run_until_complete(scenario())
+        assert response is None
+        # A refusal books nothing, so the queue it would have joined never moved.
+        assert sched.view.cluster.busy_until["s0"] == 0.0
+    finally:
+        sim.loop.close()
+
+
 def test_dispatch_folds_each_action_and_answers_nothing():
     """The learning half: each action lands in the cluster sensor and answers None.
 
@@ -2053,10 +2143,12 @@ def _accepted(*, prefill: str = "s0", decode: str = "s1", done: float = 5.0,
 def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
     """What a decision's atomicity rests on, both ways it can be checked.
 
-    ``_admit`` moves three sensors with one dispatch and is a plain ``def``; an
-    ``await`` anywhere under it would let a second decision be formed against a
-    half-committed one. Nothing in kvcache parks on a gate, so the commit itself has
-    nobody to wake -- checked here rather than assumed, by asking the loop.
+    ``decide`` ranks, judges and books in one turn: it is ``async`` only because a caller
+    reaches it as a service, and an ``await`` anywhere in it would let a second decision be
+    formed against a half-committed one. Read off the syntax, since that is where the
+    property lives -- a coroutine that never yields is not a coroutine a checker can spot.
+    Nothing in kvcache parks on a gate, so the commit itself has nobody to wake, which the
+    loop is asked below rather than assumed.
     """
     sim = Simulation(_make_topology(2))
     sched = LoadBalanceScheduler(
@@ -2064,7 +2156,10 @@ def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
     )
     sched.attach(sim.view)
     assert not inspect.iscoroutinefunction(Dispatcher.dispatch_sync)
-    assert not inspect.iscoroutinefunction(_Scheduler._admit)
+    decides = ast.parse(textwrap.dedent(inspect.getsource(_Scheduler.decide)))
+    assert not [
+        node for node in ast.walk(decides) if isinstance(node, (ast.Await, ast.AsyncWith))
+    ], "decide suspends somewhere: a second decision could interleave with this one"
     for sensor in (sched.view.cluster, sched.view.reserved, sched.view.routed):
         assert not any(
             inspect.iscoroutinefunction(fold) for fold in sensor.folds.values()
@@ -2105,9 +2200,9 @@ def test_a_run_that_does_not_predict_reserves_nothing():
         assert sched.view.cluster.busy_until["s0"] == 5.0
         assert sched.view.routed.peer("s0", ["a"]) == "s1"
         # And the decode-side prediction is the observed occupancy, untouched by a
-        # promise this run never made -- read off the ranking, since the chain above it
-        # keeps only the host it named.
-        pool = sched._decode.ranking.select(_plan(ttft=0.0, done_time=5.0), "s0")
+        # promise this run never made -- read off the pool, since the stages above it
+        # keep only the host it named (:func:`_pool`).
+        pool = _pool(sched._decode).select(_plan(ttft=0.0, done_time=5.0), "s0")
         assert pool.key["s1"][0] == 0
     finally:
         sim.loop.close()

@@ -65,8 +65,7 @@ class Response:
         plan: what prefilling on ``prefill`` was priced at.
         pred_tbt: the inter-token gap implied by the decode batch this request was
             predicted to meet -- the decode side's, so not on the plan. What the TBT
-            SLO is applied to
-            (:meth:`~kvcache_sim.control.scheduler._Scheduler._admit`).
+            SLO bounds (:func:`~kvcache_sim.control.scheduler._tbt_at_most`).
     """
 
     prefill: VolumeId

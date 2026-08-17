@@ -19,8 +19,9 @@ pin the contract each one owes its callers:
    selector they hold -- off the view that selector declared -- whether or not they
    consult it. ``FirstMatch`` picks between alternatives, ``Balance`` appends the load
    on the sources one answer named as a further dimension of its key (what to make of
-   that is the fold ``WithFold`` stamps), and a ranking narrows itself in place
-   (``require``, ``take``);
+   that is the fold ``WithFold`` stamps), ``Bounded`` holds the head the chain left in
+   front to a limit the caller wrote, and a ranking narrows itself in place (``require``,
+   ``take``);
 4. the data plane's two methods default to real behaviour (run the call, do
    nothing after), so a capability overrides one method rather than filling in
    a stub;
@@ -53,7 +54,7 @@ from proposed import ControlPlane, Key, KeySelector, Selection
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
     Annotate, Balance, Const, declares, FirstMatch, WithFold, Best, NaiveKeySelector,
-    Lift, prefer, Selector, Ordered,
+    Lift, pipe, prefer, Bounded, Selector, Ordered,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
@@ -576,6 +577,66 @@ def test_best_takes_the_winner_in_one_pass_and_ordered_would_leave_it_in_front()
         Const(Selection.of(["v1", "v0"])),                          # keyed by nothing
     ):
         assert _select(Best(ranking)).head == _select(Ordered(ranking)).head
+
+
+def test_a_bound_drops_what_lies_outside_it_and_keeps_the_order_it_was_handed():
+    """``Bounded`` cuts sources and nothing else: no reordering, no pick, keys intact.
+
+    An empty result is the abstention, so a caller reads "nobody is inside the bound" as an
+    answer that names nobody rather than as a second kind of return.
+    """
+    ranked = Const(Selection.priced([("v0", 9), ("v1", 2)]))
+    kept = _select(pipe(ranked, Bounded(lambda dims: dims[0] < 5)))
+    assert (kept.sources, kept.key) == (("v1",), {"v1": (2,)})
+    # The order is the producer's, not one this stage imposed: v0 was named first.
+    both = _select(pipe(ranked, Bounded(lambda dims: dims[0] < 20)))
+    assert both.sources == ("v0", "v1")
+    assert _select(pipe(ranked, Bounded(lambda dims: dims[0] > 20))).abstains
+
+
+def test_where_a_bound_sits_is_whether_a_miss_reroutes_or_refuses():
+    """Below the cut it is a constraint the winner is chosen under; above it, a refusal.
+
+    The same bound and the same ranking, answering differently -- so a chain says which of
+    the two a run means, and neither is hidden inside the stage.
+    """
+    ranked = Const(Selection.priced([("v0", 9), ("v1", 2)]))
+    outside_the_winner = lambda dims: dims[0] > 5             # v1, the best, lies outside
+    # Below: v1 is dropped and v0 wins, though the fold ranked it lower.
+    assert _select(pipe(ranked, Bounded(outside_the_winner), Best)).sources == ("v0",)
+    # Above: the winner is judged as picked, and a miss does not fall to the runner-up.
+    assert _select(pipe(ranked, Best, Bounded(outside_the_winner))).abstains
+
+
+def test_a_bound_reads_the_dimensions_a_fold_would_have_blended():
+    """One tuple, one convention: positional, in the order the stages annotated.
+
+    So the figure an SLO is held against is a figure the ranking was built out of, and a
+    bound cannot be written against a dimension the chain does not carry.
+    """
+    two = Const(Selection.keyed([("v0", (2, 40)), ("v1", (9, 1))]))
+    by_second = pipe(two, WithFold(lambda dims: dims[1]))
+    assert _select(pipe(by_second, Best)).sources == ("v1",)                     # the 1
+    # Bounding dimension 0 drops the fold's winner; bounding the folded one keeps it.
+    assert _select(
+        pipe(by_second, Bounded(lambda dims: dims[0] <= 5), Best)
+    ).sources == ("v0",)
+    assert _select(
+        pipe(by_second, Bounded(lambda dims: dims[1] <= 5), Best)
+    ).sources == ("v1",)
+
+
+def test_a_bound_over_both_empties():
+    """The abstention names nothing to test; the directory's own answer refuses to narrow.
+
+    ``Selection()`` is every holder in directory order, and cutting it would answer with
+    nobody -- the opposite decision -- so it is a wiring error here as it is in every other
+    narrowing (:meth:`Selection.only`).
+    """
+    abstained = Selection.abstain()
+    assert _select(pipe(Const(abstained), Bounded(lambda dims: False))) is abstained
+    with pytest.raises(ValueError, match="cannot be cut"):
+        _select(pipe(Const(Selection.universe()), Bounded(lambda dims: True)))
 
 
 def test_lifting_an_endomorphism_composes_and_carries_the_identity():

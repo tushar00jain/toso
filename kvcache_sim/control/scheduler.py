@@ -47,7 +47,7 @@ promised and not yet seen to land, and the pulls already priced. Every fact in i
 comes from the hosts, dispatched as actions (:attr:`_Scheduler.dispatcher`).
 
 A decision naming the host that asked is dispatched the same way, as one
-:class:`~kvcache_sim.control._sensor.Committed` (:meth:`_Scheduler._admit`) folded into
+:class:`~kvcache_sim.control._sensor.Committed` (:meth:`_Scheduler.decide`) folded into
 each sensor it moves: the cluster sensor takes the prefill instance the plan spoke for,
 the reservation sensor stands in for a request no host can report yet, the routed one
 remembers the peer the pull was priced against. A decision naming somebody else is an
@@ -71,8 +71,8 @@ from proposed import (
     ControlPlane, Dispatcher, Key, Selection,
 )
 from proposed.selector import (
-    Annotate, Balance, Best, declared, FirstMatch, Ordered, pipe, Readings, Selector,
-    WithFold,
+    Annotate, Balance, Best, Bound, Bounded, declared, FirstMatch, Ks, Ordered, pipe,
+    Readings, Selector, WithFold,
 )
 
 from domain import (
@@ -176,6 +176,40 @@ def _by_queue(dims: Tuple[Plan, float]) -> float:
     return dims[1]
 
 
+# -- the two bounds: what admission holds a decision to ---------------------- #
+# The reference algorithm judges the *pick* and rejects, rather than routing around a miss
+# (Mooncake arXiv:2407.00079 Algorithm 1, transcribed in
+# ``docs/torchstore_kvcache_design.md`` §5.4). Which is what settles where in a chain a
+# bound goes (:func:`~proposed.selector.Bounded`): below the cut only where it is monotone
+# in that chain's fold, so the answer is the one judging the pick would give. Decode has
+# that -- TBT is strictly increasing in the batch it folds on -- and so does cache-aware
+# prefill, whose fold *is* TTFT. The baseline folds on the queue, which nothing ties to
+# TTFT, so there the bound judges the pick.
+
+
+def _ttft_at_most(slo_ttft: float) -> Bound[Plan, Unpack[Ks]]:
+    """Predicted TTFT no later than ``slo_ttft``, read off dimension 0, the plan."""
+    return lambda dims: dims[0].ttft <= slo_ttft
+
+
+def _pred_tbt(
+    batch: int, profile: MachineProfile, model: Model, *, enabled: bool
+) -> float:
+    """The gap a request joining a batch of ``batch`` sees; zero where no decode is
+    modelled, which is what the answer reports too (:attr:`Response.pred_tbt`).
+    """
+    if not enabled:
+        return 0.0
+    return decode_step_time(batch + 1, profile, model)
+
+
+def _tbt_at_most(
+    slo_tbt: float, profile: MachineProfile, model: Model, *, enabled: bool
+) -> Bound[int]:
+    """Predicted TBT no more than ``slo_tbt``, off the batch the decode chain keys."""
+    return lambda dims: _pred_tbt(dims[0], profile, model, enabled=enabled) <= slo_tbt
+
+
 def _busy_at(view: Any, _ask: Any) -> Readings[float]:
     """When each instance frees up (:class:`~kvcache_sim.control._view.ClusterView`).
 
@@ -203,7 +237,8 @@ class _Scheduler(ControlPlane):
         block_tokens: tokens per KV block.
         profile / model: the cost constants prediction is priced against.
         decode_pool / prefill_pool: instance subsets (default: all).
-        slo_ttft / slo_tbt: what admission holds a decision to (:meth:`_admit`).
+        slo_ttft / slo_tbt: what a decision must meet to be admitted
+            (:func:`_ttft_at_most`, :func:`_tbt_at_most`).
         simulate_decode: whether the run models batched decode at all.
         early_rejection: :class:`Occupancy` -- which decode occupancy the TBT SLO is
             judged against.
@@ -318,15 +353,19 @@ class _Scheduler(ControlPlane):
                 profile=self.profile,
                 model=self.model,
             ),
+            Bounded(
+                _tbt_at_most(
+                    self.slo_tbt, self.profile, self.model, enabled=self.tbt_enabled
+                )
+            ),
             Best,
         )
         # Which host prefills: whichever instance in the prefill pool serving the request
         # costs least -- queue, then transfer, then prefill -- with the peer the reuse
         # ranking named priced in against recomputing.
         #
-        # Both of these name one host and are read at one head (:meth:`_admit`), so they
-        # end in ``Best``: a decision refused for an SLO miss does not fall to the
-        # runner-up, and nothing here reads what a loser was priced at.
+        # Both of these name one host and are read at one head (:meth:`decide`), so they
+        # cut to ``Best``, and nothing here reads what a loser was priced at.
         priced = Priced(
             self.prefill_ids,
             block_tokens=self.B,
@@ -342,9 +381,12 @@ class _Scheduler(ControlPlane):
                 Annotate(_busy_at, senses=(ClusterView,))(priced),
                 WithFold(_by_queue),
                 Best,
+                Bounded(_ttft_at_most(self.slo_ttft)),
             )
         else:
-            self._prefill = pipe(priced, WithFold(_by_ttft), Best)
+            self._prefill = pipe(
+                priced, WithFold(_by_ttft), Bounded(_ttft_at_most(self.slo_ttft)), Best
+            )
 
         for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
             ranking.attach(declared(self.view, ranking))
@@ -374,8 +416,9 @@ class _Scheduler(ControlPlane):
         """Where should ``request`` run? Both selections, or ``None`` if refused.
 
         The decode side is chosen against the *winning* prefill candidate's predicted
-        completion, so the second selection is asked once and after the first. ``None``
-        is an SLO miss: no host this request may run on, and nothing has run.
+        completion, so the second selection is asked once, after the first, and not at all
+        where the first already answered with nobody. ``None`` is a refusal: no host this
+        request may run on, and nothing has run.
 
         Nothing that ranks, prices or holds a candidate host to an SLO reads
         ``requester``. Where a request should run is a fact about the cluster, not
@@ -407,57 +450,29 @@ class _Scheduler(ControlPlane):
                 ),
                 requester,
             )
+            if prefill.abstains:
+                # Outside the TTFT bound, or an empty pool.
+                return None
             # The winning plan, read once off the dimension it rides in, so both halves
             # of the answer are formed against the same one.
             plan: Plan = prefill.key[prefill.head][0]
             decode = self._decode.select(plan, requester)
+            if decode.abstains:
+                # Outside the TBT bound.
+                return None
 
-        return self._admit(request, requester, prefill, plan, decode)
-
-    # -- admission -------------------------------------------------------- #
-    def _admit(
-        self,
-        request: Request,
-        requester: str,
-        prefill: Selection,
-        plan: Plan,
-        decode: Selection,
-    ) -> Optional[Response]:
-        """The two winners as one :class:`Response`, held to the SLOs and committed.
-
-        Assembled before the SLOs are checked, so the value they judge is the value
-        the answer carries. ``None`` is a rejection, and costs nothing: this runs
-        before the prefill does.
-
-        ``plan`` is the winning prefill candidate's, read off its key by :meth:`decide`
-        -- the same value the decode side was chosen against.
-        """
         instance = decode.sources[0]
-        # The decode answer keys the occupancy, which is what the TBT SLO is judged
-        # on (:class:`~kvcache_sim.control._selector.DecodeBatch`).
         batch = decode.key[instance][0]
         response = Response(
             prefill=prefill.sources[0],
             decode=instance,
             plan=plan,
-            pred_tbt=(
-                decode_step_time(batch + 1, self.profile, self.model)
-                if self.tbt_enabled
-                else 0.0
+            pred_tbt=_pred_tbt(
+                batch, self.profile, self.model, enabled=self.tbt_enabled
             ),
         )
-        if response.plan.ttft > self.slo_ttft:
-            return None
-        # A run that does not model decode has no batch to hold to a TBT SLO.
-        if self.tbt_enabled and response.pred_tbt > self.slo_tbt:
-            return None
-        # Accepted: one action, folded into every sensor it moves. Each fold writes its
-        # own sensor and reads no other, so their order is unobservable. Booked at the
-        # instant the decision is made, so nothing decided after it prices against a
-        # queue that does not hold this request yet.
-        #
-        # Synchronous, not the endpoint a host reports over: nothing in this method may
-        # suspend, or a second decision could interleave with a half-committed one.
+        # Booked at the instant the decision is made, so nothing decided after
+        # it prices against a queue that does not hold this request yet.
         self.dispatcher.dispatch_sync(Committed(response, request.output_tokens))
         if response.prefill != requester:
             # Moved elsewhere: remember the answer for the one ask that follows. Kept

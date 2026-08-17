@@ -35,17 +35,20 @@ What a check compares is :attr:`Selector.subject_type` and not the class, since 
 erases the parameter and a combinator's subject is the one it was handed rather than one it
 declares.
 
-Admission and SLO gates are neither: an answer that is not a ranked set of sources does not
-belong in a :class:`Selection` at all. A gate rides *with* one -- a selector that refuses
-abstains (:meth:`Selection.abstain`), and what it would have answered is not in the ranking.
+A **bound** -- an admission or SLO gate -- is no selector either: yes-or-no is not a ranked
+set of sources and does not belong in a :class:`Selection`. It is a :data:`Stage`
+(:func:`Bounded`), reading the key the stages below it measured and answering with a
+ranking still: the sources inside the bound, or the abstention when none of them is
+(:meth:`Selection.abstain`), which every caller of a chain already knows how to carry.
 
 A decision is **declared**: a chain, built where the selector is wired, in two halves.
 The **base** makes a :class:`Selection` out of a subject and settles what is measured --
 :class:`Const` over a pool the caller already knows, or a capability's own ranking, with
 whatever annotates it wrapped around it there (``Balance(ranking)``). A **stage** then
 interprets what the base measured without moving it: :class:`WithFold` says how the key is
-read, :func:`Ordered` and :func:`Best` order or cut. So a chain is one arity end to end and
-a list of stages (:data:`Stage`, :func:`pipe`). :class:`FirstMatch` picks between whole
+read, :func:`Ordered` and :func:`Best` order or cut, :func:`Bounded` drops what lies
+outside a bound the caller wrote. So a chain is one arity end to end and a list of
+stages (:data:`Stage`, :func:`pipe`). :class:`FirstMatch` picks between whole
 alternatives -- ask each in order, take the first answer -- and checks its links agree on
 one subject at construction, since a chain hands *one* subject to every link. Every
 combinator hands the subject down untouched and takes it off what it holds, which is why
@@ -59,10 +62,12 @@ rankings combined into one answer is a **plane's** job: it joins them and hands 
 down as part of the subject, as a **value**, measured once per decision where holding a
 *selector* would re-select once per candidate.
 
-Narrowing an answer is not a composition of selectors here: a test an application owns is
-applied to the ranking it was given, by whoever has both (:meth:`Selection.require`,
-:meth:`Selection.take`). A capability writing a combinator of its own needs only
-:func:`declares` and :func:`declared` from here.
+What narrows an answer is always a test the application owns; what this module says is
+where one may be applied. In a chain that is :func:`Bounded`, over the dimensions; in the
+hands of whoever holds a ranking it is that ranking's own (:meth:`Selection.take`,
+:meth:`Selection.only`, :meth:`Selection.require`, which takes the head's id and so reaches
+what the key does not hold -- the pool a decision was priced against, say). A capability
+writing a combinator of its own needs only :func:`declares` and :func:`declared` from here.
 """
 
 from __future__ import annotations
@@ -82,6 +87,7 @@ __all__ = [
     "declared",
     "declares", "Selector", "KeySelector", "NaiveKeySelector", "Stage", "pipe",
     "FirstMatch", "Const", "Annotate", "Balance", "Lift", "WithFold", "Ordered", "Best",
+    "Bound", "Bounded",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -534,9 +540,9 @@ def declared(
 
 #: One operation on a ranking that **interprets** what is already measured, leaving the
 #: dimensions where they are: :class:`WithFold` stamps, :func:`Ordered` and :func:`Best`
-#: order or cut. An operation with a parameter of its own takes that first, so it is
-#: already a stage where a chain names it. The arity is preserved in the type, so a chain
-#: of these is one arity end to end (:func:`pipe`).
+#: order or cut, :func:`Bounded` drops. An operation with a parameter of its own takes
+#: that first, so it is already a stage where a chain names it. The arity is preserved in
+#: the type, so a chain of these is one arity end to end (:func:`pipe`).
 #:
 #: What is not one: a **base**, which makes a ranking rather than taking one
 #: (:class:`Const`); :class:`FirstMatch`, which takes a list of alternatives; and
@@ -853,6 +859,45 @@ def Ordered(ranking: Selector[_S, Unpack[Ks]]) -> Lift[_S, Unpack[Ks]]:
 def Best(ranking: Selector[_S, Unpack[Ks]]) -> Lift[_S, Unpack[Ks]]:
     """The single best source of one ranking's answer (:func:`_best`)."""
     return Lift(ranking, _best)
+
+
+#: Whether one source's dimensions lie inside what a caller allows: the tuple a
+#: :data:`Fold` takes, read the same way and by position, answered yes or no. An
+#: ``at most`` on one dimension is one of these, with the direction and the limit the
+#: caller's business; the arity is checked where the chain is declared (:func:`Bounded`).
+Bound = Callable[[Tuple[Unpack[Ks]]], bool]
+
+
+def Bounded(bound: Bound[Unpack[Ks]]) -> Stage[_S, Unpack[Ks]]:
+    """One ranking cut to the sources inside ``bound``, or the abstention if none is.
+
+    A limit as a chain link, so what admits a decision is declared where the decision is
+    and a caller reads a refusal as an answer that names nobody. Order and keys are the
+    ones it was handed (:meth:`Selection.only`); one call per source. Carries the arity the
+    bound reads, as :class:`WithFold` does, so one over a ranking of any other arity is
+    refused where the chain is declared and nothing here has an absent dimension to read.
+
+    **Where it sits is which question it answers**, and both are worth having:
+
+    * **below** an ordering link (:func:`Ordered`, :func:`Best`) -- the winner is chosen
+      among the sources inside the bound, so a ranking whose best source lies outside it
+      answers with the best source that does not, and fewer sources are left to order;
+    * **above** one -- the winner is judged once it is picked, so a ranking whose best
+      source lies outside the bound abstains rather than falling to the runner-up, which
+      the fold ranked *lower* on a figure the bound may not even read.
+
+    Where the bound is an ``at most`` on the very figure the fold returns, or on anything
+    monotone in it, the two coincide: the least element is inside the limit exactly when any
+    element is. Only a fold reading something else can tell them apart.
+    """
+    def gate(answer: Selection[Unpack[Ks]]) -> Selection[Unpack[Ks]]:
+        # The abstention names nothing to test; ⊤ is refused by ``only`` as a wiring error.
+        if answer.abstains:
+            return answer
+        key = answer.key or {}
+        return answer.only([s for s in (answer.sources or ()) if bound(key[s])])
+
+    return lambda ranking: Lift(ranking, gate)
 
 
 def pipe(
