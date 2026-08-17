@@ -753,6 +753,42 @@ def test_an_exhausted_chain_abstains_so_chains_nest():
     assert _select(FirstMatch([inner, last])).sources == ("v2",)
 
 
+def test_the_abstention_is_the_identity_of_choosing_between_answers():
+    """A link that abstains cannot change what the rest of a chain answers.
+
+    On either side of it, which is what lets ``FirstMatch`` seed its fold with an
+    abstention and lets a gate be wired anywhere in a chain.
+    """
+    answer = Selection.of(["v0"])
+    assert Selection.abstain().otherwise(answer) is answer
+    assert answer.otherwise(Selection.abstain()) is answer
+
+
+def test_choosing_between_answers_is_associative():
+    """Where a chain is bracketed cannot change its answer, so chains nest.
+
+    The property ``FirstMatch([FirstMatch([a, b]), c])`` rests on, stated at the
+    operation underneath it rather than only at the combinator.
+    """
+    empty, naive = Selection.abstain(), Selection.universe()
+    for a in (empty, naive, Selection.of(["v0"])):
+        for b in (empty, Selection.of(["v1"])):
+            for c in (empty, Selection.of(["v2"])):
+                assert a.otherwise(b).otherwise(c) == a.otherwise(b.otherwise(c))
+
+
+def test_the_naive_answer_absorbs_whatever_would_be_chosen_after_it():
+    """``Selection.universe`` decides, so nothing chosen after it is reachable.
+
+    The asymmetry between the two empties, as a law: only an abstention falls through,
+    and ``sources is None`` names every holder rather than nobody.
+    """
+    naive = Selection.universe()
+    assert naive.otherwise(Selection.of(["v1"])) is naive
+    assert not naive.abstains
+    assert Selection.abstain().abstains
+
+
 def test_first_match_keeps_the_winner_s_readiness_gate():
     async def gate() -> None:
         return None

@@ -34,7 +34,7 @@ from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
 from proposed.selector import (
-    Balance, Const, FirstMatch, Folded, Max, Selector, Sort,
+    Balance, Const, FirstMatch, Folded, Lift, Max, Selector, Sort,
 )
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk, Priced,
@@ -1762,6 +1762,18 @@ def test_spread_reads_ranks_deterministically():
     assert all(len(set(r)) == len(r) == 3 for r in first)
 
 
+def _stamps_a_fold(link) -> bool:
+    """Whether ``link`` is a ``Folded``: the lift whose endo writes a fold on an answer.
+
+    Read off what the endo does rather than off the type, since the three lifts differ by
+    the endo they hold and not by class (:class:`proposed.selector.Lift`).
+    """
+    return (
+        isinstance(link, Lift)
+        and link.endo(Selection.of(["v0"])).fold is not None
+    )
+
+
 def test_the_spread_reads_flag_reaches_a_scenario_run():
     """The opt-in entry point, exercised from the flag to the ledger.
 
@@ -1785,13 +1797,10 @@ def test_the_spread_reads_flag_reaches_a_scenario_run():
     # answers, stamped with the fold that reads the dimension it appends -- or the load
     # would be measured and never read.
     fetched = [run.control._fetch.ranking.selectors[-1] for run in aware]
-    assert all(
-        isinstance(p, Folded) and p.fold is not None and isinstance(p.ranking, Balance)
-        for p in fetched
-    )
+    assert all(_stamps_a_fold(p) and isinstance(p.ranking, Balance) for p in fetched)
     # ...and the replicating run prices against one too, so the pull it plans is
     # spread the same way the read that carries it out will be.
-    assert isinstance(aware[-1].control._reuse.ranking, Folded)
+    assert _stamps_a_fold(aware[-1].control._reuse.ranking)
 
     def pull_sources(result):
         return sorted(

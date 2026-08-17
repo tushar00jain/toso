@@ -6,7 +6,7 @@ The answer is always volume ids, what orders them, and the moment they become us
 stage **annotates**: it appends a dimension to the sort key and leaves the order alone,
 so a chain of them costs one fold rather than one sort per stage, and that fold can be
 greedy over every dimension at once where a re-sort could only take them one at a time.
-Ordering is a link like any other (:class:`Sort`, :class:`Max`), and the only kind that
+Ordering is a link like any other (:func:`Sort`, :func:`Max`), and the only kind that
 touches :attr:`Selection.sources`.
 
 What differs is the **subject**, and every selector names its own in its header::
@@ -37,14 +37,14 @@ rather than one it declares.
 
 Admission and SLO gates are neither: an answer that is not a ranked set of sources
 does not belong in a :class:`Selection` at all. A gate rides *with* one instead --
-a selector that refuses abstains (``Selection.of([])``), and what it would have
+a selector that refuses abstains (:meth:`Selection.abstain`), and what it would have
 answered is simply not in the ranking.
 
 A decision is **declared**: a chain, built where the selector is wired, whose links each
 fill one of four roles -- a **base** makes a :class:`Selection` out of a subject
 (:class:`Const` over a pool the caller already knows, or a capability's own ranking); a
-**stage** appends a dimension (:class:`Annotate`, :class:`Balance`); :class:`Folded` says
-how the key is read; :class:`Sort` and :class:`Max` order or cut. :class:`FirstMatch`
+**stage** appends a dimension (:class:`Annotate`, :class:`Balance`); :func:`Folded` says
+how the key is read; :func:`Sort` and :func:`Max` order or cut. :class:`FirstMatch`
 picks between whole alternatives -- ask each in order, take the first answer -- and checks
 its links agree on one subject at construction, since a chain hands *one* subject to
 every link. Every combinator hands the subject down untouched and takes it off what it
@@ -82,7 +82,7 @@ __all__ = [
     "Ready", "Dims", "Fold", "Readings", "Selection", "prefer", "DecisionLog",
     "declared",
     "declares", "Selector", "KeySelector", "NaiveKeySelector",
-    "FirstMatch", "Const", "Annotate", "Balance", "Folded", "Sort", "Max",
+    "FirstMatch", "Const", "Annotate", "Balance", "Lift", "Folded", "Sort", "Max",
 ]
 
 # A readiness gate: called with no arguments, awaited until the chosen source is
@@ -109,7 +109,7 @@ Dims = Tuple[Any, ...]
 #: orders by: ``dims -> comparable``, lower still better. Positional, so a fold reads
 #: ``dims[1]`` and a chain missing that stage raises instead of quietly comparing the
 #: wrong number. ``None`` is the lexicographic default, which needs no arithmetic at all
-#: (:class:`Sort`).
+#: (:func:`Sort`).
 Fold = Callable[[Dims], Any]
 
 #: What one stage appends (:meth:`Selection.annotated`): a reading per source, either
@@ -122,14 +122,17 @@ class Selection:
     """Sources for one subject, what orders them, and when they become usable.
 
     A stage annotates and does not order: it appends to :attr:`key` and leaves
-    :attr:`sources` however it built them. Only :class:`Sort` and :class:`Max` order one,
+    :attr:`sources` however it built them. Only :func:`Sort` and :func:`Max` order one,
     and there is no flag saying that either has: a selection's order is whatever its
     producer left.
 
     Args:
         sources: volume ids. ``None`` -- the default -- means *every holder, in
             directory order*, which is what the real directory returns on its own, so
-            a ``None`` selection leaves the store's answer untouched (:func:`prefer`).
+            a ``None`` selection leaves the store's answer untouched (:func:`prefer`);
+            :meth:`universe` names it. ``()`` names nobody and decides nothing
+            (:meth:`abstain`, :attr:`abstains`). The two empties are opposites where a
+            chain chooses between answers (:meth:`otherwise`).
         key: ``source id -> the dimensions that order it`` (:data:`Dims`), one per
             stage that measured it. What a stage *holds* about a source rides here as a
             dimension too -- a plan, a score -- so a ranking cannot come apart from what
@@ -140,7 +143,7 @@ class Selection:
             has not registered yet. Spent by :meth:`settled` before the answer
             travels, never handed to whoever asked.
         fold: how to read :attr:`key`, stamped by the link that knows both the dimensions
-            there are and what they mean together (:class:`Folded`) -- so nothing that
+            there are and what they mean together (:func:`Folded`) -- so nothing that
             orders this names a fold, and two callers of one ranking cannot fold it two
             different ways. ``None`` compares the dimensions as they stand. A closure, so
             :meth:`settled` drops it as it drops the gate.
@@ -176,7 +179,7 @@ class Selection:
     ) -> "Selection":
         """``(id, dims)`` pairs: what orders each source, from one sequence.
 
-        The sequence's own order is not a ranking -- :class:`Sort` and :class:`Max` read
+        The sequence's own order is not a ranking -- :func:`Sort` and :func:`Max` read
         the dimensions.
         """
         return cls(
@@ -195,6 +198,16 @@ class Selection:
         """``(id, price)`` pairs, that price standing as the one dimension: cheapest is
         best."""
         return cls.keyed([(i, (p,)) for i, p in candidates], ready=ready)
+
+    @classmethod
+    def universe(cls) -> "Selection":
+        """Every holder, in directory order: the store's own answer (:attr:`sources`)."""
+        return cls()
+
+    @classmethod
+    def abstain(cls) -> "Selection":
+        """Nobody, deciding nothing: the identity of :meth:`otherwise`."""
+        return cls.of([])
 
     def annotated(self, readings: "Readings") -> "Selection":
         """This selection with one reading per source appended as a further dimension.
@@ -236,11 +249,20 @@ class Selection:
         return replace(self, ready=None, fold=None)
 
     @property
+    def abstains(self) -> bool:
+        """Whether this names nobody: the one empty a chain passes over."""
+        return self.sources == ()
+
+    def otherwise(self, other: "Selection") -> "Selection":
+        """This selection if it decided anything, else ``other`` (:class:`FirstMatch`)."""
+        return other if self.abstains else self
+
+    @property
     def head(self) -> Optional[VolumeId]:
         """The leading source, or ``None`` if this names none in particular.
 
         The id a caller acts on, and the *best* source once this has been ordered
-        (:class:`Sort`, :class:`Max`); what the winning stage measured is
+        (:func:`Sort`, :func:`Max`); what the winning stage measured is
         ``key[head]``. ``None`` for both empties, which a caller reading the head cannot
         tell apart and does not need to: neither one names a source to act on.
         """
@@ -279,7 +301,7 @@ class Selection:
         and a ranking need not be in the order ``ok`` measures -- the sources behind the
         head are the ones the ranking preferred *less*, so promoting one on a raw
         measurement would overrule it from outside. Which is why a ranking is ordered
-        first (:class:`Sort`, :class:`Max`): unordered, the head this judges is
+        first (:func:`Sort`, :func:`Max`): unordered, the head this judges is
         the producer's build order and nothing more. An abstention is returned
         unchanged, since there is no head to judge.
 
@@ -294,7 +316,7 @@ class Selection:
             )
         if not self.sources or ok(self.sources[0]):
             return self
-        return Selection.of([])
+        return Selection.abstain()
 
 
 def prefer(
@@ -432,15 +454,15 @@ class KeySelector(Selector[Sequence[Key]]):
 class NaiveKeySelector(KeySelector):
     """Every holder, in directory order, usable now.
 
-    Precisely the real directory's own answer, so this returns the empty
-    :class:`Selection` rather than re-deriving it: a read preferring what it names is
-    byte-identical to a read that names nothing (:func:`prefer`).
+    Precisely the real directory's own answer, so this returns
+    :meth:`Selection.universe` rather than re-deriving it: a read preferring what it
+    names is byte-identical to a read that names nothing (:func:`prefer`).
     """
 
     name = "naive"
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection:
-        return Selection()
+        return Selection.universe()
 
 
 def declares(
@@ -479,17 +501,20 @@ class FirstMatch(Selector[_S]):
 
     A :class:`Selection` can be empty in two ways, and they mean opposite things:
 
-    * ``Selection()`` -- ``sources is None`` -- is *every holder, in directory
-      order*, the decision :class:`NaiveKeySelector` makes. It **wins the chain**, and
-      the selectors behind it are never consulted.
-    * ``Selection.of([])`` names nobody. That is the **abstention**, and it falls
-      through.
+    * :meth:`Selection.universe` -- ``sources is None`` -- is *every holder, in
+      directory order*, the decision :class:`NaiveKeySelector` makes. It **wins the
+      chain**, and the selectors behind it are never consulted.
+    * :meth:`Selection.abstain` names nobody. That is the **abstention**, and it falls
+      through (:attr:`Selection.abstains`).
 
-    An exhausted chain abstains in turn, which keeps chaining associative:
-    ``FirstMatch([FirstMatch([a, b]), c])`` still reaches ``c``, as it could not if
-    the inner chain's exhaustion arrived looking like a decision. A chain that
-    should always answer ends with a :class:`NaiveKeySelector`. The winner is returned
-    exactly as built, so a readiness gate rides along untouched.
+    The chain is a fold of :meth:`Selection.otherwise` over the links' answers, seeded
+    with the abstention, and three laws of that operation are what a chain rests on: the
+    abstention is its identity, so an exhausted chain abstains in turn; it is
+    associative, so ``FirstMatch([FirstMatch([a, b]), c])`` still reaches ``c``, as it
+    could not if the inner chain's exhaustion arrived looking like a decision; and the
+    universe absorbs whatever would be chosen after it. A chain that should always answer
+    ends with a :class:`NaiveKeySelector`. The winner is returned exactly as built, so a
+    readiness gate rides along untouched.
 
     The subject goes down every link untouched, so a link reading it as anything else
     would answer a question it was not asked: the links must agree on one
@@ -529,12 +554,17 @@ class FirstMatch(Selector[_S]):
         return self
 
     def select(self, subject: _S, requester: str) -> Selection:
-        """The first non-abstaining answer, or an abstention if there is none."""
+        """The first non-abstaining answer, or an abstention if there is none.
+
+        A link is asked only once every link before it has abstained, so the seed is what
+        an exhausted chain answers with and no link behind a decision is consulted.
+        """
+        answer = Selection.abstain()
         for selector in self.selectors:
-            selection = selector.select(subject, requester)
-            if selection.sources is None or selection.sources:
-                return selection
-        return Selection.of([])
+            answer = selector.select(subject, requester).otherwise(answer)
+            if not answer.abstains:
+                break
+        return answer
 
 
 class Const(Selector[Any]):
@@ -644,7 +674,7 @@ class Balance(Annotate[_S]):
     **No arithmetic**, so there is nothing here for a caller to supply: whoever folds
     decides what a busy source costs, which is the application's own trade -- blocks of
     prefix run against reads routed at a host, seconds of link time against seconds of
-    queue (:class:`Folded`).
+    queue (:func:`Folded`).
 
     Args:
         ranking: the selector asked. Behind one that keyed nothing, the load is the whole
@@ -658,25 +688,6 @@ class Balance(Annotate[_S]):
         super().__init__(ranking, _load_at, senses=(LoadView,))
 
 
-class Folded(_Link[_S]):
-    """One ranking's answer with ``fold`` stamped on it (:attr:`Selection.fold`).
-
-    Declared where both halves of the key exist -- the dimensions there are, and what
-    they mean together -- so nothing that orders the answer names a fold and two callers
-    of one ranking cannot fold it two different ways. ``None`` leaves the dimensions
-    compared as they stand.
-    """
-
-    name = "folded"
-
-    def __init__(self, ranking: Selector[_S], fold: Optional[Fold]) -> None:
-        super().__init__(ranking)
-        self.fold = fold
-
-    def select(self, subject: _S, requester: str) -> Selection:
-        return replace(self.ranking.select(subject, requester), fold=self.fold)
-
-
 def _comparable(selection: Selection) -> Optional[Callable[[VolumeId], Any]]:
     """What orders one of ``selection``'s sources, or ``None`` if nothing says what best is.
 
@@ -684,8 +695,8 @@ def _comparable(selection: Selection) -> Optional[Callable[[VolumeId], Any]]:
     comparable to order by; with none they are compared as they stand, which is
     lexicographic over the stages in the order they annotated. Either way the id is the
     last thing compared, here and nowhere else, so no two sources compare equal: a run
-    reproduces, and the least of a pool (:class:`Max`) is the front of a sort of it
-    (:class:`Sort`).
+    reproduces, and the least of a pool (:func:`_best`) is the front of a sort of it
+    (:func:`_ordered`).
     """
     if not selection.sources or selection.key is None:
         return None
@@ -695,41 +706,73 @@ def _comparable(selection: Selection) -> Optional[Callable[[VolumeId], Any]]:
     return lambda s: (fold(key[s]), s)
 
 
-class Sort(_Link[_S]):
-    """One ranking's answer, ordered best-first.
+#: What a :class:`Lift` applies to the answer it was handed: one endomorphism of a
+#: :class:`Selection`, total over both empties and over an answer no stage keyed.
+_Endo = Callable[[Selection], Selection]
 
-    Both empties pass through, as does an answer no stage keyed: the order a producer
-    left is the answer when there is nothing to beat it.
+
+def _stamp(fold: Optional[Fold]) -> _Endo:
+    """Write ``fold`` onto an answer, ``None`` included (:func:`Folded`)."""
+    return lambda answer: replace(answer, fold=fold)
+
+
+def _ordered(answer: Selection) -> Selection:
+    """``answer`` best-first, or untouched if nothing says what best is.
+
+    Both empties, and an answer no stage keyed: the producer's own order stands.
+    """
+    order = _comparable(answer)
+    if order is None:
+        return answer
+    return answer.only(sorted(answer.sources or (), key=order))
+
+
+def _best(answer: Selection) -> Selection:
+    """``answer`` cut to its single best source, that source's key and the gate intact.
+
+    One pass, not a sort of the pool: still the source :func:`_ordered` would leave in
+    front, since :func:`_comparable` admits no ties. Keyed by nothing, the leader stands.
+    """
+    if not answer.sources:
+        return answer
+    order = _comparable(answer)
+    best = answer.sources[0] if order is None else min(answer.sources, key=order)
+    return answer.only((best,))
+
+
+class Lift(_Link[_S]):
+    """One ranking's answer with ``endo`` applied to it.
+
+    The shape :func:`Folded`, :func:`Sort` and :func:`Max` share. The endo is handed the
+    whole answer, so a readiness gate and the dimensions ride through whatever it does
+    with the sources, and what comes back is a selection however far it cut -- a chain
+    that named one source can still be settled (:meth:`Selection.settled`).
+
+    Args:
+        ranking: the selector asked.
+        endo: what to make of what it answered (:data:`_Endo`).
     """
 
-    name = "sort"
+    name = "lift"
+
+    def __init__(self, ranking: Selector[_S], endo: _Endo) -> None:
+        super().__init__(ranking)
+        self.endo = endo
 
     def select(self, subject: _S, requester: str) -> Selection:
-        answer = self.ranking.select(subject, requester)
-        order = _comparable(answer)
-        if order is None:
-            return answer
-        return answer.only(sorted(answer.sources or (), key=order))
+        return self.endo(self.ranking.select(subject, requester))
 
 
-class Max(_Link[_S]):
-    """The single best source of one ranking's answer, with its key and the gate.
+def Folded(ranking: Selector[_S], fold: Optional[Fold]) -> Lift[_S]:
+    """One ranking's answer with ``fold`` stamped on it (:attr:`Selection.fold`)."""
+    return Lift(ranking, _stamp(fold))
 
-    What a chain naming one source ends in, and it is still a selection, so
-    :meth:`Selection.settled` can be spent on it afterwards. Both empties pass through.
 
-    Takes the winner without ordering the losers: one pass over the pool rather than a
-    sort of it, which is what a chain wanting only a head should cost. The head is the one
-    :class:`Sort` would leave in front, since :func:`_comparable` admits no ties. An
-    answer no stage keyed has no best, so the producer's leading source stands.
-    """
+def Sort(ranking: Selector[_S]) -> Lift[_S]:
+    """One ranking's answer, ordered best-first (:func:`_ordered`)."""
+    return Lift(ranking, _ordered)
 
-    name = "max"
 
-    def select(self, subject: _S, requester: str) -> Selection:
-        answer = self.ranking.select(subject, requester)
-        if not answer.sources:
-            return answer
-        order = _comparable(answer)
-        best = answer.sources[0] if order is None else min(answer.sources, key=order)
-        return answer.only((best,))
+def Max(ranking: Selector[_S]) -> Lift[_S]:
+    """The single best source of one ranking's answer (:func:`_best`)."""
+    return Lift(ranking, _best)
