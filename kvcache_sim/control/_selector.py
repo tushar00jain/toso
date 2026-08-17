@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from proposed import Key, KeySelector, Selection
-from proposed.selector import Dims, Fold, Selector
+from proposed.selector import Fold, Selector
 
 from domain import decode_step_time, MachineProfile, Model, prefill_time
 
@@ -63,7 +63,6 @@ class LongestPrefixKeySelector(KeySelector):
     ``python -m kvcache_sim hotspot --spread-reads``.
     """
 
-    name = "longest-prefix"
     sensors = (PrefixView,)
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection:
@@ -98,7 +97,7 @@ def by_prefix_and_load(bound: int = 1) -> Fold:
     *addition*, and keeping the raw count behind the bound leaves two levelled replicas
     alternating instead of reverting to id order.
     """
-    def fold(dims: Dims) -> Tuple[int, int]:
+    def fold(dims: Tuple[int, int]) -> Tuple[int, int]:
         run, load = dims
         return (run + min(load, bound), load)
 
@@ -112,7 +111,6 @@ class LocalOnly(Selector[Sequence[Key]]):
     be a decision naming every holder in directory order.
     """
 
-    name = "local-only"
     sensors = ()
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection:
@@ -133,7 +131,6 @@ class RoutedPull(KeySelector):
     so a memo ranked down is a pull served by a volume nothing charged for.
     """
 
-    name = "routed-pull"
     sensors = (RoutedView,)
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection:
@@ -188,7 +185,6 @@ class Priced(Selector[PrefillAsk]):
             before pulling beats recomputing (:func:`_worth_pulling`).
     """
 
-    name = "priced"
     sensors = (ClusterView,)
 
     def __init__(
@@ -296,7 +292,6 @@ class DecodeBatch(Selector[Plan]):
         profile / model: the cost constants a reservation's decode is priced against.
     """
 
-    name = "decode-batch"
     sensors = (ClusterView, ReservedView)
 
     def __init__(

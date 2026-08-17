@@ -34,7 +34,7 @@ from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import ControlPlane, Dispatcher, KeySelector, LoadView, Selection
 from proposed.selector import (
-    Balance, Const, FirstMatch, Folded, Lift, Max, pipe, Selector, Sort,
+    Balance, Const, FirstMatch, WithFold, Lift, Best, pipe, Selector, Ordered,
 )
 from kvcache_sim.control._selector import (
     by_prefix_and_load, LocalOnly, LongestPrefixKeySelector, PrefillAsk, Priced,
@@ -1634,7 +1634,7 @@ def _spread(bound: int = 1) -> Selector:
     """The opt-in ranking, as the plane declares it: the prefix run with the recent
     grants appended, stamped with the fold that docks one by the other."""
     return pipe(
-        LongestPrefixKeySelector(), Balance, Folded(by_prefix_and_load(bound))
+        LongestPrefixKeySelector(), Balance, WithFold(by_prefix_and_load(bound))
     )
 
 
@@ -1662,13 +1662,13 @@ def _replicated(holders, blocks, *, num=4):
 def _select_heads(sim, selector, keys, *, count, moving=True):
     """The winner of ``count`` successive asks, the load moving as each is decided.
 
-    The chain the run declares: the ranking keys, a :class:`~proposed.selector.Max` takes
+    The chain the run declares: the ranking keys, a :func:`~proposed.selector.Best` takes
     one, the decision that follows names that source, and the sensor counts it
     (:class:`~kvcache_sim.control._sensor.SourceLoad`). ``moving=False`` is a load
     nothing moves, which is the base ranking's own order.
     """
     load = SourceLoad()
-    best = Max(selector).attach(sim.view.derived(LoadView, load=load))
+    best = Best(selector).attach(sim.view.derived(LoadView, load=load))
 
     heads = []
     with sim.mesh.installed():
@@ -1739,7 +1739,7 @@ def test_spread_reads_ranks_deterministically():
     """
     def rankings(sim, keys):
         load = SourceLoad()
-        selector = Sort(_spread()).attach(sim.view.derived(LoadView, load=load))
+        selector = Ordered(_spread()).attach(sim.view.derived(LoadView, load=load))
         out = []
         with sim.mesh.installed():
             for _ in range(5):
@@ -1765,7 +1765,7 @@ def test_spread_reads_ranks_deterministically():
 
 
 def _stamps_a_fold(link) -> bool:
-    """Whether ``link`` is a ``Folded``: the lift whose endo writes a fold on an answer.
+    """Whether ``link`` is a ``WithFold``: the lift whose endo writes a fold on an answer.
 
     Read off what the endo does rather than off the type, since the three lifts differ by
     the endo they hold and not by class (:class:`proposed.selector.Lift`).
@@ -1867,7 +1867,7 @@ def _prefill_ranking(sched, request, requester):
 
 
 def _priced_pool(sched, request, requester) -> tuple:
-    """Every candidate the prefill ranking priced, under the ``Max`` that cuts to one.
+    """Every candidate the prefill ranking priced, under the ``Best`` that cuts to one.
 
     The chain answers with the winner alone, so the pool it chose from is read off the
     ranking beneath it -- which is where "every instance, priced" is a property.
@@ -1956,7 +1956,7 @@ def _plan(*, ttft: float, match_blocks: int = 0, done_time: float = 0.0) -> Plan
 
 def _ordered(pool: Selection, fold) -> tuple:
     """``pool`` ordered as the prefill chain orders one: stamped with ``fold``, sorted."""
-    chain = pipe(Const(pool), Folded(fold), Sort)
+    chain = pipe(Const(pool), WithFold(fold), Ordered)
     return chain.select(None, "s0").sources
 
 
@@ -1966,7 +1966,7 @@ def test_a_plan_in_a_key_is_ordered_only_by_a_fold_that_names_what_it_compares()
     A plan has no order of its own, so the fold that ranks a pool of them says which
     figure it compares -- and one that named none raises instead of ordering by
     something meaningless. Two plans that fold alike are left to the instance id, in the
-    one place every tie is settled (:class:`proposed.selector.Sort`).
+    one place every tie is settled (:func:`proposed.selector.Ordered`).
     """
     with pytest.raises(TypeError):
         _plan(ttft=1.0) < _plan(ttft=2.0)
@@ -1980,7 +1980,8 @@ def test_a_plan_in_a_key_is_ordered_only_by_a_fold_that_names_what_it_compares()
     )
     assert _ordered(tied, _by_ttft) == ("s0", "s1")
     # ...and the baseline's fold reads the dimension appended behind the plan instead.
-    assert _ordered(tied.annotated({"s0": 9.0, "s1": 1.0}), _by_queue) == ("s1", "s0")
+    queued = {"s0": 9.0, "s1": 1.0}.__getitem__
+    assert _ordered(tied.annotated(queued), _by_queue) == ("s1", "s0")
 
 
 def test_a_refusal_is_a_decision_not_taken():

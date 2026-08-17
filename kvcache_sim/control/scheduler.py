@@ -65,13 +65,13 @@ executed cost off it.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from proposed import (
     ControlPlane, Dispatcher, Key, Selection,
 )
 from proposed.selector import (
-    Annotate, Balance, declared, Dims, FirstMatch, Folded, Max, pipe, Selector, Sort,
+    Annotate, Balance, Best, declared, FirstMatch, Ordered, pipe, Selector, WithFold,
 )
 
 from domain import (
@@ -140,7 +140,7 @@ def _source_ranking(source: Source) -> Selector[Sequence[Key]]:
     fold with it, so both chains it goes into weigh them the same way.
     """
     if source is Source.SPREAD:
-        return pipe(LongestPrefixKeySelector(), Balance, Folded(by_prefix_and_load()))
+        return pipe(LongestPrefixKeySelector(), Balance, WithFold(by_prefix_and_load()))
     return LongestPrefixKeySelector()
 
 
@@ -155,12 +155,12 @@ def _source_ranking(source: Source) -> Selector[Sequence[Key]]:
 # the longer-idle host.
 
 
-def _by_ttft(dims: Dims) -> float:
+def _by_ttft(dims: Tuple[Plan]) -> float:
     """The cache-aware fold: the whole predicted queue + transfer + prefill."""
     return dims[0].ttft
 
 
-def _by_queue(dims: Dims) -> float:
+def _by_queue(dims: Tuple[Plan, float]) -> float:
     """The baseline's fold: the queue a candidate would join, and nothing else."""
     return dims[1]
 
@@ -211,12 +211,12 @@ class _Scheduler(ControlPlane):
         # Which peer a candidate may pull the prefix from. One winner, asked once per
         # decision; ``LocalOnly`` names nobody, so the baseline reuses only what a host
         # already holds.
-        self._reuse = Max(
-            _source_ranking(source) if reuse is Reuse.PEERS else LocalOnly()
+        self._reuse = pipe(
+            _source_ranking(source) if reuse is Reuse.PEERS else LocalOnly(), Best
         )
         # Which peer serves a fetch: the one this plane already priced the pull
         # against, else whoever holds the longest prefix.
-        self._fetch = pipe(FirstMatch([RoutedPull(), _source_ranking(source)]), Sort)
+        self._fetch = pipe(FirstMatch([RoutedPull(), _source_ranking(source)]), Ordered)
         #: Which fold orders the prefill pool, and with it whether the queue is
         #: measured at all (:meth:`attach`).
         self._rank = rank
@@ -295,14 +295,14 @@ class _Scheduler(ControlPlane):
                 profile=self.profile,
                 model=self.model,
             ),
-            Max,
+            Best,
         )
         # Which host prefills: whichever instance in the prefill pool serving the request
         # costs least -- queue, then transfer, then prefill -- with the peer the reuse
         # ranking named priced in against recomputing.
         #
         # Both of these name one host and are read at one head (:meth:`_admit`), so they
-        # end in ``Max``: a decision refused for an SLO miss does not fall to the
+        # end in ``Best``: a decision refused for an SLO miss does not fall to the
         # runner-up, and nothing here reads what a loser was priced at.
         priced = Priced(
             self.prefill_ids,
@@ -318,14 +318,14 @@ class _Scheduler(ControlPlane):
             self._prefill = pipe(
                 priced,
                 Annotate(
-                    lambda view, _ask: view.cluster.busy_until,
+                    lambda view, _ask: view.cluster.busy_until.__getitem__,
                     senses=(ClusterView,),
                 ),
-                Folded(_by_queue),
-                Max,
+                WithFold(_by_queue),
+                Best,
             )
         else:
-            self._prefill = pipe(priced, Folded(_by_ttft), Max)
+            self._prefill = pipe(priced, WithFold(_by_ttft), Best)
 
         for ranking in (self._fetch, self._reuse, self._prefill, self._decode):
             ranking.attach(declared(self.view, ranking))

@@ -70,7 +70,6 @@ class Candidates(KeySelector):
     candidate.
     """
 
-    name = "candidates"
     sensors = (FanoutView,)
 
     def __init__(self, fabric: float = CHAIN, payload_bytes: int = 1) -> None:

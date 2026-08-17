@@ -16,7 +16,7 @@ from typing import Any, Optional, Sequence
 
 from proposed import ControlPlane, DecisionLog, Dispatcher, Key, Selection
 from proposed.selector import (
-    Balance, Dims, FirstMatch, Folded, NaiveKeySelector, pipe, Selector, Sort,
+    Balance, FirstMatch, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
 )
 
 from ._answer import committed
@@ -27,7 +27,7 @@ from ._view import DedupView
 __all__ = ["Dedup"]
 
 
-def _soonest(dims: Dims) -> float:
+def _soonest(dims: Tuple[float, int]) -> float:
     """Spread's fold: with the fabric free the score is one read, so a reader queued
     behind ``queued`` others waits that many times over."""
     score, queued = dims
@@ -49,8 +49,6 @@ class Dedup(ControlPlane):
         trace: optional :class:`~proposed.selector.DecisionLog` for each routing
             decision. Records only; no metric turns on it.
     """
-
-    name = "dedup"
 
     def __init__(
         self,
@@ -90,12 +88,12 @@ class Dedup(ControlPlane):
                 pipe(
                     Candidates(SPREAD if self._spread else CHAIN),
                     Balance,
-                    Folded(_soonest if self._spread else None),
+                    WithFold(_soonest if self._spread else None),
                 ),
                 # Tail: an unroutable ask gets the directory's own answer, not a hole.
                 NaiveKeySelector(),
             ]),
-            Sort,
+            Ordered,
         ).attach(self.view)
 
     # -- what a reader asks -------------------------------------------------- #
