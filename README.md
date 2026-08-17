@@ -58,6 +58,7 @@ noise while still exercising the real TorchStore path.
 ## Where to look
 
 - Designs: [TorchStore overview](docs/torchstore.md),
+  [generic cache](docs/toso.md),
   [dedup](docs/torchstore_dedup_design.md),
   [KV cache](docs/torchstore_kvcache_design.md),
   [DES](docs/des_design.md), and [control flow](docs/architecture.md).
