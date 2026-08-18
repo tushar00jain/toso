@@ -46,9 +46,9 @@ from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
 
-from dedup_sim.control._sensor import FanoutSensor, Published
+from dedup_sim.control._sensor import DedupDirectorySensor, FanoutSensor, Published
 from dedup_sim.control.routing import Dedup
-from proposed import DirectorySensor, Endpoint, Environment
+from proposed import Endpoint, Environment
 from dedup_sim.data.read_through import ReadThroughPlane
 from torchstore.controller import ObjectType, StorageInfo
 from torchstore.transport import Request
@@ -286,7 +286,7 @@ def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
     topology = {v: Endpoint(id=v, host=v, node=v) for v in ids}
     plane.attach(
         Environment(topology, directory),
-        {DirectorySensor: DirectorySensor(directory)},
+        {DedupDirectorySensor: DedupDirectorySensor(directory)},
     )
     return plane
 
@@ -404,18 +404,20 @@ def test_a_peer_never_feeds_more_than_the_cap():
 
 
 def test_the_sensor_remembers_no_registrations():
-    """What it keeps is per requester, not per (volume, key) ever registered.
+    """The sensors retain routes, not settled directory registrations.
 
-    Two rounds of ``W`` and a round of ``W2`` went through this sensor, and what is
-    left names neither: the debts are settled, so nothing is outstanding, and the
-    routes are one per reader whatever the run read. Nothing accumulates per
+    Two rounds of ``W`` and a round of ``W2`` went through these sensors, and what is
+    left names neither: the pending entries are settled, and the routes are one per
+    reader whatever the run read. Nothing accumulates per
     ``(volume, key)`` -- not a registration, and not a waiter either, since who is
     waiting is not recorded anywhere at all
     (:meth:`proposed.dispatch.Dispatcher.gate`).
     """
     result, plane = _run()
+    directory = plane.sensor(DedupDirectorySensor)
     fanout = plane.sensor(FanoutSensor)
-    assert fanout._promised == {}, "a put owed by a run that finished"
+    assert directory.in_flight() == set(), "a put owed by a run that finished"
+    assert directory._pending_by_key == {}, "a settled pending directory entry"
     assert fanout._route_by_key == {}, "completed publications retain no key plan"
     assert fanout._route_required == {}, "completed routes retain no regions"
     assert set(fanout._route) == set(result.workload.reader_ids)

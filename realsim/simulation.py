@@ -154,9 +154,24 @@ class Simulation:
                     f"hands it the stack's ports, which a selector or a bare "
                     f"callable has nowhere to receive"
                 )
-            control.attach(
-                self.environment, {DirectorySensor: self.directory_sensor}
-            )
+            directory_types = [
+                sensor_type
+                for sensor_type in control.sensors
+                if issubclass(sensor_type, DirectorySensor)
+            ]
+            if len(directory_types) > 1:
+                raise TypeError("a control plane may declare one directory sensor")
+            available = {}
+            if directory_types:
+                sensor_type = directory_types[0]
+                # A capability subtype adds state but reads this run's controller.
+                observed = (
+                    self.directory_sensor
+                    if sensor_type is DirectorySensor
+                    else sensor_type(self.directory_sensor.directory)
+                )
+                available[sensor_type] = observed
+            control.attach(self.environment, available)
         # What reaching a control plane costs. Resolved once, here, because this is
         # the one place a run's control services are built -- the same reason
         # ``make_controller_adapter`` resolves the directory's. One distance for both

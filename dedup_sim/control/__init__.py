@@ -6,7 +6,8 @@ source question a reader asks, answered from a chain over
 withholds the answer until every selected pending source is usable.
 
 Nothing here makes that answer come true: a reader commits one
-:class:`~dedup_sim.control._sensor.Published` and this plane's own state
-(:mod:`dedup_sim.control._sensor`) folds it. The plane holds no client, no volume and
-no deployment, and executes nothing; the read-through write is :mod:`dedup_sim.data`.
+:class:`~dedup_sim.control._sensor.Published`, folded into the pending directory
+overlay and fan-out state before it wakes readers. The plane holds no client, no
+volume and no deployment, and executes nothing; the read-through write is
+:mod:`dedup_sim.data`.
 """

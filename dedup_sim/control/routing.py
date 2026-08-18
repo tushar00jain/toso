@@ -17,7 +17,6 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence, Tuple,
 from proposed import (
     ControlPlane,
     DecisionLog,
-    DirectorySensor,
     Dispatcher,
     Environment,
     Key,
@@ -35,9 +34,14 @@ from proposed.selector import (
     Selector,
     WithFold,
 )
-from ._fetch import FetchCoverage
 from ._selector import Candidates, CHAIN, Holders, SPREAD
-from ._sensor import Asked, FanoutSensor, Published, Routed
+from ._sensor import (
+    Asked,
+    DedupDirectorySensor,
+    FanoutSensor,
+    Published,
+    Routed,
+)
 
 __all__ = ["Dedup", "ReadPlan"]
 
@@ -84,7 +88,7 @@ class Dedup(ControlPlane):
             decision. Records only; no metric turns on it.
     """
 
-    sensors = (DirectorySensor, FanoutSensor)
+    sensors = (DedupDirectorySensor, FanoutSensor)
 
     def __init__(
         self,
@@ -97,26 +101,26 @@ class Dedup(ControlPlane):
         self._spread = spread
         self._trace = trace
         self.dispatcher: Optional[Dispatcher] = None
-        self._chain: Optional[Selector[FetchCoverage, Unpack[Tuple[Any, ...]]]] = None
+        self._chain: Optional[Selector[Sequence[Key], Unpack[Tuple[Any, ...]]]] = None
 
     def attach(
         self,
         environment: Environment,
         sensors: Optional[Mapping[type, Sensor]] = None,
     ) -> "Dedup":
-        """Build this plane's sensor and attach the chain that reads it.
+        """Build this plane's sensors and attach the chain that reads them.
 
-        The sensor is built here, never accepted from a caller: two planes sharing one
-        would each answer for the other's decisions -- a requester handed a peer the
-        other plane planned, then waiting on a put only the other plane hears about.
+        The pending overlay and fan-out state are plane-owned: two planes sharing either
+        would answer from the other's decisions and wait on publications only the other
+        plane hears about.
 
         Sorted rather than cut to the winner: a reader reads its preference down, so a
         source ranked behind the head still serves the read if the head evicted the key
         before the reader got there.
         """
-        sensor = FanoutSensor(fanout_cap=self._cap)
         available = dict(sensors or {})
-        available[type(sensor)] = sensor
+        fanout = FanoutSensor(fanout_cap=self._cap)
+        available[type(fanout)] = fanout
         super().attach(environment, available)
         self.dispatcher = Dispatcher()
         for observed in self._sensed.values():
@@ -164,28 +168,20 @@ class Dedup(ControlPlane):
         # source is named. Dispatched without suspending, so the debt and the decision
         # priced against it are one turn.
         self.dispatcher.dispatch_sync(Asked(requester, tuple(requests)))
-        directory = self.sensor(DirectorySensor)
-        fanout = self.sensor(FanoutSensor)
+        directory = self.sensor(DedupDirectorySensor)
         with directory.pinned(keys):
-            requested = tuple(fanout.plan(requester).values())
-            coverage = FetchCoverage.discover(
-                directory,
-                requested,
-                directory.locate(keys),
-                fanout.promised(keys),
-            )
-            ranking = self._chain.select(coverage, requester)
-            return self._committed(requester, coverage, ranking)
+            ranking = self._chain.select(keys, requester)
+            return self._committed(requester, ranking)
 
-    def _committed(
-        self, requester: str, coverage: FetchCoverage, ranking: Selection
-    ) -> ReadPlan:
+    def _committed(self, requester: str, ranking: Selection) -> ReadPlan:
         """Commit the selected fetch and gate pending sources."""
         # No suspension splits the sensor read-modify-write sequence.
         assert ranking.sources is not None, "the dedup chain names an explicit order"
 
         fanout = self.sensor(FanoutSensor)
-        fetch = coverage.plan(ranking.sources, requester=requester)
+        directory = self.sensor(DedupDirectorySensor)
+        requested = tuple(directory.plan(requester).values())
+        fetch = directory.plan_fetch(requested, ranking.sources, requester=requester)
         sources = fetch.sources
 
         if self._trace is not None:
@@ -209,8 +205,6 @@ class Dedup(ControlPlane):
         )
 
         required = {source: fetch.required[source] for source in fetch.pending}
-        directory = self.sensor(DirectorySensor)
-        requested = tuple(fanout.plan(requester).values())
         gate = self.dispatcher.gate(
             lambda: directory.covers(requested, required, live=True),
             (Published(source) for source in fetch.pending),

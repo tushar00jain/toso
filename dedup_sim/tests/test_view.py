@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Sequence
 
 import pytest
 
 from dedup_sim.control._selector import Candidates, Holders
-from dedup_sim.control._fetch import FetchCoverage
-from dedup_sim.control._sensor import Asked, FanoutSensor, Published, Routed
+from dedup_sim.control._sensor import (
+    Asked,
+    DedupDirectorySensor,
+    FanoutSensor,
+    Published,
+    Routed,
+)
 from dedup_sim.control.routing import Dedup
 from proposed import DirectorySensor, Dispatcher, Endpoint, Environment
 from proposed.selector import Balance, FirstMatch, Ordered
@@ -45,21 +51,32 @@ def _request(key: str, tensor_slice: TensorSlice | None = None) -> Request:
     return Request.from_any(key, None, tensor_slice).meta_only()
 
 
-def _coverage(directory, fanout, requester, keys):
-    requests = tuple(fanout.plan(requester).values())
-    return FetchCoverage.discover(
-        directory,
-        requests,
-        directory.locate(keys),
-        fanout.promised(keys),
+def _dispatcher(directory, fanout):
+    dispatcher = Dispatcher()
+    dispatcher.compose(directory)
+    dispatcher.compose(fanout)
+    return dispatcher
+
+
+def test_dedup_selectors_take_keys():
+    assert Candidates.subject_type == Sequence[str]
+    assert Holders.subject_type == Sequence[str]
+
+
+def test_dedup_uses_the_supplied_concrete_directory_sensor():
+    directory = DedupDirectorySensor(_Holds("origin"))
+    plane = Dedup().attach(
+        Environment(_TOPOLOGY, _PROFILE),
+        {DedupDirectorySensor: directory},
     )
+    assert plane.sensor(DedupDirectorySensor) is directory
 
 
 def test_a_fanout_nobody_supplied_raises():
-    directory = DirectorySensor(_Holds("origin"))
+    directory = DedupDirectorySensor(_Holds("origin"))
     with pytest.raises(RuntimeError, match="FanoutSensor"):
         Candidates().attach(
-            Environment(_TOPOLOGY, _PROFILE), {DirectorySensor: directory}
+            Environment(_TOPOLOGY, _PROFILE), {DedupDirectorySensor: directory}
         )
 
 
@@ -72,16 +89,13 @@ def test_holders_preserve_directory_order_and_name_each_source_once():
                 "K1": {"origin": info, "r0": info},
             }
 
-    directory = DirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Directory())
     selector = Holders().attach(
         Environment(_TOPOLOGY, _PROFILE),
-        {DirectorySensor: directory},
+        {DedupDirectorySensor: directory},
     )
-    requests = [_request("K0"), _request("K1")]
-    live = directory.locate([request.key for request in requests])
-    coverage = FetchCoverage.discover(directory, requests, live, {})
 
-    assert selector.select(coverage, "r1").sources == (
+    assert selector.select(["K0", "K1"], "r1").sources == (
         "replica",
         "origin",
         "r0",
@@ -90,44 +104,47 @@ def test_holders_preserve_directory_order_and_name_each_source_once():
 
 def test_the_ranking_keeps_fanout_under_reranking():
     fanout = FanoutSensor(fanout_cap=1)
-    dispatcher = Dispatcher()
-    dispatcher.compose(fanout)
+    directory = DedupDirectorySensor(_Holds("origin"))
+    dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("r0", (_request("K"),)))
-    dispatcher.dispatch_sync(Routed("r0", ("origin",)))
+    dispatcher.dispatch_sync(Routed("r0", ("origin",), (("K", ("origin",)),)))
     dispatcher.dispatch_sync(Asked("r1", (_request("K"),)))
     ranking = Candidates()
     chain = Ordered(FirstMatch([Balance(ranking)]))
-    directory = DirectorySensor(_Holds("origin"))
     chain.attach(
         Environment(_TOPOLOGY, _PROFILE),
         {
-            DirectorySensor: directory,
+            DedupDirectorySensor: directory,
             FanoutSensor: fanout,
         },
     )
 
     assert ranking.sensor(FanoutSensor) is fanout
-    assert chain.select(_coverage(directory, fanout, "r1", ["K"]), "r1").sources == (
+    assert chain.select(["K"], "r1").sources == (
         "r0",
         "origin",
     )
 
 
-def test_promises_are_indexed_only_under_their_keys():
+def test_pending_entries_are_indexed_only_under_their_keys():
+    directory = DedupDirectorySensor(_Holds("origin"))
     fanout = FanoutSensor()
-    dispatcher = Dispatcher()
-    dispatcher.compose(fanout)
+    dispatcher = _dispatcher(directory, fanout)
     requests = {_key: _request(_key) for _key in ("K0", "K1")}
     dispatcher.dispatch_sync(Asked("r0", tuple(requests.values())))
 
-    assert fanout.promised(["K0"]) == {"K0": {"r0": requests["K0"]}}
-    assert fanout.promised(["K2"]) == {"K2": {}}
+    assert directory.plan("r0") == requests
+    pending = directory.pending(["K0"])["K0"]
+    assert set(pending) == {"r0"}
+    assert pending["r0"].object_type is ObjectType.TENSOR
+    assert pending["r0"].tensor_slices == {None}
+    assert directory.pending(["K2"]) == {"K2": {}}
 
 
 def test_a_producer_has_one_publication_in_flight():
+    directory = DedupDirectorySensor(_Holds("origin"))
     fanout = FanoutSensor()
-    dispatcher = Dispatcher()
-    dispatcher.compose(fanout)
+    dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("r0", (_request("K0"),)))
 
     with pytest.raises(ValueError, match="r0 already has an in-flight publication"):
@@ -136,7 +153,68 @@ def test_a_producer_has_one_publication_in_flight():
     dispatcher.dispatch_sync(Published("r0"))
     request = _request("K1")
     dispatcher.dispatch_sync(Asked("r0", (request,)))
-    assert fanout.plan("r0") == {"K1": request}
+    assert directory.plan("r0") == {"K1": request}
+
+
+def test_publication_folds_directory_and_fanout_before_one_waiter_wakes():
+    async def publish():
+        directory = DedupDirectorySensor(_Holds("origin"))
+        fanout = FanoutSensor()
+        dispatcher = _dispatcher(directory, fanout)
+        assert Asked in directory.folds and Asked not in fanout.folds
+        assert Published in directory.folds and Published in fanout.folds
+        request = _request("K")
+        dispatcher.dispatch_sync(Asked("r0", (request,)))
+        dispatcher.dispatch_sync(
+            Routed(
+                "r0",
+                ("origin",),
+                (("K", ("origin",)),),
+                ("origin",),
+            )
+        )
+        ready = dispatcher.gate(lambda: False, (Published("r0"),))
+        assert ready is not None
+        assert len(dispatcher._waiters[Published("r0")]) == 1
+
+        task = asyncio.create_task(ready())
+        await asyncio.sleep(0)
+        dispatcher.dispatch_sync(Published("r0"))
+        await task
+        return directory.in_flight(), fanout.route_plan("r0")
+
+    observed, _trace = run_sim(publish())
+    assert observed == (set(), {})
+
+
+def test_pending_sources_do_not_satisfy_live_coverage():
+    info = StorageInfo(ObjectType.TENSOR, {None})
+
+    class _Directory:
+        def __init__(self):
+            self.entries = {}
+
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: dict(self.entries.get(key, {})) for key in keys}
+
+    state = _Directory()
+    directory = DedupDirectorySensor(state)
+    fanout = FanoutSensor()
+    dispatcher = _dispatcher(directory, fanout)
+    request = _request("K")
+    dispatcher.dispatch_sync(Asked("p", (request,)))
+    planned = directory.plan_fetch([request], ("p",))
+
+    assert directory.serving_sources([request]) == ({"p"}, {"p"})
+    assert not directory.covers([request], planned.required, live=True)
+
+    state.entries["K"] = {"p": info}
+    assert directory.covers([request], planned.required, live=True)
+    assert directory.serving_sources([request]) == ({"p"}, set())
+
+    dispatcher.dispatch_sync(Published("p"))
+    assert directory.pending(["K"]) == {"K": {}}
+    assert directory.serving_sources([request]) == ({"p"}, set())
 
 
 def test_region_planning_is_torchstores_expansion():
@@ -159,7 +237,6 @@ def test_region_planning_is_torchstores_expansion():
 
 
 def test_every_whole_value_source_is_rankable_before_narrowing():
-    directory = DirectorySensor(_Holds("origin"))
     request = _request("K")
     live = {
         "K": {
@@ -167,32 +244,41 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
             "replica": StorageInfo(ObjectType.TENSOR, {None}),
         }
     }
-    promised = {"K": {"r0": request}}
 
-    coverage = FetchCoverage.discover(directory, [request], live, promised)
-    planned = coverage.plan(("r0", "replica", "origin"))
-    without_peer = coverage.plan(("replica", "origin"))
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: dict(live.get(key, {})) for key in keys}
 
-    assert coverage.candidates == {"origin", "replica", "r0"}
-    assert coverage.pending == {"r0"}
+    directory = DedupDirectorySensor(_Directory())
+    fanout = FanoutSensor()
+    dispatcher = _dispatcher(directory, fanout)
+    dispatcher.dispatch_sync(Asked("r0", (request,)))
+
+    candidates, pending = directory.serving_sources([request])
+    planned = directory.plan_fetch([request], ("r0", "replica", "origin"))
+    without_peer = directory.plan_fetch([request], ("replica", "origin"))
+
+    assert candidates == {"origin", "replica", "r0"}
+    assert pending == {"r0"}
     assert planned.by_key == {"K": ("r0",)}
     assert without_peer.by_key == {"K": ("replica",)}
 
 
 def test_two_pending_slices_form_one_torchstore_fetch_plan():
-    directory = DirectorySensor(_Holds("origin"))
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {}
+
+    directory = DedupDirectorySensor(_Directory())
+    fanout = FanoutSensor()
+    dispatcher = _dispatcher(directory, fanout)
     left = TensorSlice((0,), (0,), (8,), (4,), (2,))
     right = TensorSlice((4,), (1,), (8,), (4,), (2,))
     request = _request("K")
-    promised = {
-        "K": {
-            "p0": _request("K", left),
-            "p1": _request("K", right),
-        }
-    }
+    dispatcher.dispatch_sync(Asked("p0", (_request("K", left),)))
+    dispatcher.dispatch_sync(Asked("p1", (_request("K", right),)))
 
-    coverage = FetchCoverage.discover(directory, [request], {}, promised)
-    planned = coverage.plan(("p0", "p1"))
+    planned = directory.plan_fetch([request], ("p0", "p1"))
     live = {
         "K": {
             "p0": StorageInfo(ObjectType.TENSOR_SLICE, {left}),
@@ -206,12 +292,17 @@ def test_two_pending_slices_form_one_torchstore_fetch_plan():
 
 
 def test_sparse_candidate_discovery_visits_only_present_entries(monkeypatch):
-    directory = DirectorySensor(_Holds("origin"))
     requests = [_request(f"K{i}") for i in range(20)]
     live = {
         request.key: {f"v{i}": StorageInfo(ObjectType.TENSOR, {None})}
         for i, request in enumerate(requests)
     }
+
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: dict(live.get(key, {})) for key in keys}
+
+    directory = DedupDirectorySensor(_Directory())
     visited = 0
     original = directory.plan_requests
 
@@ -222,32 +313,11 @@ def test_sparse_candidate_discovery_visits_only_present_entries(monkeypatch):
 
     monkeypatch.setattr(directory, "plan_requests", counted)
 
-    coverage = FetchCoverage.discover(directory, requests, live, {})
+    candidates, pending = directory.serving_sources(requests)
 
-    assert coverage.candidates == {f"v{i}" for i in range(20)}
-    assert coverage.pending == set()
+    assert candidates == {f"v{i}" for i in range(20)}
+    assert pending == set()
     assert visited == 40
-
-
-def test_commit_reuses_candidate_expansion(monkeypatch):
-    directory = DirectorySensor(_Holds("origin"))
-    original = directory.plan_requests
-    expansions = 0
-
-    def counted(requests, located=None):
-        nonlocal expansions
-        expansions += 1
-        return original(requests, located)
-
-    monkeypatch.setattr(directory, "plan_requests", counted)
-    plane = Dedup().attach(
-        Environment(_TOPOLOGY, _PROFILE),
-        {DirectorySensor: directory},
-    )
-
-    run_sim(plane._decide([_request("K")], "r0"))
-
-    assert expansions == 3
 
 
 def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():
@@ -284,16 +354,17 @@ def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():
 
         plane = Dedup().attach(
             Environment(topology, _SliceProfile()),
-            {DirectorySensor: DirectorySensor(directory)},
+            {DedupDirectorySensor: DedupDirectorySensor(directory)},
         )
         plane.dispatcher.dispatch_sync(Asked("p0", (_request("K", left),)))
-        plane.dispatcher.dispatch_sync(Routed("p0", ("t0",)))
+        plane.dispatcher.dispatch_sync(Routed("p0", ("t0",), (("K", ("t0",)),)))
         plane.dispatcher.dispatch_sync(Asked("p1", (_request("K", right),)))
-        plane.dispatcher.dispatch_sync(Routed("p1", ("t1",)))
+        plane.dispatcher.dispatch_sync(Routed("p1", ("t1",), (("K", ("t1",)),)))
 
         planned = await plane._decide([_request("K")], "r")
         assert planned.by_key == {"K": ("p0", "p1")}
         assert set(plane.dispatcher._waiters) == {Published("p0"), Published("p1")}
+        assert all(len(waiters) == 1 for waiters in plane.dispatcher._waiters.values())
         task = asyncio.create_task(planned.settled())
         await asyncio.sleep(0)
         directory.publish("p0", left)
@@ -332,19 +403,18 @@ def test_a_partial_reader_can_follow_a_peer_fetching_more_regions():
 
     ids = ("t0", "t1", "p0", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
-    directory = DirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Directory())
     fanout = FanoutSensor()
-    dispatcher = Dispatcher()
-    dispatcher.compose(fanout)
+    dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p0", (_request("K"),)))
-    dispatcher.dispatch_sync(Routed("p0", ("t0", "t1")))
+    dispatcher.dispatch_sync(Routed("p0", ("t0", "t1"), (("K", ("t0", "t1")),)))
     dispatcher.dispatch_sync(Asked("r", (_request("K", left),)))
     ranking = Ordered(Candidates()).attach(
         Environment(topology, _SliceProfile()),
-        {DirectorySensor: directory, FanoutSensor: fanout},
+        {DedupDirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(_coverage(directory, fanout, "r", ["K"]), "r").head == "p0"
+    assert ranking.select(["K"], "r").head == "p0"
 
 
 def test_a_subset_reader_accounts_for_the_peers_other_keys():
@@ -363,10 +433,9 @@ def test_a_subset_reader_accounts_for_the_peers_other_keys():
 
     ids = ("t0", "t1", "p0", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
-    directory = DirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Directory())
     fanout = FanoutSensor()
-    dispatcher = Dispatcher()
-    dispatcher.compose(fanout)
+    dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p0", (_request("K0"), _request("K1"))))
     dispatcher.dispatch_sync(
         Routed(
@@ -378,10 +447,10 @@ def test_a_subset_reader_accounts_for_the_peers_other_keys():
     dispatcher.dispatch_sync(Asked("r", (_request("K0"),)))
     ranking = Ordered(Candidates()).attach(
         Environment(topology, _Profile()),
-        {DirectorySensor: directory, FanoutSensor: fanout},
+        {DedupDirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(_coverage(directory, fanout, "r", ["K0"]), "r").head == "p0"
+    assert ranking.select(["K0"], "r").head == "p0"
 
 
 def test_a_route_accepts_a_dependency_that_has_since_published():
@@ -403,10 +472,9 @@ def test_a_route_accepts_a_dependency_that_has_since_published():
     ids = ("t0", "t1", "q", "p", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
     state = _Directory()
-    directory = DirectorySensor(state)
+    directory = DedupDirectorySensor(state)
     fanout = FanoutSensor()
-    dispatcher = Dispatcher()
-    dispatcher.compose(fanout)
+    dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("q", (_request("K1"),)))
     dispatcher.dispatch_sync(Routed("q", ("t1",), (("K1", ("t1",)),)))
     dispatcher.dispatch_sync(Asked("p", (_request("K0"), _request("K1"))))
@@ -423,10 +491,10 @@ def test_a_route_accepts_a_dependency_that_has_since_published():
     dispatcher.dispatch_sync(Asked("r", (_request("K0"),)))
     ranking = Ordered(Candidates()).attach(
         Environment(topology, _Profile()),
-        {DirectorySensor: directory, FanoutSensor: fanout},
+        {DedupDirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(_coverage(directory, fanout, "r", ["K0"]), "r").head == "p"
+    assert ranking.select(["K0"], "r").head == "p"
 
 
 def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
@@ -434,9 +502,13 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
     right = TensorSlice((4,), (1,), (8,), (4,), (2,))
     request = _request("K", left)
     original = {"K": {"t": StorageInfo(ObjectType.TENSOR_SLICE, {left})}}
-    planning_directory = DirectorySensor(_Holds("origin"))
-    coverage = FetchCoverage.discover(planning_directory, [request], original, {})
-    route = coverage.plan(("t",))
+
+    class _Original:
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: dict(original.get(key, {})) for key in keys}
+
+    planning_directory = DedupDirectorySensor(_Original())
+    route = planning_directory.plan_fetch([request], ("t",))
 
     class _Directory:
         def locate_raw(self, keys, missing_ok=False):
@@ -444,10 +516,9 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
 
     ids = ("t", "p", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
-    directory = DirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Directory())
     fanout = FanoutSensor()
-    dispatcher = Dispatcher()
-    dispatcher.compose(fanout)
+    dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p", (request,)))
     dispatcher.dispatch_sync(
         Routed(
@@ -461,7 +532,7 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
     dispatcher.dispatch_sync(Asked("r", (request,)))
     ranking = Ordered(Candidates()).attach(
         Environment(topology, _PROFILE),
-        {DirectorySensor: directory, FanoutSensor: fanout},
+        {DedupDirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(_coverage(directory, fanout, "r", ["K"]), "r").sources == ()
+    assert ranking.select(["K"], "r").sources == ()

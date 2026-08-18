@@ -38,13 +38,11 @@ releases the next reader's withheld answer (:mod:`dedup_sim.data`).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Unpack
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Unpack
 
-from proposed import DirectorySensor, Key, Selection, VolumeId
-from proposed.selector import Selector
+from proposed import Key, KeySelector, Selection, VolumeId
 
-from ._fetch import FetchCoverage
-from ._sensor import FanoutSensor
+from ._sensor import DedupDirectorySensor, FanoutSensor
 
 __all__ = ["Candidates", "Holders", "CHAIN", "SPREAD"]
 
@@ -54,16 +52,25 @@ CHAIN = 10.0
 SPREAD = 0.0
 
 
-class Holders(Selector[FetchCoverage, Unpack[Tuple[()]]]):
+class Holders(KeySelector[Unpack[Tuple[()]]]):
     """Every live holder, once, in directory order."""
 
+    sensors = (DedupDirectorySensor,)
+
     def select(
-        self, coverage: FetchCoverage, requester: str
+        self, keys: Sequence[Key], requester: str
     ) -> Selection[Unpack[Tuple[()]]]:
-        return Selection.of(coverage.holders)
+        located = self.sensor(DedupDirectorySensor).locate(keys)
+        return Selection.of(
+            tuple(
+                dict.fromkeys(
+                    source for by_source in located.values() for source in by_source
+                )
+            )
+        )
 
 
-class Candidates(Selector[FetchCoverage, float]):
+class Candidates(KeySelector[float]):
     """Holders and planned peers as one pool, each priced in seconds.
 
     Args:
@@ -80,19 +87,19 @@ class Candidates(Selector[FetchCoverage, float]):
     nothing, so it is no candidate.
     """
 
-    sensors = (DirectorySensor, FanoutSensor)
+    sensors = (DedupDirectorySensor, FanoutSensor)
 
     def __init__(self, fabric: float = CHAIN, payload_bytes: int = 1) -> None:
         self.fabric = fabric
         self.payload_bytes = payload_bytes
 
-    def select(self, coverage: FetchCoverage, requester: str) -> Selection[float]:
+    def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
         """Every source with a relevant key region, scored; else abstain."""
         fanout = self.sensor(FanoutSensor)
-        directory = self.sensor(DirectorySensor)
-        located = directory.locate(coverage.keys)
-        candidates = coverage.candidates
-        pending = coverage.pending
+        directory = self.sensor(DedupDirectorySensor)
+        requested = tuple(directory.plan(requester).values())
+        located = directory.locate(keys)
+        candidates, pending = directory.serving_sources(requested)
         queued = fanout.named()
         located_by_key: Dict[str, Mapping[VolumeId, Any]] = dict(located)
         # Discounted from the cap below: a second ask costs no slot, so a reader
@@ -100,7 +107,7 @@ class Candidates(Selector[FetchCoverage, float]):
         mine = set(fanout.planned(requester))
         priced: List[Tuple[VolumeId, float]] = []
         waits: Dict[VolumeId, Optional[float]] = {}
-        in_flight = fanout.in_flight()
+        in_flight = directory.in_flight()
         live = candidates - pending
         for volume in candidates:
             # Never a source for itself.
@@ -138,7 +145,7 @@ class Candidates(Selector[FetchCoverage, float]):
         volume: VolumeId,
         fanout: FanoutSensor,
         in_flight: Set[VolumeId],
-        directory: DirectorySensor,
+        directory: DedupDirectorySensor,
         located: Dict[Key, Mapping[VolumeId, Any]],
         waits: Dict[VolumeId, Optional[float]],
         visiting: Set[VolumeId],
@@ -162,7 +169,7 @@ class Candidates(Selector[FetchCoverage, float]):
                 by_source.setdefault(source, set()).add(key)
         pending = fanout.route_pending(volume)
         required = fanout.route_required(volume)
-        requests = tuple(fanout.plan(volume).values())
+        requests = tuple(directory.plan(volume).values())
         arrivals: List[float] = []
         for source, source_keys in by_source.items():
             expected = required.get(source)

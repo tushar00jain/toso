@@ -1,34 +1,18 @@
-"""The fan-out tree and pending puts a dedup decision reads."""
+"""The fan-out tree a dedup decision reads."""
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping
 
 from proposed import Key, LoadSensor, VolumeId
 from proposed.dispatch import Action, Fold
 
-__all__ = ["Asked", "FanoutSensor", "Published", "Retired", "Routed"]
+from ._directory import Published
 
-
-@dataclass(frozen=True)
-class Asked(Action):
-    """``requester`` is about to read ``requests`` through, so it owes those puts."""
-
-    requester: VolumeId
-    requests: tuple[Any, ...]
-
-    def __hash__(self) -> int:
-        return hash((type(self), self.requester))
-
-
-@dataclass(frozen=True)
-class Published(Action):
-    """``producer``'s promised read-through batch has landed."""
-
-    producer: VolumeId
+__all__ = ["FanoutSensor", "Retired", "Routed"]
 
 
 @dataclass(frozen=True)
@@ -51,11 +35,11 @@ class Retired(Action):
 
 
 class FanoutSensor(LoadSensor):
-    """Who is folded in behind whom and which puts are owed. Nobody's wait is here.
+    """Who is folded in behind whom. Nobody's wait is here.
 
-    Asks, routes, retirements and publications move it through actions. A fold writes
-    this state before its commit wakes anybody. Nothing here reads the directory's
-    state, and nothing reads this.
+    Routes, retirements and publications move it through actions. A fold writes this
+    state before its commit wakes anybody. Nothing here reads the directory's state,
+    and nothing reads this.
 
     Args:
         fanout_cap: readers one peer may be planned to feed -- 1 a chain, >= 2 a
@@ -75,11 +59,7 @@ class FanoutSensor(LoadSensor):
         # every decision reads it, and re-deriving it walks the whole tree. Moved only
         # by the two members that move a route, so the two cannot disagree.
         self._load: Counter = Counter()
-        # producer -> its one in-flight read-through batch, indexed by key.
-        self._promised: Dict[VolumeId, Dict[Key, Any]] = {}
-        self._promised_by_key: Dict[Key, Dict[VolumeId, Any]] = {}
         self._folds: Dict[type, Fold] = {
-            Asked: self._asked,
             Published: self._published,
             Retired: self._retired,
             Routed: self._routed,
@@ -90,25 +70,8 @@ class FanoutSensor(LoadSensor):
         """What it folds, by action type."""
         return MappingProxyType(self._folds)
 
-    def _asked(self, action: Asked) -> None:
-        """A reader is about to read this batch through: it owes those puts from now."""
-        if action.requester in self._promised:
-            raise ValueError(f"{action.requester} already has an in-flight publication")
-        promised = {request.key: request for request in action.requests}
-        if len(promised) != len(action.requests):
-            raise ValueError("a publication names each key once")
-        self._promised[action.requester] = promised
-        for key, request in promised.items():
-            self._promised_by_key.setdefault(key, {})[action.requester] = request
-
     def _published(self, action: Published) -> None:
-        """A reader's batch has landed: settle the debt it owed."""
-        promised = self._promised.pop(action.producer, {})
-        for key in promised:
-            producers = self._promised_by_key[key]
-            del producers[action.producer]
-            if not producers:
-                del self._promised_by_key[key]
+        """A reader's batch has landed: its pending route facts are settled."""
         self._route_by_key.pop(action.producer, None)
         self._route_pending.pop(action.producer, None)
         self._route_required.pop(action.producer, None)
@@ -129,13 +92,7 @@ class FanoutSensor(LoadSensor):
         if len(set(action.sources)) != len(action.sources):
             raise ValueError("a route names each source once")
         previous = self._route.get(action.requester, ())
-        by_key = (
-            dict(action.by_key)
-            if action.by_key
-            else {
-                key: action.sources for key in self._promised.get(action.requester, {})
-            }
-        )
+        by_key = dict(action.by_key)
         # Unmoved route.
         if previous == action.sources:
             self._route_by_key[action.requester] = by_key
@@ -179,20 +136,6 @@ class FanoutSensor(LoadSensor):
             self._load[source] -= 1
         else:
             del self._load[source]
-
-    def plan(self, producer: VolumeId) -> Mapping[Key, Any]:
-        """``producer``'s in-flight requests, by key."""
-        return MappingProxyType(self._promised[producer])
-
-    def promised(self, keys: Sequence[Key]) -> Dict[Key, Mapping[VolumeId, Any]]:
-        """Pending directory entries for ``keys``."""
-        return {
-            key: MappingProxyType(self._promised_by_key.get(key, {})) for key in keys
-        }
-
-    def in_flight(self) -> set[VolumeId]:
-        """Producers with a publication outstanding."""
-        return set(self._promised)
 
     def route_plan(self, producer: VolumeId) -> Mapping[Key, tuple[VolumeId, ...]]:
         """Per-key sources feeding ``producer``'s publication."""

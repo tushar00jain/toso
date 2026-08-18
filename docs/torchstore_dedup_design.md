@@ -37,7 +37,8 @@ optimize the final microseconds of a fused one-hop engine; or change the
 ┌────────────── CONTROL ──────────────┐      ┌──────────── DATA ─────────────┐      ┌────────── TORCHSTORE ──────────┐
 │ Dedup ControlPlane                  │      │ ReadThroughPlane              │      │ Controller: current holders    │
 │ source rank + readiness + load      │answer│ preferred batch → local put   │─────►│ LocalClient: slice planning    │
-│ FanoutSensor: tree / promises / load│      │ dispatch Published            │      │ StorageVolume: resident bytes  │
+│ DirectorySensor: live + pending     │      │ dispatch Published            │      │ StorageVolume: resident bytes  │
+│ FanoutSensor: tree / load           │      │                               │      │                                │
 │ reads Environment + Sensors         │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
 └─────────────────────────────────────┘      └───────────────────────────────┘      └────────────────────────────────┘
 ┌──────────────── DIRECTORY TRUTH ─────────────────┐   ┌──────────────────── SENSOR TRUTH ────────────────────┐
@@ -46,10 +47,11 @@ optimize the final microseconds of a fused one-hop engine; or change the
 ```
 <!-- text-diagram:shape:end -->
 
-The `Controller` remains the authority for current residency. The dedup
-`ControlPlane` holds only the planned fan-out tree, source load, and readiness of
-copies that have not registered yet. Its selectors read the directory and fan-out
-sensors directly; they move no bytes.
+The `Controller` remains the authority for current residency. The dedup directory
+sensor overlays separately committed pending entries for planning, while its live
+reads still come only from the controller. `FanoutSensor` holds the planned tree,
+source load, and route dependencies. Selectors read both sensors directly; they move
+no bytes.
 
 The data plane scopes the directory answer by key, then calls `LocalClient.get_batch`.
 TorchStore still performs request expansion, slice intersection, transport, assembly,
@@ -140,7 +142,7 @@ on plan(reader r, regions):                    # one control-plane turn
   answer(by_key, wait=Published(selected_pending_producers(by_key)))
 
 on Published(reader r):
-  settle_promise(r); release_incoming_edges(r); wake_waiters(r)
+  remove_pending_entry(r); release_incoming_edges(r); wake_waiters(r)
 ```
 
 `directory_holders` returns registered sources; `promised_peers_below_cap` returns
