@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from dedup_sim.control._selector import Candidates
-from dedup_sim.control._sensor import Asked, FanoutSensor
-from proposed import DirectorySensor, Endpoint, Environment
+from dedup_sim.control._sensor import Asked, FanoutSensor, Routed
+from proposed import DirectorySensor, Dispatcher, Endpoint, Environment
 from proposed.selector import Balance, FirstMatch, Ordered
 
 
@@ -43,8 +43,10 @@ def test_a_fanout_nobody_supplied_raises():
 
 def test_the_ranking_keeps_fanout_under_reranking():
     fanout = FanoutSensor(fanout_cap=1)
-    fanout.route("r0", "origin")
-    fanout.folds[Asked](Asked("r0", ("K",)))
+    dispatcher = Dispatcher()
+    dispatcher.compose(fanout)
+    dispatcher.dispatch_sync(Routed("r0", "origin"))
+    dispatcher.dispatch_sync(Asked("r0", ("K",)))
     ranking = Candidates()
     chain = Ordered(FirstMatch([Balance(ranking)]))
     chain.attach(

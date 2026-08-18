@@ -117,11 +117,11 @@ class ReservationSensor(Sensor):
 
     def _committed(self, action: Committed) -> None:
         """Stand in for the accepted decision's decode until its prefill lands."""
-        self.reserve(
+        self._held.append(Reservation(
             action.response.plan.done_time,
             action.response.decode,
             action.output_tokens,
-        )
+        ))
 
     def _prefill_finished(self, action: PrefillFinished) -> None:
         """Drop what a host has now been seen to finish.
@@ -131,10 +131,6 @@ class ReservationSensor(Sensor):
         a run carries every prefill it ever promised.
         """
         self._held = [r for r in self._held if r.prefill_done >= action.now]
-
-    def reserve(self, prefill_done: float, decode_id: str, output_tokens: int) -> None:
-        """Record a committed prefill and the decode it is bound for."""
-        self._held.append(Reservation(prefill_done, decode_id, output_tokens))
 
     def pending(self, now: float) -> Sequence[Reservation]:
         """Reservations whose prefill has not completed as of ``now``.
@@ -178,7 +174,11 @@ class RoutedPullSensor(Sensor):
         """
         plan = action.response.plan
         if plan.reuse_source is not None and plan.pull_keys:
-            self.route(action.response.prefill, plan.pull_keys, plan.reuse_source)
+            self._pending.append((
+                action.response.prefill,
+                tuple(plan.pull_keys),
+                plan.reuse_source,
+            ))
 
     def _answered(self, action: FetchAnswered) -> None:
         """Spend the memo that fetch was answered from.
@@ -190,10 +190,6 @@ class RoutedPullSensor(Sensor):
         found = self._match(action.requester, action.keys)
         if found is not None:
             del self._pending[found]
-
-    def route(self, requester: str, keys: Sequence[str], peer: str) -> None:
-        """Remember that ``requester``'s pull of ``keys`` was priced against ``peer``."""
-        self._pending.append((requester, tuple(keys), peer))
 
     def peer(self, requester: str, keys: Sequence[str]) -> Optional[str]:
         """The peer ``requester``'s pull of ``keys`` was priced against.

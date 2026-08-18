@@ -1676,6 +1676,8 @@ def _select_heads(sim, selector, keys, *, count, moving=True):
         sim.environment,
         {DirectorySensor: sim.directory_sensor, SourceLoad: load},
     )
+    dispatcher = Dispatcher()
+    dispatcher.compose(load)
 
     heads = []
     with sim.mesh.installed():
@@ -1683,7 +1685,7 @@ def _select_heads(sim, selector, keys, *, count, moving=True):
             head = best.select(keys, "s0").head
             heads.append(head)
             if moving:
-                load.folds[Committed](_accepted(source=head, pull=list(keys)))
+                dispatcher.dispatch_sync(_accepted(source=head, pull=list(keys)))
     return heads
 
 
@@ -1750,12 +1752,16 @@ def test_spread_reads_ranks_deterministically():
             sim.environment,
             {DirectorySensor: sim.directory_sensor, SourceLoad: load},
         )
+        dispatcher = Dispatcher()
+        dispatcher.compose(load)
         out = []
         with sim.mesh.installed():
             for _ in range(5):
                 ranked = selector.select(keys, "s0").sources
                 out.append(ranked)
-                load.folds[Committed](_accepted(source=ranked[0], pull=list(keys)))
+                dispatcher.dispatch_sync(
+                    _accepted(source=ranked[0], pull=list(keys))
+                )
         return out
 
     holders, blocks = ["s1", "s2", "s3"], {"s1": 4, "s2": 4, "s3": 3}

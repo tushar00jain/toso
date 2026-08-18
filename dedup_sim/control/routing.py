@@ -23,7 +23,7 @@ from proposed.selector import (
 )
 
 from ._selector import Candidates, CHAIN, SPREAD
-from ._sensor import Asked, FanoutSensor
+from ._sensor import Asked, FanoutSensor, Retired, Routed
 
 __all__ = ["Dedup"]
 
@@ -153,7 +153,7 @@ class Dedup(ControlPlane):
             return ranking
         fanout = self.sensor(FanoutSensor)
         if fanout.planned(requester) != source:
-            fanout.route(requester, source)
+            self.dispatcher.dispatch_sync(Routed(requester, source))
             if self._trace is not None:
                 self._trace.record(self.env.now(), "route", f"{requester} <- {source}")
         facts = [(source, key) for key in keys]
@@ -169,7 +169,7 @@ class Dedup(ControlPlane):
             # Already holds every key.
             return ranking
         # Evicted after publication.
-        fanout.retire(requester, source)
+        self.dispatcher.dispatch_sync(Retired(requester, source))
         if self._trace is not None:
             self._trace.record(self.env.now(), "retire", f"{source} holds nothing")
         return Selection()

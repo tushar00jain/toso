@@ -10,7 +10,7 @@ from typing import Dict, Iterable, Mapping, Optional, Set, Tuple
 from proposed import Key, LoadSensor, VolumeId
 from proposed.dispatch import Action, Fold, Stored
 
-__all__ = ["Asked", "FanoutSensor"]
+__all__ = ["Asked", "FanoutSensor", "Retired", "Routed"]
 
 
 @dataclass(frozen=True)
@@ -21,13 +21,28 @@ class Asked(Action):
     keys: Tuple[Key, ...]
 
 
+@dataclass(frozen=True)
+class Routed(Action):
+    """``requester`` is routed through ``source``."""
+
+    requester: VolumeId
+    source: VolumeId
+
+
+@dataclass(frozen=True)
+class Retired(Action):
+    """``requester`` no longer routes through ``source``."""
+
+    requester: VolumeId
+    source: VolumeId
+
+
 class FanoutSensor(LoadSensor):
     """Who is folded in behind whom and which puts are owed. Nobody's wait is here.
 
-    Two actions move it: the ask that takes a debt on, and the put that settles it. The
-    fold writes this state and the commit *after* it is what wakes anybody, so a woken
-    requester never re-reads before the debt is settled. Nothing here reads the
-    directory's state, and nothing reads this.
+    Asks, routes, retirements and stored puts move it through actions. A fold writes
+    this state before its commit wakes anybody. Nothing here reads the directory's
+    state, and nothing reads this.
 
     Args:
         fanout_cap: readers one peer may be planned to feed -- 1 a chain, >= 2 a
@@ -49,8 +64,12 @@ class FanoutSensor(LoadSensor):
         # routed it OWES that registration. This is the only thing that makes waiting
         # for a source safe (:meth:`~dedup_sim.control.routing.Dedup._committed`).
         self._promised: Set[Tuple[str, str]] = set()
-        # A debt taken on, and the same debt settled.
-        self._folds: Dict[type, Fold] = {Asked: self._asked, Stored: self._stored}
+        self._folds: Dict[type, Fold] = {
+            Asked: self._asked,
+            Retired: self._retired,
+            Routed: self._routed,
+            Stored: self._stored,
+        }
 
     @property
     def folds(self) -> Mapping[type, Fold]:
@@ -75,30 +94,30 @@ class FanoutSensor(LoadSensor):
         """``requester -> its source``: the tree, and the edges a decision walks."""
         return MappingProxyType(self._route)
 
-    def route(self, requester: str, source: str) -> None:
+    def _routed(self, action: Routed) -> None:
         """Fold ``requester`` in behind ``source``, and make it a source itself.
 
         One requester, one edge: re-routing replaces it rather than adding a second, so
         no bookkeeping drift can hand out more slots than the cap.
         """
-        previous = self._route.get(requester)
+        previous = self._route.get(action.requester)
         # Unmoved route.
-        if previous == source:
+        if previous == action.source:
             return
         if previous is not None:
             self._drop(previous)
-        self._route[requester] = source
-        self._load[source] += 1
+        self._route[action.requester] = action.source
+        self._load[action.source] += 1
 
     def named(self) -> Mapping[str, int]:
         """``source -> requesters currently routed to it``. Absent means none."""
         return MappingProxyType(self._load)
 
-    def retire(self, requester: str, source: str) -> None:
+    def _retired(self, action: Retired) -> None:
         """Drop ``requester``'s route to a source nothing is coming from."""
-        previous = self._route.pop(requester, None)
-        if previous is not None:
-            self._drop(previous)
+        if self._route.get(action.requester) == action.source:
+            del self._route[action.requester]
+            self._drop(action.source)
 
     def _drop(self, source: str) -> None:
         """One reader fewer behind ``source``; absent at zero, as :meth:`named` says."""

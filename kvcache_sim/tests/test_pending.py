@@ -19,6 +19,14 @@ from kvcache_sim.control._sensor import (
     Committed, FetchAnswered, PrefillFinished, Reservation, ReservationSensor,
     RoutedPullSensor, SourceLoad,
 )
+from proposed import Dispatcher
+
+
+def _dispatch(sensor, *actions):
+    dispatcher = Dispatcher()
+    dispatcher.compose(sensor)
+    for action in actions:
+        dispatcher.dispatch_sync(action)
 
 
 # --------------------------------------------------------------------------
@@ -34,7 +42,7 @@ def test_a_reservation_that_has_come_true_is_not_pending():
     it would be added on top of that -- the same request predicted as two.
     """
     reserved = ReservationSensor()
-    reserved.reserve(prefill_done=10.0, decode_id="d0", output_tokens=4)
+    _dispatch(reserved, _committed(done=10.0))
     assert [r.decode_id for r in reserved.pending(now=9.0)] == ["d0"]
     assert list(reserved.pending(now=10.5)) == []
 
@@ -42,7 +50,7 @@ def test_a_reservation_that_has_come_true_is_not_pending():
 def test_a_reservation_is_pending_up_to_the_instant_it_lands():
     """The boundary is inclusive: at exactly its completion it still counts."""
     reserved = ReservationSensor()
-    reserved.reserve(prefill_done=10.0, decode_id="d0", output_tokens=4)
+    _dispatch(reserved, _committed(done=10.0))
     assert len(reserved.pending(now=10.0)) == 1
 
 
@@ -55,8 +63,11 @@ def test_a_read_filters_at_its_own_clock_and_not_at_the_last_write():
     or the last report.
     """
     reserved = ReservationSensor()
-    reserved.reserve(prefill_done=1.0, decode_id="d0", output_tokens=4)
-    reserved.reserve(prefill_done=2.0, decode_id="d1", output_tokens=4)
+    _dispatch(
+        reserved,
+        _committed(done=1.0),
+        _committed(decode="d1", done=2.0),
+    )
     # Nothing reported -- and the read is still correct at every instant.
     assert len(reserved.pending(now=0.0)) == 2
     assert [r.decode_id for r in reserved.pending(now=1.5)] == ["d1"]
@@ -71,9 +82,12 @@ def test_a_landed_prefill_drops_the_reservations_it_made_stale():
     would still be pending if the fold had kept them.
     """
     reserved = ReservationSensor()
-    reserved.reserve(prefill_done=1.0, decode_id="d0", output_tokens=4)
-    reserved.reserve(prefill_done=9.0, decode_id="d1", output_tokens=4)
-    reserved.folds[PrefillFinished](PrefillFinished("s0", 5.0))
+    _dispatch(
+        reserved,
+        _committed(done=1.0),
+        _committed(decode="d1", done=9.0),
+        PrefillFinished("s0", 5.0),
+    )
     assert [r.decode_id for r in reserved.pending(now=0.0)] == ["d1"]
 
 
@@ -94,9 +108,9 @@ def test_a_routed_pull_is_answered_once():
     peer chosen for a different request -- and charge a locality tier nobody priced.
     """
     routed = RoutedPullSensor()
-    routed.route("s0", ["a", "b"], "s1")
+    _dispatch(routed, _committed(source="s1", pull=["a", "b"]))
     assert routed.peer("s0", ["a", "b"]) == "s1"
-    routed.folds[FetchAnswered](_answered(keys=("a", "b")))
+    _dispatch(routed, _answered(keys=("a", "b")))
     assert routed.peer("s0", ["a", "b"]) is None
 
 
@@ -107,9 +121,12 @@ def test_answering_a_fetch_nothing_priced_spends_nothing():
     other requester's memo where it was.
     """
     routed = RoutedPullSensor()
-    routed.route("s0", ["a"], "s1")
-    routed.folds[FetchAnswered](_answered(requester="s2"))
-    routed.folds[FetchAnswered](_answered(keys=("z",)))
+    _dispatch(
+        routed,
+        _committed(source="s1", pull=["a"]),
+        _answered(requester="s2"),
+        _answered(keys=("z",)),
+    )
     assert routed.peer("s0", ["a"]) == "s1"
 
 
@@ -120,10 +137,13 @@ def test_pulls_to_one_instance_are_answered_oldest_first():
     that answer spends.
     """
     routed = RoutedPullSensor()
-    routed.route("s0", ["a"], "s1")
-    routed.route("s0", ["a"], "s2")
+    _dispatch(
+        routed,
+        _committed(source="s1", pull=["a"]),
+        _committed(source="s2", pull=["a"]),
+    )
     assert routed.peer("s0", ["a"]) == "s1"
-    routed.folds[FetchAnswered](_answered())
+    _dispatch(routed, _answered())
     assert routed.peer("s0", ["a"]) == "s2"
 
 
@@ -135,7 +155,7 @@ def test_a_memo_answers_exactly_what_was_planned():
     locality tier chosen for another request.
     """
     routed = RoutedPullSensor()
-    routed.route("s0", ["a", "b", "c"], "s1")
+    _dispatch(routed, _committed(source="s1", pull=["a", "b", "c"]))
     assert routed.peer("s0", ["a", "b"]) is None
     assert routed.peer("s0", ["c", "b", "a"]) == "s1"  # order is not identity
 
@@ -143,7 +163,7 @@ def test_a_memo_answers_exactly_what_was_planned():
 def test_nobody_elses_pull_answers_a_fetch():
     """A peer priced for one requester says nothing about another's fetch."""
     routed = RoutedPullSensor()
-    routed.route("s0", ["a"], "s1")
+    _dispatch(routed, _committed(source="s1", pull=["a"]))
     assert routed.peer("s2", ["a"]) is None       # different requester
     assert routed.peer("s0", ["a", "z"]) is None  # more than was planned
     assert routed.peer("s0", ["a"]) == "s1"       # ...and it is still there
@@ -175,7 +195,10 @@ def test_a_reservation_is_written_by_the_action_and_nothing_else():
     composes no sensor for this fold to be registered on.
     """
     reserved = ReservationSensor()
-    reserved.folds[Committed](_committed(decode="d1", done=10.0, output_tokens=7))
+    _dispatch(
+        reserved,
+        _committed(decode="d1", done=10.0, output_tokens=7),
+    )
     assert list(reserved.pending(now=9.0)) == [
         Reservation(prefill_done=10.0, decode_id="d1", output_tokens=7)
     ]
@@ -189,11 +212,14 @@ def test_a_pull_is_remembered_only_when_the_plan_priced_one():
     so recording one would answer a fetch with a peer nothing was priced against.
     """
     routed = RoutedPullSensor()
-    routed.folds[Committed](_committed(source=None, pull=()))
-    routed.folds[Committed](_committed(source="s1", pull=()))     # priced no keys
-    routed.folds[Committed](_committed(source=None, pull=["a"]))  # named no peer
+    _dispatch(
+        routed,
+        _committed(source=None, pull=()),
+        _committed(source="s1", pull=()),     # priced no keys
+        _committed(source=None, pull=["a"]),  # named no peer
+    )
     assert routed.peer("s0", ["a"]) is None, "nothing was priced, so nothing is owed"
-    routed.folds[Committed](_committed(source="s1", pull=["a"]))
+    _dispatch(routed, _committed(source="s1", pull=["a"]))
     assert routed.peer("s0", ["a"]) == "s1"
 
 
@@ -205,8 +231,11 @@ def test_load_counts_the_source_a_decision_priced_a_pull_against():
     reading from.
     """
     load = SourceLoad()
-    load.folds[Committed](_committed(source=None, pull=()))         # nothing named
-    load.folds[Committed](_committed(source="s1", pull=["a"]))
-    load.folds[Committed](_committed(source="s1", pull=["b"]))
-    load.folds[Committed](_committed(source="s2", pull=["c"]))
+    _dispatch(
+        load,
+        _committed(source=None, pull=()),         # nothing named
+        _committed(source="s1", pull=["a"]),
+        _committed(source="s1", pull=["b"]),
+        _committed(source="s2", pull=["c"]),
+    )
     assert dict(load.named()) == {"s1": 2, "s2": 1}
