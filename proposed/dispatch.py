@@ -5,7 +5,7 @@ scheduler's reservation, the routed record and the pending map
 (``kvcache_sim.control._sensor``), and written one at a time their order is a caller's
 problem. Folded from one :class:`Action` and committed together, it is nobody's. A
 capability with one owner per fact gets the commit and the wake instead --
-``dedup_sim`` folds :class:`Stored` in one place and parks its readers on the commit.
+``dedup_sim`` folds its completion in one place and parks its readers on the commit.
 
 **No application state is stored here.** Every reducer goes on owning exactly what it
 owned before, and is handed no way to read a neighbour's. The dispatcher holds its
@@ -24,13 +24,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Set
 
-from proposed.deployment import Key, VolumeId
 from proposed.selector import Ready
 
-__all__ = ["Action", "Dispatcher", "Fold", "Probe", "Reducer", "Stored"]
+__all__ = ["Action", "Dispatcher", "Fold", "Probe", "Reducer"]
 
 #: Folds one action into one reducer's own state, and reads nothing else.
 Fold = Callable[[Any], None]
@@ -46,19 +44,6 @@ class Action:
 
 #: Reads whether what a waiter is waiting for is true now.
 Probe = Callable[[], bool]
-
-
-@dataclass(frozen=True)
-class Stored(Action):
-    """``host`` holds ``key`` from now on -- one reader's landed put.
-
-    The put registered itself before it returned, so the directory needs nothing from
-    this: what it carries is who stored what, for whoever keeps state about the debt
-    that put discharged.
-    """
-
-    host: VolumeId
-    key: Key
 
 
 class Reducer(Protocol):

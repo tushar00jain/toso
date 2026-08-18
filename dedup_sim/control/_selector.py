@@ -38,11 +38,11 @@ releases the next reader's withheld answer (:mod:`dedup_sim.data`).
 
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from proposed import DirectorySensor, Key, KeySelector, Selection, VolumeId
 
-from ._sensor import FanoutSensor
+from ._sensor import FanoutSensor, _storage_covers
 
 __all__ = ["Candidates", "CHAIN", "SPREAD"]
 
@@ -63,10 +63,10 @@ class Candidates(KeySelector[float]):
             little more than its link's latency; a run that knows the size can say so,
             and the bandwidth term then sharpens the ratio between tiers.
 
-    A peer is offered only while it still **owes** the key: from the ask that promises
-    it (:class:`~dedup_sim.control._sensor.Asked`) until its read-through lands. One
-    that published and has since evicted owes nothing and holds nothing, so it is no
-    candidate.
+    A peer is offered only while its promised requests cover this request: from the ask
+    that promises them (:class:`~dedup_sim.control._sensor.Asked`) until its
+    read-through lands. One that published and has since evicted owes nothing and holds
+    nothing, so it is no candidate.
     """
 
     sensors = (DirectorySensor, FanoutSensor)
@@ -78,10 +78,18 @@ class Candidates(KeySelector[float]):
     def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
         """Everything that could serve every one of ``keys``, scored; else abstain."""
         fanout = self.sensor(FanoutSensor)
-        by_key = self.sensor(DirectorySensor).holders(keys)
-        holds = set(by_key[keys[0]])
-        for key in keys[1:]:
-            holds &= set(by_key[key])
+        requested = fanout.plan(requester)
+        located = self.sensor(DirectorySensor).locate(keys)
+        volumes = {volume for by_volume in located.values() for volume in by_volume}
+        holds = {
+            volume
+            for volume in volumes
+            if all(
+                volume in located.get(key, {})
+                and _storage_covers(located[key][volume], request)
+                for key, request in requested.items()
+            )
+        }
         routes, queued = fanout.routes(), fanout.named()
         # Discounted from the cap below: a second ask costs no slot, so a reader
         # re-asking after an eviction is not shut out by its own place in the queue.
@@ -96,7 +104,7 @@ class Candidates(KeySelector[float]):
             # Never a source for itself.
             if volume == requester:
                 continue
-            wait = self._wait(volume, keys, holds, routes, waits)
+            wait = self._wait(volume, requested, holds, routes, waits)
             if wait is None:
                 continue
             behind = queued.get(volume, 0) - (volume == mine)
@@ -114,12 +122,12 @@ class Candidates(KeySelector[float]):
     def _wait(
         self,
         volume: VolumeId,
-        keys: Sequence[Key],
+        requested: Mapping[Key, Any],
         holds: Set[VolumeId],
         routes: Mapping[VolumeId, VolumeId],
         waits: Dict[VolumeId, Optional[float]],
     ) -> Optional[float]:
-        """Seconds until ``volume`` holds ``keys``; ``0`` if it does, ``None`` if never.
+        """Seconds until ``volume`` covers the request; ``0`` now, ``None`` if never.
 
         A peer's wait is its own source's wait plus the link between the two, so a
         branch costs what its links cost rather than a hop count, and a peer two cheap
@@ -147,14 +155,12 @@ class Candidates(KeySelector[float]):
                 break
             # Owes nothing, or more steps than there are edges -- a walk that cannot
             # terminate is a cycle, and this is what stops following it.
-            if len(branch) > len(routes) or not fanout.owes(
-                [(volume, key) for key in keys]
-            ):
+            if len(branch) > len(routes) or not fanout.covers(volume, requested):
                 wait = waits[volume] = None
                 break
             branch.append(volume)
             source = routes.get(volume)
-            # Owed the key, but nothing is planned to feed it: no copy on the way.
+            # Owes the request, but has no source.
             if source is None:
                 wait = waits[volume] = None
                 break

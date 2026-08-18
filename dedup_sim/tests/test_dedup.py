@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from dataclasses import dataclass
 
 import pytest
 import torch
 
 from dedup_sim.tests._run import run
-from proposed import Dispatcher, Stored
+from proposed import Action, Dispatcher
 from putget_sim.workload.put_get import DEFAULT_N, MODE_META, MODE_METADATA
 from realsim.seams.transport import TensorDescriptor
 from sim_common import config
@@ -249,13 +250,22 @@ def test_the_scenario_holds_no_burst_loop():
 
     tree = ast.parse(inspect.getsource(scenarios))
     # The capability contributes a selector and a data plane; the burst itself is
-    # putget_sim's fixture. So the scenario stages nothing of its own: no
-    # coroutine, hence no gather, no await, no execution order to get wrong.
+    # putget_sim's fixture. The one coroutine unwraps that plane's one-key batch;
+    # no loop or gather stages the burst in the scenario.
     assert not [
         n
         for n in ast.walk(tree)
-        if isinstance(n, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor))
+        if isinstance(n, ast.AsyncFor)
+        or (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "gather"
+        )
     ]
+    assert [n.name for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)] == [
+        "drive"
+    ]
+    assert len([n for n in ast.walk(tree) if isinstance(n, ast.Await)]) == 1
     # ...and every run is literally the same workload object, one selector apart:
     # the baseline and each routed cap cannot differ in what they simulate.
     runs = scenarios.Dedup().runs()
@@ -276,6 +286,12 @@ def test_the_scenario_holds_no_burst_loop():
 # --------------------------------------------------------------------------
 
 #: The action these gates wait for.
+@dataclass(frozen=True)
+class Stored(Action):
+    host: str
+    key: str
+
+
 _FACT = Stored("v0", "K")
 
 
@@ -419,6 +435,23 @@ def test_released_gates_leave_no_waiter_registration():
         return dispatcher._waiters
 
     waiters, _trace = run_sim(_versions())
+    assert waiters == {}
+
+
+def test_cancelled_gates_leave_no_waiter_registration():
+    async def _cancel() -> dict:
+        landed: set = set()
+        dispatcher = _dispatcher(landed)
+        gate = dispatcher.gate(lambda: False, (_FACT,))
+        assert gate is not None
+        task = asyncio.create_task(gate())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return dispatcher._waiters
+
+    waiters, _trace = run_sim(_cancel())
     assert waiters == {}
 
 

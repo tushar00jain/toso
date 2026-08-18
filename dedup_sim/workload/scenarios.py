@@ -42,15 +42,19 @@ NUM_READERS = 3
 FANOUT_CAPS = (1, 2)
 
 
-def _read_through(sim, burst) -> ItemDispatch:
+def _read_through(sim) -> ItemDispatch:
     """This run's data plane, brought up against the assembled stack.
 
     The plane makes both of a reader's store calls itself, so what the runner drives
     is one member and the item carries only who is reading.
     """
-    plane = ReadThroughPlane(KEY, burst.expected, trace=sim.trace)
+    plane = ReadThroughPlane(trace=sim.trace)
     plane.attach(sim)
-    return ItemDispatch(lambda item: plane.read_through(item.id))
+
+    async def drive(item):
+        return (await plane.read_through(item.id, {KEY: None}))[KEY]
+
+    return ItemDispatch(drive)
 
 
 class Dedup(Scenario):
@@ -93,7 +97,7 @@ class Dedup(Scenario):
                     # drives is the dispatch that calls it. Wiring, so it is here
                     # and not in ``data/``. The plane is built with its knobs and
                     # handed the deployment, exactly as a control plane is.
-                    data=lambda sim, b=burst: _read_through(sim, b),
+                    data=_read_through,
                     profile=burst.profile,
                     trace=trace,
                 )
@@ -161,7 +165,7 @@ class WeightSync(Scenario):
                     label,
                     workload,
                     control=routing.Dedup(spread=spread, trace=trace),
-                    data=lambda sim, w=workload: _read_through(sim, w),
+                    data=_read_through,
                     profile=workload.profile,
                     trace=trace,
                 )

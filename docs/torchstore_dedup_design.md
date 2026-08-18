@@ -36,12 +36,12 @@ optimize the final microseconds of a fused one-hop engine; or change the
 ```
 ┌────────────── CONTROL ──────────────┐      ┌──────────── DATA ─────────────┐      ┌────────── TORCHSTORE ──────────┐
 │ Dedup ControlPlane                  │      │ ReadThroughPlane              │      │ Controller: current holders    │
-│ source rank + readiness + load      │answer│ preferred get → local put     │─────►│ LocalClient: slice planning    │
-│ FanoutSensor: tree / promises / load│      │ dispatch Stored               │      │ StorageVolume: resident bytes  │
+│ source rank + readiness + load      │answer│ preferred batch → local put   │─────►│ LocalClient: slice planning    │
+│ FanoutSensor: tree / promises / load│      │ dispatch Published            │      │ StorageVolume: resident bytes  │
 │ reads Environment + Sensors         │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
 └─────────────────────────────────────┘      └───────────────────────────────┘      └────────────────────────────────┘
 ┌──────────────── DIRECTORY TRUTH ─────────────────┐   ┌──────────────────── SENSOR TRUTH ────────────────────┐
-│ local put registers reader as a current holder   │   │ Stored settles the promised copy and wakes dependents│
+│ batch put registers reader as a current holder   │   │ Published settles its plan and wakes dependents      │
 └──────────────────────────────────────────────────┘   └──────────────────────────────────────────────────────┘
 ```
 <!-- text-diagram:shape:end -->
@@ -51,10 +51,10 @@ The `Controller` remains the authority for current residency. The dedup
 copies that have not registered yet. Its selectors read the directory and fan-out
 sensors directly; they move no bytes.
 
-The data plane executes an ordinary preferred `get`, writes the result into the
-reader's co-located volume, and reports `Stored`. The put changes directory truth;
-the action settles the planned copy in `FanoutSensor`. A waiting reader is answered
-only when both agree that its source can serve the key.
+The data plane executes an ordinary preferred `get_batch`, writes the result into the
+reader's co-located volume, and reports `Published(reader)`. The put changes directory
+truth; the action settles the producer's planned batch in `FanoutSensor`. A waiting
+reader is answered only when both agree that its source can serve the request.
 
 Every generator already has a volume under `LocalRankStrategy`, so read-through
 population needs no new storage actor.
@@ -141,15 +141,16 @@ on plan(reader r, regions):                    # one control-plane turn
     reserve_edge(src, r, R)                    # charges fan-out and source load
     answer(R, src, wait=ready(src, R) + slot(src))
 
-on Stored(reader r, region R):
-  settle_promise(R, r); release_incoming_edge(r, R); wake_waiters(R)
+on Published(reader r):
+  settle_promise(r); release_incoming_edges(r); wake_waiters(r)
 ```
 
 `directory_holders` returns registered sources; `promised_peers_below_cap` returns
 readers whose copies are in flight and still have fan-out capacity. `score` is the
 readiness-plus-transfer formula above; `active_load` and `stable_id` are its load and
 deterministic tie-breaks. `ready` and `slot` are the source-copy and fan-out wait gates.
-`promise` and `reserve_edge` record the planned copy and load; `Stored` settles both.
+`promise` and `reserve_edge` record the planned copy and load; `Published` settles the
+producer's whole in-flight plan.
 
 Every request is decided against all earlier promises and reservations. The source
 load is therefore part of the same atomic decision as the route; two readers cannot
@@ -173,16 +174,23 @@ Optional put-side de-replication splits a replicated writer's shared shard acros
 replicas. Existing assembly reconstructs the full value. This reduces put traffic and
 storage footprint but is independent of read routing.
 
-State-dict `MAPPING` is the commit and version boundary. A new marker invalidates the
-previous version's planned and cached copies. Copies stay pinned within one sync
-window; optional deletion reclaims them after the version changes.
+`Published(producer)` is the completion boundary for the producer's one in-flight
+plan. The plan holds the region geometry used for coverage; waiters and completion
+actions hold only the producer. Copies stay pinned within one sync window; optional
+deletion reclaims them after the version changes.
+
+The executable plane builds existing meta-only `Request` values from the caller's
+`key -> tensor/DTensor/None` batch. Promised coverage compares their `TensorSlice`
+values, and current-holder coverage compares them with the directory's `StorageInfo`.
+The current selector still requires one source to cover the whole batch; composing
+several partial sources is a separate routing shape.
 
 ## 6. Correctness and failure handling
 
 - **Fabric objective:** peer routing reaches 1x origin bytes while its scored wait and
   hop remain cheaper; any extra trainer root is an explicit lower-latency choice.
-- **No torn source:** a peer becomes readable only after its put has registered and
-  `Stored` has settled the promise.
+- **No torn source:** a peer becomes readable only after its batch put has registered
+  and `Published` has settled the promise.
 - **Deterministic order:** serialized decisions and stable tie-breaks define the same
   tree for the same inputs.
 - **Load bound:** reservations count before the answer is returned, and a source never
@@ -191,8 +199,8 @@ window; optional deletion reclaims them after the version changes.
   intersection and assembly.
 - **Puller failure:** a promise needs a timeout. On expiry, cancel its dependent routes
   and designate another reader or trainer source.
-- **Stale version:** reads remain gated by the committed `MAPPING`; version changes
-  discard promises before any new plan is issued.
+- **Overlapping publication:** one producer may have one plan in flight; a second is
+  rejected until `Published` settles the first.
 
 The online tree can be deeper than a global optimum, and one control service may
 back-pressure at very wide fan-in. Key-hash sharding is the scale-out path, provided

@@ -1,9 +1,9 @@
 """1x-fabric dedup routing: :class:`Dedup`, the capability's whole control plane.
 
-One member, and it is everything a reader asks: *which volumes serve this key for me,
+One member, and it is everything a reader asks: *which volumes serve this batch for me,
 and when are they usable* (:meth:`Dedup.sources`). That the put landed is not a second
 question and not a report to this plane: it is one action a reader commits
-(:class:`proposed.dispatch.Stored`), folded by this plane's own state
+(:class:`dedup_sim.control._sensor.Published`), folded by this plane's own state
 (:attr:`Dedup.dispatcher`).
 
 The ranking is :mod:`dedup_sim.control._selector`.
@@ -16,14 +16,13 @@ from typing import Any, List, Mapping, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
     ControlPlane, DecisionLog, DirectorySensor, Dispatcher, Environment, Key,
-    endpoint, Selection, Sensor, Stored,
+    endpoint, Selection, Sensor,
 )
 from proposed.selector import (
     Balance, FirstMatch, Fold, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
 )
-
 from ._selector import Candidates, CHAIN, SPREAD
-from ._sensor import Asked, FanoutSensor, Retired, Routed
+from ._sensor import Asked, FanoutSensor, Published, Retired, Routed, _storage_covers
 
 __all__ = ["Dedup"]
 
@@ -110,15 +109,15 @@ class Dedup(ControlPlane):
     # -- what a reader asks -------------------------------------------------- #
     @endpoint
     async def sources(
-        self, keys: Sequence[Key], requester: str
+        self, requests: Sequence[Any], requester: str
     ) -> Selection[Unpack[Tuple[Any, ...]]]:
-        """Which volumes serve ``keys`` for ``requester``, once they are usable."""
+        """Which volumes serve ``requests`` for ``requester``, once they are usable."""
         # The wait is spent here, not handed back: a caller that read before these
         # sources held the key would go to a volume with nothing to serve.
-        return await (await self._decide(keys, requester)).settled()
+        return await (await self._decide(requests, requester)).settled()
 
     async def _decide(
-        self, keys: Sequence[Key], requester: str
+        self, requests: Sequence[Any], requester: str
     ) -> Selection[Unpack[Tuple[Any, ...]]]:
         """The whole decision with the gate unspent, awaitable without parking.
 
@@ -130,17 +129,18 @@ class Dedup(ControlPlane):
         would price one delay twice. The tie-break keeps two replicas of one key
         alternating rather than falling back to id order.
         """
-        keys = list(keys)
+        requests = list(requests)
+        keys = [request.key for request in requests]
         # Asking is what makes this requester a peer, so its debt is dispatched before
         # the ranking is consulted -- that debt is what bounds the wait on whichever
         # source is named. Dispatched without suspending, so the debt and the decision
         # priced against it are one turn.
-        self.dispatcher.dispatch_sync(Asked(requester, tuple(keys)))
+        self.dispatcher.dispatch_sync(Asked(requester, tuple(requests)))
         ranking = self._chain.select(keys, requester)
-        return self._committed(keys, requester, ranking)
+        return self._committed(requester, ranking)
 
     def _committed(
-        self, keys: Sequence[Key], requester: str, ranking: Selection
+        self, requester: str, ranking: Selection
     ) -> Selection:
         """``ranking``, routed to its head and gated until that head is usable.
 
@@ -156,17 +156,18 @@ class Dedup(ControlPlane):
             self.dispatcher.dispatch_sync(Routed(requester, source))
             if self._trace is not None:
                 self._trace.record(self.env.now(), "route", f"{requester} <- {source}")
-        facts = [(source, key) for key in keys]
-        if fanout.owes(facts):
+        requested = fanout.plan(requester)
+        facts = [(source, key) for key in requested]
+        if fanout.covers(source, requested):
             # Pending publication.
             return replace(
                 ranking,
                 ready=self.dispatcher.gate(
-                    lambda: len(self._registered(facts)) == len(facts),
-                    (Stored(host, key) for host, key in facts),
+                    lambda: len(self._registered(facts, requested)) == len(facts),
+                    (Published(source),),
                 ),
             )
-        if len(self._registered(facts)) == len(facts):
+        if len(self._registered(facts, requested)) == len(facts):
             # Already holds every key.
             return ranking
         # Evicted after publication.
@@ -176,13 +177,16 @@ class Dedup(ControlPlane):
         return Selection()
 
     def _registered(
-        self, facts: Sequence[Tuple[str, Key]]
+        self,
+        facts: Sequence[Tuple[str, Key]],
+        requested: Mapping[Key, Any],
     ) -> List[Tuple[str, Key]]:
         """Facts the directory holds now."""
         directory = self.sensor(DirectorySensor)
-        by_key = directory.holders([key for _volume, key in facts], live=True)
+        by_key = directory.locate_live([key for _volume, key in facts])
         return [
             (volume, key)
             for volume, key in facts
-            if volume in by_key[key]
+            if volume in by_key.get(key, {})
+            and _storage_covers(by_key[key][volume], requested[key])
         ]

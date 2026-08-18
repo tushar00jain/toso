@@ -46,10 +46,11 @@ from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
 from sim_common.cost_model import DEFAULT_PROFILE
 
-from dedup_sim.control._sensor import FanoutSensor
+from dedup_sim.control._sensor import FanoutSensor, Published
 from dedup_sim.control.routing import Dedup
-from proposed import DirectorySensor, Endpoint, Environment, Stored
+from proposed import DirectorySensor, Endpoint, Environment
 from dedup_sim.data.read_through import ReadThroughPlane
+from torchstore.transport import Request
 
 #: The version that displaces ``W`` in a one-deep reader volume.
 NEXT_VERSION = "W2"
@@ -58,6 +59,10 @@ PAYLOAD_BYTES = DEFAULT_N * 4
 #: Virtual seconds between rounds. Orders of magnitude longer than the whole
 #: burst takes, and asserted below, so a round observes the one before it whole.
 ROUND = 1.0
+
+
+def _request(key: str) -> Request:
+    return Request.from_any(key, None).meta_only()
 
 
 class VersionedRounds(PutGetBurst):
@@ -107,13 +112,14 @@ def _per_item(sim, workload) -> Any:
     reader storing its *own* new version, which is the workload seeding a state and
     not a read to publish. No subclass: the plane already takes the key.
     """
-    plane = ReadThroughPlane(KEY, workload.put_value)
+    plane = ReadThroughPlane()
     plane.attach(sim)
 
     async def drive(item: Any) -> Any:
         if item.payload is None:
             return await item.run()
-        return await plane.read_through(*item.payload)
+        requester, key = item.payload
+        return (await plane.read_through(requester, {key: None}))[key]
 
     return drive
 
@@ -264,7 +270,7 @@ def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
     """A plane whose chain senses ``directory``, as a run's wiring leaves it.
 
     ``attach`` is the whole of it, as it is in a run: it composes the plane's own state
-    onto the dispatcher it builds, and that state is the only thing a landed put folds.
+    onto the dispatcher it builds, and that state folds each completed batch.
     """
     plane = Dedup(fanout_cap=fanout_cap)
     ids = {"p", *(f"r{i}" for i in range(10))}
@@ -293,11 +299,11 @@ def test_one_registration_releases_every_requester_waiting_on_it():
     async def _burst():
         directory = Directory(W="p")
         plane = _sensing(directory, fanout_cap=2)
-        await plane.sources([KEY], "r0")  # r0 <- p, the origin: usable now
+        await plane.sources([_request(KEY)], "r0")  # r0 <- p, the origin: usable now
         answered: List[str] = []
 
         async def ask(name: str):
-            selection = await plane.sources([KEY], name)
+            selection = await plane.sources([_request(KEY)], name)
             answered.append(name)
             return selection
 
@@ -305,10 +311,12 @@ def test_one_registration_releases_every_requester_waiting_on_it():
         tasks = [loop.create_task(ask(name)) for name in ("r1", "r2")]
         await asyncio.sleep(0)
         assert answered == [], "answered before the peer published"
-        # r0's put: the directory gains it, and then the one action settles the debt
-        # r0 owed -- whose commit is what completes both gates.
+        assert set(plane.dispatcher._waiters) == {Published("r0")}
+        plane.dispatcher.dispatch_sync(Published("r9"))
+        await asyncio.sleep(0)
+        assert answered == [], "answered for another producer's publication"
         directory.publish("r0", KEY)
-        plane.dispatcher.dispatch_sync(Stored("r0", KEY))
+        plane.dispatcher.dispatch_sync(Published("r0"))
         waiters = await asyncio.gather(*tasks)
         assert all(w.head == "r0" for w in waiters)
         # Nothing that crossed the boundary carries a closure with it.
@@ -333,21 +341,21 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
     async def _after_the_eviction():
         directory = Directory(W="p")
         plane = _sensing(directory, fanout_cap=3)
-        await plane.sources([KEY], "r0")  # r0 <- p
+        await plane.sources([_request(KEY)], "r0")  # r0 <- p
         directory.publish("r0", KEY)                       # r0's read-through lands
-        plane.dispatcher.dispatch_sync(Stored("r0", KEY))
+        plane.dispatcher.dispatch_sync(Published("r0"))
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
         # It answers at all, which is the hang that would not: the retired peer is
         # never priced, so what is left is the holder -- read from, not waited on.
-        stale = await plane.sources([KEY], "r1")
+        stale = await plane.sources([_request(KEY)], "r1")
         assert stale.head == "p", "parked on a registration nobody owes"
         assert stale.ready is None
 
         # r1 is a live source though -- it is fetching now -- so r2 attaches to it
         # rather than to the peer that was retired. Its decision therefore gates,
         # which is why this asks the chain rather than awaiting the plane's answer.
-        return await plane._decide([KEY], "r2")
+        return await plane._decide([_request(KEY)], "r2")
 
     selection, _trace = run_sim(_after_the_eviction())
     assert selection.head == "r1"
@@ -370,13 +378,13 @@ def test_a_peer_never_feeds_more_than_the_cap():
     async def _fanout_across_a_retire():
         directory = Directory(W="p")
         plane = _sensing(directory, fanout_cap=cap)
-        await plane.sources([KEY], "r0")            # r0 <- p, the origin
+        await plane.sources([_request(KEY)], "r0")  # r0 <- p, the origin
         for name in ("r1", "r2", "r3"):             # r0 fills, then r1 takes the rest
-            await plane._decide([KEY], name)
+            await plane._decide([_request(KEY)], name)
         # The origin drops the key, so nothing is coming to r0 or to anyone behind it:
         # no volume has a copy on the way, and the next ask is the directory's answer.
         directory.evict("p", KEY)
-        last = await plane._decide([KEY], "r4")
+        last = await plane._decide([_request(KEY)], "r4")
         return Counter(plane.sensor(FanoutSensor).routes().values()), last.sources
 
     served, last = run_sim(_fanout_across_a_retire())[0]
@@ -397,6 +405,6 @@ def test_the_sensor_remembers_no_registrations():
     """
     result, plane = _run()
     fanout = plane.sensor(FanoutSensor)
-    assert fanout._promised == set(), "a put owed by a run that finished"
+    assert fanout._promised == {}, "a put owed by a run that finished"
     assert set(fanout._route) == set(result.workload.reader_ids)
     assert not hasattr(fanout, "_ready"), "the waiting is the commit, and is nobody's"

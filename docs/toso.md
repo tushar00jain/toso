@@ -87,15 +87,14 @@ C asks for W
   -> selector chooses B
   -> answer waits at a readiness gate
 
-B finishes get -> local put -> directory registers B -> Stored commit
-  -> gate rechecks directory
+B finishes get_batch -> local put_batch -> directory registers B -> Published(B)
   -> C receives B as a usable source
 ```
 
 - The gate delays the control-plane answer, not the storage operation.
 - A promised source is released only after the directory confirms every requested key.
-- Waiters recheck current residency after a commit, so a stale publication event does
-  not hide a later eviction.
+- One producer has one publication in flight, and its completion releases all
+  compatible waiters without repeating the request plan in each gate.
 - The local `put` turns a consumer into a source; repeated read-through fills create
   the tree.
 
@@ -198,12 +197,16 @@ data-plane application steps         |      routed calls and deployment wiring
 The minimum read-through path is small:
 
 ```python
-selection = await control.sources.call_one([key], requester)
-value = await deployment.client_for(
+requests = tuple(
+    Request.from_any(key, value).meta_only()
+    for key, value in entries.items()
+)
+selection = await control.sources.call_one(requests, requester)
+values = await deployment.client_for(
     requester, prefer=selection.sources
-).get(key)
-await deployment.client_for(requester).put(key, value)
-await deployment.dispatcher_handle.dispatch.call_one(Stored(requester, key))
+).get_batch(entries)
+await deployment.client_for(requester).put_batch(values)
+await deployment.dispatcher_handle.dispatch.call_one(Published(requester))
 ```
 
 - Change the selector chain to change placement or source preference.

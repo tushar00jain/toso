@@ -84,6 +84,6 @@ ONE REQUEST — dedup and KV-cache
 ```
 <!-- text-diagram:request-lifecycle:end -->
 
-Dedup feedback: the put changes the directory; `Stored` settles the promised copy.
+Dedup feedback: the batch put changes the directory; `Published` settles its promise.
 KV feedback: publish/evict changes prefix presence; `PrefillFinished`, `ComputeBusy`,
 `DecodeState`, `Committed`, and `FetchAnswered` update the sensors for the next request.

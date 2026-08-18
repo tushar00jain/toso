@@ -33,15 +33,15 @@ capability's whole control plane, reached as a service of its own:
    `fanout_cap` readers are behind it (`1` -> a chain, `>=2` -> a shallow tree).
 3. That peer has not registered yet, so the decision carries a **readiness gate**
    and `sources` *does not answer* until the peer's read-through put lands. The
-   caller's read is then an unmodified `client.get` with a preference passed to it:
+   caller's read is then an unmodified `client.get_batch` with a preference passed to it:
    no client change is needed, nothing is installed in the store, and no client is
    lied to.
 4. The read-through is the data plane's one job
-   (`dedup_sim.data.read_through`): after a reader's `get` returns, it `put`s the
-   key into its own co-located volume -- a zero-fabric local write through the real
-   `client.put` path, which registers the key before it returns -- and then **commits
-   one action**, `Stored`, which the plane's own fan-out folds. The action satisfies
-   gates waiting on that publication; a gate opens after every key it named lands.
+   (`dedup_sim.data.read_through`): after a reader's batch returns, it stores the
+   keys in its own co-located volume -- a zero-fabric local write through the real
+   `client.put_batch` path, which registers every key before it returns -- and then
+   commits `Published(reader)`. The plane's own fan-out folds that one action and
+   releases every gate waiting on the completed producer.
 
 Because a peer outprices a holder, exactly one reader ever pulls from a pre-existing
 holder: the only origin-sourced transfer is that first hop, `origin_bytes == 1x` the
@@ -177,7 +177,7 @@ dedup_sim/
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
                           #   with a source once it is usable, off the chain it
                           #   builds and the one fold that orders what the chain
-                          #   keyed; a landed put is an action it folds, not a
+                          #   keyed; a completed batch is an action it folds, not a
                           #   question it is asked. `spread` picks the fabric dial
                           #   and the fold that reads the queue at a source
     _selector.py          #   Candidates: one ranking over everything that could
@@ -187,10 +187,10 @@ dedup_sim/
                           #   fabric that hop burns
     _sensor.py            #   FanoutSensor: who is folded in behind whom and which
                           #   puts are owed -- the plane's one record and the reducer
-                          #   that folds each ask and landed put
+                          #   that folds each ask and completed batch
   data/                   # EXECUTES
     read_through.py       #   ReadThroughPlane: one DataPlane method -- ask, read,
-                          #   put, commit one Stored action, over the Deployment's
+                          #   put, commit one Published action, over the Deployment's
                           #   client and ports
   workload/               # WHAT IS SIMULATED
     scenarios.py          #   the Dedup and WeightSync Scenarios: the Runs to compare
@@ -216,7 +216,7 @@ visible from which folders exist and how thick they are:
 
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
-| `control/` — what is decided | `routing.py`: one plane, `sources` + `_selector.py` (the chain behind it) + `_sensor.py` (the fan-out it senses, and folds a landed put into) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_prefix.py` (prefix runs) |
+| `control/` — what is decided | `routing.py`: one plane, `sources` + `_selector.py` (the chain behind it) + `_sensor.py` (the fan-out it senses, and folds a completed batch into) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_prefix.py` (prefix runs) |
 | `data/` — what executes | `read_through.py`: one member — ask, get, local put, commit | `serving.py` (the per-request lifecycle) + `_decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |

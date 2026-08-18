@@ -14,8 +14,8 @@
         </between>
         <box title="DATA" width="31">
           <line>ReadThroughPlane</line>
-          <line>preferred get → local put</line>
-          <line>dispatch Stored</line>
+          <line>preferred batch → local put</line>
+          <line>dispatch Published</line>
           <line>moves bytes through Deployment</line>
         </box>
         <between>
@@ -31,10 +31,10 @@
       </row>
       <row gap="3">
         <box title="DIRECTORY TRUTH" width="50">
-          <line>local put registers reader as a current holder</line>
+          <line>batch put registers reader as a current holder</line>
         </box>
         <box title="SENSOR TRUTH" width="54">
-          <line>Stored settles the promised copy and wakes dependents</line>
+          <line>Published settles its plan and wakes dependents</line>
         </box>
       </row>
     </stack>

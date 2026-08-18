@@ -63,7 +63,7 @@ missing" section.
 from .deployment import (
     Controller, Deployment, Key, Sensor, StorageFull, StorageVolume, VolumeId,
 )
-from .dispatch import Action, Dispatcher, Reducer, Stored
+from .dispatch import Action, Dispatcher, Reducer
 from .endpoint import endpoint
 from .plane import ControlPlane, DataPlane
 from .routed import routed, RoutedPlane
@@ -87,7 +87,6 @@ __all__ = [
     "Action",
     "Dispatcher",
     "Reducer",
-    "Stored",
     "endpoint",
     "Controller",
     "Sensor",
