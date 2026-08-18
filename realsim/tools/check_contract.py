@@ -154,7 +154,9 @@ WALLCLOCK_READS: Dict[str, str] = {
 # Matched against the *resolved* dotted module path (relative imports included).
 # A module is banned if it equals one of these or starts with it plus a dot.
 CONTROL_FORBIDDEN: Dict[str, str] = {
-    "torchstore": "a real store client (control decides; it never calls the store)",
+    "torchstore.client": "a real store client (control decides; it never calls the store)",
+    "torchstore.api": "the store API (control returns decisions; data executes them)",
+    "torchstore.storage_volume": "a storage volume (control never moves stored data)",
     "realsim.mesh": "the mesh (control gets an environment and sensors)",
     "realsim.adapters": "a real client/controller adapter",
     "realsim.seams": "the store seams (transport, volumes, controller handle)",
@@ -187,9 +189,8 @@ CONTROL_SEGMENT = "control"
 # because production has no workload package to import.
 WORKLOAD_SEGMENT = "workload"
 
-# The ``proposed`` package is the surface argued for upstream, so it must be
-# implementable inside torchstore with no simulator underneath it. Anything it
-# imported from here could not be shipped, which would make the ask a fiction.
+# The ``proposed`` package is the surface argued for upstream, so it may use
+# torchstore but must remain independent of simulator and capability packages.
 PROPOSED_PKG = "proposed"
 PROPOSED_FORBIDDEN: Dict[str, str] = {
     "realsim": "simulator scaffolding (the proposal has to stand without it)",
@@ -197,7 +198,6 @@ PROPOSED_FORBIDDEN: Dict[str, str] = {
     "dedup_sim": "a capability (the proposal must not know its consumers)",
     "kvcache_sim": "a capability (the proposal must not know its consumers)",
     "putget_sim": "a capability (the proposal must not know its consumers)",
-    "torchstore": "the store itself (this package is what torchstore would gain)",
 }
 
 
@@ -315,8 +315,7 @@ class _ContractVisitor(ast.NodeVisitor):
     def _check_plane_import(self, module: str, lineno: int) -> None:
         """Flag a ``control/`` module importing the executing half.
 
-        Also flags a ``proposed/`` module reaching for anything the proposal
-        could not be shipped with.
+        Also flags a ``proposed/`` module reaching into simulator-only packages.
         """
         if not module:
             return

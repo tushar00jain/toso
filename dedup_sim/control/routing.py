@@ -30,14 +30,13 @@ from proposed.selector import (
     Balance,
     FirstMatch,
     Fold,
-    NaiveKeySelector,
     Ordered,
     pipe,
     Selector,
     WithFold,
 )
-from .._planning import plan_fetch, requirements_met
-from ._selector import Candidates, CHAIN, SPREAD
+from ._planning import discover_fetch, FetchCoverage, plan_fetch
+from ._selector import Candidates, CHAIN, Holders, SPREAD
 from ._sensor import Asked, FanoutSensor, Published, Routed
 
 __all__ = ["Dedup", "ReadPlan"]
@@ -98,7 +97,7 @@ class Dedup(ControlPlane):
         self._spread = spread
         self._trace = trace
         self.dispatcher: Optional[Dispatcher] = None
-        self._chain: Optional[Selector[Sequence[Key], Unpack[Tuple[Any, ...]]]] = None
+        self._chain: Optional[Selector[FetchCoverage, Unpack[Tuple[Any, ...]]]] = None
 
     def attach(
         self,
@@ -122,24 +121,20 @@ class Dedup(ControlPlane):
         self.dispatcher = Dispatcher()
         for observed in self._sensed.values():
             self.dispatcher.compose(observed)
-        # Which volumes serve a read: every holder of the key and every peer already
-        # planned to hold it, priced together in seconds, so which one wins is
-        # arithmetic off the score rather than an order the caller has to know.
-        # ``None`` names no arity to read off it, so the key this leaves alone is said
-        # here: the score Candidates prices, then the readers Balance counts.
+        # Candidates prices first; Balance's queue depth breaks ties unless spread
+        # folds both dimensions into the expected wait.
         fold: Optional[Fold[float, int]] = _soonest if self._spread else None
-        self._chain = pipe(
-            FirstMatch(
-                [
-                    pipe(
-                        Balance(Candidates(SPREAD if self._spread else CHAIN)),
-                        WithFold(fold),
-                    ),
-                    # Tail: an unroutable ask gets the directory's own answer, not a hole.
-                    NaiveKeySelector(),
-                ]
-            ),
-            Ordered,
+        self._chain = FirstMatch(
+            [
+                pipe(
+                    Balance(Candidates(SPREAD if self._spread else CHAIN)),
+                    WithFold(fold),
+                    # Slice plans may consume several candidates, best first.
+                    Ordered,
+                ),
+                # An unroutable ask keeps the directory's own preference order.
+                Holders(),
+            ]
         ).attach(environment, self._sensed)
         return self
 
@@ -170,38 +165,36 @@ class Dedup(ControlPlane):
         # priced against it are one turn.
         self.dispatcher.dispatch_sync(Asked(requester, tuple(requests)))
         directory = self.sensor(DirectorySensor)
-        with directory.pinned(keys):
-            ranking = self._chain.select(keys, requester)
-            return self._committed(requester, ranking)
-
-    def _committed(self, requester: str, ranking: Selection) -> ReadPlan:
-        """Narrow ``ranking`` with TorchStore's planner and gate pending sources."""
-        # No suspension splits the sensor read-modify-write sequence.
         fanout = self.sensor(FanoutSensor)
-        directory = self.sensor(DirectorySensor)
-        requested = tuple(fanout.plan(requester).values())
-        live = directory.locate([request.key for request in requested])
-        order = ranking.sources
-        if order is None:
-            order = tuple(
-                dict.fromkeys(
-                    source for by_source in live.values() for source in by_source
-                )
+        with directory.pinned(keys):
+            requested = tuple(fanout.plan(requester).values())
+            coverage = discover_fetch(
+                directory,
+                requested,
+                directory.locate(keys),
+                fanout.promised(keys),
             )
-        allowed = set(order)
-        promised = {
-            key: {
-                producer: request
-                for producer, request in producers.items()
-                if producer != requester and producer in allowed
-            }
-            for key, producers in fanout.promised(
-                [request.key for request in requested]
-            ).items()
-        }
-        fetch = plan_fetch(requested, live, promised, order)
+            ranking = self._chain.select(coverage, requester)
+            return self._committed(requester, coverage, ranking)
+
+    def _committed(
+        self, requester: str, coverage: FetchCoverage, ranking: Selection
+    ) -> ReadPlan:
+        """Commit the selected fetch and gate pending sources."""
+        # No suspension splits the sensor read-modify-write sequence.
+        assert ranking.sources is not None, "the dedup chain names an explicit order"
+
+        fanout = self.sensor(FanoutSensor)
+        fetch = plan_fetch(coverage, ranking.sources, requester=requester)
         sources = fetch.sources
-        previous = fanout.planned(requester)
+
+        if self._trace is not None:
+            previous = fanout.planned(requester)
+            if previous != sources:
+                self._trace.record(
+                    self.env.now(), "route", f"{requester} <- {','.join(sources)}"
+                )
+
         self.dispatcher.dispatch_sync(
             Routed(
                 requester,
@@ -214,18 +207,13 @@ class Dedup(ControlPlane):
                 ),
             )
         )
-        if previous != sources:
-            if self._trace is not None:
-                self._trace.record(
-                    self.env.now(), "route", f"{requester} <- {','.join(sources)}"
-                )
+
         required = {source: fetch.required[source] for source in fetch.pending}
+        directory = self.sensor(DirectorySensor)
+        requested = tuple(fanout.plan(requester).values())
         gate = self.dispatcher.gate(
-            lambda: requirements_met(
-                requested,
-                directory.locate_live([request.key for request in requested]),
-                required,
-            ),
+            lambda: directory.covers(requested, required, live=True),
             (Published(source) for source in fetch.pending),
         )
+
         return ReadPlan(fetch.by_key, sources, gate)

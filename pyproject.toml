@@ -46,6 +46,10 @@ lint = ["mypy>=2.3", "ruff>=0.16"]
 files = ["proposed"]
 mypy_path = "."
 
+[[tool.mypy.overrides]]
+module = ["torchstore.*"]
+ignore_missing_imports = true
+
 [tool.ruff.lint]
 # Pyflakes only -- undefined names, dead imports, redefinitions -- over every file,
 # which is the half mypy cannot reach given the scope above.

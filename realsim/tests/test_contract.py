@@ -545,6 +545,8 @@ def test_lint_allows_what_control_is_supposed_to_use():
         "from proposed import KeySelector, Selection\n"
         "from proposed import DirectorySensor, Environment\n"
         "from proposed import Environment\n"
+        "from torchstore.controller import StorageInfo\n"
+        "from torchstore.transport import Request\n"
         "from domain import prefill_time, MachineProfile\n"
         "from ._cache import LRUCache\n"
         "from .request import Request\n"
@@ -610,21 +612,21 @@ def test_the_simulator_rules_do_not_apply_to_workload():
 
 
 def test_lint_flags_the_proposal_leaning_on_the_simulator():
-    """``proposed/`` has to be implementable inside torchstore with nothing under it."""
+    """``proposed/`` may use torchstore, but not its simulator or consumers."""
     for line in (
         "from realsim.mesh import Mesh\n",
         "from realsim.seams.controller_handle import LocalControllerHandle\n",
-        "import torchstore\n",
         "from kvcache_sim.control._selector import LongestPrefixKeySelector\n",
     ):
         assert "proposed-imports-simulator" in _codes(line, path=PROPOSED), line
 
 
 def test_the_proposal_stands_on_its_own():
-    """It may use itself and the stdlib -- nothing else, not even sim_common."""
+    """It may use torchstore, itself, and the stdlib, but not sim_common."""
     assert _codes(
         "from proposed import Endpoint, locality, Tier\n"
         "from .environment import Environment\n"
+        "from torchstore.transport import Request\n"
         "import asyncio\n",
         path=PROPOSED,
     ) == set()

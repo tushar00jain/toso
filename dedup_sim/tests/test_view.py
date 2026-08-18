@@ -6,13 +6,8 @@ import asyncio
 
 import pytest
 
-from dedup_sim.control._selector import Candidates
-from dedup_sim import _planning
-from dedup_sim._planning import (
-    plan_fetch,
-    relevant_sources,
-    requirements_met,
-)
+from dedup_sim.control._selector import Candidates, Holders
+from dedup_sim.control._planning import discover_fetch, plan_fetch
 from dedup_sim.control._sensor import Asked, FanoutSensor, Published, Routed
 from dedup_sim.control.routing import Dedup
 from proposed import DirectorySensor, Dispatcher, Endpoint, Environment
@@ -50,12 +45,47 @@ def _request(key: str, tensor_slice: TensorSlice | None = None) -> Request:
     return Request.from_any(key, None, tensor_slice).meta_only()
 
 
+def _coverage(directory, fanout, requester, keys):
+    requests = tuple(fanout.plan(requester).values())
+    return discover_fetch(
+        directory,
+        requests,
+        directory.locate(keys),
+        fanout.promised(keys),
+    )
+
+
 def test_a_fanout_nobody_supplied_raises():
     directory = DirectorySensor(_Holds("origin"))
     with pytest.raises(RuntimeError, match="FanoutSensor"):
         Candidates().attach(
             Environment(_TOPOLOGY, _PROFILE), {DirectorySensor: directory}
         )
+
+
+def test_holders_preserve_directory_order_and_name_each_source_once():
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            info = StorageInfo(ObjectType.TENSOR, {None})
+            return {
+                "K0": {"replica": info, "origin": info},
+                "K1": {"origin": info, "r0": info},
+            }
+
+    directory = DirectorySensor(_Directory())
+    selector = Holders().attach(
+        Environment(_TOPOLOGY, _PROFILE),
+        {DirectorySensor: directory},
+    )
+    requests = [_request("K0"), _request("K1")]
+    live = directory.locate([request.key for request in requests])
+    coverage = discover_fetch(directory, requests, live, {})
+
+    assert selector.select(coverage, "r1").sources == (
+        "replica",
+        "origin",
+        "r0",
+    )
 
 
 def test_the_ranking_keeps_fanout_under_reranking():
@@ -67,16 +97,20 @@ def test_the_ranking_keeps_fanout_under_reranking():
     dispatcher.dispatch_sync(Asked("r1", (_request("K"),)))
     ranking = Candidates()
     chain = Ordered(FirstMatch([Balance(ranking)]))
+    directory = DirectorySensor(_Holds("origin"))
     chain.attach(
         Environment(_TOPOLOGY, _PROFILE),
         {
-            DirectorySensor: DirectorySensor(_Holds("origin")),
+            DirectorySensor: directory,
             FanoutSensor: fanout,
         },
     )
 
     assert ranking.sensor(FanoutSensor) is fanout
-    assert chain.select(["K"], "r1").sources == ("r0", "origin")
+    assert chain.select(_coverage(directory, fanout, "r1", ["K"]), "r1").sources == (
+        "r0",
+        "origin",
+    )
 
 
 def test_promises_are_indexed_only_under_their_keys():
@@ -106,14 +140,15 @@ def test_a_producer_has_one_publication_in_flight():
 
 
 def test_region_planning_is_torchstores_expansion():
+    directory = DirectorySensor(_Holds("origin"))
     half = TensorSlice((0,), (0,), (8,), (4,), (2,))
     quarter = TensorSlice((1,), (0,), (8,), (2,), (4,))
     crossing = TensorSlice((3,), (0,), (8,), (2,), (4,))
     stored = StorageInfo(ObjectType.TENSOR_SLICE, {half})
-    quarter_plan = _planning._volume_requests(
+    quarter_plan = directory.plan_requests(
         [_request("K", quarter)], {"K": {"origin": stored}}
     )
-    crossing_plan = _planning._volume_requests(
+    crossing_plan = directory.plan_requests(
         [_request("K", crossing)], {"K": {"origin": stored}}
     )
 
@@ -124,6 +159,7 @@ def test_region_planning_is_torchstores_expansion():
 
 
 def test_every_whole_value_source_is_rankable_before_narrowing():
+    directory = DirectorySensor(_Holds("origin"))
     request = _request("K")
     live = {
         "K": {
@@ -133,15 +169,18 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
     }
     promised = {"K": {"r0": request}}
 
-    candidates, pending = relevant_sources([request], live, promised)
-    planned = plan_fetch([request], live, promised, ("r0", "replica", "origin"))
+    coverage = discover_fetch(directory, [request], live, promised)
+    planned = plan_fetch(coverage, ("r0", "replica", "origin"))
+    without_peer = plan_fetch(coverage, ("replica", "origin"))
 
-    assert candidates == {"origin", "replica", "r0"}
-    assert pending == {"r0"}
+    assert coverage.candidates == {"origin", "replica", "r0"}
+    assert coverage.pending == {"r0"}
     assert planned.by_key == {"K": ("r0",)}
+    assert without_peer.by_key == {"K": ("replica",)}
 
 
 def test_two_pending_slices_form_one_torchstore_fetch_plan():
+    directory = DirectorySensor(_Holds("origin"))
     left = TensorSlice((0,), (0,), (8,), (4,), (2,))
     right = TensorSlice((4,), (1,), (8,), (4,), (2,))
     request = _request("K")
@@ -152,7 +191,8 @@ def test_two_pending_slices_form_one_torchstore_fetch_plan():
         }
     }
 
-    planned = plan_fetch([request], {}, promised, ("p0", "p1"))
+    coverage = discover_fetch(directory, [request], {}, promised)
+    planned = plan_fetch(coverage, ("p0", "p1"))
     live = {
         "K": {
             "p0": StorageInfo(ObjectType.TENSOR_SLICE, {left}),
@@ -162,30 +202,52 @@ def test_two_pending_slices_form_one_torchstore_fetch_plan():
 
     assert planned.by_key == {"K": ("p0", "p1")}
     assert planned.pending == {"p0", "p1"}
-    assert requirements_met([request], live, planned.required)
+    assert directory.covers([request], planned.required, live)
 
 
 def test_sparse_candidate_discovery_visits_only_present_entries(monkeypatch):
+    directory = DirectorySensor(_Holds("origin"))
     requests = [_request(f"K{i}") for i in range(20)]
     live = {
         request.key: {f"v{i}": StorageInfo(ObjectType.TENSOR, {None})}
         for i, request in enumerate(requests)
     }
     visited = 0
-    original = _planning._PLANNER._build_volume_requests
+    original = directory.plan_requests
 
-    def counted(requests, maps, transports):
+    def counted(requests, located=None):
         nonlocal visited
-        visited += sum(len(entries) for entries in maps.values())
-        return original(requests, maps, transports)
+        visited += sum(len(entries) for entries in located.values())
+        return original(requests, located)
 
-    monkeypatch.setattr(_planning._PLANNER, "_build_volume_requests", counted)
+    monkeypatch.setattr(directory, "plan_requests", counted)
 
-    candidates, pending = relevant_sources(requests, live, {})
+    coverage = discover_fetch(directory, requests, live, {})
 
-    assert candidates == {f"v{i}" for i in range(20)}
-    assert pending == set()
+    assert coverage.candidates == {f"v{i}" for i in range(20)}
+    assert coverage.pending == set()
     assert visited == 40
+
+
+def test_commit_reuses_candidate_expansion(monkeypatch):
+    directory = DirectorySensor(_Holds("origin"))
+    original = directory.plan_requests
+    expansions = 0
+
+    def counted(requests, located=None):
+        nonlocal expansions
+        expansions += 1
+        return original(requests, located)
+
+    monkeypatch.setattr(directory, "plan_requests", counted)
+    plane = Dedup().attach(
+        Environment(_TOPOLOGY, _PROFILE),
+        {DirectorySensor: directory},
+    )
+
+    run_sim(plane._decide([_request("K")], "r0"))
+
+    assert expansions == 3
 
 
 def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():
@@ -282,7 +344,7 @@ def test_a_partial_reader_can_follow_a_peer_fetching_more_regions():
         {DirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(["K"], "r").head == "p0"
+    assert ranking.select(_coverage(directory, fanout, "r", ["K"]), "r").head == "p0"
 
 
 def test_a_subset_reader_accounts_for_the_peers_other_keys():
@@ -319,7 +381,7 @@ def test_a_subset_reader_accounts_for_the_peers_other_keys():
         {DirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(["K0"], "r").head == "p0"
+    assert ranking.select(_coverage(directory, fanout, "r", ["K0"]), "r").head == "p0"
 
 
 def test_a_route_accepts_a_dependency_that_has_since_published():
@@ -364,7 +426,7 @@ def test_a_route_accepts_a_dependency_that_has_since_published():
         {DirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(["K0"], "r").head == "p"
+    assert ranking.select(_coverage(directory, fanout, "r", ["K0"]), "r").head == "p"
 
 
 def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
@@ -372,7 +434,9 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
     right = TensorSlice((4,), (1,), (8,), (4,), (2,))
     request = _request("K", left)
     original = {"K": {"t": StorageInfo(ObjectType.TENSOR_SLICE, {left})}}
-    route = plan_fetch([request], original, {}, ("t",))
+    planning_directory = DirectorySensor(_Holds("origin"))
+    coverage = discover_fetch(planning_directory, [request], original, {})
+    route = plan_fetch(coverage, ("t",))
 
     class _Directory:
         def locate_raw(self, keys, missing_ok=False):
@@ -400,4 +464,4 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
         {DirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    assert ranking.select(["K"], "r").sources == ()
+    assert ranking.select(_coverage(directory, fanout, "r", ["K"]), "r").sources == ()

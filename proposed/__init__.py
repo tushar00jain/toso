@@ -48,12 +48,13 @@ simulator, ``proposed`` is the design being argued for.
   the server's decision; following it is nobody's to write twice;
 * :mod:`proposed.environment` -- :class:`~proposed.environment.Environment`, the
   stable facts and calculations for one run;
-* :mod:`proposed.sensors` -- :class:`~proposed.sensors.DirectorySensor`, the live raw
-  directory read, and :class:`~proposed.sensors.LoadSensor`, the common load reading.
+* :mod:`proposed.sensors` -- :class:`~proposed.sensors.DirectorySensor`, the coherent
+  directory read and metadata-only fetch planning, and
+  :class:`~proposed.sensors.LoadSensor`, the common load reading.
 
 Import rule, enforced by ``realsim/tools/check_contract.py``: this package may not
-import the simulator, a capability, or torchstore itself. Monarch actor primitives
-are part of the deployment surface; simulator scaffolding is not.
+import the simulator or a capability. TorchStore and Monarch actor primitives are part
+of the deployment surface; simulator scaffolding is not.
 
 The gaps each piece answers are listed in the design doc's "What torchstore is
 missing" section.

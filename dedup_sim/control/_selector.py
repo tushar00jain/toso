@@ -38,14 +38,15 @@ releases the next reader's withheld answer (:mod:`dedup_sim.data`).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Unpack
 
-from proposed import DirectorySensor, Key, KeySelector, Selection, VolumeId
+from proposed import DirectorySensor, Key, Selection, VolumeId
+from proposed.selector import Selector
 
-from .._planning import relevant_sources, requirements_met
+from ._planning import FetchCoverage
 from ._sensor import FanoutSensor
 
-__all__ = ["Candidates", "CHAIN", "SPREAD"]
+__all__ = ["Candidates", "Holders", "CHAIN", "SPREAD"]
 
 #: Measured: on the default profile :data:`CHAIN` keeps a cap-1 chain 1x seven readers
 #: deep and a cap-2 tree 1x well past sixty (``dedup_sim/tests/test_dedup.py``).
@@ -53,7 +54,16 @@ CHAIN = 10.0
 SPREAD = 0.0
 
 
-class Candidates(KeySelector[float]):
+class Holders(Selector[FetchCoverage, Unpack[Tuple[()]]]):
+    """Every live holder, once, in directory order."""
+
+    def select(
+        self, coverage: FetchCoverage, requester: str
+    ) -> Selection[Unpack[Tuple[()]]]:
+        return Selection.of(coverage.holders)
+
+
+class Candidates(Selector[FetchCoverage, float]):
     """Holders and planned peers as one pool, each priced in seconds.
 
     Args:
@@ -76,16 +86,15 @@ class Candidates(KeySelector[float]):
         self.fabric = fabric
         self.payload_bytes = payload_bytes
 
-    def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
+    def select(self, coverage: FetchCoverage, requester: str) -> Selection[float]:
         """Every source with a relevant key region, scored; else abstain."""
         fanout = self.sensor(FanoutSensor)
-        requested = tuple(fanout.plan(requester).values())
-        located = self.sensor(DirectorySensor).locate(keys)
-        candidates, pending = relevant_sources(
-            requested, located, fanout.promised(keys)
-        )
+        directory = self.sensor(DirectorySensor)
+        located = directory.locate(coverage.keys)
+        candidates = coverage.candidates
+        pending = coverage.pending
         queued = fanout.named()
-        located_by_key: Dict[Key, Mapping[VolumeId, Any]] = dict(located)
+        located_by_key: Dict[str, Mapping[VolumeId, Any]] = dict(located)
         # Discounted from the cap below: a second ask costs no slot, so a reader
         # re-asking after an eviction is not shut out by its own place in the queue.
         mine = set(fanout.planned(requester))
@@ -104,7 +113,7 @@ class Candidates(KeySelector[float]):
                     volume,
                     fanout,
                     in_flight,
-                    self.sensor(DirectorySensor),
+                    directory,
                     located_by_key,
                     waits,
                     set(),
@@ -162,7 +171,7 @@ class Candidates(KeySelector[float]):
                 for key in required_keys:
                     if key not in located:
                         located.update(directory.locate_live([key]))
-                ready = requirements_met(requests, located, {source: expected})
+                ready = directory.covers(requests, {source: expected}, located)
             else:
                 ready = True
                 for key in source_keys:
