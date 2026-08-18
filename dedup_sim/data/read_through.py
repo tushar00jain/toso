@@ -2,10 +2,10 @@
 
 Ask, read, put, then commit, and the order is load-bearing. Asking first keeps the read
 an unmodified ``client.get``: the only thing routing it is the preference handed to
-``client_for``. The put is awaited before the commit so a woken reader's re-read finds
-this one -- the directory is written inside the put. The commit
-(:class:`~proposed.dispatch.Stored`) settles the debt the fan-out recorded and wakes
-whoever parked on it; nothing else in the run knows the put happened.
+``client_for``. The put is awaited before the commit so the directory observation and
+the action agree that the key landed. The commit
+(:class:`~proposed.dispatch.Stored`) settles the debt the fan-out recorded and
+satisfies gates waiting on it; nothing else in the run knows the put happened.
 """
 
 from __future__ import annotations

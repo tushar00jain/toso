@@ -82,8 +82,7 @@ class FanoutSensor(LoadSensor):
 
     def _stored(self, action: Stored) -> None:
         """A reader's put has landed: settle the debt it owed."""
-        # The put wrote the directory before this action was dispatched, and a parked
-        # requester re-reads the directory when it wakes.
+        # The put wrote the directory before this action was dispatched.
         self._promised.discard((action.host, action.key))
 
     def planned(self, requester: str) -> Optional[str]:

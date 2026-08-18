@@ -16,7 +16,7 @@ from typing import Any, List, Mapping, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
     ControlPlane, DecisionLog, DirectorySensor, Dispatcher, Environment, Key,
-    endpoint, Selection, Sensor,
+    endpoint, Selection, Sensor, Stored,
 )
 from proposed.selector import (
     Balance, FirstMatch, Fold, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
@@ -162,7 +162,8 @@ class Dedup(ControlPlane):
             return replace(
                 ranking,
                 ready=self.dispatcher.gate(
-                    lambda: len(self._registered(facts)) == len(facts)
+                    lambda: len(self._registered(facts)) == len(facts),
+                    (Stored(host, key) for host, key in facts),
                 ),
             )
         if len(self._registered(facts)) == len(facts):
@@ -177,7 +178,7 @@ class Dedup(ControlPlane):
     def _registered(
         self, facts: Sequence[Tuple[str, Key]]
     ) -> List[Tuple[str, Key]]:
-        """Facts the directory holds now; gates must re-read this live."""
+        """Facts the directory holds now."""
         directory = self.sensor(DirectorySensor)
         by_key = directory.holders([key for _volume, key in facts], live=True)
         return [

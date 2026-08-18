@@ -7,11 +7,10 @@ problem. Folded from one :class:`Action` and committed together, it is nobody's.
 capability with one owner per fact gets the commit and the wake instead --
 ``dedup_sim`` folds :class:`Stored` in one place and parks its readers on the commit.
 
-**Nothing is stored here.** A dispatcher holds registrations -- an action type, and the
-reducers that fold it -- and no state at all. Every reducer goes on owning exactly what
-it owned before, and is handed no way to read a neighbour's. What is shared is the
-transaction: one entry point, one boundary after every reducer for that action has run,
-one payload-free notification at it.
+**No application state is stored here.** Every reducer goes on owning exactly what it
+owned before, and is handed no way to read a neighbour's. The dispatcher holds its
+wiring and currently parked waiters: one entry point, one boundary after every reducer
+for that action has run, and payload-free gate updates for that action.
 
 Which is the rule that makes the order they run in irrelevant, stated here and nowhere
 else: **a reducer writes its own state and reads nothing else.** A fold reaching for
@@ -24,8 +23,9 @@ The vocabulary is Redux's, minus one word: a *selector* here ranks sources
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Set
 
 from proposed.deployment import Key, VolumeId
 from proposed.selector import Ready
@@ -35,11 +35,6 @@ __all__ = ["Action", "Dispatcher", "Fold", "Probe", "Reducer", "Stored"]
 #: Folds one action into one reducer's own state, and reads nothing else.
 Fold = Callable[[Any], None]
 
-#: Reads whether what a waiter is waiting for is true *now*, from wherever that truth
-#: lives (for a registration, the directory). Not a coroutine: it is called between two
-#: commits, and a read that could suspend would answer for another moment.
-Probe = Callable[[], bool]
-
 
 class Action:
     """Something that happened, as a value: the one thing a caller dispatches.
@@ -47,6 +42,10 @@ class Action:
     A base rather than a protocol, for :class:`proposed.deployment.Sensor`'s reason: a
     member-less protocol would declare nothing, every object satisfying it.
     """
+
+
+#: Reads whether what a waiter is waiting for is true now.
+Probe = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -69,6 +68,14 @@ class Reducer(Protocol):
     def folds(self) -> Mapping[type, Fold]:
         """``action type -> the write that folds it``, so it is called for those and no
         others. Fixed for the reducer's life."""
+
+
+class _Waiter:
+    """One gate, released after every missing action commits."""
+
+    def __init__(self, actions: Iterable[Action]) -> None:
+        self.missing: Set[Action] = set(actions)
+        self.ready = asyncio.Event()
 
 
 class Dispatcher:
@@ -94,9 +101,8 @@ class Dispatcher:
         # action type -> the folds to run for it, in composition order. The order is
         # fixed so a run is reproducible; nothing rests on which it is (see above).
         self._folds: Dict[type, List[Fold]] = {}
-        # The event the next commit sets, replaced as it is set: a waiter holds the
-        # object, so it is woken exactly once, by the commit it captured.
-        self._commit = asyncio.Event()
+        # action -> the gates still missing it, in parking order.
+        self._waiters: Dict[Action, Dict[_Waiter, None]] = {}
 
     def compose(self, reducer: Reducer) -> None:
         """Register ``reducer``'s folds."""
@@ -139,43 +145,51 @@ class Dispatcher:
             )
         for fold in folds:
             fold(action)
-        # The commit boundary: every reducer for this action has written, so everything
-        # parked is woken -- with nothing, because what it needs is what it can read.
-        woken, self._commit = self._commit, asyncio.Event()
-        woken.set()
+        # Every fold is visible before this commit satisfies a gate.
+        for waiter in self._waiters.pop(action, {}):
+            waiter.missing.discard(action)
+            if not waiter.missing:
+                waiter.ready.set()
 
-    def gate(self, holds: Probe) -> Optional[Ready]:
-        """An awaitable that returns once ``holds()`` is true, or ``None`` if it is.
+    def gate(
+        self, holds: Probe, actions: Iterable[Action]
+    ) -> Optional[Ready]:
+        """An awaitable for every ``action``, or ``None`` if ``holds()`` now.
 
-        ``None`` means "no need to wait at all", not an empty wait. Whether what
-        ``holds`` reads is *coming* is the caller's question: a gate on something
-        nothing will ever commit parks its waiter for the rest of the run.
+        A gate on an action that will never commit parks its waiter for the rest of the
+        run. Callers naming several actions must know they are all coming when the
+        probe is false.
 
-        Three things make it safe. No lost wakeup: each pass captures the next commit
-        *before* reading, so one landing in between sets an event the waiter already
-        holds. Nothing remembered: ``holds`` is asked again at every commit, so a fact
-        that was true and has since stopped being one -- a volume that evicted what it
-        registered -- parks its next waiter rather than releasing it. And nothing kept
-        per waiter or per fact, so what wakes anybody is a commit and never an action.
+        The gate parks before probing, so a commit during that read cannot be lost.
+        Each commit removes one missing action; only the last wakes the task.
         """
-        # TODO: wake only the waiters an action concerns. Every commit wakes every
-        # parked waiter, which re-probes and re-parks: O(parked) per commit, so O(m^2)
-        # over a burst of m readers. The remedy is cheap, linear and not speculative --
-        # the interest -> event map a per-fact readiness gate keeps, so a commit sets
-        # only what it touched. What is not cheap is the vocabulary: only an application
-        # knows which interests its own action satisfies, so the action would declare
-        # what it touches and this would take the keys to park under. The default stays
-        # "wake everyone" whichever way that goes -- an under-reported touch is a waiter
-        # that never wakes, where this is only slow. Nothing here is wrong today: the
-        # probe decides, and a wake, a probe and a re-park cost no simulated time.
+        waiter = _Waiter(actions)
+        if not waiter.missing:
+            if holds():
+                return None
+            raise ValueError("a false gate must name at least one action")
+        for action in waiter.missing:
+            self._waiters.setdefault(action, {})[waiter] = None
         if holds():
+            for action in waiter.missing:
+                waiters = self._waiters.get(action)
+                if waiters is None:
+                    continue
+                waiters.pop(waiter, None)
+                if not waiters:
+                    del self._waiters[action]
             return None
 
         async def ready() -> None:
-            while True:
-                commit = self._commit
-                if holds():
-                    return
-                await commit.wait()
+            try:
+                await waiter.ready.wait()
+            finally:
+                for action in waiter.missing:
+                    waiters = self._waiters.get(action)
+                    if waiters is None:
+                        continue
+                    waiters.pop(waiter, None)
+                    if not waiters:
+                        del self._waiters[action]
 
         return ready

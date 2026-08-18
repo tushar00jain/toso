@@ -206,7 +206,7 @@ proposed/       every contract that outlives the simulator; imports nothing
                   store cannot see, reached only in the process that holds it)
   dispatch.py     Dispatcher -- where a host's facts arrive, and one action, every
                   reducer that folds its type, one commit, and one payload-free
-                  wake at it. Holds no state itself
+                  gate update at it. Holds no application state itself
   plane.py        ControlPlane -- attach(environment, sensors) + dispatcher, the one a run puts a
                   service in front of; DataPlane -- attach(deployment), routes,
                   and no verbs: what a capability does is its own to name

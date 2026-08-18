@@ -40,9 +40,8 @@ capability's whole control plane, reached as a service of its own:
    (`dedup_sim.data.read_through`): after a reader's `get` returns, it `put`s the
    key into its own co-located volume -- a zero-fabric local write through the real
    `client.put` path, which registers the key before it returns -- and then **commits
-   one action**, `Stored`, which the plane's own fan-out folds. That commit wakes every
-   parked reader, each of which re-reads the directory: one of them now finds its peer
-   there, and the gate is open.
+   one action**, `Stored`, which the plane's own fan-out folds. The action satisfies
+   gates waiting on that publication; a gate opens after every key it named lands.
 
 Because a peer outprices a holder, exactly one reader ever pulls from a pre-existing
 holder: the only origin-sourced transfer is that first hop, `origin_bytes == 1x` the

@@ -250,8 +250,8 @@ class Directory:
         """``volume``'s read-through lands: the directory gains it.
 
         What a real ``client.put`` does before it returns, which is why every caller
-        below does this and *then* dispatches: a waiter woken by the commit re-reads
-        this map and has to find the volume in it.
+        below does this and *then* dispatches: observing this map before parking tells
+        a gate which publications are still missing.
         """
         self.by_key.setdefault(key, set()).add(volume)
 
@@ -306,7 +306,7 @@ def test_one_registration_releases_every_requester_waiting_on_it():
         await asyncio.sleep(0)
         assert answered == [], "answered before the peer published"
         # r0's put: the directory gains it, and then the one action settles the debt
-        # r0 owed -- whose commit is what wakes r1 and r2 to re-read the directory.
+        # r0 owed -- whose commit is what completes both gates.
         directory.publish("r0", KEY)
         plane.dispatcher.dispatch_sync(Stored("r0", KEY))
         waiters = await asyncio.gather(*tasks)

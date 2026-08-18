@@ -271,15 +271,11 @@ def test_the_scenario_holds_no_burst_loop():
 # properties a hand-rolled latch gets wrong, so they are asserted directly rather
 # than only through a burst that happens to exercise them.
 #
-# Nothing is remembered anywhere: a parked waiter is woken by *any* commit and
-# re-reads the truth from wherever the caller said it lives -- the real directory,
-# in the selector -- because a volume that evicts makes a past registration false.
-# ``holds`` stands in for that read, and ``landed`` for the state whoever committed
-# had written.
+# A gate observes the directory, then waits only for publications still missing.
+# ``landed`` stands in for the directory state.
 # --------------------------------------------------------------------------
 
-#: The action these gates are commits of. Any action type does; what a waiter reads
-#: is state, never the action.
+#: The action these gates wait for.
 _FACT = Stored("v0", "K")
 
 
@@ -298,7 +294,7 @@ def test_a_fact_the_directory_already_holds_needs_no_gate():
     """The whole point of the read: never wait for what is already true."""
 
     async def _ask():
-        return Dispatcher().gate(lambda: True)
+        return Dispatcher().gate(lambda: True, ())
 
     gate, _trace = run_sim(_ask())
     assert gate is None
@@ -307,15 +303,16 @@ def test_a_fact_the_directory_already_holds_needs_no_gate():
 def test_a_gate_opens_at_the_commit_that_makes_its_read_true():
     """Committed *after* the waiter parked: it is released, not stranded.
 
-    And a commit that does not satisfy the read leaves it parked -- the waiter is
-    woken by every commit, so what releases it is the state it re-reads, not the
-    action that happened to wake it.
+    A commit for one required fact leaves it parked until the probe sees both.
     """
 
     async def _wait() -> list:
         landed: set = set()
         dispatcher = _dispatcher(landed)
-        gate = dispatcher.gate(lambda: {("v0", "K"), ("v1", "K")} <= landed)
+        gate = dispatcher.gate(
+            lambda: {("v0", "K"), ("v1", "K")} <= landed,
+            (_FACT, Stored("v1", "K")),
+        )
         assert gate is not None
         order: list[str] = []
 
@@ -334,6 +331,40 @@ def test_a_gate_opens_at_the_commit_that_makes_its_read_true():
 
     order, _trace = run_sim(_wait())
     assert order == ["released"]
+
+
+def test_only_the_last_named_commit_wakes_the_gate():
+    async def _wait() -> int:
+        landed: set = set()
+        dispatcher = _dispatcher(landed)
+        probes = 0
+
+        def holds() -> bool:
+            nonlocal probes
+            probes += 1
+            return {("v0", "K"), ("v1", "K")} <= landed
+
+        gate = dispatcher.gate(holds, (_FACT, Stored("v1", "K")))
+        assert gate is not None
+        task = asyncio.create_task(gate())
+        await asyncio.sleep(0)
+        assert probes == 1
+
+        dispatcher.dispatch_sync(Stored("v1", "other"))
+        await asyncio.sleep(0)
+        assert probes == 1
+
+        dispatcher.dispatch_sync(_FACT)
+        await asyncio.sleep(0)
+        assert not task.done(), "released with one publication still missing"
+        assert probes == 1, "re-probed after a relevant commit"
+
+        dispatcher.dispatch_sync(Stored("v1", "K"))
+        await task
+        return probes
+
+    probes, _trace = run_sim(_wait())
+    assert probes == 1
 
 
 def test_a_commit_between_the_read_and_the_wait_is_not_lost():
@@ -359,7 +390,7 @@ def test_a_commit_between_the_read_and_the_wait_is_not_lost():
                 return False
             return ("v0", "K") in landed
 
-        gate = dispatcher.gate(holds)
+        gate = dispatcher.gate(holds, (_FACT,))
         assert gate is not None, "the first read said not yet, which it did"
         await asyncio.wait_for(gate(), timeout=None)
         return "released"
@@ -368,28 +399,27 @@ def test_a_commit_between_the_read_and_the_wait_is_not_lost():
     assert result == "released", "parked on a commit that had already happened"
 
 
-def test_nothing_is_kept_per_waiter_or_per_fact():
-    """Otherwise the object grows for the life of the run.
+def test_released_gates_leave_no_waiter_registration():
+    """The action map contains only currently parked waiters."""
 
-    A gate per ``(volume, key)`` is what used to be kept -- one entry per fact being
-    waited on, so a run that reads a hundred model versions carried a hundred times
-    the readers' worth of them until each was released. A payload-free notification
-    keeps one event, whatever is waiting and however many versions go by.
-    """
-
-    async def _versions() -> int:
+    async def _versions() -> dict:
         landed: set = set()
         dispatcher = _dispatcher(landed)
         for version in range(100):
             key = f"W{version}"
-            assert dispatcher.gate(lambda k=key: ("v0", k) in landed) is not None
+            gate = dispatcher.gate(
+                lambda k=key: ("v0", k) in landed,
+                (Stored("v0", key),),
+            )
+            assert gate is not None
+            task = asyncio.create_task(gate())
+            await asyncio.sleep(0)
             dispatcher.dispatch_sync(Stored("v0", key))
-        # One commit event and one registration per action type: no waiter's name, no
-        # fact it asked about, nothing that grew with the hundred versions above.
-        return len(vars(dispatcher)) + len(dispatcher._folds)
+            await task
+        return dispatcher._waiters
 
-    kept, _trace = run_sim(_versions())
-    assert kept == 3, "the dispatcher grew with what went through it"
+    waiters, _trace = run_sim(_versions())
+    assert waiters == {}
 
 
 def test_a_registration_that_was_evicted_does_not_open_a_later_gate():
@@ -405,11 +435,11 @@ def test_a_registration_that_was_evicted_does_not_open_a_later_gate():
         landed: set = set()
         dispatcher = _dispatcher(landed)
         holds = lambda: ("v0", "K") in landed          # noqa: E731
-        assert dispatcher.gate(holds) is not None
+        assert dispatcher.gate(holds, (_FACT,)) is not None
         dispatcher.dispatch_sync(_FACT)                     # v0's put landed
-        assert dispatcher.gate(holds) is None          # ...so nobody waits
+        assert dispatcher.gate(holds, (_FACT,)) is None
         landed.discard(("v0", "K"))                    # a newer version displaces it
-        return dispatcher.gate(holds)
+        return dispatcher.gate(holds, (_FACT,))
 
     gate, _trace = run_sim(_evict_then_ask())
     assert gate is not None, "answered from memory, not from the directory"

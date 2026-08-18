@@ -39,8 +39,8 @@ simulator, ``proposed`` is the design being argued for.
   host reports arrives and the one way a fact is announced: an
   :class:`~proposed.dispatch.Action` folded by every
   :class:`~proposed.dispatch.Reducer` that folds its type, and one commit, at which
-  whoever is waiting is woken and re-reads. It stores nothing itself, and no reducer
-  can reach another's state;
+  that action satisfies gates waiting on it. A gate wakes after every action it
+  named has committed. No reducer can reach another's state;
 * :mod:`proposed.routed` -- :func:`~proposed.routed.routed`, how a data plane says
   that a member may answer with the *address* of the host a request belongs on and
   where in that answer it is, and :class:`~proposed.routed.RoutedPlane`, a caller that
