@@ -26,6 +26,8 @@ from functools import partial
 from typing import Any, Callable, Dict, Optional, TypeVar
 from weakref import WeakKeyDictionary
 
+from monarch._src.actor.endpoint import EndpointProperty  # type: ignore[import-untyped]
+
 __all__ = ["Where", "routed", "declared", "RoutedPlane", "peerless"]
 
 _M = TypeVar("_M")
@@ -154,7 +156,9 @@ def peerless(plane: Any) -> None:
     surface = {
         name for name in dir(type(plane))
         if not name.startswith("_")
-        and inspect.iscoroutinefunction(getattr(type(plane), name, None))
+        and isinstance(
+            inspect.getattr_static(type(plane), name, None), EndpointProperty
+        )
     }
     for name, held in sorted(vars(plane).items()):
         if isinstance(held, Mapping):

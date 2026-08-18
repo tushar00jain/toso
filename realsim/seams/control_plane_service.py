@@ -8,14 +8,9 @@ deciding object in this process, receiving ordinary calls instead of messages.
 
 Its surface is the plane's own
 ------------------------------
-:class:`~proposed.plane.ControlPlane` declares a lifecycle and no questions: what a
-capability's hosts may *ask* is the capability's to name -- ``decide`` for
-``kvcache_sim``'s scheduler, ``select`` for a plane whose answer is a
-:class:`~proposed.selector.Selection`, whatever a capability written next needs. So
-this service does not name them either: it reads them off the plane it is handed
-(:func:`_asked_of`) and forwards each one. Which is all a service is -- the surface is
-the capability's, the decisions are the capability's, and neither side has to know
-about the other's process.
+:class:`~proposed.plane.ControlPlane` declares a lifecycle and no questions. A
+capability marks its own questions with :func:`proposed.endpoint`; this service
+mounts those declarations and names none itself.
 
 A capability adding a second question therefore changes nothing here, and nothing in
 :mod:`realsim.seams.control_plane_handle` either.
@@ -27,36 +22,16 @@ folds it.
 
 from __future__ import annotations
 
-import inspect
 from typing import Any, Tuple
 
-from proposed import ControlPlane
+from realsim.seams._plane import endpoint_names, mount_endpoints
 
 __all__ = ["ControlPlaneService"]
 
 
 def _asked_of(control: Any) -> Tuple[str, ...]:
-    """The members of ``control`` a host may ask: its public coroutines, sorted.
-
-    A question is answered, so it is awaited -- which is what makes "is a coroutine"
-    the test rather than a list of names this file would have to keep current. Sorted,
-    so a handle's endpoints are built in one order whatever ``dir`` reports.
-
-    Two kinds of member are deliberately not questions. Anything underscored is the
-    plane's own working, so a coroutine a capability does not want reached says so the
-    ordinary way. And nothing :class:`~proposed.plane.ControlPlane` declares is one:
-    ``attach`` and ``cluster`` are the lifecycle a *run* drives, and a host reaching
-    those would be holding the plane rather than asking it.
-    """
-    lifecycle = {
-        name for base in ControlPlane.__mro__ for name in vars(base)
-    }
-    return tuple(sorted(
-        name for name in dir(type(control))
-        if not name.startswith("_")
-        and name not in lifecycle
-        and inspect.iscoroutinefunction(getattr(control, name, None))
-    ))
+    """The endpoints ``control`` explicitly offers to hosts."""
+    return endpoint_names(control)
 
 
 class ControlPlaneService:
@@ -70,9 +45,4 @@ class ControlPlaneService:
     def __init__(self, control: Any) -> None:
         self.control = control
         #: What a caller may ask, and what a handle builds its endpoints from.
-        self.asked = _asked_of(control)
-        for name in self.asked:
-            # The bound method itself. A forwarder that wrapped the call would be a
-            # place for behaviour to accumulate on the way to the plane that is
-            # supposed to own all of it.
-            setattr(self, name, getattr(control, name))
+        self.asked = mount_endpoints(self, control)

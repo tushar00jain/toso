@@ -23,12 +23,13 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from realsim.seams.link import LocalEndpoint, ServiceHop
+from realsim.seams._plane import LocalPlaneHandle
+from realsim.seams.link import ServiceHop
 
 __all__ = ["LocalDataPlaneHandle"]
 
 
-class LocalDataPlaneHandle:
+class LocalDataPlaneHandle(LocalPlaneHandle):
     """A reference to a :class:`DataPlaneService` living in this process.
 
     Args:
@@ -39,12 +40,7 @@ class LocalDataPlaneHandle:
     """
 
     def __init__(self, service: Any, *, hop: Optional[ServiceHop] = None) -> None:
-        self.service = service
-        self.hop = hop if hop is not None else ServiceHop()
-        #: The members this handle offers, in the order the endpoints were built.
-        self.asked = tuple(service.asked)
-        for name in self.asked:
-            setattr(self, name, LocalEndpoint(getattr(service, name), self.hop))
+        super().__init__(service, hop=hop)
 
     @property
     def plane(self) -> Any:

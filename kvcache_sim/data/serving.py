@@ -110,7 +110,7 @@ from typing import List, Optional
 
 import torch
 
-from proposed import ControlPlane, DataPlane, Deployment, routed
+from proposed import ControlPlane, DataPlane, Deployment, endpoint, routed
 
 from ..control.scheduler import (
     ComputeBusy, DecodeState, Plan, PrefillFinished, Response,
@@ -214,6 +214,7 @@ class ServingHost(DataPlane):
         )
 
     # -- the request's prefill: decide where it belongs, or serve it -------- #
+    @endpoint
     @routed(at=lambda prefilled: prefilled.elsewhere)
     async def prefill(self, request: Request) -> Optional["Prefilled"]:
         """Ask control where ``request`` belongs; serve it here, or answer with there.
@@ -399,6 +400,7 @@ class ServingHost(DataPlane):
     # -- decode, on a host that has to go and get the KV -------------------- #
     # No declaration: this answer is tokens, and a host that has them is the last one
     # the request visits.
+    @endpoint
     async def decode(
         self, request: Request, response: Response
     ) -> List[torch.Tensor]:

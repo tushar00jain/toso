@@ -16,7 +16,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
     ControlPlane, DecisionLog, DirectorySensor, Dispatcher, Environment, Key,
-    Selection, Sensor,
+    endpoint, Selection, Sensor,
 )
 from proposed.selector import (
     Balance, FirstMatch, Fold, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
@@ -109,6 +109,7 @@ class Dedup(ControlPlane):
         return self
 
     # -- what a reader asks -------------------------------------------------- #
+    @endpoint
     async def sources(
         self, keys: Sequence[Key], requester: str
     ) -> Selection[Unpack[Tuple[Any, ...]]]:

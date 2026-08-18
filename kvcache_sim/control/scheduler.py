@@ -67,7 +67,8 @@ from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
-    ControlPlane, DirectorySensor, Dispatcher, Environment, Key, Selection, Sensor,
+    ControlPlane, DirectorySensor, Dispatcher, endpoint, Environment, Key, Selection,
+    Sensor,
 )
 from proposed.selector import (
     Annotate, Balance, Best, Bound, Bounded, FirstMatch, Ks, Ordered, pipe,
@@ -398,6 +399,7 @@ class _Scheduler(ControlPlane):
         return self
 
     # -- what a serving host asks, at the two moments it has a question ------- #
+    @endpoint
     async def sources(
         self, keys: Sequence[Key], requester: str
     ) -> Selection[Unpack[Tuple[Any, ...]]]:
@@ -418,6 +420,7 @@ class _Scheduler(ControlPlane):
         self.dispatcher.dispatch_sync(FetchAnswered(requester, tuple(keys)))
         return await answer.settled()
 
+    @endpoint
     async def decide(self, request: Request, requester: str) -> Optional[Response]:
         """Where should ``request`` run? Both selections, or ``None`` if refused.
 

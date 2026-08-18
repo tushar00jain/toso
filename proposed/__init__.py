@@ -51,12 +51,9 @@ simulator, ``proposed`` is the design being argued for.
 * :mod:`proposed.sensors` -- :class:`~proposed.sensors.DirectorySensor`, the live raw
   directory read, and :class:`~proposed.sensors.LoadSensor`, the common load reading.
 
-Import rule, enforced by ``realsim/tools/check_contract.py``: **this package may
-not import anything at all** -- not ``realsim``, not a capability, not even
-``sim_common``. That is what keeps it honest: a contract that needed the simulator
-underneath it could not survive outside the harness. The locality types live here
-rather than in ``sim_common`` for the same reason; only the *cost* of a tier is
-simulation.
+Import rule, enforced by ``realsim/tools/check_contract.py``: this package may not
+import the simulator, a capability, or torchstore itself. Monarch actor primitives
+are part of the deployment surface; simulator scaffolding is not.
 
 The gaps each piece answers are listed in the design doc's "What torchstore is
 missing" section.
@@ -67,6 +64,7 @@ from .deployment import (
     Controller, Deployment, Key, Sensor, StorageFull, StorageVolume, VolumeId,
 )
 from .dispatch import Action, Dispatcher, Reducer, Stored
+from .endpoint import endpoint
 from .plane import ControlPlane, DataPlane
 from .routed import routed, RoutedPlane
 from .selector import declares, DecisionLog, KeySelector, Selection
@@ -90,6 +88,7 @@ __all__ = [
     "Dispatcher",
     "Reducer",
     "Stored",
+    "endpoint",
     "Controller",
     "Sensor",
     "StorageVolume",

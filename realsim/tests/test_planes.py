@@ -45,11 +45,13 @@ from typing import Any, Optional, Sequence
 
 import pytest
 import torch
+from monarch.actor import Actor
+from monarch._src.actor.endpoint import EndpointProperty
 
 from realsim.mesh import Mesh
 from realsim.seams.data_plane_service import DataPlaneService
 from realsim.simulation import Simulation
-from proposed import DataPlane, routed, RoutedPlane
+from proposed import DataPlane, endpoint, routed, RoutedPlane
 from proposed import ControlPlane, Key, KeySelector, Selection
 # Not re-exported by the package: what a deployment implements is one of the two
 # subtypes, and these are implementations of them (or the base they share).
@@ -162,6 +164,7 @@ class _Ranks(ControlPlane):
         super().attach(environment, sensors)
         self.selector.attach(environment, sensors)
 
+    @endpoint
     async def sources(self, keys, requester) -> Selection:
         return await self.selector.select(list(keys), requester).settled()
 
@@ -305,9 +308,11 @@ def test_a_plane_declares_whatever_it_wants_told():
     heard: list[tuple[str, tuple[str, ...]]] = []
 
     class _Hears(ControlPlane):
+        @endpoint
         async def sources(self, keys, requester):
             return Selection()
 
+        @endpoint
         async def published(self, requester, keys):
             heard.append((requester, tuple(keys)))
 
@@ -379,6 +384,7 @@ class _Decides(ControlPlane):
         self.answer = answer
         self.asked: list[str] = []
 
+    @endpoint
     async def decide(self, subject, requester):
         self.asked.append(requester)
         return self.answer
@@ -399,23 +405,34 @@ def test_the_run_s_plane_is_fronted_as_a_service():
     assert plane.asked == ["a"]
 
 
+def test_planes_are_actors_and_endpoints_remain_locally_callable():
+    assert issubclass(ControlPlane, Actor)
+    assert issubclass(DataPlane, Actor)
+    assert isinstance(_Decides.decide, EndpointProperty)
+    assert asyncio.run(_Decides().decide("subject", "a")) == "decided"
+
+
 def test_a_handle_offers_the_members_the_plane_declares_and_no_others():
     """The seam is written once for every capability, however many questions it asks.
 
     ``ControlPlane`` declares a lifecycle and no questions, so the service and the
-    handle read the plane's own public coroutines instead of naming any: a capability
-    adding a second question adds nothing to ``realsim/seams``. Underscored members
-    are the plane's working, and ``attach`` is the run's, so neither is reachable.
+    handle read the plane's endpoint declarations instead of naming any. An
+    unannotated coroutine is private to the plane even when its name is public.
     """
 
     class _Two(ControlPlane):
+        @endpoint
         async def decide(self, subject, requester):
             return "decided"
 
+        @endpoint
         async def price(self, subject, requester):
             return "priced"
 
         async def _internal(self):           # its own working, not a question
+            return "no"
+
+        async def accidental(self):          # public but not an endpoint
             return "no"
 
         def ready(self):                     # not awaited, so not a question
@@ -425,7 +442,7 @@ def test_a_handle_offers_the_members_the_plane_declares_and_no_others():
     handle = sim.control_plane_handle
     assert handle.asked == ("decide", "price")
     assert _drive(sim, handle.price.call_one("subject", "a")) == "priced"
-    for hidden in ("_internal", "ready", "attach", "sensor"):
+    for hidden in ("_internal", "accidental", "ready", "attach", "sensor"):
         assert not isinstance(getattr(handle, hidden, None), LocalEndpoint)
 
 
@@ -1393,6 +1410,7 @@ class _Rerouted(DataPlane):
         self.names = names
         self.seen: list[str] = []
 
+    @endpoint
     @routed(at=lambda answered: answered.elsewhere)
     async def serve(self, subject: str):
         self.seen.append(subject)
@@ -1416,6 +1434,7 @@ class _Circling(DataPlane):
         self.me = me
         self.other = other
 
+    @endpoint
     @routed(at=lambda answered: answered.elsewhere)
     async def serve(self, subject: str):
         return _Answer(elsewhere=self.other)
@@ -1424,39 +1443,22 @@ class _Circling(DataPlane):
 class _Refuses(DataPlane):
     """A plane that answers nothing at all."""
 
+    @endpoint
     @routed(at=lambda answered: answered.elsewhere)
     async def serve(self, subject: str) -> None:
         return None
 
 
-def _endpointish(method):
-    """Stand in for Monarch's ``@endpoint``: a descriptor holding the method.
-
-    Not the real one -- what matters is the shape a wrapper has (an object whose only
-    reference to the method is private), which is why ``routed`` may not be one and
-    has to record its declaration where a class can still find it.
-    """
-
-    class _Property:
-        def __init__(self, method) -> None:
-            self._method = method
-
-        def __get__(self, instance, owner):
-            return self
-
-    return _Property(method)
-
-
 class _EitherOrder(DataPlane):
     """The declaration composes with a wrapper above it and below it."""
 
-    @_endpointish
+    @endpoint
     @routed(at=lambda answered: None)
     async def over(self, subject: str) -> None:
         ...
 
     @routed(at=lambda answered: None)
-    @_endpointish
+    @endpoint
     async def under(self, subject: str) -> None:
         ...
 

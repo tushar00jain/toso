@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
-from proposed import ControlPlane, DataPlane, Deployment, Stored
+from proposed import ControlPlane, DataPlane, Deployment, endpoint, Stored
 
 __all__ = ["ReadThroughPlane"]
 
@@ -41,6 +41,7 @@ class ReadThroughPlane(DataPlane):
         """Keep the deployment whose clients this plane puts through."""
         self.deployment = deployment
 
+    @endpoint
     async def read_through(self, requester: str, key: Optional[str] = None) -> Any:
         """``requester`` reads ``key``, then keeps what it read; answers with the read.
 

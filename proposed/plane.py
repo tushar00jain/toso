@@ -23,6 +23,9 @@ Both are lifecycle-only, and for one reason: what a capability is asked and what
 does are the capability's, so a run reaches them by holding the object it was given
 rather than by a member this package named in advance.
 
+Both are Monarch actors. A capability marks the members callers may reach with
+:func:`proposed.endpoint`; the same members remain directly callable before spawn.
+
 What is deliberately *not* here
 -------------------------------
 Anything shaped like a run. This package may not import the simulator (see
@@ -57,6 +60,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from monarch.actor import Actor  # type: ignore[import-untyped]
+
 from proposed.dispatch import Dispatcher
 from proposed.routed import declared, Where
 from proposed.sensors import Sensing
@@ -64,7 +69,7 @@ from proposed.sensors import Sensing
 __all__ = ["ControlPlane", "DataPlane"]
 
 
-class DataPlane:
+class DataPlane(Actor):
     """A capability's executing half, as a harness brings it up.
 
     No verbs. Moving bytes is an ordinary client call -- ``get``, ``put``,
@@ -107,7 +112,7 @@ class DataPlane:
         """
 
 
-class ControlPlane(Sensing):
+class ControlPlane(Sensing, Actor):
     """What a capability's *deciding* half looks like to a harness.
 
     The sibling of :class:`DataPlane`, and as capability-agnostic: it says nothing

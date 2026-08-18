@@ -35,7 +35,7 @@ from kvcache_sim.data._store import KVStore
 from kvcache_sim.data.serving import ServingHost
 from kvcache_sim.control.request import Request
 from proposed import (
-    ControlPlane, DirectorySensor, Dispatcher, KeySelector, Selection,
+    ControlPlane, DirectorySensor, Dispatcher, endpoint, KeySelector, Selection,
 )
 from proposed.selector import (
     Balance, Const, FirstMatch, WithFold, Lift, Best, pipe, Selector, Ordered,
@@ -1541,7 +1541,7 @@ def test_a_request_is_placed_in_one_reroute_at_any_distance(knob):
     # One configuration, not the scenario's pair: two runs would count one request id
     # twice and the maximum below is per journey.
     run = scenarios.SharedPrefix(1).runs()[0]
-    ServingHost.prefill = counted
+    ServingHost.prefill = endpoint(counted)
     try:
         with config.overrides(**knob):
             result = run.execute()
@@ -2166,7 +2166,7 @@ def test_a_commit_cannot_suspend_so_a_decision_cannot_interleave():
     )
     sched.attach(sim.environment, {DirectorySensor: sim.directory_sensor})
     assert not inspect.iscoroutinefunction(Dispatcher.dispatch_sync)
-    decides = ast.parse(textwrap.dedent(inspect.getsource(_Scheduler.decide)))
+    decides = ast.parse(textwrap.dedent(inspect.getsource(_Scheduler.decide._method)))
     assert not [
         node for node in ast.walk(decides) if isinstance(node, (ast.Await, ast.AsyncWith))
     ], "decide suspends somewhere: a second decision could interleave with this one"
