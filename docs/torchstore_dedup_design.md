@@ -12,7 +12,8 @@ sources by readiness, transfer time, fabric cost, and load.
 This document covers the capability-specific design. See
 [`architecture.md`](architecture.md) for the shared control/sensor/data feedback loop,
 [`torchstore.md`](torchstore.md) for TorchStore internals, and
-[`des_design.md`](des_design.md) for the simulation stack.
+[`des_design.md`](des_design.md) for the simulation stack. The workload envelope and
+reusable control-plane benchmark are in [`dedup_scaling.md`](dedup_scaling.md).
 
 ## 1. Boundary
 

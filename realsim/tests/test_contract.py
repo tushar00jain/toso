@@ -45,6 +45,14 @@ def _codes(source: str, *, is_test: bool = False, path: str = "snippet.py"):
     return {v.code for v in scan_source(source, path, is_test=is_test)}
 
 
+def test_dedup_benchmark_may_measure_wall_time():
+    source = "import time\ntime.perf_counter()\n"
+    assert "wallclock-read" in _codes(source)
+    assert "wallclock-read" not in _codes(
+        source, path="realsim/tools/benchmark_dedup_control.py"
+    )
+
+
 def _parse(source: str):
     import ast
 
