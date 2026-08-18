@@ -21,15 +21,59 @@ each into its own state).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from proposed import Sensor
-from proposed.dispatch import Fold
+from proposed.dispatch import Action, Fold
 
-from ._action import Committed, FetchAnswered, PrefillFinished
+from .._answer import Response
 
-__all__ = ["Reservation", "ReservationSensor", "RoutedPullSensor"]
+__all__ = [
+    "Committed", "FetchAnswered", "PrefillFinished", "Reservation",
+    "ReservationSensor", "RoutedPullSensor",
+]
+
+
+@dataclass(frozen=True)
+class PrefillFinished(Action):
+    """*Prefill really finished at this clock -- what is the queue tail now?*
+
+    The only thing that tells this control plane its picture of an instance's
+    prefill queue was wrong: ``now`` is measured independently by the host's
+    accelerator.
+
+    Reported over a call the host waits for: the decode admission it asks next must
+    be decided against a sensor that has already folded this completion.
+    """
+
+    inst: str
+    now: float
+
+
+@dataclass(frozen=True)
+class FetchAnswered(Action):
+    """``requester`` was told which peers serve its fetch of ``keys``.
+
+    A fetch a pull was priced for spends that memo; one nothing priced spends nothing.
+    """
+
+    requester: str
+    keys: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Committed(Action):
+    """An accepted decision, folded into every sensor it moves.
+
+    Dispatched at commit rather than while pricing, so a losing candidate or a
+    decision an SLO refused leaves nothing behind. ``output_tokens`` lets a reservation
+    stand in for a decode that has not started without reading the request.
+    """
+
+    response: Response
+    output_tokens: int
 
 
 class Reservation(NamedTuple):

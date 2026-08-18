@@ -42,7 +42,6 @@ from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from proposed import DirectorySensor, Key, KeySelector, Selection, VolumeId
 
-from ._answer import holders
 from ._sensor import FanoutSensor
 
 __all__ = ["Candidates", "CHAIN", "SPREAD"]
@@ -79,10 +78,10 @@ class Candidates(KeySelector[float]):
     def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
         """Everything that could serve every one of ``keys``, scored; else abstain."""
         fanout = self.sensor(FanoutSensor)
-        located = self.sensor(DirectorySensor).locate(keys)
-        holds = set(holders(located, keys[0]))
+        by_key = self.sensor(DirectorySensor).holders(keys)
+        holds = set(by_key[keys[0]])
         for key in keys[1:]:
-            holds &= set(holders(located, key))
+            holds &= set(by_key[key])
         routes, queued = fanout.routes(), fanout.named()
         # Discounted from the cap below: a second ask costs no slot, so a reader
         # re-asking after an eviction is not shut out by its own place in the queue.

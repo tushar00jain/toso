@@ -1,17 +1,24 @@
-"""The read-through tree a dedup plane has planned: :class:`FanoutSensor`."""
+"""The fan-out tree and pending puts a dedup decision reads."""
 
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Dict, Iterable, Mapping, Optional, Set, Tuple
 
-from proposed import LoadSensor
-from proposed.dispatch import Fold, Stored
+from proposed import Key, LoadSensor, VolumeId
+from proposed.dispatch import Action, Fold, Stored
 
-from ._action import Asked
+__all__ = ["Asked", "FanoutSensor"]
 
-__all__ = ["FanoutSensor"]
+
+@dataclass(frozen=True)
+class Asked(Action):
+    """``requester`` is about to read ``keys`` through, so it owes those puts."""
+
+    requester: VolumeId
+    keys: Tuple[Key, ...]
 
 
 class FanoutSensor(LoadSensor):
@@ -40,12 +47,11 @@ class FanoutSensor(LoadSensor):
         # (volume, key) publications planned and not yet seen to land: a routed
         # requester reads the key through into its own volume, so from the moment it is
         # routed it OWES that registration. This is the only thing that makes waiting
-        # for a source safe (:func:`~dedup_sim.control._answer.committed`).
+        # for a source safe (:meth:`~dedup_sim.control.routing.Dedup._committed`).
         self._promised: Set[Tuple[str, str]] = set()
         # A debt taken on, and the same debt settled.
         self._folds: Dict[type, Fold] = {Asked: self._asked, Stored: self._stored}
 
-    # -- what it folds ------------------------------------------------------- #
     @property
     def folds(self) -> Mapping[type, Fold]:
         """What it folds, by action type."""
@@ -57,11 +63,10 @@ class FanoutSensor(LoadSensor):
 
     def _stored(self, action: Stored) -> None:
         """A reader's put has landed: settle the debt it owed."""
-        # Nothing is recorded: the put wrote the directory before this action was
-        # dispatched, and a parked requester re-reads the directory when it wakes.
+        # The put wrote the directory before this action was dispatched, and a parked
+        # requester re-reads the directory when it wakes.
         self._promised.discard((action.host, action.key))
 
-    # -- the tree ------------------------------------------------------------ #
     def planned(self, requester: str) -> Optional[str]:
         """The source ``requester`` is already folded in behind, if any."""
         return self._route.get(requester)
@@ -77,11 +82,9 @@ class FanoutSensor(LoadSensor):
         no bookkeeping drift can hand out more slots than the cap.
         """
         previous = self._route.get(requester)
-        # Unmoved: nothing to re-count.
+        # Unmoved route.
         if previous == source:
             return
-        # The count follows the edge, which is what keeps named() the same fact as
-        # routes().
         if previous is not None:
             self._drop(previous)
         self._route[requester] = source
@@ -89,16 +92,10 @@ class FanoutSensor(LoadSensor):
 
     def named(self) -> Mapping[str, int]:
         """``source -> requesters currently routed to it``. Absent means none."""
-        # The same fact as the tree: one count, moved wherever a route is, so there is
-        # no second tally to keep in step. A finished read is not observed, so a source
-        # stays counted for as long as it is planned to serve.
         return MappingProxyType(self._load)
 
     def retire(self, requester: str, source: str) -> None:
         """Drop ``requester``'s route to a source nothing is coming from."""
-        # No route is kept, so the next ask is priced afresh. The source needs no
-        # eviction of its own: it is offered only while it still owes the key
-        # (:meth:`owes`), and it no longer does.
         previous = self._route.pop(requester, None)
         if previous is not None:
             self._drop(previous)
@@ -110,7 +107,6 @@ class FanoutSensor(LoadSensor):
         else:
             del self._load[source]
 
-    # -- the debt ------------------------------------------------------------ #
     def owes(self, facts: Iterable[Tuple[str, str]]) -> bool:
         """Is every one of these ``(volume, key)`` publications still owed?"""
         return all(fact in self._promised for fact in facts)

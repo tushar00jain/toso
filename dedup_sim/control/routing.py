@@ -6,13 +6,13 @@ question and not a report to this plane: it is one action a reader commits
 (:class:`proposed.dispatch.Stored`), folded by this plane's own state
 (:attr:`Dedup.dispatcher`).
 
-The ranking is :mod:`dedup_sim.control._selector`; what a decision is made of once the
-chain has named a head is :mod:`dedup_sim.control._answer`.
+The ranking is :mod:`dedup_sim.control._selector`.
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional, Sequence, Tuple, Unpack
+from dataclasses import replace
+from typing import Any, List, Mapping, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
     ControlPlane, DecisionLog, DirectorySensor, Dispatcher, Environment, Key,
@@ -22,7 +22,6 @@ from proposed.selector import (
     Balance, FirstMatch, Fold, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
 )
 
-from ._answer import committed
 from ._selector import Candidates, CHAIN, SPREAD
 from ._sensor import Asked, FanoutSensor
 
@@ -138,13 +137,51 @@ class Dedup(ControlPlane):
         # priced against it are one turn.
         self.dispatcher.dispatch_sync(Asked(requester, tuple(keys)))
         ranking = self._chain.select(keys, requester)
-        return committed(
-            self.env,
-            self.sensor(DirectorySensor),
-            self.sensor(FanoutSensor),
-            self.dispatcher,
-            keys,
-            requester,
-            ranking,
-            self._trace,
-        )
+        return self._committed(keys, requester, ranking)
+
+    def _committed(
+        self, keys: Sequence[Key], requester: str, ranking: Selection
+    ) -> Selection:
+        """``ranking``, routed to its head and gated until that head is usable.
+
+        A source that owes the keys is gated on its pending registration. A source
+        that neither owes nor holds them has evicted them and is retired.
+        """
+        # No suspension splits the sensor read-modify-write sequence.
+        source = ranking.head
+        if source is None:
+            return ranking
+        fanout = self.sensor(FanoutSensor)
+        if fanout.planned(requester) != source:
+            fanout.route(requester, source)
+            if self._trace is not None:
+                self._trace.record(self.env.now(), "route", f"{requester} <- {source}")
+        facts = [(source, key) for key in keys]
+        if fanout.owes(facts):
+            # Pending publication.
+            return replace(
+                ranking,
+                ready=self.dispatcher.gate(
+                    lambda: len(self._registered(facts)) == len(facts)
+                ),
+            )
+        if len(self._registered(facts)) == len(facts):
+            # Already holds every key.
+            return ranking
+        # Evicted after publication.
+        fanout.retire(requester, source)
+        if self._trace is not None:
+            self._trace.record(self.env.now(), "retire", f"{source} holds nothing")
+        return Selection()
+
+    def _registered(
+        self, facts: Sequence[Tuple[str, Key]]
+    ) -> List[Tuple[str, Key]]:
+        """Facts the directory holds now; gates must re-read this live."""
+        directory = self.sensor(DirectorySensor)
+        by_key = directory.holders([key for _volume, key in facts], live=True)
+        return [
+            (volume, key)
+            for volume, key in facts
+            if volume in by_key[key]
+        ]

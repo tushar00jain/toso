@@ -21,7 +21,7 @@ from typing import Dict, Mapping
 from proposed import LoadSensor, VolumeId
 from proposed.dispatch import Fold
 
-from ._action import Committed
+from ._pending import Committed
 
 __all__ = ["SourceLoad"]
 

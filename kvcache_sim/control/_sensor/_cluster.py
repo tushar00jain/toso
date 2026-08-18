@@ -29,15 +29,36 @@ arrives as a dispatched action, and the control plane reads the result through
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, List, Mapping, Sequence
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 from proposed import Sensor
-from proposed.dispatch import Fold
+from proposed.dispatch import Action, Fold
 
-from ._action import Committed, ComputeBusy, DecodeState, PrefillFinished
+from ._pending import Committed, PrefillFinished
 
-__all__ = ["ClusterSensor"]
+__all__ = ["ClusterSensor", "ComputeBusy", "DecodeState"]
+
+
+@dataclass(frozen=True)
+class ComputeBusy(Action):
+    """A decode step occupied a **coupled** instance's compute until ``until``."""
+
+    inst: str
+    until: float
+
+
+@dataclass(frozen=True)
+class DecodeState(Action):
+    """``inst``'s live decode batch, as one estimated finish time per request.
+
+    Its length is the occupancy and its values answer "still decoding at ``t``?".
+    Reported whenever the batch changes.
+    """
+
+    inst: str
+    finishes: Tuple[float, ...]
 
 
 class ClusterSensor(Sensor):

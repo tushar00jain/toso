@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import (
-    Any, Dict, FrozenSet, Iterator, Mapping, Optional, Sequence, Tuple, TypeVar,
+    Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence, Tuple, TypeVar,
 )
 
 from proposed.deployment import Controller, Sensor, VolumeId
@@ -91,6 +91,13 @@ class DirectorySensor(Sensor):
         if not keys:
             return {}
         return self.directory.locate_raw(list(keys), missing_ok=True)
+
+    def holders(
+        self, keys: Sequence[str], *, live: bool = False
+    ) -> Dict[str, List[VolumeId]]:
+        """``key -> volume ids`` from the pinned answer, or a live read when asked."""
+        located = self.locate_live(keys) if live else self.locate(keys)
+        return {key: list(located.get(key, {})) for key in keys}
 
     @contextmanager
     def pinned(self, keys: Sequence[str]) -> Iterator[None]:

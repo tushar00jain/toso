@@ -105,10 +105,12 @@ def test_environment_and_directory_sensor_read_the_run():
             await sim.mesh.client("a").put("W", _payload())
             await asyncio.sleep(2.0)
             located = directory.locate(["W", "absent"])
-            return located, sim.environment.now()
+            holders = directory.holders(["W", "absent"])
+            return located, holders, sim.environment.now()
 
-    (located, now) = _drive(sim, scenario())
+    (located, holders, now) = _drive(sim, scenario())
     assert list(located["W"]) == ["a"]
+    assert holders == {"W": ["a"], "absent": []}
     # Absent keys are simply missing -- a directory sensor reports, it does not raise.
     assert "absent" not in located
     assert now >= 2.0

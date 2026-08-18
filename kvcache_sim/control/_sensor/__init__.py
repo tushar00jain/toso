@@ -13,19 +13,19 @@ separates them is who writes each:
   decision and read by a ranking that spreads reads over equally good ones.
 
 None is reached from outside this process. Every write is an action
-(:mod:`kvcache_sim.control._sensor._action`) dispatched into this plane's one
-dispatcher, so an accepted decision moves every sensor it touches or none of them. What
-the run fronts with a service is that dispatcher, never a sensor.
+dispatched into this plane's one dispatcher, so an accepted decision moves every
+sensor it touches or none of them. What the run fronts with a service is that
+dispatcher, never a sensor.
 
 Folder-private, all four: only control-plane selectors read them.
 """
 
-from ._action import (
-    Committed, ComputeBusy, DecodeState, FetchAnswered, PrefillFinished,
-)
-from ._cluster import ClusterSensor
+from ._cluster import ClusterSensor, ComputeBusy, DecodeState
 from ._load import SourceLoad
-from ._pending import Reservation, ReservationSensor, RoutedPullSensor
+from ._pending import (
+    Committed, FetchAnswered, PrefillFinished, Reservation, ReservationSensor,
+    RoutedPullSensor,
+)
 
 __all__ = [
     "ClusterSensor",

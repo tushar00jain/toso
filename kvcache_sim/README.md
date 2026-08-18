@@ -270,16 +270,12 @@ kvcache_sim/
                           #   whether it names peers or prices a pool; a
                           #   verdict -- an SLO gate -- is not
     _sensor/              #   one sensor per kind of fact this plane holds
-      _action.py          #     the four actions that move them, each a
-                          #     proposed.dispatch.Action: PrefillFinished,
-                          #     ComputeBusy and DecodeState from a host, and
-                          #     Committed, the decision this plane dispatches to
-                          #     itself. An action does not know who folds it
       _cluster.py         #     ClusterSensor: the PREDICTED prefill queue and
                           #     the observed decode batches -- what a host keeps
                           #     true, and nothing else. One per run, built in
                           #     attach(), written only by the fold it publishes,
-                          #     and read by everything that ranks hosts by load
+                          #     and read by everything that ranks hosts by load;
+                          #     ComputeBusy and DecodeState live with this sensor
       _pending.py         #     ReservationSensor / RoutedPullSensor: what this
                           #     plane decided and has not yet seen carried out,
                           #     both written by the Committed action that took it.
@@ -290,7 +286,8 @@ kvcache_sim/
                           #     nothing is offered that has come true. Only a run
                           #     that predicts composes the
                           #     reservation sensor, which is the whole of the
-                          #     condition on a reservation
+                          #     condition on a reservation. Committed,
+                          #     PrefillFinished and FetchAnswered live here
     _prefix.py            #   prefix run calculation, derived from the pinned
                           #   DirectorySensor; selectors declare concrete sensor
                           #   types for cluster, reservations and routed pulls
