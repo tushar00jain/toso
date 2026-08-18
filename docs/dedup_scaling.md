@@ -48,11 +48,11 @@ of the state.
 | `Asked` → directory pending indexes | `O(K)` per generator; `O(GK)` for the burst | `O(GK)` entries in each of two indexes; both reference the same `_PendingEntry` | Included in `pending_build_ms` and `full_decision_ms` |
 | `Routed` → fan-out route state | `O(R + S)` per generator for `S` selected sources | `O(GR + GS + V)` requirements, route edges, and source loads | Included in `pending_build_ms` and `full_decision_ms` |
 | Pinned live-directory snapshot | `O(KT)` | `O(KT)` transient copied mappings | `snapshot_ms` |
-| Pending overlay and live merge | `O(KV)` | `O(KV)` transient `StorageInfo` mappings | Part of `serving_sources_ms` and `plan_fetch_ms` |
-| TorchStore request expansion | `O(KV)` for the benchmark's one region per key/source; higher with slice intersections | `O(KV)` transient requests and region counters | Part of `serving_sources_ms` and `plan_fetch_ms` |
-| Coverage regrouping | `O(KV)` by indexing expanded regions once by key and source | `O(KV)` coverage records and counters | Part of `serving_sources_ms` and `plan_fetch_ms` |
+| Pending overlay and live merge | `O(KV)` | `O(KV)` transient source mappings; unchanged live `StorageInfo` is shared | Part of `serving_sources_ms` |
+| TorchStore request expansion | `O(KV)` for the benchmark's one region per key/source; higher with slice intersections | `O(KV)` transient requests and region counters | Part of `serving_sources_ms` |
+| Coverage regrouping and decision cache | `O(KV)` by indexing expanded regions once by key and source | `O(KV)` coverage retained until the pinned decision exits | Built in `serving_sources_ms`, reused by `plan_fetch_ms` |
 | Candidate readiness and scoring | `O(GK + V + V log V)` for dense pending routes, including ordering | `O(V + K)` transient wait memo and one pending route's coverage work | Part of `full_decision_ms` |
-| Fetch materialization | `O(KV)` including its own coverage construction | `O(KV)` transient coverage; up to `O(KV)` required-region output | `plan_fetch_ms` |
+| Fetch materialization | `O(KV)` over cached coverage | Up to `O(KV)` required-region output | `plan_fetch_ms` |
 | Gate registration | `O(P)` | `O(P)` waiter links per blocked decision, up to `O(GP)` at the burst peak | Included in `full_decision_ms` |
 | `Published` commit | `O(K + R + Wₐ)` to remove pending keys and requirements and release waiters | Releases `O(K + R + Wₐ)` pending requirements and waiter links; route/load history remains until rerouted or retired | Not measured |
 | Whole serialized decision | `O(KV + GK + V log V)` | Adds `O(K + R + P)` retained state for the requester plus `O(KV)` transient planning state | `full_decision_ms` |
@@ -81,8 +81,9 @@ bookkeeping, but they do not separate that fixed framework cost from the sensor 
 Each matching `*_python_peak_kib` column is `tracemalloc`'s additional peak for
 Python metadata allocated during that phase. It excludes native allocations, tensor
 allocators, process RSS, and the workload state live before tracing starts. The
-benchmark does not dispatch `Published`, so it does not cover completion cleanup or
-waking `Wₐ` blocked decisions.
+cached coverage built by `serving_sources` is therefore baseline state for the
+`plan_fetch_python_peak_kib` phase. The benchmark does not dispatch `Published`, so
+it does not cover completion cleanup or waking `Wₐ` blocked decisions.
 
 ## Reusable benchmark
 
@@ -97,11 +98,11 @@ and Python build.
 
 | case | keys | source ranks | generators | indexed entries | pending build ms | snapshot ms | serving sources ms | plan fetch ms | full decision ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| smoke | 8 | 2 | 8 | 208 | 0.272 | 0.022 | 0.557 | 0.474 | 1.971 |
+| smoke | 8 | 2 | 8 | 208 | 0.273 | 0.007 | 0.449 | 0.155 | 1.664 |
 
 | pending build peak KiB | snapshot peak KiB | serving sources peak KiB | plan fetch peak KiB | full decision peak KiB | candidates | pending candidates | selected sources |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 37.688 | 3.594 | 68.141 | 69.312 | 103.766 | 10 | 8 | 1 |
+| 37.688 | 3.953 | 64.719 | 9.492 | 85.367 | 10 | 8 | 1 |
 
 Run the intended 8B scale or supply a deployment-specific point:
 
@@ -124,10 +125,12 @@ Output is one tab-separated header and row with fixed column order. Commit or ar
 that row alongside the code revision and host description; compare the same preset,
 Python build, and machine before and after a change. The tool measures runtime first,
 then creates a fresh workload for the traced-memory pass. Tracing starts separately
-for each phase, so its overhead cannot affect the `*_ms` columns. Wall-clock values
-are medians for the repeated phase measurements, while pending-state construction and
-the full decision are single peak-state observations to avoid multiplying large
-allocations. Each memory phase runs once.
+for each phase, so its overhead cannot affect the `*_ms` columns. Each planning sample
+opens a fresh pin, measures cold `serving_sources`, then measures cached `plan_fetch`
+before leaving that pin. Wall-clock values are medians for the repeated phase
+measurements, while pending-state construction and the full decision are single
+peak-state observations to avoid multiplying large allocations. Each memory phase
+runs once in the same cold-then-cached order.
 
 The tool does not measure controller RPC, payload transfer, publication latency, or
 the simulation scheduler. It answers whether one serialized dedup controller can

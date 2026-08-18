@@ -25,7 +25,7 @@ from typing import Callable, Sequence, TypeVar
 # Keep TorchStore's import-time setup warning out of the tabular report.
 os.environ.setdefault("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", "910737418240")
 
-from dedup_sim.control._sensor import Asked, DedupDirectorySensor, Routed
+from dedup_sim.control._sensor import Asked, DedupDirectorySensor, PlannedFetch, Routed
 from dedup_sim.control.routing import Dedup
 from proposed import Endpoint, Environment
 from torchstore.controller import ObjectType, StorageInfo
@@ -119,10 +119,10 @@ class _Workload:
         with self.directory.pinned([request.key for request in self.requests]):
             pass
 
-    def serving_sources(self):
+    def serving_sources(self) -> tuple[set[str], set[str]]:
         return self.directory.serving_sources(self.requests)
 
-    def plan_fetch(self):
+    def plan_fetch(self) -> PlannedFetch:
         order = (*self.generators, *self.sources)
         return self.directory.plan_fetch(self.requests, order, requester=self.probe)
 
@@ -184,6 +184,43 @@ def _python_peak_kib(operation: Callable[[], object]) -> float:
     return (peak - baseline) / 1024
 
 
+def _planning_ms(
+    workload: _Workload, *, warmups: int, repeats: int
+) -> tuple[float, float, tuple[set[str], set[str]], PlannedFetch]:
+    keys = [request.key for request in workload.requests]
+
+    def sample() -> tuple[float, float, tuple[set[str], set[str]], PlannedFetch]:
+        with workload.directory.pinned(keys):
+            started = time.perf_counter()
+            serving = workload.serving_sources()
+            serving_ms = (time.perf_counter() - started) * 1_000
+            started = time.perf_counter()
+            fetch = workload.plan_fetch()
+            plan_ms = (time.perf_counter() - started) * 1_000
+        return serving_ms, plan_ms, serving, fetch
+
+    for _ in range(warmups):
+        sample()
+    serving_samples = []
+    plan_samples = []
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(repeats):
+            serving_ms, plan_ms, serving, fetch = sample()
+            serving_samples.append(serving_ms)
+            plan_samples.append(plan_ms)
+    finally:
+        if enabled:
+            gc.enable()
+    return (
+        statistics.median(serving_samples),
+        statistics.median(plan_samples),
+        serving,
+        fetch,
+    )
+
+
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=tuple(_PRESETS), default="smoke")
@@ -235,17 +272,9 @@ def _runtime(args: argparse.Namespace) -> _Runtime:
     snapshot_ms, _ = _median_ms(
         workload.snapshot, warmups=args.warmups, repeats=args.repeats
     )
-    with workload.directory.pinned([request.key for request in workload.requests]):
-        serving_ms, serving = _median_ms(
-            workload.serving_sources,
-            warmups=args.warmups,
-            repeats=args.repeats,
-        )
-        plan_ms, fetch = _median_ms(
-            workload.plan_fetch,
-            warmups=args.warmups,
-            repeats=args.repeats,
-        )
+    serving_ms, plan_ms, serving, fetch = _planning_ms(
+        workload, warmups=args.warmups, repeats=args.repeats
+    )
     gc.collect()
     started = time.perf_counter()
     workload.decide()

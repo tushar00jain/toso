@@ -283,6 +283,104 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
     assert without_peer.by_key == {"K": ("replica",)}
 
 
+def test_one_pinned_decision_expands_matching_coverage_once(monkeypatch):
+    directory = DedupDirectorySensor(_Holds("origin"))
+    requests = [_request("K0"), _request("K1")]
+    computations = 0
+    original = directory._compute_coverage
+
+    def counted(requests):
+        nonlocal computations
+        computations += 1
+        return original(requests)
+
+    monkeypatch.setattr(directory, "_compute_coverage", counted)
+    with directory.pinned([request.key for request in requests]):
+        directory.serving_sources(tuple(requests))
+        directory.plan_fetch(tuple(requests), ("origin",))
+
+    assert computations == 1
+
+
+def test_each_pinned_decision_recomputes_matching_coverage(monkeypatch):
+    directory = DedupDirectorySensor(_Holds("origin"))
+    requests = [_request("K")]
+    computations = 0
+    original = directory._compute_coverage
+
+    def counted(requests):
+        nonlocal computations
+        computations += 1
+        return original(requests)
+
+    monkeypatch.setattr(directory, "_compute_coverage", counted)
+    for _ in range(2):
+        with directory.pinned(["K"]):
+            directory.serving_sources(tuple(requests))
+            directory.plan_fetch(tuple(requests), ("origin",))
+
+    assert computations == 2
+
+
+def test_pinned_coverage_recomputes_after_request_content_changes(monkeypatch):
+    directory = DedupDirectorySensor(_Holds("origin"))
+    request = _request("K")
+    computations = 0
+    original = directory._compute_coverage
+
+    def counted(requests):
+        nonlocal computations
+        computations += 1
+        return original(requests)
+
+    monkeypatch.setattr(directory, "_compute_coverage", counted)
+    with directory.pinned(["K"]):
+        directory.serving_sources((request,))
+        request.tensor_slice = TensorSlice((0,), (0,), (8,), (4,), (2,))
+        directory.plan_fetch((request,), ("origin",))
+
+    assert computations == 2
+
+
+def test_unpinned_coverage_is_never_cached(monkeypatch):
+    directory = DedupDirectorySensor(_Holds("origin"))
+    requests = [_request("K")]
+    computations = 0
+    original = directory._compute_coverage
+
+    def counted(requests):
+        nonlocal computations
+        computations += 1
+        return original(requests)
+
+    monkeypatch.setattr(directory, "_compute_coverage", counted)
+    directory.serving_sources(tuple(requests))
+    directory.plan_fetch(tuple(requests), ("origin",))
+
+    assert computations == 2
+
+
+def test_pending_merge_copies_only_live_metadata_that_grows():
+    left = TensorSlice((0,), (0,), (8,), (4,), (2,))
+    right = TensorSlice((4,), (1,), (8,), (4,), (2,))
+    whole = StorageInfo(ObjectType.TENSOR, {None})
+    partial = StorageInfo(ObjectType.TENSOR_SLICE, {left})
+    live = {"K": {"whole": whole, "partial": partial}}
+    pending = {
+        "K": {
+            "whole": StorageInfo(ObjectType.TENSOR, {None}),
+            "partial": StorageInfo(ObjectType.TENSOR_SLICE, {right}),
+        }
+    }
+
+    merged = DedupDirectorySensor._merged(live, pending, ("K",))
+
+    assert merged["K"]["whole"] is whole
+    assert merged["K"]["partial"] is not partial
+    assert merged["K"]["partial"].tensor_slices == {left, right}
+    assert partial.tensor_slices == {left}
+
+
 def test_multi_key_coverage_keeps_regions_under_their_sources():
     info = StorageInfo(ObjectType.TENSOR, {None})
     live = {"K0": {"v0": info}, "K1": {"v1": info}}

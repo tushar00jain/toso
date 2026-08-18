@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Iterator, Mapping, Sequence
 
 from proposed import Controller, DirectorySensor, Key, VolumeId
 from proposed.dispatch import Action, Fold
@@ -15,6 +16,7 @@ from torchstore.transport import Request
 __all__ = ["Asked", "DedupDirectorySensor", "PlannedFetch", "Published"]
 
 _Region = tuple[Key, object]
+_RequestSignature = tuple[str, int, object, int, bool]
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,15 @@ class DedupDirectorySensor(DirectorySensor):
             Asked: self._asked,
             Published: self._published,
         }
+        # Expanded metadata is reusable only within one pinned directory snapshot.
+        self._coverage_cache: (
+            tuple[
+                tuple[Request, ...],
+                tuple[_RequestSignature, ...],
+                tuple[_KeyCoverage, ...],
+            ]
+            | None
+        ) = None
 
     @property
     def folds(self) -> Mapping[type, Fold]:
@@ -138,6 +149,16 @@ class DedupDirectorySensor(DirectorySensor):
     def in_flight(self) -> set[VolumeId]:
         """Producers with pending directory entries."""
         return set(self._pending)
+
+    @contextmanager
+    def pinned(self, keys: Sequence[Key]) -> Iterator[None]:
+        """Pin live metadata and one matching coverage expansion."""
+        with super().pinned(keys):
+            self._coverage_cache = None
+            try:
+                yield
+            finally:
+                self._coverage_cache = None
 
     def serving_sources(
         self, requests: Sequence[Request]
@@ -214,6 +235,27 @@ class DedupDirectorySensor(DirectorySensor):
         return PlannedFetch(by_key, dict(required), frozenset(pending))
 
     def _coverage(self, requests: Sequence[Request]) -> tuple[_KeyCoverage, ...]:
+        current = tuple(requests)
+        signature = tuple(self._request_signature(request) for request in current)
+        if self._keys is not None and self._coverage_cache is not None:
+            cached_requests, cached_signature, cached = self._coverage_cache
+            if (
+                len(current) == len(cached_requests)
+                and all(
+                    request is previous
+                    for request, previous in zip(current, cached_requests)
+                )
+                and signature == cached_signature
+            ):
+                return cached
+        coverage = self._compute_coverage(current)
+        if self._keys is not None:
+            self._coverage_cache = current, signature, coverage
+        return coverage
+
+    def _compute_coverage(
+        self, requests: Sequence[Request]
+    ) -> tuple[_KeyCoverage, ...]:
         keys = tuple(dict.fromkeys(request.key for request in requests))
         live = self.locate(keys)
         combined = self._merged(live, self.pending(keys), keys)
@@ -237,6 +279,26 @@ class DedupDirectorySensor(DirectorySensor):
             for key in keys
         )
 
+    @staticmethod
+    def _request_signature(request: Request) -> _RequestSignature:
+        tensor_slice = request.tensor_slice
+        slice_signature: object = None
+        if tensor_slice is not None:
+            slice_signature = (
+                tuple(tensor_slice.offsets),
+                tuple(tensor_slice.coordinates),
+                tuple(tensor_slice.global_shape),
+                tuple(tensor_slice.local_shape),
+                tuple(tensor_slice.mesh_shape),
+            )
+        return (
+            request.key,
+            id(request.tensor_val),
+            slice_signature,
+            id(request.objects),
+            request.is_object,
+        )
+
     def _regions_by_key(
         self, plan: Mapping[VolumeId, Sequence[Request]]
     ) -> Dict[Key, Dict[VolumeId, tuple[_Region, ...]]]:
@@ -257,17 +319,21 @@ class DedupDirectorySensor(DirectorySensor):
     ) -> Dict[Key, Dict[VolumeId, StorageInfo]]:
         merged: Dict[Key, Dict[VolumeId, StorageInfo]] = {}
         for key in keys:
-            entries = {
-                source: StorageInfo(info.object_type, set(info.tensor_slices))
-                for source, info in live.get(key, {}).items()
-            }
+            entries = dict(live.get(key, {}))
             for source, info in pending.get(key, {}).items():
                 previous = entries.get(source)
                 if previous is None:
                     entries[source] = StorageInfo(
                         info.object_type, set(info.tensor_slices)
                     )
-                elif previous.object_type == info.object_type:
-                    previous.update(info)
+                elif (
+                    previous.object_type == info.object_type
+                    and info.tensor_slices - previous.tensor_slices
+                ):
+                    updated = StorageInfo(
+                        previous.object_type, set(previous.tensor_slices)
+                    )
+                    updated.update(info)
+                    entries[source] = updated
             merged[key] = entries
         return merged
