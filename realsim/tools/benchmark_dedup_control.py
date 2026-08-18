@@ -5,8 +5,9 @@ Run from the repository root::
     .venv/bin/python -m realsim.tools.benchmark_dedup_control
     .venv/bin/python -m realsim.tools.benchmark_dedup_control --preset planned-8b
 
-The workload uses metadata-only TorchStore requests. It measures directory and
-routing work, not payload allocation, transport, or simulated transfer time.
+The workload uses metadata-only TorchStore requests. Runtime and traced Python peak
+allocation are measured in separate passes. Payload allocation, transport, native
+allocators, process RSS, and simulated transfer time are outside the measurement.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import gc
 import os
 import statistics
 import time
+import tracemalloc
 from dataclasses import dataclass
 from typing import Callable, Sequence, TypeVar
 
@@ -56,8 +58,7 @@ class _StaticDirectory:
     def __init__(self, requests: Sequence[Request], sources: Sequence[str]) -> None:
         info = StorageInfo(ObjectType.from_request(requests[0]), {None})
         self._located = {
-            request.key: {source: info for source in sources}
-            for request in requests
+            request.key: {source: info for source in sources} for request in requests
         }
 
     def locate_raw(
@@ -74,6 +75,80 @@ class _Profile:
         if src.id == dst.id:
             return 0.0
         return 10.0 if src.id.startswith("source-") else 1.0
+
+
+class _Workload:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.requests = tuple(
+            Request.from_any(f"model.weight.{index}", None).meta_only()
+            for index in range(args.keys)
+        )
+        self.sources = tuple(f"source-{index}" for index in range(args.source_ranks))
+        self.generators = tuple(
+            f"generator-{index}" for index in range(args.generators)
+        )
+        self.probe = "probe"
+        topology = {
+            volume: Endpoint(id=volume, host=volume, node=volume)
+            for volume in (*self.sources, *self.generators, self.probe)
+        }
+        self.directory = DedupDirectorySensor(
+            _StaticDirectory(self.requests, self.sources)
+        )
+        self.plane = Dedup(fanout_cap=args.fanout_cap).attach(
+            Environment(topology, _Profile()),
+            {DedupDirectorySensor: self.directory},
+        )
+        assert self.plane.dispatcher is not None
+        self.regions = tuple((request.key, None) for request in self.requests)
+
+    def build_pending(self) -> None:
+        assert self.plane.dispatcher is not None
+        for index, generator in enumerate(self.generators):
+            source = self.sources[index % len(self.sources)]
+            self.plane.dispatcher.dispatch_sync(Asked(generator, self.requests))
+            self.plane.dispatcher.dispatch_sync(
+                Routed(
+                    requester=generator,
+                    sources=(source,),
+                    required=((source, self.regions),),
+                )
+            )
+
+    def snapshot(self) -> None:
+        with self.directory.pinned([request.key for request in self.requests]):
+            pass
+
+    def serving_sources(self):
+        return self.directory.serving_sources(self.requests)
+
+    def plan_fetch(self):
+        order = (*self.generators, *self.sources)
+        return self.directory.plan_fetch(self.requests, order, requester=self.probe)
+
+    def decide(self) -> None:
+        asyncio.run(self.plane._decide(self.requests, self.probe))
+
+
+@dataclass(frozen=True)
+class _Runtime:
+    pending_build_ms: float
+    snapshot_ms: float
+    serving_sources_ms: float
+    plan_fetch_ms: float
+    full_decision_ms: float
+    candidates: int
+    pending_candidates: int
+    selected_sources: int
+
+
+@dataclass(frozen=True)
+class _Memory:
+    pending_build_python_peak_kib: float
+    snapshot_python_peak_kib: float
+    serving_sources_python_peak_kib: float
+    plan_fetch_python_peak_kib: float
+    full_decision_python_peak_kib: float
 
 
 def _median_ms(
@@ -94,6 +169,19 @@ def _median_ms(
         if enabled:
             gc.enable()
     return statistics.median(samples), result
+
+
+def _python_peak_kib(operation: Callable[[], object]) -> float:
+    gc.collect()
+    tracemalloc.start()
+    try:
+        baseline, _peak = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
+        operation()
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return (peak - baseline) / 1024
 
 
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -127,12 +215,9 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     if args.warmups < 0:
         parser.error("--warmups cannot be negative")
     indexed_entries = args.keys * (args.source_ranks + 3 * args.generators)
-    region_checks = args.keys * args.keys * (
-        args.source_ranks + args.generators
-    )
+    region_checks = args.keys * args.keys * (args.source_ranks + args.generators)
     if not args.allow_large and (
-        indexed_entries > _MAX_INDEXED_ENTRIES
-        or region_checks > _MAX_REGION_CHECKS
+        indexed_entries > _MAX_INDEXED_ENTRIES or region_checks > _MAX_REGION_CHECKS
     ):
         parser.error(
             "workload exceeds the default allocation/work guard; use "
@@ -141,77 +226,78 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
-def _run(args: argparse.Namespace) -> None:
-    requests = tuple(
-        Request.from_any(f"model.weight.{index}", None).meta_only()
-        for index in range(args.keys)
-    )
-    sources = tuple(f"source-{index}" for index in range(args.source_ranks))
-    generators = tuple(f"generator-{index}" for index in range(args.generators))
-    probe = "probe"
-    topology = {
-        volume: Endpoint(id=volume, host=volume, node=volume)
-        for volume in (*sources, *generators, probe)
-    }
-    directory = DedupDirectorySensor(_StaticDirectory(requests, sources))
-    plane = Dedup(fanout_cap=args.fanout_cap).attach(
-        Environment(topology, _Profile()),
-        {DedupDirectorySensor: directory},
-    )
-    assert plane.dispatcher is not None
-
-    regions = tuple((request.key, None) for request in requests)
+def _runtime(args: argparse.Namespace) -> _Runtime:
+    workload = _Workload(args)
     gc.collect()
     started = time.perf_counter()
-    for index, generator in enumerate(generators):
-        source = sources[index % len(sources)]
-        plane.dispatcher.dispatch_sync(Asked(generator, requests))
-        plane.dispatcher.dispatch_sync(
-            Routed(
-                requester=generator,
-                sources=(source,),
-                required=((source, regions),),
-            )
-        )
+    workload.build_pending()
     pending_build_ms = (time.perf_counter() - started) * 1_000
-
-    def snapshot() -> None:
-        with directory.pinned([request.key for request in requests]):
-            pass
-
     snapshot_ms, _ = _median_ms(
-        snapshot, warmups=args.warmups, repeats=args.repeats
+        workload.snapshot, warmups=args.warmups, repeats=args.repeats
     )
-    with directory.pinned([request.key for request in requests]):
+    with workload.directory.pinned([request.key for request in workload.requests]):
         serving_ms, serving = _median_ms(
-            lambda: directory.serving_sources(requests),
+            workload.serving_sources,
             warmups=args.warmups,
             repeats=args.repeats,
         )
-        order = (*generators, *sources)
         plan_ms, fetch = _median_ms(
-            lambda: directory.plan_fetch(requests, order, requester=probe),
+            workload.plan_fetch,
             warmups=args.warmups,
             repeats=args.repeats,
         )
-
     gc.collect()
     started = time.perf_counter()
-    asyncio.run(plane._decide(requests, probe))
+    workload.decide()
     decision_ms = (time.perf_counter() - started) * 1_000
-
     candidates, pending = serving
+    return _Runtime(
+        pending_build_ms,
+        snapshot_ms,
+        serving_ms,
+        plan_ms,
+        decision_ms,
+        len(candidates),
+        len(pending),
+        len(fetch.sources),
+    )
+
+
+def _memory(args: argparse.Namespace) -> _Memory:
+    workload = _Workload(args)
+    pending_build = _python_peak_kib(workload.build_pending)
+    snapshot = _python_peak_kib(workload.snapshot)
+    with workload.directory.pinned([request.key for request in workload.requests]):
+        serving = _python_peak_kib(workload.serving_sources)
+        plan = _python_peak_kib(workload.plan_fetch)
+    decision = _python_peak_kib(workload.decide)
+    return _Memory(pending_build, snapshot, serving, plan, decision)
+
+
+def _run(args: argparse.Namespace) -> None:
+    runtime = _runtime(args)
+    memory = _memory(args)
     indexed_entries = args.keys * (args.source_ranks + 3 * args.generators)
     print(
         "case\tkeys\tsource_ranks\tgenerators\tindexed_metadata_entries\t"
         "pending_build_ms\tsnapshot_ms\tserving_sources_ms\tplan_fetch_ms\t"
-        "full_decision_ms\tcandidates\tpending_candidates\tselected_sources"
+        "full_decision_ms\tpending_build_python_peak_kib\t"
+        "snapshot_python_peak_kib\tserving_sources_python_peak_kib\t"
+        "plan_fetch_python_peak_kib\tfull_decision_python_peak_kib\t"
+        "candidates\tpending_candidates\tselected_sources"
     )
     print(
         f"{args.case}\t{args.keys}\t{args.source_ranks}\t{args.generators}\t"
-        f"{indexed_entries}\t{pending_build_ms:.3f}\t{snapshot_ms:.3f}\t"
-        f"{serving_ms:.3f}\t{plan_ms:.3f}\t{decision_ms:.3f}\t"
-        f"{len(candidates)}\t{len(pending)}\t{len(fetch.sources)}"
+        f"{indexed_entries}\t{runtime.pending_build_ms:.3f}\t"
+        f"{runtime.snapshot_ms:.3f}\t{runtime.serving_sources_ms:.3f}\t"
+        f"{runtime.plan_fetch_ms:.3f}\t{runtime.full_decision_ms:.3f}\t"
+        f"{memory.pending_build_python_peak_kib:.3f}\t"
+        f"{memory.snapshot_python_peak_kib:.3f}\t"
+        f"{memory.serving_sources_python_peak_kib:.3f}\t"
+        f"{memory.plan_fetch_python_peak_kib:.3f}\t"
+        f"{memory.full_decision_python_peak_kib:.3f}\t"
+        f"{runtime.candidates}\t{runtime.pending_candidates}\t"
+        f"{runtime.selected_sources}"
     )
 
 

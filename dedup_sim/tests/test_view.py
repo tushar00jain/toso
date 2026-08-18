@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from typing import Sequence
 
 import pytest
@@ -280,6 +281,49 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
     assert pending == {"r0"}
     assert planned.by_key == {"K": ("r0",)}
     assert without_peer.by_key == {"K": ("replica",)}
+
+
+def test_multi_key_coverage_keeps_regions_under_their_sources():
+    info = StorageInfo(ObjectType.TENSOR, {None})
+    live = {"K0": {"v0": info}, "K1": {"v1": info}}
+
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: dict(live.get(key, {})) for key in keys}
+
+    directory = DedupDirectorySensor(_Directory())
+    planned = directory.plan_fetch([_request("K0"), _request("K1")], ("v0", "v1"))
+
+    assert planned.by_key == {"K0": ("v0",), "K1": ("v1",)}
+    assert planned.required == {
+        "v0": Counter({("K0", None): 1}),
+        "v1": Counter({("K1", None): 1}),
+    }
+
+
+def test_sliced_coverage_preserves_region_order_and_multiplicity():
+    half = TensorSlice((0,), (0,), (8,), (4,), (2,))
+    quarter = TensorSlice((1,), (0,), (8,), (2,), (4,))
+    crossing = TensorSlice((3,), (0,), (8,), (2,), (4,))
+
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {
+                key: {"origin": StorageInfo(ObjectType.TENSOR_SLICE, {half})}
+                for key in keys
+            }
+
+    directory = DedupDirectorySensor(_Directory())
+    planned = directory.plan_fetch(
+        [_request("K", quarter), _request("K", quarter), _request("K", crossing)],
+        ("origin",),
+    )
+
+    assert tuple(planned.required["origin"].elements()) == (
+        ("K", ((1,), (2,), (8,))),
+        ("K", ((1,), (2,), (8,))),
+        ("K", ((3,), (1,), (8,))),
+    )
 
 
 def test_two_pending_slices_form_one_torchstore_fetch_plan():

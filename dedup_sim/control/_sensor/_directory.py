@@ -217,14 +217,10 @@ class DedupDirectorySensor(DirectorySensor):
         keys = tuple(dict.fromkeys(request.key for request in requests))
         live = self.locate(keys)
         combined = self._merged(live, self.pending(keys), keys)
-        combined_plan = self.requests_by_source(requests, combined)
-        live_plan = self.requests_by_source(requests, live)
-        combined_regions = {
-            source: self.regions(parts) for source, parts in combined_plan.items()
-        }
-        live_regions = {
-            source: self.regions(parts) for source, parts in live_plan.items()
-        }
+        combined_by_key = self._regions_by_key(
+            self.requests_by_source(requests, combined)
+        )
+        live_by_key = self._regions_by_key(self.requests_by_source(requests, live))
         return tuple(
             _KeyCoverage(
                 key,
@@ -232,24 +228,26 @@ class DedupDirectorySensor(DirectorySensor):
                 tuple(
                     _SourceCoverage(
                         source,
-                        tuple(
-                            region
-                            for region in combined_regions.get(
-                                source, Counter()
-                            ).elements()
-                            if region[0] == key
-                        ),
-                        tuple(
-                            region
-                            for region in live_regions.get(source, Counter()).elements()
-                            if region[0] == key
-                        ),
+                        combined_by_key.get(key, {}).get(source, ()),
+                        live_by_key.get(key, {}).get(source, ()),
                     )
                     for source in combined[key]
                 ),
             )
             for key in keys
         )
+
+    def _regions_by_key(
+        self, plan: Mapping[VolumeId, Sequence[Request]]
+    ) -> Dict[Key, Dict[VolumeId, tuple[_Region, ...]]]:
+        indexed: Dict[Key, Dict[VolumeId, tuple[_Region, ...]]] = defaultdict(dict)
+        for source, parts in plan.items():
+            source_by_key: Dict[Key, list[_Region]] = defaultdict(list)
+            for region in self.regions(parts).elements():
+                source_by_key[region[0]].append(region)
+            for key, regions in source_by_key.items():
+                indexed[key][source] = tuple(regions)
+        return indexed
 
     @staticmethod
     def _merged(
