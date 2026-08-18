@@ -42,7 +42,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from proposed import DirectorySensor, Key, KeySelector, Selection, VolumeId
 
-from ._sensor import FanoutSensor, _storage_covers
+from .._planning import relevant_sources, requirements_met
+from ._sensor import FanoutSensor
 
 __all__ = ["Candidates", "CHAIN", "SPREAD"]
 
@@ -76,39 +77,43 @@ class Candidates(KeySelector[float]):
         self.payload_bytes = payload_bytes
 
     def select(self, keys: Sequence[Key], requester: str) -> Selection[float]:
-        """Everything that could serve every one of ``keys``, scored; else abstain."""
+        """Every source with a relevant key region, scored; else abstain."""
         fanout = self.sensor(FanoutSensor)
-        requested = fanout.plan(requester)
+        requested = tuple(fanout.plan(requester).values())
         located = self.sensor(DirectorySensor).locate(keys)
-        volumes = {volume for by_volume in located.values() for volume in by_volume}
-        holds = {
-            volume
-            for volume in volumes
-            if all(
-                volume in located.get(key, {})
-                and _storage_covers(located[key][volume], request)
-                for key, request in requested.items()
-            )
-        }
-        routes, queued = fanout.routes(), fanout.named()
+        candidates, pending = relevant_sources(
+            requested, located, fanout.promised(keys)
+        )
+        queued = fanout.named()
+        located_by_key: Dict[Key, Mapping[VolumeId, Any]] = dict(located)
         # Discounted from the cap below: a second ask costs no slot, so a reader
         # re-asking after an eviction is not shut out by its own place in the queue.
-        mine = fanout.planned(requester)
+        mine = set(fanout.planned(requester))
         priced: List[Tuple[VolumeId, float]] = []
-        # Memo for the walk below: one entry per volume reached, so a branch is walked
-        # once per decision and not once per candidate. The pool needs no order of its
-        # own -- the score orders it, and the fold reading it is total (id the last
-        # tie-break).
         waits: Dict[VolumeId, Optional[float]] = {}
-        for volume in holds | routes.keys():
+        in_flight = fanout.in_flight()
+        live = candidates - pending
+        for volume in candidates:
             # Never a source for itself.
             if volume == requester:
                 continue
-            wait = self._wait(volume, requested, holds, routes, waits)
+            wait = (
+                0.0
+                if volume in live
+                else self._wait(
+                    volume,
+                    fanout,
+                    in_flight,
+                    self.sensor(DirectorySensor),
+                    located_by_key,
+                    waits,
+                    set(),
+                )
+            )
             if wait is None:
                 continue
-            behind = queued.get(volume, 0) - (volume == mine)
-            if wait and behind >= fanout.cap:
+            behind = queued.get(volume, 0) - (volume in mine)
+            if volume in pending and behind >= fanout.cap:
                 # A peer at its cap: the ceiling on how wide the tree fans out, and the
                 # only thing the cap does. A holder has no such limit; its price is
                 # what keeps readers off it.
@@ -122,54 +127,71 @@ class Candidates(KeySelector[float]):
     def _wait(
         self,
         volume: VolumeId,
-        requested: Mapping[Key, Any],
-        holds: Set[VolumeId],
-        routes: Mapping[VolumeId, VolumeId],
+        fanout: FanoutSensor,
+        in_flight: Set[VolumeId],
+        directory: DirectorySensor,
+        located: Dict[Key, Mapping[VolumeId, Any]],
         waits: Dict[VolumeId, Optional[float]],
+        visiting: Set[VolumeId],
     ) -> Optional[float]:
-        """Seconds until ``volume`` covers the request; ``0`` now, ``None`` if never.
-
-        A peer's wait is its own source's wait plus the link between the two, so a
-        branch costs what its links cost rather than a hop count, and a peer two cheap
-        hops away can be sooner than one over a slow link. Every step up the branch must
-        still be coming: a volume that owes nothing and holds nothing has no copy on the
-        way.
-
-        Missing: elapsed time is not subtracted, so a fetch already in flight is priced
-        as if it started now and its peer reads as slightly further off than it is.
-        Exact for a synchronized burst, where every decision is made at one instant.
-
-        Every volume the walk passes is answered on the way back down (``waits``), so a
-        chain of ``m`` readers costs ``m`` steps in total, not ``m`` per reader.
-        """
-        fanout = self.sensor(FanoutSensor)
-        branch: List[VolumeId] = []
-        while True:
-            # Priced by an earlier candidate's walk.
-            if volume in waits:
-                wait = waits[volume]
-                break
-            # A holder waits for nothing.
-            if volume in holds:
-                wait = waits[volume] = 0.0
-                break
-            # Owes nothing, or more steps than there are edges -- a walk that cannot
-            # terminate is a cycle, and this is what stops following it.
-            if len(branch) > len(routes) or not fanout.covers(volume, requested):
-                wait = waits[volume] = None
-                break
-            branch.append(volume)
-            source = routes.get(volume)
-            # Owes the request, but has no source.
-            if source is None:
-                wait = waits[volume] = None
-                break
-            volume = source
-        for node in reversed(branch):
+        if volume in waits:
+            return waits[volume]
+        if volume not in in_flight:
+            waits[volume] = None
+            return None
+        if volume in visiting:
+            waits[volume] = None
+            return None
+        plan = fanout.route_plan(volume)
+        if not plan:
+            waits[volume] = None
+            return None
+        visiting.add(volume)
+        by_source: Dict[VolumeId, set[Key]] = {}
+        for key, sources in plan.items():
+            for source in sources:
+                by_source.setdefault(source, set()).add(key)
+        pending = fanout.route_pending(volume)
+        required = fanout.route_required(volume)
+        requests = tuple(fanout.plan(volume).values())
+        arrivals: List[float] = []
+        for source, source_keys in by_source.items():
+            expected = required.get(source)
+            if expected:
+                required_keys = {key for key, _region in expected}
+                for key in required_keys:
+                    if key not in located:
+                        located.update(directory.locate_live([key]))
+                ready = requirements_met(requests, located, {source: expected})
+            else:
+                ready = True
+                for key in source_keys:
+                    if key not in located:
+                        located.update(directory.locate_live([key]))
+                    if source not in located.get(key, {}):
+                        ready = False
+                        break
+            if ready:
+                wait = 0.0
+            elif source in pending and source in in_flight:
+                wait = self._wait(
+                    source,
+                    fanout,
+                    in_flight,
+                    directory,
+                    located,
+                    waits,
+                    visiting,
+                )
+            else:
+                wait = None
             if wait is None:
-                waits[node] = None
-                continue
-            wait += self.env.read_time(volume, node, self.payload_bytes)
-            waits[node] = wait
-            volume = node
-        return waits[branch[0]] if branch else wait
+                waits[volume] = None
+                visiting.remove(volume)
+                return None
+            arrivals.append(
+                wait + self.env.read_time(source, volume, self.payload_bytes)
+            )
+        visiting.remove(volume)
+        waits[volume] = max(arrivals)
+        return waits[volume]

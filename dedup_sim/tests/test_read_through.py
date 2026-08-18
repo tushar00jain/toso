@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from dedup_sim.control._sensor import Published
-from dedup_sim.data.read_through import ReadThroughPlane
-from proposed import Selection
+from dedup_sim.control.routing import ReadPlan
+from dedup_sim.data.read_through import _Locate, ReadThroughPlane
+from torchstore.controller import ObjectType, StorageInfo
 from sim_common.async_engine import run_sim
 
 
@@ -25,7 +26,7 @@ class _Control:
 
     async def _sources(self, keys, requester):
         self.asked.append((keys, requester))
-        return Selection(sources=("source",))
+        return ReadPlan({request.key: ("source",) for request in keys}, ("source",))
 
 
 class _Dispatcher:
@@ -39,12 +40,11 @@ class _Dispatcher:
 
 class _Client:
     def __init__(self) -> None:
-        self.gets = []
         self.puts = []
-
-    async def get_batch(self, keys):
-        self.gets.append(keys)
-        return {key: f"read-{key}" for key in keys}
+        self._controller = type(
+            "Controller", (), {"locate_volumes": _Call(lambda *_args: None)}
+        )()
+        self.strategy = object()
 
     async def put_batch(self, entries):
         self.puts.append(entries)
@@ -62,14 +62,24 @@ class _Deployment:
         return self.client
 
 
-def test_a_batch_put_dispatches_one_publication():
+def test_a_batch_put_dispatches_one_publication(monkeypatch):
     deployment = _Deployment()
     plane = ReadThroughPlane()
     plane.attach(deployment)
+    fetches = []
 
-    result, _trace = run_sim(
-        plane.read_through("r0", {"K0": None, "K1": None})
-    )
+    class _Routed:
+        def __init__(self, controller, strategy):
+            self.controller = controller
+            self.strategy = strategy
+
+        async def get_batch(self, entries):
+            fetches.append(entries)
+            return {key: f"read-{key}" for key in entries}
+
+    monkeypatch.setattr("dedup_sim.data.read_through.LocalClient", _Routed)
+
+    result, _trace = run_sim(plane.read_through("r0", {"K0": None, "K1": None}))
 
     assert result == {"K0": "read-K0", "K1": "read-K1"}
     requests, requester = deployment.control_plane_handle.asked[0]
@@ -78,7 +88,24 @@ def test_a_batch_put_dispatches_one_publication():
         ("K0", None),
         ("K1", None),
     ]
-    assert deployment.client.gets == [{"K0": None, "K1": None}]
+    assert fetches == [{"K0": None, "K1": None}]
     assert deployment.client.puts == [{"K0": "read-K0", "K1": "read-K1"}]
     assert deployment.dispatcher_handle.actions == [Published("r0")]
-    assert deployment.vends == [("r0", ("source",)), ("r0", None)]
+    assert deployment.vends == [("r0", None), ("r0", None)]
+
+
+def test_the_scoped_controller_applies_each_keys_own_sources():
+    info = StorageInfo(ObjectType.TENSOR, {None})
+
+    async def locate(keys):
+        return {
+            "K0": {"a": info, "b": info},
+            "K1": {"b": info, "c": info},
+        }
+
+    scoped = _Locate(_Call(locate), {"K0": ("b",), "K1": ("c",)})
+
+    result, _trace = run_sim(scoped.call_one(["K0", "K1"]))
+
+    assert list(result["K0"]) == ["b"]
+    assert list(result["K1"]) == ["c"]

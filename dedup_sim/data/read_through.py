@@ -1,11 +1,9 @@
 """Read-through: a finished reader becomes a real directory source.
 
-Ask, read, put, then commit, and the order is load-bearing. Asking first keeps the read
-an unmodified ``client.get_batch``: the only thing routing it is the preference handed
-to ``client_for``. The put is awaited before the commit so the directory observation
-and the action agree that the batch landed. The commit settles the debt the fan-out
-recorded and satisfies gates waiting on it; nothing else in the run knows the put
-happened.
+Ask, read, put, then commit, and the order is load-bearing. ``LocalClient.get_batch``
+uses TorchStore's fetch planner against the per-key sources control selected. The put is awaited
+before the commit so the directory observation and the action agree that the batch
+landed.
 """
 
 from __future__ import annotations
@@ -15,11 +13,31 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 from proposed import ControlPlane, DataPlane, Deployment, endpoint
+from proposed.selector import prefer
+from torchstore.client import LocalClient
 from torchstore.transport import Request
 
 from ..control._sensor import Published
 
 __all__ = ["ReadThroughPlane"]
+
+
+class _Locate:
+    def __init__(self, locate, by_key) -> None:
+        self._locate = locate
+        self._by_key = by_key
+
+    async def call_one(self, keys):
+        located = await self._locate.call_one(keys)
+        return {
+            key: prefer({key: located[key]}, self._by_key.get(key, ()))[key]
+            for key in keys
+        }
+
+
+class _ScopedController:
+    def __init__(self, controller, by_key) -> None:
+        self.locate_volumes = _Locate(controller.locate_volumes, by_key)
 
 
 class ReadThroughPlane(DataPlane):
@@ -54,14 +72,15 @@ class ReadThroughPlane(DataPlane):
         if not batch:
             raise ValueError("read_through requires at least one entry")
         requests = tuple(
-            Request.from_any(key, value).meta_only()
-            for key, value in batch.items()
+            Request.from_any(key, value).meta_only() for key, value in batch.items()
         )
         control: ControlPlane = self.deployment.control_plane_handle
-        selection = await control.sources.call_one(requests, requester)
-        results = await self.deployment.client_for(
-            requester, prefer=selection.sources
-        ).get_batch(batch)
+        plan = await control.sources.call_one(requests, requester)
+        client = self.deployment.client_for(requester)
+        routed = LocalClient(
+            _ScopedController(client._controller, plan.by_key), client.strategy
+        )
+        results = await routed.get_batch(batch)
         if self.trace is not None:
             self.trace.record(
                 asyncio.get_running_loop().time(), "burst", f"reader {requester} done"
@@ -69,7 +88,5 @@ class ReadThroughPlane(DataPlane):
         # A second vend, with no preference: a put chooses its own volume (the
         # co-located one), and leaving the read's preference bound would say otherwise.
         await self.deployment.client_for(requester).put_batch(results)
-        await self.deployment.dispatcher_handle.dispatch.call_one(
-            Published(requester)
-        )
+        await self.deployment.dispatcher_handle.dispatch.call_one(Published(requester))
         return results

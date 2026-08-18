@@ -201,10 +201,12 @@ requests = tuple(
     Request.from_any(key, value).meta_only()
     for key, value in entries.items()
 )
-selection = await control.sources.call_one(requests, requester)
-values = await deployment.client_for(
-    requester, prefer=selection.sources
-).get_batch(entries)
+plan = await control.sources.call_one(requests, requester)
+client = deployment.client_for(requester)
+routed = LocalClient(
+    _ScopedController(client._controller, plan.by_key), client.strategy
+)
+values = await routed.get_batch(entries)
 await deployment.client_for(requester).put_batch(values)
 await deployment.dispatcher_handle.dispatch.call_one(Published(requester))
 ```

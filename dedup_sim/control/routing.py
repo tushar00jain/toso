@@ -11,20 +11,55 @@ The ranking is :mod:`dedup_sim.control._selector`.
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any, List, Mapping, Optional, Sequence, Tuple, Unpack
+from dataclasses import dataclass, replace
+from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence, Tuple, Unpack
 
 from proposed import (
-    ControlPlane, DecisionLog, DirectorySensor, Dispatcher, Environment, Key,
-    endpoint, Selection, Sensor,
+    ControlPlane,
+    DecisionLog,
+    DirectorySensor,
+    Dispatcher,
+    Environment,
+    Key,
+    VolumeId,
+    endpoint,
+    Selection,
+    Sensor,
 )
 from proposed.selector import (
-    Balance, FirstMatch, Fold, NaiveKeySelector, Ordered, pipe, Selector, WithFold,
+    Balance,
+    FirstMatch,
+    Fold,
+    NaiveKeySelector,
+    Ordered,
+    pipe,
+    Selector,
+    WithFold,
 )
+from .._planning import plan_fetch, requirements_met
 from ._selector import Candidates, CHAIN, SPREAD
-from ._sensor import Asked, FanoutSensor, Published, Retired, Routed, _storage_covers
+from ._sensor import Asked, FanoutSensor, Published, Routed
 
-__all__ = ["Dedup"]
+__all__ = ["Dedup", "ReadPlan"]
+
+
+@dataclass(frozen=True)
+class ReadPlan:
+    """Per-key source preferences and their readiness."""
+
+    by_key: Mapping[Key, tuple[VolumeId, ...]]
+    sources: tuple[VolumeId, ...]
+    ready: Optional[Callable[[], Awaitable[None]]] = None
+
+    @property
+    def head(self) -> Optional[VolumeId]:
+        return self.sources[0] if self.sources else None
+
+    async def settled(self) -> "ReadPlan":
+        if self.ready is not None:
+            await self.ready()
+            return replace(self, ready=None)
+        return self
 
 
 def _soonest(dims: Tuple[float, int]) -> float:
@@ -35,7 +70,7 @@ def _soonest(dims: Tuple[float, int]) -> float:
 
 
 class Dedup(ControlPlane):
-    """Dedup's whole control plane: one member over one source chain.
+    """Dedup's whole control plane: one member over source chains.
 
     Args:
         fanout_cap: peers one source may be planned to feed -- 1 a chain, >= 2 a
@@ -94,31 +129,29 @@ class Dedup(ControlPlane):
         # here: the score Candidates prices, then the readers Balance counts.
         fold: Optional[Fold[float, int]] = _soonest if self._spread else None
         self._chain = pipe(
-            FirstMatch([
-                pipe(
-                    Balance(Candidates(SPREAD if self._spread else CHAIN)),
-                    WithFold(fold),
-                ),
-                # Tail: an unroutable ask gets the directory's own answer, not a hole.
-                NaiveKeySelector(),
-            ]),
+            FirstMatch(
+                [
+                    pipe(
+                        Balance(Candidates(SPREAD if self._spread else CHAIN)),
+                        WithFold(fold),
+                    ),
+                    # Tail: an unroutable ask gets the directory's own answer, not a hole.
+                    NaiveKeySelector(),
+                ]
+            ),
             Ordered,
         ).attach(environment, self._sensed)
         return self
 
     # -- what a reader asks -------------------------------------------------- #
     @endpoint
-    async def sources(
-        self, requests: Sequence[Any], requester: str
-    ) -> Selection[Unpack[Tuple[Any, ...]]]:
+    async def sources(self, requests: Sequence[Any], requester: str) -> ReadPlan:
         """Which volumes serve ``requests`` for ``requester``, once they are usable."""
         # The wait is spent here, not handed back: a caller that read before these
         # sources held the key would go to a volume with nothing to serve.
         return await (await self._decide(requests, requester)).settled()
 
-    async def _decide(
-        self, requests: Sequence[Any], requester: str
-    ) -> Selection[Unpack[Tuple[Any, ...]]]:
+    async def _decide(self, requests: Sequence[Any], requester: str) -> ReadPlan:
         """The whole decision with the gate unspent, awaitable without parking.
 
         The chain keys each source ``(score, queued)``: the seconds
@@ -136,57 +169,63 @@ class Dedup(ControlPlane):
         # source is named. Dispatched without suspending, so the debt and the decision
         # priced against it are one turn.
         self.dispatcher.dispatch_sync(Asked(requester, tuple(requests)))
-        ranking = self._chain.select(keys, requester)
-        return self._committed(requester, ranking)
+        directory = self.sensor(DirectorySensor)
+        with directory.pinned(keys):
+            ranking = self._chain.select(keys, requester)
+            return self._committed(requester, ranking)
 
-    def _committed(
-        self, requester: str, ranking: Selection
-    ) -> Selection:
-        """``ranking``, routed to its head and gated until that head is usable.
-
-        A source that owes the keys is gated on its pending registration. A source
-        that neither owes nor holds them has evicted them and is retired.
-        """
+    def _committed(self, requester: str, ranking: Selection) -> ReadPlan:
+        """Narrow ``ranking`` with TorchStore's planner and gate pending sources."""
         # No suspension splits the sensor read-modify-write sequence.
-        source = ranking.head
-        if source is None:
-            return ranking
         fanout = self.sensor(FanoutSensor)
-        if fanout.planned(requester) != source:
-            self.dispatcher.dispatch_sync(Routed(requester, source))
-            if self._trace is not None:
-                self._trace.record(self.env.now(), "route", f"{requester} <- {source}")
-        requested = fanout.plan(requester)
-        facts = [(source, key) for key in requested]
-        if fanout.covers(source, requested):
-            # Pending publication.
-            return replace(
-                ranking,
-                ready=self.dispatcher.gate(
-                    lambda: len(self._registered(facts, requested)) == len(facts),
-                    (Published(source),),
+        directory = self.sensor(DirectorySensor)
+        requested = tuple(fanout.plan(requester).values())
+        live = directory.locate([request.key for request in requested])
+        order = ranking.sources
+        if order is None:
+            order = tuple(
+                dict.fromkeys(
+                    source for by_source in live.values() for source in by_source
+                )
+            )
+        allowed = set(order)
+        promised = {
+            key: {
+                producer: request
+                for producer, request in producers.items()
+                if producer != requester and producer in allowed
+            }
+            for key, producers in fanout.promised(
+                [request.key for request in requested]
+            ).items()
+        }
+        fetch = plan_fetch(requested, live, promised, order)
+        sources = fetch.sources
+        previous = fanout.planned(requester)
+        self.dispatcher.dispatch_sync(
+            Routed(
+                requester,
+                sources,
+                tuple(fetch.by_key.items()),
+                tuple(source for source in sources if source in fetch.pending),
+                tuple(
+                    (source, tuple(fetch.required[source].elements()))
+                    for source in sources
                 ),
             )
-        if len(self._registered(facts, requested)) == len(facts):
-            # Already holds every key.
-            return ranking
-        # Evicted after publication.
-        self.dispatcher.dispatch_sync(Retired(requester, source))
-        if self._trace is not None:
-            self._trace.record(self.env.now(), "retire", f"{source} holds nothing")
-        return Selection()
-
-    def _registered(
-        self,
-        facts: Sequence[Tuple[str, Key]],
-        requested: Mapping[Key, Any],
-    ) -> List[Tuple[str, Key]]:
-        """Facts the directory holds now."""
-        directory = self.sensor(DirectorySensor)
-        by_key = directory.locate_live([key for _volume, key in facts])
-        return [
-            (volume, key)
-            for volume, key in facts
-            if volume in by_key.get(key, {})
-            and _storage_covers(by_key[key][volume], requested[key])
-        ]
+        )
+        if previous != sources:
+            if self._trace is not None:
+                self._trace.record(
+                    self.env.now(), "route", f"{requester} <- {','.join(sources)}"
+                )
+        required = {source: fetch.required[source] for source in fetch.pending}
+        gate = self.dispatcher.gate(
+            lambda: requirements_met(
+                requested,
+                directory.locate_live([request.key for request in requested]),
+                required,
+            ),
+            (Published(source) for source in fetch.pending),
+        )
+        return ReadPlan(fetch.by_key, sources, gate)

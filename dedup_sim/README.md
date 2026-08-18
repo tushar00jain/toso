@@ -31,11 +31,8 @@ capability's whole control plane, reached as a service of its own:
 2. Every later reader finds a **peer** cheaper: a reader that is about to hold the
    key, one tier away instead of across the fabric. A peer stops being offered once
    `fanout_cap` readers are behind it (`1` -> a chain, `>=2` -> a shallow tree).
-3. That peer has not registered yet, so the decision carries a **readiness gate**
-   and `sources` *does not answer* until the peer's read-through put lands. The
-   caller's read is then an unmodified `client.get_batch` with a preference passed to it:
-   no client change is needed, nothing is installed in the store, and no client is
-   lied to.
+3. A selected peer that has not registered adds `Published(peer)` to the decision's
+   **readiness gate**. `sources` answers after every selected peer lands.
 4. The read-through is the data plane's one job
    (`dedup_sim.data.read_through`): after a reader's batch returns, it stores the
    keys in its own co-located volume -- a zero-fabric local write through the real
@@ -173,15 +170,16 @@ against a `Deployment` (enforced by `realsim/tools/check_contract.py`).
 
 ```
 dedup_sim/
+  _planning.py           # TorchStore's request expansion over live + promised entries
   control/                # DECIDES
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
-                          #   with a source once it is usable, off the chain it
+                          #   with per-key sources once they are usable, off the chain it
                           #   builds and the one fold that orders what the chain
                           #   keyed; a completed batch is an action it folds, not a
                           #   question it is asked. `spread` picks the fabric dial
                           #   and the fold that reads the queue at a source
-    _selector.py          #   Candidates: one ranking over everything that could
-                          #   serve the read -- the holders and the peers already
+    _selector.py          #   Candidates: one ranking over every relevant region holder
+                          #   and the peers already
                           #   routed to fetch it -- priced in seconds: the wait
                           #   until a source has the key, the hop to me, and the
                           #   fabric that hop burns
@@ -189,9 +187,8 @@ dedup_sim/
                           #   puts are owed -- the plane's one record and the reducer
                           #   that folds each ask and completed batch
   data/                   # EXECUTES
-    read_through.py       #   ReadThroughPlane: one DataPlane method -- ask, read,
-                          #   put, commit one Published action, over the Deployment's
-                          #   client and ports
+    read_through.py       #   ReadThroughPlane: apply the per-key directory scope to
+                          #   LocalClient._fetch, put, then commit Published
   workload/               # WHAT IS SIMULATED
     scenarios.py          #   the Dedup and WeightSync Scenarios: the Runs to compare
                           #   (the fixture as it is, and with the two planes added)

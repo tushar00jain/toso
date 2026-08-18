@@ -50,6 +50,7 @@ from dedup_sim.control._sensor import FanoutSensor, Published
 from dedup_sim.control.routing import Dedup
 from proposed import DirectorySensor, Endpoint, Environment
 from dedup_sim.data.read_through import ReadThroughPlane
+from torchstore.controller import ObjectType, StorageInfo
 from torchstore.transport import Request
 
 #: The version that displaces ``W`` in a one-deep reader volume.
@@ -100,7 +101,9 @@ class VersionedRounds(PutGetBurst):
             items += [
                 WorkItem(f"{reader}/1-read", 0.0, _get(reader, KEY), (reader, KEY)),
                 WorkItem(f"{reader}/2-next", ROUND, _put(reader, NEXT_VERSION)),
-                WorkItem(f"{reader}/3-read", 2 * ROUND, _get(reader, KEY), (reader, KEY)),
+                WorkItem(
+                    f"{reader}/3-read", 2 * ROUND, _get(reader, KEY), (reader, KEY)
+                ),
             ]
         return items
 
@@ -249,7 +252,13 @@ class Directory:
         return 10.0 if src.id == "p" else 1.0
 
     def locate_raw(self, keys, missing_ok: bool = False):
-        return {k: {v: None for v in sorted(self.by_key.get(k, ()))} for k in keys}
+        return {
+            k: {
+                v: StorageInfo(ObjectType.TENSOR, {None})
+                for v in sorted(self.by_key.get(k, ()))
+            }
+            for k in keys
+        }
 
     # -- what the volumes do to it ------------------------------------------ #
     def publish(self, volume: str, key: str) -> None:
@@ -342,7 +351,7 @@ def test_a_peer_that_holds_nothing_and_owes_nothing_is_not_waited_for():
         directory = Directory(W="p")
         plane = _sensing(directory, fanout_cap=3)
         await plane.sources([_request(KEY)], "r0")  # r0 <- p
-        directory.publish("r0", KEY)                       # r0's read-through lands
+        directory.publish("r0", KEY)  # r0's read-through lands
         plane.dispatcher.dispatch_sync(Published("r0"))
         directory.evict("r0", KEY)  # ...and a newer version displaces it
 
@@ -379,18 +388,19 @@ def test_a_peer_never_feeds_more_than_the_cap():
         directory = Directory(W="p")
         plane = _sensing(directory, fanout_cap=cap)
         await plane.sources([_request(KEY)], "r0")  # r0 <- p, the origin
-        for name in ("r1", "r2", "r3"):             # r0 fills, then r1 takes the rest
+        for name in ("r1", "r2", "r3"):  # r0 fills, then r1 takes the rest
             await plane._decide([_request(KEY)], name)
         # The origin drops the key, so nothing is coming to r0 or to anyone behind it:
         # no volume has a copy on the way, and the next ask is the directory's answer.
         directory.evict("p", KEY)
         last = await plane._decide([_request(KEY)], "r4")
-        return Counter(plane.sensor(FanoutSensor).routes().values()), last.sources
+        routes = plane.sensor(FanoutSensor).routes().values()
+        return Counter(source for route in routes for source in route), last.sources
 
     served, last = run_sim(_fanout_across_a_retire())[0]
-    assert served["r0"] == cap        # never a slot more, before the retire or after
-    assert served["r1"] == 1          # r3, once r0 was full
-    assert last is None               # nothing to route r4 to; the directory answers
+    assert served["r0"] == cap  # never a slot more, before the retire or after
+    assert served["r1"] == 1  # r3, once r0 was full
+    assert last == ()  # nothing to route r4 to
 
 
 def test_the_sensor_remembers_no_registrations():
@@ -406,5 +416,7 @@ def test_the_sensor_remembers_no_registrations():
     result, plane = _run()
     fanout = plane.sensor(FanoutSensor)
     assert fanout._promised == {}, "a put owed by a run that finished"
+    assert fanout._route_by_key == {}, "completed publications retain no key plan"
+    assert fanout._route_required == {}, "completed routes retain no regions"
     assert set(fanout._route) == set(result.workload.reader_ids)
     assert not hasattr(fanout, "_ready"), "the waiting is the commit, and is nobody's"

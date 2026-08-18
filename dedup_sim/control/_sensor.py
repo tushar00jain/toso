@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Sequence
 
 from proposed import Key, LoadSensor, VolumeId
 from proposed.dispatch import Action, Fold
@@ -33,10 +33,13 @@ class Published(Action):
 
 @dataclass(frozen=True)
 class Routed(Action):
-    """``requester`` is routed through ``source``."""
+    """``requester`` is routed through ``sources``."""
 
     requester: VolumeId
-    source: VolumeId
+    sources: tuple[VolumeId, ...]
+    by_key: tuple[tuple[Key, tuple[VolumeId, ...]], ...] = ()
+    pending: tuple[VolumeId, ...] = ()
+    required: tuple[tuple[VolumeId, tuple[Any, ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,14 +66,18 @@ class FanoutSensor(LoadSensor):
 
     def __init__(self, fanout_cap: int = 1) -> None:
         self.cap = fanout_cap
-        # requester -> the source it was routed to, decided once and then reused.
-        self._route: Dict[str, str] = {}
+        # requester -> the sources it was routed through.
+        self._route: Dict[VolumeId, tuple[VolumeId, ...]] = {}
+        self._route_by_key: Dict[VolumeId, Dict[Key, tuple[VolumeId, ...]]] = {}
+        self._route_pending: Dict[VolumeId, set[VolumeId]] = {}
+        self._route_required: Dict[VolumeId, Dict[VolumeId, Counter]] = {}
         # source -> how many are behind it, carried rather than counted on demand:
         # every decision reads it, and re-deriving it walks the whole tree. Moved only
         # by the two members that move a route, so the two cannot disagree.
         self._load: Counter = Counter()
         # producer -> its one in-flight read-through batch, indexed by key.
         self._promised: Dict[VolumeId, Dict[Key, Any]] = {}
+        self._promised_by_key: Dict[Key, Dict[VolumeId, Any]] = {}
         self._folds: Dict[type, Fold] = {
             Asked: self._asked,
             Published: self._published,
@@ -86,40 +93,67 @@ class FanoutSensor(LoadSensor):
     def _asked(self, action: Asked) -> None:
         """A reader is about to read this batch through: it owes those puts from now."""
         if action.requester in self._promised:
-            raise ValueError(
-                f"{action.requester} already has an in-flight publication"
-            )
+            raise ValueError(f"{action.requester} already has an in-flight publication")
         promised = {request.key: request for request in action.requests}
         if len(promised) != len(action.requests):
             raise ValueError("a publication names each key once")
         self._promised[action.requester] = promised
+        for key, request in promised.items():
+            self._promised_by_key.setdefault(key, {})[action.requester] = request
 
     def _published(self, action: Published) -> None:
         """A reader's batch has landed: settle the debt it owed."""
-        self._promised.pop(action.producer, None)
+        promised = self._promised.pop(action.producer, {})
+        for key in promised:
+            producers = self._promised_by_key[key]
+            del producers[action.producer]
+            if not producers:
+                del self._promised_by_key[key]
+        self._route_by_key.pop(action.producer, None)
+        self._route_pending.pop(action.producer, None)
+        self._route_required.pop(action.producer, None)
 
-    def planned(self, requester: str) -> Optional[str]:
-        """The source ``requester`` is already folded in behind, if any."""
-        return self._route.get(requester)
+    def planned(self, requester: str) -> tuple[VolumeId, ...]:
+        """The sources ``requester`` is already folded in behind."""
+        return self._route.get(requester, ())
 
-    def routes(self) -> Mapping[str, str]:
-        """``requester -> its source``: the tree, and the edges a decision walks."""
+    def routes(self) -> Mapping[VolumeId, tuple[VolumeId, ...]]:
+        """``requester -> its sources``."""
         return MappingProxyType(self._route)
 
     def _routed(self, action: Routed) -> None:
-        """Fold ``requester`` in behind ``source``, and make it a source itself.
+        """Fold ``requester`` in behind ``sources``, and make it a source itself.
 
-        One requester, one edge: re-routing replaces it rather than adding a second, so
-        no bookkeeping drift can hand out more slots than the cap.
+        Re-routing replaces every prior edge, so load and the cap stay aligned.
         """
-        previous = self._route.get(action.requester)
+        if len(set(action.sources)) != len(action.sources):
+            raise ValueError("a route names each source once")
+        previous = self._route.get(action.requester, ())
+        by_key = (
+            dict(action.by_key)
+            if action.by_key
+            else {
+                key: action.sources for key in self._promised.get(action.requester, {})
+            }
+        )
         # Unmoved route.
-        if previous == action.source:
+        if previous == action.sources:
+            self._route_by_key[action.requester] = by_key
+            self._route_pending[action.requester] = set(action.pending)
+            self._route_required[action.requester] = {
+                source: Counter(regions) for source, regions in action.required
+            }
             return
-        if previous is not None:
-            self._drop(previous)
-        self._route[action.requester] = action.source
-        self._load[action.source] += 1
+        for source in previous:
+            self._drop(source)
+        self._route[action.requester] = action.sources
+        self._route_by_key[action.requester] = by_key
+        self._route_pending[action.requester] = set(action.pending)
+        self._route_required[action.requester] = {
+            source: Counter(regions) for source, regions in action.required
+        }
+        for source in action.sources:
+            self._load[source] += 1
 
     def named(self) -> Mapping[str, int]:
         """``source -> requesters currently routed to it``. Absent means none."""
@@ -127,8 +161,16 @@ class FanoutSensor(LoadSensor):
 
     def _retired(self, action: Retired) -> None:
         """Drop ``requester``'s route to a source nothing is coming from."""
-        if self._route.get(action.requester) == action.source:
-            del self._route[action.requester]
+        previous = self._route.get(action.requester, ())
+        if action.source in previous:
+            remaining = tuple(source for source in previous if source != action.source)
+            self._route[action.requester] = remaining
+            self._route_by_key[action.requester] = {
+                key: tuple(source for source in sources if source != action.source)
+                for key, sources in self._route_by_key.get(action.requester, {}).items()
+            }
+            self._route_pending[action.requester].discard(action.source)
+            self._route_required[action.requester].pop(action.source, None)
             self._drop(action.source)
 
     def _drop(self, source: str) -> None:
@@ -142,53 +184,24 @@ class FanoutSensor(LoadSensor):
         """``producer``'s in-flight requests, by key."""
         return MappingProxyType(self._promised[producer])
 
-    def covers(
-        self, producer: VolumeId, requested: Mapping[Key, Any]
-    ) -> bool:
-        """Does ``producer``'s promised batch cover ``requested``?"""
-        promised = self._promised.get(producer)
-        return promised is not None and all(
-            key in promised and _request_covers(promised[key], request)
-            for key, request in requested.items()
-        )
+    def promised(self, keys: Sequence[Key]) -> Dict[Key, Mapping[VolumeId, Any]]:
+        """Pending directory entries for ``keys``."""
+        return {
+            key: MappingProxyType(self._promised_by_key.get(key, {})) for key in keys
+        }
 
+    def in_flight(self) -> set[VolumeId]:
+        """Producers with a publication outstanding."""
+        return set(self._promised)
 
-def _slice_covers(available: Optional[Any], requested: Optional[Any]) -> bool:
-    """Whether one stored/requested tensor region contains another."""
-    if available is None:
-        return True
-    if requested is None:
-        return (
-            all(offset == 0 for offset in available.offsets)
-            and tuple(available.local_shape) == tuple(available.global_shape)
-        )
-    if tuple(available.global_shape) != tuple(requested.global_shape):
-        return False
-    return all(
-        have_offset <= need_offset
-        and need_offset + need_size <= have_offset + have_size
-        for have_offset, have_size, need_offset, need_size in zip(
-            available.offsets,
-            available.local_shape,
-            requested.offsets,
-            requested.local_shape,
-        )
-    )
+    def route_plan(self, producer: VolumeId) -> Mapping[Key, tuple[VolumeId, ...]]:
+        """Per-key sources feeding ``producer``'s publication."""
+        return MappingProxyType(self._route_by_key.get(producer, {}))
 
+    def route_pending(self, producer: VolumeId) -> set[VolumeId]:
+        """Sources ``producer`` is waiting to publish."""
+        return set(self._route_pending.get(producer, set()))
 
-def _request_covers(available: Any, requested: Any) -> bool:
-    """Whether one promised request contains another request for the same key."""
-    return available.key == requested.key and _slice_covers(
-        available.tensor_slice, requested.tensor_slice
-    )
-
-
-def _storage_covers(info: object, requested: Any) -> bool:
-    """Whether one directory entry can serve ``requested`` alone."""
-    tensor_slices = getattr(info, "tensor_slices", None)
-    if tensor_slices is None:
-        return True
-    return any(
-        _slice_covers(tensor_slice, requested.tensor_slice)
-        for tensor_slice in tensor_slices
-    )
+    def route_required(self, producer: VolumeId) -> Mapping[VolumeId, Counter]:
+        """Exact regions each source must provide to ``producer``."""
+        return MappingProxyType(self._route_required.get(producer, {}))

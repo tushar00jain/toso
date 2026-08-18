@@ -51,10 +51,10 @@ The `Controller` remains the authority for current residency. The dedup
 copies that have not registered yet. Its selectors read the directory and fan-out
 sensors directly; they move no bytes.
 
-The data plane executes an ordinary preferred `get_batch`, writes the result into the
-reader's co-located volume, and reports `Published(reader)`. The put changes directory
-truth; the action settles the producer's planned batch in `FanoutSensor`. A waiting
-reader is answered only when both agree that its source can serve the request.
+The data plane scopes the directory answer by key, then calls `LocalClient.get_batch`.
+TorchStore still performs request expansion, slice intersection, transport, assembly,
+and in-place application. The data plane writes the result into the reader's
+co-located volume and reports `Published(reader)`.
 
 Every generator already has a volume under `LocalRankStrategy`, so read-through
 population needs no new storage actor.
@@ -124,22 +124,20 @@ breaks otherwise similar choices, and `fanout_cap` prevents one early reader fro
 serving the whole burst. The first pulls of different regions therefore spread across
 trainer volumes, while later reads extend only the peer branches that remain cheaper.
 
-Stable volume-id tie-breaking makes equal-cost decisions deterministic. An explicit
-source preference is passed into the ordinary read planner; if the preferred peer
-evicts before the read, later ranked sources remain valid fallbacks.
+Stable volume-id tie-breaking makes equal-cost decisions deterministic. TorchStore's
+planner narrows the ranking independently for each key, so sparse placements cost
+the number of relevant directory and promise entries rather than every key times
+every rank.
 
 ### 4.1 Per-request algorithm (serial, so race-free)
 
 ```text
 on plan(reader r, regions):                    # one control-plane turn
-  for R in regions:
-    present = directory_holders(R) - {r}
-    promised = promised_peers_below_cap(R) - {r}
-    src = min(present | promised, key=(score, active_load, stable_id))
-
-    promise(R, r)                              # r will publish after its get
-    reserve_edge(src, r, R)                    # charges fan-out and source load
-    answer(R, src, wait=ready(src, R) + slot(src))
+  entries = directory_entries(regions) + promised_entries(regions)
+  ranked = sort(relevant_sources(entries), key=(score, active_load, stable_id))
+  by_key = LocalClient._build_volume_requests(regions, ranked)
+  reserve_edges(r, unique_sources(by_key))
+  answer(by_key, wait=Published(selected_pending_producers(by_key)))
 
 on Published(reader r):
   settle_promise(r); release_incoming_edges(r); wake_waiters(r)
@@ -180,10 +178,9 @@ actions hold only the producer. Copies stay pinned within one sync window; optio
 deletion reclaims them after the version changes.
 
 The executable plane builds existing meta-only `Request` values from the caller's
-`key -> tensor/DTensor/None` batch. Promised coverage compares their `TensorSlice`
-values, and current-holder coverage compares them with the directory's `StorageInfo`.
-The current selector still requires one source to cover the whole batch; composing
-several partial sources is a separate routing shape.
+`key -> tensor/DTensor/None` batch. `ObjectType.from_request`, `StorageInfo`, and
+`LocalClient._build_volume_requests` interpret both live and promised entries. One
+key may select several slice producers; its gate names only their `Published` actions.
 
 ## 6. Correctness and failure handling
 
