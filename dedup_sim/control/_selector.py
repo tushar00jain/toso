@@ -158,35 +158,20 @@ class Candidates(KeySelector[float]):
         if volume in visiting:
             waits[volume] = None
             return None
-        plan = fanout.route_plan(volume)
-        if not plan:
+        required = fanout.route_required(volume)
+        if not required:
             waits[volume] = None
             return None
         visiting.add(volume)
-        by_source: Dict[VolumeId, set[Key]] = {}
-        for key, sources in plan.items():
-            for source in sources:
-                by_source.setdefault(source, set()).add(key)
         pending = fanout.route_pending(volume)
-        required = fanout.route_required(volume)
         requests = tuple(directory.plan(volume).values())
         arrivals: List[float] = []
-        for source, source_keys in by_source.items():
-            expected = required.get(source)
-            if expected:
-                required_keys = {key for key, _region in expected}
-                for key in required_keys:
-                    if key not in located:
-                        located.update(directory.locate_live([key]))
-                ready = directory.covers(requests, {source: expected}, located)
-            else:
-                ready = True
-                for key in source_keys:
-                    if key not in located:
-                        located.update(directory.locate_live([key]))
-                    if source not in located.get(key, {}):
-                        ready = False
-                        break
+        for source, expected in required.items():
+            required_keys = {key for key, _region in expected}
+            for key in required_keys:
+                if key not in located:
+                    located.update(directory.locate_live([key]))
+            ready = directory.covers(requests, {source: expected}, located)
             if ready:
                 wait = 0.0
             elif source in pending and source in in_flight:

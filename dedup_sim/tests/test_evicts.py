@@ -418,7 +418,6 @@ def test_the_sensor_remembers_no_registrations():
     fanout = plane.sensor(FanoutSensor)
     assert directory.in_flight() == set(), "a put owed by a run that finished"
     assert directory._pending_by_key == {}, "a settled pending directory entry"
-    assert fanout._route_by_key == {}, "completed publications retain no key plan"
     assert fanout._route_required == {}, "completed routes retain no regions"
     assert set(fanout._route) == set(result.workload.reader_ids)
     assert not hasattr(fanout, "_ready"), "the waiting is the commit, and is nobody's"

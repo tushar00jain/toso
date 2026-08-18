@@ -193,11 +193,10 @@ class Dedup(ControlPlane):
 
         self.dispatcher.dispatch_sync(
             Routed(
-                requester,
-                sources,
-                tuple(fetch.by_key.items()),
-                tuple(source for source in sources if source in fetch.pending),
-                tuple(
+                requester=requester,
+                sources=sources,
+                pending=tuple(source for source in sources if source in fetch.pending),
+                required=tuple(
                     (source, tuple(fetch.required[source].elements()))
                     for source in sources
                 ),

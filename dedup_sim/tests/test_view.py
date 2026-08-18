@@ -58,6 +58,20 @@ def _dispatcher(directory, fanout):
     return dispatcher
 
 
+def _routed(directory, requester, order):
+    requests = tuple(directory.plan(requester).values())
+    fetch = directory.plan_fetch(requests, order, requester=requester)
+    return Routed(
+        requester=requester,
+        sources=fetch.sources,
+        pending=tuple(source for source in fetch.sources if source in fetch.pending),
+        required=tuple(
+            (source, tuple(fetch.required[source].elements()))
+            for source in fetch.sources
+        ),
+    )
+
+
 def test_dedup_selectors_take_keys():
     assert Candidates.subject_type == Sequence[str]
     assert Holders.subject_type == Sequence[str]
@@ -107,7 +121,7 @@ def test_the_ranking_keeps_fanout_under_reranking():
     directory = DedupDirectorySensor(_Holds("origin"))
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("r0", (_request("K"),)))
-    dispatcher.dispatch_sync(Routed("r0", ("origin",), (("K", ("origin",)),)))
+    dispatcher.dispatch_sync(_routed(directory, "r0", ("origin",)))
     dispatcher.dispatch_sync(Asked("r1", (_request("K"),)))
     ranking = Candidates()
     chain = Ordered(FirstMatch([Balance(ranking)]))
@@ -124,6 +138,17 @@ def test_the_ranking_keeps_fanout_under_reranking():
         "r0",
         "origin",
     )
+
+
+def test_a_route_requires_regions_for_every_source():
+    directory = DedupDirectorySensor(_Holds("origin"))
+    fanout = FanoutSensor()
+    dispatcher = _dispatcher(directory, fanout)
+
+    with pytest.raises(ValueError, match="non-empty regions for every source"):
+        dispatcher.dispatch_sync(Routed("r0", ("origin",)))
+
+    assert fanout.routes() == {}
 
 
 def test_pending_entries_are_indexed_only_under_their_keys():
@@ -165,14 +190,7 @@ def test_publication_folds_directory_and_fanout_before_one_waiter_wakes():
         assert Published in directory.folds and Published in fanout.folds
         request = _request("K")
         dispatcher.dispatch_sync(Asked("r0", (request,)))
-        dispatcher.dispatch_sync(
-            Routed(
-                "r0",
-                ("origin",),
-                (("K", ("origin",)),),
-                ("origin",),
-            )
-        )
+        dispatcher.dispatch_sync(_routed(directory, "r0", ("origin",)))
         ready = dispatcher.gate(lambda: False, (Published("r0"),))
         assert ready is not None
         assert len(dispatcher._waiters[Published("r0")]) == 1
@@ -181,7 +199,7 @@ def test_publication_folds_directory_and_fanout_before_one_waiter_wakes():
         await asyncio.sleep(0)
         dispatcher.dispatch_sync(Published("r0"))
         await task
-        return directory.in_flight(), fanout.route_plan("r0")
+        return directory.in_flight(), fanout.route_required("r0")
 
     observed, _trace = run_sim(publish())
     assert observed == (set(), {})
@@ -357,9 +375,10 @@ def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():
             {DedupDirectorySensor: DedupDirectorySensor(directory)},
         )
         plane.dispatcher.dispatch_sync(Asked("p0", (_request("K", left),)))
-        plane.dispatcher.dispatch_sync(Routed("p0", ("t0",), (("K", ("t0",)),)))
+        sensor = plane.sensor(DedupDirectorySensor)
+        plane.dispatcher.dispatch_sync(_routed(sensor, "p0", ("t0",)))
         plane.dispatcher.dispatch_sync(Asked("p1", (_request("K", right),)))
-        plane.dispatcher.dispatch_sync(Routed("p1", ("t1",), (("K", ("t1",)),)))
+        plane.dispatcher.dispatch_sync(_routed(sensor, "p1", ("t1",)))
 
         planned = await plane._decide([_request("K")], "r")
         assert planned.by_key == {"K": ("p0", "p1")}
@@ -407,7 +426,7 @@ def test_a_partial_reader_can_follow_a_peer_fetching_more_regions():
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p0", (_request("K"),)))
-    dispatcher.dispatch_sync(Routed("p0", ("t0", "t1"), (("K", ("t0", "t1")),)))
+    dispatcher.dispatch_sync(_routed(directory, "p0", ("t0", "t1")))
     dispatcher.dispatch_sync(Asked("r", (_request("K", left),)))
     ranking = Ordered(Candidates()).attach(
         Environment(topology, _SliceProfile()),
@@ -437,13 +456,7 @@ def test_a_subset_reader_accounts_for_the_peers_other_keys():
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p0", (_request("K0"), _request("K1"))))
-    dispatcher.dispatch_sync(
-        Routed(
-            "p0",
-            ("t0", "t1"),
-            (("K0", ("t0",)), ("K1", ("t1",))),
-        )
-    )
+    dispatcher.dispatch_sync(_routed(directory, "p0", ("t0", "t1")))
     dispatcher.dispatch_sync(Asked("r", (_request("K0"),)))
     ranking = Ordered(Candidates()).attach(
         Environment(topology, _Profile()),
@@ -476,16 +489,9 @@ def test_a_route_accepts_a_dependency_that_has_since_published():
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("q", (_request("K1"),)))
-    dispatcher.dispatch_sync(Routed("q", ("t1",), (("K1", ("t1",)),)))
+    dispatcher.dispatch_sync(_routed(directory, "q", ("t1",)))
     dispatcher.dispatch_sync(Asked("p", (_request("K0"), _request("K1"))))
-    dispatcher.dispatch_sync(
-        Routed(
-            "p",
-            ("t0", "q"),
-            (("K0", ("t0",)), ("K1", ("q",))),
-            ("q",),
-        )
-    )
+    dispatcher.dispatch_sync(_routed(directory, "p", ("t0", "q")))
     state.entries["K1"]["q"] = info
     dispatcher.dispatch_sync(Published("q"))
     dispatcher.dispatch_sync(Asked("r", (_request("K0"),)))
@@ -522,11 +528,9 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
     dispatcher.dispatch_sync(Asked("p", (request,)))
     dispatcher.dispatch_sync(
         Routed(
-            "p",
-            ("t",),
-            (("K", ("t",)),),
-            (),
-            (("t", tuple(route.required["t"].elements())),),
+            requester="p",
+            sources=("t",),
+            required=(("t", tuple(route.required["t"].elements())),),
         )
     )
     dispatcher.dispatch_sync(Asked("r", (request,)))
