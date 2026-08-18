@@ -170,8 +170,8 @@ against a `Deployment` (enforced by `realsim/tools/check_contract.py`).
 
 ```
 dedup_sim/
-  _planning.py           # TorchStore's request expansion over live + promised entries
   control/                # DECIDES
+    _fetch.py             #   immutable live + promised coverage and materialization
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
                           #   with per-key sources once they are usable, off the chain it
                           #   builds and the one fold that orders what the chain

@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Unpack
 from proposed import DirectorySensor, Key, Selection, VolumeId
 from proposed.selector import Selector
 
-from ._planning import FetchCoverage
+from ._fetch import FetchCoverage
 from ._sensor import FanoutSensor
 
 __all__ = ["Candidates", "Holders", "CHAIN", "SPREAD"]

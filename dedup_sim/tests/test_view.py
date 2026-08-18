@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from dedup_sim.control._selector import Candidates, Holders
-from dedup_sim.control._planning import discover_fetch, plan_fetch
+from dedup_sim.control._fetch import FetchCoverage
 from dedup_sim.control._sensor import Asked, FanoutSensor, Published, Routed
 from dedup_sim.control.routing import Dedup
 from proposed import DirectorySensor, Dispatcher, Endpoint, Environment
@@ -47,7 +47,7 @@ def _request(key: str, tensor_slice: TensorSlice | None = None) -> Request:
 
 def _coverage(directory, fanout, requester, keys):
     requests = tuple(fanout.plan(requester).values())
-    return discover_fetch(
+    return FetchCoverage.discover(
         directory,
         requests,
         directory.locate(keys),
@@ -79,7 +79,7 @@ def test_holders_preserve_directory_order_and_name_each_source_once():
     )
     requests = [_request("K0"), _request("K1")]
     live = directory.locate([request.key for request in requests])
-    coverage = discover_fetch(directory, requests, live, {})
+    coverage = FetchCoverage.discover(directory, requests, live, {})
 
     assert selector.select(coverage, "r1").sources == (
         "replica",
@@ -169,9 +169,9 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
     }
     promised = {"K": {"r0": request}}
 
-    coverage = discover_fetch(directory, [request], live, promised)
-    planned = plan_fetch(coverage, ("r0", "replica", "origin"))
-    without_peer = plan_fetch(coverage, ("replica", "origin"))
+    coverage = FetchCoverage.discover(directory, [request], live, promised)
+    planned = coverage.plan(("r0", "replica", "origin"))
+    without_peer = coverage.plan(("replica", "origin"))
 
     assert coverage.candidates == {"origin", "replica", "r0"}
     assert coverage.pending == {"r0"}
@@ -191,8 +191,8 @@ def test_two_pending_slices_form_one_torchstore_fetch_plan():
         }
     }
 
-    coverage = discover_fetch(directory, [request], {}, promised)
-    planned = plan_fetch(coverage, ("p0", "p1"))
+    coverage = FetchCoverage.discover(directory, [request], {}, promised)
+    planned = coverage.plan(("p0", "p1"))
     live = {
         "K": {
             "p0": StorageInfo(ObjectType.TENSOR_SLICE, {left}),
@@ -222,7 +222,7 @@ def test_sparse_candidate_discovery_visits_only_present_entries(monkeypatch):
 
     monkeypatch.setattr(directory, "plan_requests", counted)
 
-    coverage = discover_fetch(directory, requests, live, {})
+    coverage = FetchCoverage.discover(directory, requests, live, {})
 
     assert coverage.candidates == {f"v{i}" for i in range(20)}
     assert coverage.pending == set()
@@ -435,8 +435,8 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
     request = _request("K", left)
     original = {"K": {"t": StorageInfo(ObjectType.TENSOR_SLICE, {left})}}
     planning_directory = DirectorySensor(_Holds("origin"))
-    coverage = discover_fetch(planning_directory, [request], original, {})
-    route = plan_fetch(coverage, ("t",))
+    coverage = FetchCoverage.discover(planning_directory, [request], original, {})
+    route = coverage.plan(("t",))
 
     class _Directory:
         def locate_raw(self, keys, missing_ok=False):

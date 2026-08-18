@@ -35,7 +35,7 @@ from proposed.selector import (
     Selector,
     WithFold,
 )
-from ._planning import discover_fetch, FetchCoverage, plan_fetch
+from ._fetch import FetchCoverage
 from ._selector import Candidates, CHAIN, Holders, SPREAD
 from ._sensor import Asked, FanoutSensor, Published, Routed
 
@@ -168,7 +168,7 @@ class Dedup(ControlPlane):
         fanout = self.sensor(FanoutSensor)
         with directory.pinned(keys):
             requested = tuple(fanout.plan(requester).values())
-            coverage = discover_fetch(
+            coverage = FetchCoverage.discover(
                 directory,
                 requested,
                 directory.locate(keys),
@@ -185,7 +185,7 @@ class Dedup(ControlPlane):
         assert ranking.sources is not None, "the dedup chain names an explicit order"
 
         fanout = self.sensor(FanoutSensor)
-        fetch = plan_fetch(coverage, ranking.sources, requester=requester)
+        fetch = coverage.plan(ranking.sources, requester=requester)
         sources = fetch.sources
 
         if self._trace is not None:
