@@ -122,6 +122,11 @@ class _Workload:
 
     def build_pending(self) -> None:
         assert self.plane.dispatcher is not None
+        # Stamped as a real decision stamps a route: taken under the pin the pending
+        # set was read in. One stamp for all of them because the live placement here
+        # never moves, which is the peak state being staged.
+        with self.directory.pinned([request.key for request in self.requests]):
+            stamp = self.directory.stamp()
         for index, generator in enumerate(self.generators):
             source = self.sources[index % len(self.sources)]
             self.plane.dispatcher.dispatch_sync(Asked(generator, self.requests))
@@ -130,6 +135,7 @@ class _Workload:
                     requester=generator,
                     sources=(source,),
                     required=((source, self.regions),),
+                    stamp=stamp,
                 )
             )
 

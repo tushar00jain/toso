@@ -16,9 +16,9 @@ in one identity test rather than a walk.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import AbstractSet, Any, Dict, Mapping, Sequence
+from typing import AbstractSet, Any, Dict, Mapping, Optional, Sequence
 
 from proposed import (
     Controller,
@@ -54,6 +54,13 @@ class Published(Action):
     """``producer``'s pending read-through batch has landed."""
 
     producer: VolumeId
+    #: The keys that really landed, or ``None`` where the caller does not say. A
+    #: producer may publish fewer keys than it promised, so a route waiting on one of
+    #: these is settled by what is named here and not by the action arriving.
+    #:
+    #: Out of the equality a gate is keyed on: a waiter names ``Published(producer)``
+    #: before anybody knows what will land (:meth:`proposed.dispatch.Dispatcher.gate`).
+    landed: Optional[frozenset[Key]] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -85,6 +92,10 @@ class DedupDirectorySensor(DirectorySensor):
         self._batches: Dict[VolumeId, _Batch] = {}
         self._shapes: Dict[_BatchSpec, _BatchSpec] = {}
         self._shape_uses: Counter[_BatchSpec] = Counter()
+        # producer -> the directory's mutation count when its batch landed. Only a
+        # deregistration can take a landed region back, and that moves the count, so an
+        # unmoved one says the copy is still there without reading for it.
+        self._landed: Dict[VolumeId, object] = {}
         self._folds: Dict[type, Fold] = {
             Asked: self._asked,
             Published: self._published,
@@ -116,6 +127,9 @@ class DedupDirectorySensor(DirectorySensor):
         # A producer may publish fewer keys than it promised, and the directory keeps
         # a promise until it is told otherwise, so the remainder is cleared here.
         self.directory.clear_projections(action.producer)
+        # Read after the put that landed, and clearing a promise is not a mutation, so
+        # this is the count a later decision compares against.
+        self._landed[action.producer] = self.moves()
         batch = self._batches.pop(action.producer, None)
         if batch is None:
             return
@@ -137,6 +151,12 @@ class DedupDirectorySensor(DirectorySensor):
     def in_flight(self) -> set[VolumeId]:
         """Producers with promises the directory is still holding."""
         return set(self._batches)
+
+    def settled(self, producer: VolumeId) -> bool:
+        """Whether ``producer``'s publication is still all the directory says."""
+        # Absent, or a directory counting no mutations: nothing to answer from.
+        landed = self._landed.get(producer)
+        return landed is not None and landed == self.moves()
 
     def promised(
         self, keys: Sequence[Key]

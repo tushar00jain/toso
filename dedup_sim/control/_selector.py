@@ -154,19 +154,35 @@ class Candidates(KeySelector[float]):
             return None
         visiting.add(volume)
         pending = fanout.route_pending(volume)
-        requests = tuple(directory.plan(volume).values())
-        # Read, not remembered: a source that published and has since evicted owes
-        # this route nothing, and the route's own pending flag would still say wait.
+        # This route's pending flags were read off the directory, so while the directory
+        # is still what it was read at they answer readiness with no read at all.
+        unmoved = fanout.route_stamp(volume) is directory.stamp()
+        requests = None
         arrivals: List[float] = []
         for source, expected in required.items():
-            if directory.covers(requests, {source: Counter(expected)}):
+            owes = pending.get(source)
+            if owes is False and directory.settled(source):
+                # Its publication carried this leg, and nothing has dropped it since.
                 wait = 0.0
-            elif source in pending and source in in_flight:
-                wait = self._wait(
-                    source, fanout, in_flight, directory, waits, visiting
+            elif unmoved:
+                wait = (
+                    self._wait(source, fanout, in_flight, directory, waits, visiting)
+                    if owes
+                    else 0.0
                 )
             else:
-                wait = None
+                # Read, not remembered: the directory has moved under these flags, and a
+                # source that published and has since evicted owes this route nothing.
+                if requests is None:
+                    requests = tuple(directory.plan(volume).values())
+                if directory.covers(requests, {source: Counter(expected)}):
+                    wait = 0.0
+                elif owes is not None and source in in_flight:
+                    wait = self._wait(
+                        source, fanout, in_flight, directory, waits, visiting
+                    )
+                else:
+                    wait = None
             if wait is None:
                 waits[volume] = None
                 visiting.remove(volume)

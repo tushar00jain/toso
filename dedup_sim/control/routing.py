@@ -202,6 +202,7 @@ class Dedup(ControlPlane):
                     (source, tuple(fetch.required[source].elements()))
                     for source in sources
                 ),
+                stamp=directory.stamp(),
             )
         )
 

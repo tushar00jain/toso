@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from contextlib import nullcontext
 from typing import Sequence
 
 import pytest
@@ -14,6 +15,7 @@ from dedup_sim.control._sensor import (
     DedupDirectorySensor,
     FanoutSensor,
     Published,
+    Retired,
     Routed,
 )
 from dedup_sim.control.routing import Dedup
@@ -36,6 +38,8 @@ class _Live(Projecting):
     def __init__(self, entries=None) -> None:
         super().__init__()
         self._store = {key: dict(volumes) for key, volumes in (entries or {}).items()}
+        #: Live mutations so far, as the real service counts them.
+        self.revision = 0
 
     @property
     def entries(self):
@@ -64,6 +68,7 @@ class _Live(Projecting):
         self.unpromise(key, volume)
         held = info if info is not None else StorageInfo(ObjectType.TENSOR, {None})
         self._store.setdefault(key, {})[volume] = held
+        self.revision += 1
 
     def evict(self, key: str, volume: str) -> None:
         self.unpromise(key, volume)
@@ -71,6 +76,7 @@ class _Live(Projecting):
         volumes.pop(volume, None)
         if not volumes:
             self._store.pop(key, None)
+        self.revision += 1
 
 
 class _Holds(_Live):
@@ -114,9 +120,18 @@ def _dispatcher(directory, fanout):
     return dispatcher
 
 
-def _routed(directory, requester, order):
+def _routed(directory, requester, order, *, stamped: bool = False):
+    """The route action a decision dispatches for ``requester`` over ``order``.
+
+    ``stamped`` plans it under a pin and vouches for the pending set against that
+    directory read, as a real decision does. Without it a later decision answers
+    readiness only by reading the directory again.
+    """
     requests = tuple(directory.plan(requester).values())
-    fetch = directory.plan_fetch(requests, order, requester=requester)
+    keys = [request.key for request in requests]
+    with directory.pinned(keys) if stamped else nullcontext():
+        fetch = directory.plan_fetch(requests, order, requester=requester)
+        stamp = directory.stamp() if stamped else None
     return Routed(
         requester=requester,
         sources=fetch.sources,
@@ -125,7 +140,21 @@ def _routed(directory, requester, order):
             (source, tuple(fetch.required[source].elements()))
             for source in fetch.sources
         ),
+        stamp=stamp,
     )
+
+
+def _probes(monkeypatch, directory) -> list:
+    """Record every live-coverage read the ranking makes off ``directory``."""
+    seen: list = []
+    original = directory.covers
+
+    def counted(requests, required, *args, **kwargs):
+        seen.append(tuple(sorted(required)))
+        return original(requests, required, *args, **kwargs)
+
+    monkeypatch.setattr(directory, "covers", counted)
+    return seen
 
 
 def test_dedup_selectors_take_keys():
@@ -734,6 +763,107 @@ def test_a_route_accepts_a_dependency_that_has_since_published():
     )
 
     assert ranking.select(["K0"], "r").head == "p"
+
+
+def test_a_publication_readies_the_routes_behind_it_with_no_directory_read(monkeypatch):
+    """The edge a decision would otherwise re-derive per leg, per peer, per decision.
+
+    ``r1`` was routed onto ``r0`` and gated on it, and ``r0``'s batch has landed. The
+    publication carries that fact to every route behind it, and the only thing that
+    can take a landed region back is a deregistration, which moves the directory. So a
+    decision pricing ``r1`` under a directory that has not moved reads no coverage.
+    """
+    info = StorageInfo(ObjectType.TENSOR, {None})
+    ids = ("origin", "r0", "r1", "r2")
+    topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
+    state = _Live({"K": {"origin": info}})
+    directory = DedupDirectorySensor(state)
+    fanout = FanoutSensor()
+    dispatcher = _dispatcher(directory, fanout)
+    dispatcher.dispatch_sync(Asked("r0", (_request("K"),)))
+    dispatcher.dispatch_sync(_routed(directory, "r0", ("origin",), stamped=True))
+    dispatcher.dispatch_sync(Asked("r1", (_request("K"),)))
+    dispatcher.dispatch_sync(_routed(directory, "r1", ("r0", "origin"), stamped=True))
+    state.publish("K", "r0", info)
+    dispatcher.dispatch_sync(Published("r0", frozenset({"K"})))
+    dispatcher.dispatch_sync(Asked("r2", (_request("K"),)))
+    ranking = Ordered(Candidates()).attach(
+        Environment(topology, _Profile()),
+        {DedupDirectorySensor: directory, FanoutSensor: fanout},
+    )
+
+    assert fanout.route_pending("r1") == {"r0": False}
+    probes = _probes(monkeypatch, directory)
+    with directory.pinned(["K"]):
+        priced = ranking.select(["K"], "r2").sources
+
+    assert "r1" in priced
+    assert probes == []
+
+
+def test_a_source_that_published_less_than_it_promised_is_still_owed(monkeypatch):
+    """The action arriving is not the fact a route waits on; what landed is.
+
+    ``r0`` promised both keys and published one, which the directory tolerates -- the
+    promise on the other is dropped rather than kept. ``r1`` planned both keys onto
+    ``r0``, so its leg goes on being owed and ``r0`` is no source for it.
+    """
+    info = StorageInfo(ObjectType.TENSOR, {None})
+    ids = ("origin", "r0", "r1", "r2")
+    topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
+    state = _Live({"K0": {"origin": info}, "K1": {"origin": info}})
+    directory = DedupDirectorySensor(state)
+    fanout = FanoutSensor()
+    dispatcher = _dispatcher(directory, fanout)
+    batch = (_request("K0"), _request("K1"))
+    dispatcher.dispatch_sync(Asked("r0", batch))
+    dispatcher.dispatch_sync(_routed(directory, "r0", ("origin",), stamped=True))
+    dispatcher.dispatch_sync(Asked("r1", batch))
+    dispatcher.dispatch_sync(_routed(directory, "r1", ("r0", "origin"), stamped=True))
+    state.publish("K0", "r0", info)
+    dispatcher.dispatch_sync(Published("r0", frozenset({"K0"})))
+    dispatcher.dispatch_sync(Asked("r2", batch))
+    ranking = Ordered(Candidates()).attach(
+        Environment(topology, _Profile()),
+        {DedupDirectorySensor: directory, FanoutSensor: fanout},
+    )
+
+    assert directory.settled("r0")  # it really did publish, and holds what it put
+    assert fanout.route_pending("r1") == {"r0": True}  # ...but not what r1 asked it for
+    with directory.pinned(["K0", "K1"]):
+        priced = ranking.select(["K0", "K1"], "r2").sources
+
+    assert "r1" not in priced
+
+
+def test_the_load_count_follows_a_route_across_retires_and_publications():
+    """What :data:`~proposed.selector.Balance` reads, off the sets a publication walks.
+
+    A publication is not a retirement: the route still names that source, so the edge
+    stays and only a re-route replaces it.
+    """
+    fanout = FanoutSensor(fanout_cap=3)
+    dispatcher = Dispatcher()
+    dispatcher.compose(fanout)
+    regions = (("K", None),)
+    for requester, sources in (("r1", ("a",)), ("r2", ("a",)), ("r3", ("a", "b"))):
+        dispatcher.dispatch_sync(
+            Routed(
+                requester, sources, required=tuple((s, regions) for s in sources)
+            )
+        )
+
+    assert dict(fanout.named()) == {"a": 3, "b": 1}
+
+    dispatcher.dispatch_sync(Retired("r3", "a"))
+    assert dict(fanout.named()) == {"a": 2, "b": 1}
+
+    dispatcher.dispatch_sync(Published("a", frozenset({"K"})))
+    assert dict(fanout.named()) == {"a": 2, "b": 1}
+
+    dispatcher.dispatch_sync(Routed("r1", ("b",), required=(("b", regions),)))
+    assert dict(fanout.named()) == {"a": 1, "b": 2}
+    assert fanout.named().get("nobody", 0) == 0
 
 
 def test_a_route_rejects_a_registered_source_with_the_wrong_slice():

@@ -89,5 +89,9 @@ class ReadThroughPlane(DataPlane):
         # A second vend, with no preference: a put chooses its own volume (the
         # co-located one), and leaving the read's preference bound would say otherwise.
         await self.deployment.client_for(requester).put_batch(results)
-        await self.deployment.dispatcher_handle.dispatch.call_one(Published(requester))
+        # What landed, not what was asked for: a reader whose fetch came back short
+        # still publishes, and a peer waiting on the missing keys must go on waiting.
+        await self.deployment.dispatcher_handle.dispatch.call_one(
+            Published(requester, frozenset(results))
+        )
         return results

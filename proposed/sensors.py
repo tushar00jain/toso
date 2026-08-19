@@ -311,19 +311,39 @@ class DirectorySensor(Sensor):
         """
         if self._keys is None:
             return build()
-        if not self._checked:
-            # Once per pin, and only for a decision that derives anything: a plane
-            # that reads holders and nothing else never signs the directory.
-            self._checked = True
-            stamp = self._directory_stamp()
-            if stamp != self._stamp:
-                self._derived.clear()
-                self._stamp = stamp
+        self._check()
         cached = self._derived.get(spec)
         if cached is None:
             cached = build()
             self._derived[spec] = cached
         return cached
+
+    def _check(self) -> None:
+        """Drop what was derived from a directory that has since moved.
+
+        Once per pin, and only for a decision that derives or stamps anything: a plane
+        that reads holders and nothing else never signs the directory.
+        """
+        if self._checked:
+            return
+        self._checked = True
+        stamp = self._directory_stamp()
+        if stamp != self._stamp:
+            self._derived.clear()
+            self._stamp = stamp
+
+    def stamp(self) -> object:
+        """What must not have moved for a fact read under this pin to still hold."""
+        # One object across pins while the directory is unchanged: compare with ``is``.
+        if self._keys is None:
+            return object()  # unpinned: nothing recorded may match
+        self._check()
+        return self._stamp
+
+    def moves(self) -> Optional[object]:
+        """The directory's own count of its mutations, or ``None`` where it keeps none."""
+        revision = getattr(self.directory, "revision", None)
+        return None if revision is None else ("revision", revision)
 
     def requirements(
         self, requests: Sequence[Request]
@@ -441,9 +461,9 @@ class DirectorySensor(Sensor):
         not -- a stub, a fixture -- is signed instead, at ``O(keys x holders)`` once
         per pin.
         """
-        revision = getattr(self.directory, "revision", None)
+        revision = self.moves()
         if revision is not None:
-            return "revision", revision
+            return revision
         # Keyed by identity and holding the object, so an id freed mid-walk cannot be
         # handed to a second StorageInfo. One entry object shared by every slot -- a
         # fixture's usual shape -- is then signed once.

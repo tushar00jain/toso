@@ -208,7 +208,9 @@ routed = LocalClient(
 )
 values = await routed.get_batch(entries)
 await deployment.client_for(requester).put_batch(values)
-await deployment.dispatcher_handle.dispatch.call_one(Published(requester))
+await deployment.dispatcher_handle.dispatch.call_one(
+    Published(requester, frozenset(values))
+)
 ```
 
 - Change the selector chain to change placement or source preference.

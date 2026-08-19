@@ -29,17 +29,23 @@ additional Python peak reported for any measured phase, not process RSS.
 
 | Workload (`K/T/G`) | Peak decision | Promise burst build | Largest Python phase peak | Assessment |
 | --- | ---: | ---: | ---: | --- |
-| Current executable test (`1/1/64`) | 1.3 ms | 0.6 ms | 0.1 MiB | Trivial |
-| Planned 8B (`290/4/16`) | 5.9 ms | 8.7 ms | 2.2 MiB | Comfortable |
-| 70B key count, small burst (`723/4/16`) | 13 ms | 20 ms | 6 MiB | Comfortable |
-| Wider 8B burst (`290/16/64`) | 16 ms | 35 ms | 9 MiB | Comfortable |
-| Wide 8B placement (`290/64/128`) | 29 ms | 173 ms | 18 MiB | Usable for burst routing |
-| Dense 70B (`723/64/128`) | 69 ms | 402 ms | 50 MiB | Inside a 100 ms envelope |
-| Fleet/MoE worst (`5,203/128/512`) | Projected 1.4–2.0 s | Projected ~11 s | Projected ~1.4 GiB | Guarded; unsupported |
+| Current executable test (`1/1/64`) | 1.3 ms | 0.7 ms | 0.1 MiB | Trivial |
+| Planned 8B (`290/4/16`) | 4.4 ms | 9.3 ms | 2.3 MiB | Comfortable |
+| 70B key count, small burst (`723/4/16`) | 9.2 ms | 21 ms | 6.3 MiB | Comfortable |
+| Wider 8B burst (`290/16/64`) | 8.2 ms | 33 ms | 9.1 MiB | Comfortable |
+| Wide 8B placement (`290/64/128`) | 17 ms | 212 ms | 18 MiB | Usable for burst routing |
+| Dense 70B (`723/64/128`) | 40 ms | 500–750 ms | 53 MiB | Inside a 100 ms envelope |
+| Fleet/MoE worst (`5,203/128/512`) | Projected 0.8–1.2 s † | Projected ~15 s † | Projected ~1.5 GiB † | Guarded; unsupported |
 
-Promise burst build is unchanged code and the noisiest column on a shared host:
-repeated single observations of dense 70B ranged 362–540 ms. Read it as an order of
-magnitude, not a delta.
+† extrapolated from the dense 70B row rather than measured; the guard rejects the
+workload by default.
+
+Promise burst build is the noisiest column on a shared host: repeated single
+observations of dense 70B ranged 362–745 ms, and three timings inside one process
+spread 492–602 ms. Read it as an order of magnitude, not a delta. It is dominated by
+the `G*K` promise writes into the directory's own map — 92,544 of them at dense 70B —
+and staging the same `G` routes with no pin and no stamp measures the same, so the
+column says nothing about anything else a change touched.
 
 The measured rows are synthetic capacity points, not observations of a particular
 deployment. The fleet row is an extrapolation from dense 70B: 7.2 times the keys,
@@ -67,11 +73,14 @@ of the state.
 | Total lifecycle including completion | `O(G(K + R + S + Fₐ) + ΣWₐ)` | Same construction peak; completion releases the promised state | Not measured |
 
 A generator completion means its read-through finished, its local `put_batch`
-registered all fetched keys, and it dispatched `Published(generator)`. Each of those
-puts replaces the promise it lands on, and `Published` clears whatever the generator
-promised and did not publish, then wakes requests that selected it as a source. A
-burst has at most `G` such completions. In each total row, `ΣWₐ` is the waiter
-wake-up work across the actions included by that row.
+registered the keys it fetched, and it dispatched `Published(generator, landed)`. Each
+of those puts replaces the promise it lands on, and `Published` clears whatever the
+generator promised and did not publish, releases the leg of every route routed onto it
+that `landed` covers, then wakes requests that selected it as a source. A burst has at
+most `G` such completions. Releasing legs stays inside the `O(GR)` term: the readers
+behind one producer are capped by `fanout_cap`, and each is one pass over the `R`
+regions it was owed. In each total row, `ΣWₐ` is the waiter wake-up work across the
+actions included by that row.
 
 ### One request at peak
 
@@ -83,14 +92,22 @@ all `G` pending requests above.
 | Pinned live-directory snapshot | `O(KT)`; promised entries are not walked | `O(KT)` transient copied mapping slots | `snapshot_ms` |
 | Cold live requirements | `O(KT)`: one planner run per source over that source's own entries, so slice intersection runs once per `(key, source)` | `O(KT)` region counters and one `K`-entry map per source | Cold `serving_sources_ms` |
 | Reused live requirements | `O(KT)` metadata signature, or `O(1)` where the directory counts its own mutations, plus `O(G)` overlap tests | Reuses the `O(KT)` counters | Reused `serving_sources_ms` |
-| Candidate readiness and scoring | `O(P(S + K) + V log V)`: each pending peer's route is probed source by source against the cached live requirements | `O(V)` transient wait memo | Part of `full_decision_ms` |
+| Candidate readiness and scoring | `O(PS + V log V)` flag lookups where the directory has not moved since each peer's route was read; `O(P(S + K) + V log V)` region checks against the cached live requirements where it has | `O(V)` transient wait memo | Part of `full_decision_ms` |
 | Fetch materialization | One planner run over `K` lazily ranked maps: `O(K)` where one source holds a whole value, `O(KV)` where every volume of a sliced key is walked | Up to `O(KS)` required-region output, and `K` map views rather than `K` ranked dicts | `plan_fetch_ms` |
 | Gate registration | `O(P)` | `O(P)` waiter links, up to `O(GP)` for blocked burst requests | Part of `full_decision_ms` |
-| Total synchronous control decision | `O(KT + G + P(S + K) + KS + V log V)` | Adds `O(K + R + P)` retained requester state plus `O(KT)` transient planning state | `full_decision_ms` |
+| Total synchronous control decision | `O(KT + G + PS + KS + V log V)` | Adds `O(K + R + P)` retained requester state plus `O(KT)` transient planning state | `full_decision_ms` |
 
 The total request row ends after the route and readiness gate are constructed. It
 does not include waiting for a pending source, transferring payloads, or publishing
 the fetched batch.
+
+Readiness carries no `K` term while the directory is what each peer's route was read
+against, because then the route's own pending flags describe live coverage exactly: a
+flag is set from the plan the route was made from and cleared by the publication that
+carried every region it named. Where the directory has moved since, the flags are not
+trusted and the leg is re-read, at one `K`-cell subtraction per `(peer, source)` — the
+`O(P(S + K))` term. A burst with no eviction in it never takes that path; a run that
+evicts between a route and a decision takes it for the routes the eviction outdates.
 
 `O(G)` rather than `O(KG)` for candidate discovery rests on the batch shape being
 interned: every generator in a synchronized burst promises the same `K` keys with the
@@ -114,7 +131,7 @@ K*T live placements
 = K*T + 2*K*G indexed entries
 ```
 
-It omits dictionary headers, `StorageInfo` objects, route edges, load counters, and
+It omits dictionary headers, `StorageInfo` objects, route edges, load sets, and
 waiter links, so it is a scale indicator rather than a memory estimate. At the fleet
 envelope it is 5,203 × (128 + 2 × 512), or 5,993,856 cells.
 
@@ -143,16 +160,16 @@ and Python build.
 
 | case | keys | sources | burst requests | indexed entries | pending build ms | cold serving ms | reused serving ms | plan fetch ms | full decision ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| smoke | 8 | 2 | 8 | 144 | 0.265 | 0.189 | 0.043 | 0.051 | 0.935 |
+| smoke | 8 | 2 | 8 | 144 | 0.322 | 0.187 | 0.043 | 0.050 | 0.834 |
 
 | pending build peak KiB | cold serving peak KiB | reused serving peak KiB | plan fetch peak KiB | full decision peak KiB | candidates | pending candidates | selected sources |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 45.469 | 9.906 | 5.672 | 6.234 | 28.477 | 10 | 8 | 1 |
+| 47.344 | 8.281 | 5.672 | 6.234 | 27.578 | 10 | 8 | 1 |
 
 The planned-8B measurements below isolate the implementation steps on one host. The
 first three rows are carried over from earlier hosts and runs; values are approximate
-rather than a performance contract. The last two were measured against the current
-tree, back to back on one host.
+rather than a performance contract. The last three were measured back to back on one
+host, the newest against the current tree.
 
 | Planner | pending build ms | serving ms | plan fetch ms | full decision ms | serving peak KiB | full peak KiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -161,6 +178,7 @@ tree, back to back on one host.
 | Shared expansions and live reuse | 13.06 | 10.46 | 7.09 | 37.81 | 1318 | 2484 |
 | Promises held in the directory | 8.00 | 1.68 | 1.67 | 6.56 | 145 | 436 |
 | Greedy planner as the dry run | 8.71 | 1.39 | 1.09 | 5.87 | 144 | 462 |
+| Readiness off the route's own flags | 9.27 | 1.41 | 1.14 | 4.43 | 144 | 462 |
 
 Run the intended 8B scale or supply a deployment-specific point:
 
@@ -236,8 +254,8 @@ Candidates.select
     |     live requirements         one GreedyClient run per source over that
     |                               source's own K entries -> K*T regions, reused
     |     one test per generator    shape identity, then K-cell Counter subtraction
-    |  _wait(g) per pending peer    per route source: a K-cell subtraction against
-    |                               the cached live requirements
+    |  _wait(g) per pending peer    per route source: one flag lookup, or a K-cell
+    |                               subtraction where the directory has since moved
     |  price V candidates           env.read_time per candidate
     |
 Balance -> WithFold -> Ordered      V-entry key mapping rebuilt three times, sort V log V
@@ -271,13 +289,16 @@ Outlives the decision; sizes are for one requester unless stated.
 | `_derived` | `DirectorySensor` | one live requirements map per batch spec | the directory's `revision` moving |
 | `Promised` entries | the controller's own directory | `K` slots, one each | a put on the same slot, or `Published` |
 | `_batches` | `DedupDirectorySensor` | `K` requests plus `K` `StorageInfo`, and one shape reference | `Published` |
-| `_route`, `_route_pending` | `FanoutSensor` | `S` + `P` | `Routed`, `Retired`, `Published` |
+| `_route`, `_route_pending`, `_route_stamp` | `FanoutSensor` | `S` + `P` + one stamp reference | `Routed`, `Retired`, `Published` |
 | `_route_required` | `FanoutSensor` | `S` Counters of up to `K` region cells; `G*K*S` cells across the burst | `Published` |
-| `_load` | `FanoutSensor` | one counter per source | `_drop` |
+| `_load` | `FanoutSensor` | one set per source, `S` entries across all of them per route | `_drop` |
+| `_landed` | `DedupDirectorySensor` | one mutation count per volume that has published | never |
 | `_waiters` | `Dispatcher` | one link per (pending source, gate) | commit |
 
 `_route_required` is the largest retained item: 92,544 cells at dense 70B, 2.66 million
-at the fleet envelope, each a `(key, slice spec)` tuple hashed on every probe.
+at the fleet envelope, each a `(key, slice spec)` tuple. A decision reads none of them
+while it can answer readiness from the flags; the fallback probe hashes every cell of
+the leg it re-reads.
 
 The `StorageInfo` a generator promised is one object, referenced by both its promise
 record and the directory entry, so a promised `(key, generator)` costs one map slot
@@ -293,7 +314,7 @@ Dies with the pin, except the derived cache, which outlives it.
 | `promised()` read | `K` references into the directory's own maps, one per decision |
 | Live requirements | `T` `K`-entry maps and `T` Counters of `K` cells, reused across decisions |
 | Ranked map views | `K` slotted views over the pinned and promised maps, no ranked dict |
-| `_wait` memo and its probes | `V` memo entries; one `K`-cell subtraction per (peer, source) |
+| `_wait` memo and its probes | `V` memo entries; no allocation per (peer, source) until a leg falls back to a `K`-cell subtraction |
 | `Selection.key` | `V` entries, rebuilt by `priced`, `annotated` and `only` |
 | `FetchPlan` | `K` source tuples plus `S` Counters |
 | `Routed.required` | every required region flattened into one tuple |
@@ -304,29 +325,28 @@ One decision at `planned-8b` (`290/4/16`), counted by wrapping the sensor:
 
 | Operation | Calls | Per key |
 | --- | ---: | ---: |
-| `request_spec` | 5,800 | 20 |
-| `requirements` | 18 | |
-| `covers` | 16 | |
+| `request_spec` | 1,160 | 4 |
+| `requirements` | 2 | |
+| `covers` | 0 | |
 | `GreedyClient` runs | 5 | |
 | `locate_live` | 1 | |
 | `promised` | 1 | |
 
-The sixteen `covers` calls are `_wait` probes, one per pending peer, and each is a
-cache lookup plus one `K`-cell Counter subtraction; the eighteen `requirements` calls
-are those plus the two planning reads, and all but one hit the cache. Four of the five
-planner runs are the per-source live expansion and the fifth is the fetch plan.
-`request_spec` is the top line: it is rebuilt only to form each batch spec, which is
-the cache key.
+No `covers` at all: every peer's route was read against this same directory, so the
+sixteen readiness questions are sixteen flag lookups. That is most of the other two
+lines as well — a `covers` probe derives the batch spec that keys the requirements
+cache, which is one `request_spec` per key each time. The two `requirements` calls left
+are the planning reads, and one of them hits the cache. Four of the five planner runs
+are the per-source live expansion and the fifth is the fetch plan.
 
 ## Potential improvement
 
 In profile order against the numbers above:
 
-- readiness is the largest remaining term, `O(P(S + K))` region checks, all of them
-  hashing `(key, slice spec)` tuples. Interning a region to an int shrinks
-  `_route_required` and speeds every probe; nothing else touches the region's
-  contents.
-- `request_spec` is rebuilt 20 times per key, all of it to key the derived cache.
+- `_route_required` is still `O(P(S + K))` region cells retained, hashed on every probe
+  the fallback path takes. Interning a region to an int shrinks the retained state and
+  speeds those probes; nothing else touches the region's contents.
+- `request_spec` is rebuilt 4 times per key, all of it to key the derived cache.
   Caching it on the request would make that lookup a pair of pointers.
 - `Routed` flattens each source's Counter through `elements()` so `_routed` can rebuild
   the same Counter. Carry the counts.
