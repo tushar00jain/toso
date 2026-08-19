@@ -19,6 +19,7 @@ from dedup_sim.control._sensor import Asked, DedupDirectorySensor, Published, Ro
 from dedup_sim.control.routing import Dedup
 from proposed import Endpoint, Environment
 from realsim.adapters.real_controller import RealControllerAdapter
+from sim_common.perfcount import InstructionCount
 from torchstore.transport import Request
 
 __all__ = ["main"]
@@ -114,6 +115,7 @@ class _Runtime:
     rank_ms: float
     gate_ms: float
     full_decision_ms: float
+    full_decision_instructions: int | None
     candidates: int
     pending_candidates: int
     selected_sources: int
@@ -221,7 +223,16 @@ def _runtime(args: argparse.Namespace) -> _Runtime:
         warmups=args.warmups,
         repeats=args.repeats,
     )
-    full_decision_ms, _ = _once_ms(workload.decide)
+    full_decision_instructions = None
+    if InstructionCount.available():
+        gc.collect()
+        with InstructionCount() as counter:
+            started = time.perf_counter()
+            workload.decide()
+            full_decision_ms = (time.perf_counter() - started) * 1_000
+        full_decision_instructions = counter.count
+    else:
+        full_decision_ms, _ = _once_ms(workload.decide)
     return _Runtime(
         declare_burst_ms,
         declare_ms,
@@ -229,6 +240,7 @@ def _runtime(args: argparse.Namespace) -> _Runtime:
         rank_ms,
         gate_ms,
         full_decision_ms,
+        full_decision_instructions,
         len(serving.live | {pub[0] for pub in serving.pending}),
         len(serving.pending),
         len(ranking.sources or ()),
@@ -254,7 +266,8 @@ def _run(args: argparse.Namespace) -> None:
     print(
         "case\tkeys\tsource_ranks\tgenerators\tindexed_metadata_entries\t"
         "declare_burst_ms\tdeclare_ms\tunion_ms\trank_ms\tgate_ms\t"
-        "full_decision_ms\tdeclare_burst_python_peak_kib\t"
+        "full_decision_ms\tfull_decision_instructions\t"
+        "declare_burst_python_peak_kib\t"
         "declare_python_peak_kib\tunion_python_peak_kib\trank_python_peak_kib\t"
         "gate_python_peak_kib\tfull_decision_python_peak_kib\tcandidates\t"
         "pending_candidates\tselected_sources"
@@ -264,7 +277,8 @@ def _run(args: argparse.Namespace) -> None:
         f"{indexed_entries}\t{runtime.declare_burst_ms:.3f}\t"
         f"{runtime.declare_ms:.3f}\t{runtime.union_ms:.3f}\t"
         f"{runtime.rank_ms:.3f}\t{runtime.gate_ms:.3f}\t"
-        f"{runtime.full_decision_ms:.3f}\t{memory.declare_burst_kib:.3f}\t"
+        f"{runtime.full_decision_ms:.3f}\t{runtime.full_decision_instructions}\t"
+        f"{memory.declare_burst_kib:.3f}\t"
         f"{memory.declare_kib:.3f}\t{memory.union_kib:.3f}\t"
         f"{memory.rank_kib:.3f}\t{memory.gate_kib:.3f}\t"
         f"{memory.full_decision_kib:.3f}\t{runtime.candidates}\t"

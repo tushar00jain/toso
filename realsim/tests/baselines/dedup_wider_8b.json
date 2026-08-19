@@ -1,0 +1,17 @@
+{
+  "workload": {"keys": 290, "source_ranks": 16, "generators": 64},
+  "counts": {
+    "candidates": 81,
+    "pending_candidates": 65,
+    "selected_sources": 80
+  },
+  "instructions": {"full_decision": 236659164},
+  "memory_kib": {
+    "declare_burst": 17131.070,
+    "declare": 267.898,
+    "union": 2107.094,
+    "rank": 38.281,
+    "gate": 26.020,
+    "full_decision": 2374.125
+  }
+}
