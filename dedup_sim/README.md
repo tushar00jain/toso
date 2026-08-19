@@ -31,14 +31,15 @@ capability's whole control plane, reached as a service of its own:
 2. Every later reader finds a **peer** cheaper: a reader that is about to hold the
    key, one tier away instead of across the fabric. A peer stops being offered once
    `fanout_cap` readers are behind it (`1` -> a chain, `>=2` -> a shallow tree).
-3. A selected peer that has not registered adds `Published(peer)` to the decision's
-   **readiness gate**. `sources` answers after every selected peer lands.
+3. A whole key gates on its first ranked serving candidate when that candidate is
+   pending; sliced requests gate on every pending candidate offering an intersecting
+   region. `sources` answers after those exact publications land.
 4. The read-through is the data plane's one job
    (`dedup_sim.data.read_through`): after a reader's batch returns, it stores the
    keys in its own co-located volume -- a zero-fabric local write through the real
    `client.put_batch` path, which registers every key before it returns -- and then
-   commits `Published(reader)`. The plane's own fan-out folds that one action and
-   releases every gate waiting on the completed producer.
+   commits `Published(reader, pub)`. The plane's own fan-out folds that one action and
+   releases every gate waiting on the completed publication.
 
 Because a peer outprices a holder, exactly one reader ever pulls from a pre-existing
 holder: the only origin-sourced transfer is that first hop, `origin_bytes == 1x` the
@@ -172,7 +173,7 @@ against a `Deployment` (enforced by `realsim/tools/check_contract.py`).
 dedup_sim/
   control/                # DECIDES
     routing.py            #   Dedup: a proposed.ControlPlane -- sources() answers
-                          #   with per-key sources once they are usable, off the chain it
+                          #   with ranked sources once they are usable, off the chain it
                           #   builds and the one fold that orders what the chain
                           #   keyed; a completed batch is an action it folds, not a
                           #   question it is asked. `spread` picks the fabric dial
@@ -182,12 +183,12 @@ dedup_sim/
                           #   routed to fetch it -- priced in seconds: the wait
                           #   until a source has the key, the hop to me, and the
                           #   fabric that hop burns
-    _sensor/              #   promised directory, fan-out state, and shared actions
-      _directory.py       #     live + promised metadata, publication facts, fetch plans
-      _fanout.py          #     route facts, dependencies, and source load
+    _sensor/              #   publication identity, arrival scores, and shared actions
+      _directory.py       #     store publication ids and their volume identities
+      _fanout.py          #     arrival scores, gates, and source load
   data/                   # EXECUTES
-    read_through.py       #   ReadThroughPlane: apply the per-key directory scope to
-                          #   LocalClient._fetch, put, then commit Published
+    read_through.py       #   ReadThroughPlane: apply the flat preference, put, then
+                          #   commit Published; a missing source triggers a re-ask
   workload/               # WHAT IS SIMULATED
     scenarios.py          #   the Dedup and WeightSync Scenarios: the Runs to compare
                           #   (the fixture as it is, and with the two planes added)
@@ -212,7 +213,7 @@ visible from which folders exist and how thick they are:
 
 | role | `dedup_sim` | `kvcache_sim` |
 |---|---|---|
-| `control/` — what is decided | `routing.py`: one plane, `sources` + `_selector.py` (the chain behind it) + `_sensor/` (promised directory, fan-out state, and their actions) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_prefix.py` (prefix runs) |
+| `control/` — what is decided | `routing.py`: one plane, `sources` + `_selector.py` (the chain behind it) + `_sensor/` (publication arrival, fan-out state, and actions) | `scheduler.py` (prefill placement, pull-vs-recompute, SLO gates, decode placement, and which peer serves a fetch) + `_selector.py` (the rankings it decides with) + `_answer.py` (the values it answers with) + `_sensor/` (the model) + `_prefix.py` (prefix runs) |
 | `data/` — what executes | `read_through.py`: one member — ask, get, local put, commit | `serving.py` (the per-request lifecycle) + `_decode.py` (the batched decode engine) + `_store.py` (the KV directory verbs) |
 | `workload/` — what is simulated | `scenarios.py`: **one fixed synchronized burst** (`putget_sim`'s fixture), parameterized by reader count | `request.py` (domain model) + `generator.py` (seeded Zipf/Poisson stream) + `scenarios.py` (six scenarios) |
 | `report/` — outcome metrics | `summary.py`: rendering only; the measurements are a shared `sim_common.report.Ledger` | `metrics.py`: its **own** per-request outcome row (TTFT/TBT percentiles, hit rate, rejections) on the same `Ledger` |

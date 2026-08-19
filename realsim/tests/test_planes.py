@@ -57,7 +57,7 @@ from proposed import ControlPlane, Key, KeySelector, Selection
 # subtypes, and these are implementations of them (or the base they share).
 from proposed.selector import (
     Annotate, Balance, Const, declares, FirstMatch, WithFold, Best, NaiveKeySelector,
-    Lift, pipe, prefer, Bounded, Selector, Ordered,
+    Lift, pipe, Bounded, Selector, Ordered,
 )
 from realsim.runner import ItemDispatch, Runner, WorkItem
 from realsim.seams.link import LocalEndpoint
@@ -67,6 +67,7 @@ from sim_common.async_engine import run_sim
 from sim_common.report import Ledger
 from sim_common.topology import Tier
 from sim_common.trace import Trace
+from torchstore.controller import Controller
 
 
 def _drive(sim, coro):
@@ -136,9 +137,9 @@ def test_directory_sensor_reports_raw_not_preferred_answers():
         with sim.mesh.installed():
             await sim.mesh.client_for("a").put("W", _payload())
             await sim.mesh.client_for("b").put("W", _payload())
-            # A reader that was told to prefer b, and the same directory as sensed.
-            sim.mesh.client_for("c", prefer=["b"])
-            preferred = await sim.controller_handle.locate_volumes.call_one(["W"])
+            preferred = await sim.controller_handle.locate_volumes.call_one(
+                ["W"], prefer=["b"]
+            )
             return preferred, sim.directory_sensor.locate(["W"])
 
     preferred, sensed = _drive(sim, scenario())
@@ -200,8 +201,8 @@ def test_preferring_the_naive_answer_changes_nothing():
 
 
 def test_no_preference_leaves_a_directory_answer_untouched():
-    located = {"K": {"v1": "info1", "v0": "info0"}}
-    assert prefer(located, Selection().sources) is located
+    located = {"v1": "info1", "v0": "info0"}
+    assert Controller._prefer(located, Selection().sources) is located
 
 
 # --------------------------------------------------------------------------
@@ -334,14 +335,8 @@ def test_the_directory_holds_nothing_that_decides():
     """
     service = Simulation(_topology()).mesh.directory.service
     assert {name for name in dir(service) if not name.startswith("_")} == {
-        # revision counts this service's own mutations; a reader compares it to
-        # decide whether what it derived still holds. It decides nothing here.
-        "controller", "entries", "keys", "locate_raw", "locate_volumes", "revision",
+        "controller", "keys", "locate_volumes", "serving_union",
         "notify_delete", "notify_delete_batch", "notify_put_batch",
-        # project/clear_projections record what a volume will hold. The directory
-        # stores what it is told and answers ordinary reads as if it were not there;
-        # who promised what, and what to do about it, stays with the caller.
-        "clear_projections", "project", "projected_owners", "live_map", "unpromise",
     }
 
 
@@ -705,15 +700,17 @@ def test_a_selection_refuses_a_source_it_could_not_order():
 
 
 def test_a_preference_reorders_a_directory_answer_to_its_ranked_sources():
-    located = {"K": {"v0": "i0", "v1": "i1", "v2": "i2"}}
-    preferred = prefer(located, Selection.of(["v2", "v0"]).sources)
-    assert list(preferred["K"]) == ["v2", "v0"]  # rank order, v1 dropped
+    located = {"v0": "i0", "v1": "i1", "v2": "i2"}
+    preferred = Controller._prefer(
+        located, Selection.of(["v2", "v0"]).sources
+    )
+    assert list(preferred) == ["v2", "v0"]  # rank order, v1 dropped
 
 
 def test_a_preference_keeps_a_key_none_of_its_sources_holds():
     """A preference must not make data disappear."""
-    located = {"K": {"v0": "i0"}}
-    assert prefer(located, ("v9",)) == located
+    located = {"v0": "i0"}
+    assert Controller._prefer(located, ("v9",)) == located
 
 
 def test_a_settled_selection_has_waited_and_carries_no_gate():

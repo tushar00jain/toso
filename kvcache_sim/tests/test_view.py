@@ -9,15 +9,8 @@ from kvcache_sim.control._selector import (
 )
 from kvcache_sim.control._sensor import ClusterSensor, RoutedPullSensor
 from proposed import DirectorySensor, Environment
-
-
-class _Walks:
-    def __init__(self) -> None:
-        self.walks = 0
-
-    def locate_raw(self, keys, missing_ok: bool = False):
-        self.walks += 1
-        return {key: {"s0": None} for key in keys}
+from realsim.adapters.real_controller import RealControllerAdapter
+from torchstore.transport import Request
 
 
 def test_a_selector_requires_each_declared_sensor():
@@ -41,16 +34,30 @@ def test_a_ranking_that_declares_nothing_needs_no_sensor():
     assert selector.select(["k"], "r").sources == ()
 
 
-def test_directory_pin_is_shared_by_every_selector_read():
-    raw = _Walks()
-    directory = DirectorySensor(raw)
+def test_directory_pin_is_shared_by_every_selector_read(monkeypatch):
+    service = RealControllerAdapter().service
+    service.notify_put_batch(
+        [Request.from_any(key, None).meta_only() for key in ("k0", "k1")],
+        "s0",
+        pending=False,
+    )
+    walks = 0
+    locate = service._locate
+
+    def counted(*args, **kwargs):
+        nonlocal walks
+        walks += 1
+        return locate(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_locate", counted)
+    directory = DirectorySensor(service)
     selector = LongestPrefixKeySelector().attach(
         Environment({}), {DirectorySensor: directory}
     )
     keys = ["k0", "k1"]
     with directory.pinned(keys):
-        assert raw.walks == 1
+        assert walks == 1
         assert selector.select(keys, "r").key == {"s0": (-2,)}
-        assert raw.walks == 1
+        assert walks == 1
     selector.select(keys, "r")
-    assert raw.walks == 2
+    assert walks == 2

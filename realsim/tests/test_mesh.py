@@ -117,7 +117,7 @@ def test_a_put_is_in_the_directory_before_it_returns():
     async def scenario():
         with mesh.installed():
             await mesh.client_for("a").put("W", torch.arange(64, dtype=torch.float32))
-            located = mesh.directory.service.locate_raw(["W"], missing_ok=True)
+            located = mesh.directory.service._locate(["W"], missing_ok=True)
             return "W" in mesh.volumes["a"].service.store.kv, list(located.get("W", {}))
 
     (stored, holders), _trace = run_sim(scenario())

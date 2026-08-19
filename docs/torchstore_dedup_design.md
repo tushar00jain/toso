@@ -137,22 +137,22 @@ every rank.
 
 ```text
 on plan(reader r, regions):                    # one control-plane turn
-  entries = directory_entries(regions) + promised_entries(regions)
-  ranked = sort(relevant_sources(entries), key=(score, active_load, stable_id))
-  by_key = LocalClient._build_volume_requests(regions, ranked)
-  reserve_edges(r, unique_sources(by_key))
-  answer(by_key, wait=Published(selected_pending_producers(by_key)))
+  pub = declare_pending_batch(r, regions)
+  live, pending = serving_union(regions)
+  sources = sort(live + publication_volumes(pending),
+                 key=(score, active_load, stable_id))
+  record_arrival(pub, sources)
+  answer(sources, wait=Published(pending head candidate per key))
 
-on Published(reader r):
-  remove_pending_entry(r); release_incoming_edges(r); wake_waiters(r)
+on Published(reader r, pub):
+  retire_pending_rows(pub); release_incoming_edges(pub); wake_waiters(pub)
 ```
 
-`directory_holders` returns registered sources; `promised_peers_below_cap` returns
-readers whose copies are in flight and still have fan-out capacity. `score` is the
-readiness-plus-transfer formula above; `active_load` and `stable_id` are its load and
-deterministic tie-breaks. `ready` and `slot` are the source-copy and fan-out wait gates.
-`promise` and `reserve_edge` record the planned copy and load; `Published` settles the
-producer's whole in-flight plan.
+`serving_union` returns live volumes and publication ids per requested key. Whole values
+wait only for that key's first ranked candidate; sliced requests wait for every ranked
+pending candidate with an intersecting region. `score` is the readiness-plus-transfer
+formula above; `active_load` and `stable_id` are its load and deterministic tie-breaks.
+`Published` settles one atomic publication.
 
 Every request is decided against all earlier promises and reservations. The source
 load is therefore part of the same atomic decision as the route; two readers cannot
@@ -176,16 +176,14 @@ Optional put-side de-replication splits a replicated writer's shared shard acros
 replicas. Existing assembly reconstructs the full value. This reduces put traffic and
 storage footprint but is independent of read routing.
 
-`Published(producer)` is the completion boundary for the producer's one in-flight
-plan. The plan holds the region geometry used for coverage; waiters and completion
-actions hold only the producer. Copies stay pinned within one sync window; optional
-deletion reclaims them after the version changes.
+`Published(producer, pub)` is the completion boundary for one atomic publication.
+Several publications from one volume may coexist; a repeated `(volume, key)`
+declaration remains attributed to the earlier publication.
 
 The executable plane builds existing meta-only `Request` values from the caller's
 `key -> tensor/DTensor/None` batch. `DirectorySensor` applies `ObjectType` semantics
-and `LocalClient._expand_tensor_slices` once per distinct request/metadata pair for
-both live and promised entries. One key may select several slice producers; its gate
-names only their `Published` actions.
+and `LocalClient._expand_tensor_slices` for stored slices. The client applies the flat
+preference per key and tracks covered slice regions so replicas are fetched once.
 
 ## 6. Correctness and failure handling
 
@@ -201,8 +199,8 @@ names only their `Published` actions.
   intersection and assembly.
 - **Puller failure:** a promise needs a timeout. On expiry, cancel its dependent routes
   and designate another reader or trainer source.
-- **Overlapping publication:** one producer may have one plan in flight; a second is
-  rejected until `Published` settles the first.
+- **Overlapping publication:** publication ids keep gates and retirement scoped when
+  one volume has several batches in flight.
 
 The online tree can be deeper than a global optimum, and one control service may
 back-pressure at very wide fan-in. Key-hash sharding is the scale-out path, provided

@@ -25,14 +25,48 @@ import pytest
 import torch
 
 from dedup_sim.tests._run import run
-from proposed import Action, Dispatcher
+from dedup_sim.control.routing import Dedup
+from dedup_sim.data.read_through import ReadThroughPlane
+from proposed import Action, Dispatcher, Endpoint
 from putget_sim.workload.put_get import DEFAULT_N, MODE_META, MODE_METADATA
+from realsim.simulation import Simulation
 from realsim.seams.transport import TensorDescriptor
 from sim_common import config
 from sim_common.async_engine import run_sim
 
 MODES = (MODE_META, MODE_METADATA)
 PAYLOAD_BYTES = DEFAULT_N * 4  # DEFAULT_N float32 elements
+
+
+def test_one_generator_can_overlap_two_read_throughs():
+    topology = {
+        volume: Endpoint(volume, volume, volume) for volume in ("origin", "r0")
+    }
+    sim = Simulation(topology, control=Dedup())
+    plane = ReadThroughPlane(trace=sim.trace)
+    plane.attach(sim)
+
+    async def scenario():
+        with sim.mesh.installed():
+            sim.origins("origin")
+            value = torch.empty(DEFAULT_N, dtype=torch.float32, device="meta")
+            await sim.client_for("origin").put_batch({"K0": value, "K1": value})
+            return await asyncio.gather(
+                plane.read_through("r0", {"K0": None}),
+                plane.read_through("r0", {"K1": None}),
+            )
+
+    results = sim.loop.run_until_complete(scenario())
+    gets = [
+        event
+        for event in sim.trace.events
+        if event[1] == "xfer" and event[2].startswith("get origin->r0")
+    ]
+
+    assert [set(result) for result in results] == [{"K0"}, {"K1"}]
+    assert sim.ledger.origin_bytes == 2 * PAYLOAD_BYTES
+    assert len(gets) == 2
+    assert gets[0][0] == gets[1][0]
 
 
 def _shape_dtype_nbytes(payload):

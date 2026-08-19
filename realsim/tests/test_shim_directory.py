@@ -83,8 +83,12 @@ def _shard_request(key: str, coord: int, mesh: int) -> Request:
 async def _drive_surface(handle):
     """Exercise the full handle surface; return a comparable snapshot dict."""
     # put an object on volume A and one DTensor shard (of 2) on volume A.
-    await handle.notify_put_batch.call([_object_request("obj")], "A")
-    await handle.notify_put_batch.call([_shard_request("dt", 0, 2)], "A")
+    await handle.notify_put_batch.call(
+        [_object_request("obj")], "A", pending=False
+    )
+    await handle.notify_put_batch.call(
+        [_shard_request("dt", 0, 2)], "A", pending=False
+    )
 
     snap = {}
     # keys() + prefix filter.
@@ -110,7 +114,9 @@ async def _drive_surface(handle):
     partial = await handle.locate_volumes.call_one(["dt"], require_fully_committed=False)
     snap["partial_volumes"] = sorted(partial["dt"])
     # complete the DTensor (second shard on volume B) -> now fully committed.
-    await handle.notify_put_batch.call([_shard_request("dt", 1, 2)], "B")
+    await handle.notify_put_batch.call(
+        [_shard_request("dt", 1, 2)], "B", pending=False
+    )
     full = await handle.locate_volumes.call_one(["dt"])
     snap["dt_volumes"] = sorted(full["dt"])
     # delete one volume's shard, then batch-delete the rest.

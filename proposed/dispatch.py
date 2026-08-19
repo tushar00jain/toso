@@ -74,9 +74,8 @@ class Dispatcher:
     so this is the whole of where a host's facts arrive and the only place an action is
     folded.
 
-    **Two ways in, one fold**, the same pair as
-    :meth:`proposed.deployment.Controller.locate_volumes` /
-    :meth:`~proposed.deployment.Controller.locate_raw` and for the same reason:
+    **Two ways in, one fold**, the same pair as the controller endpoint and its
+    synchronous local read:
     :meth:`dispatch` is the seam a reporter at any distance reaches, and
     :meth:`dispatch_sync` is what a caller in this process calls when it must not
     suspend. A caller chooses between them on the distance, never on the fold.
@@ -108,8 +107,8 @@ class Dispatcher:
     def dispatch_sync(self, action: Action) -> None:
         """Fold ``action`` into every reducer that folds its type, then commit.
 
-        **Not a coroutine, and that is load-bearing**, as
-        :meth:`proposed.deployment.Controller.locate_raw` is not one: no decision can
+        **Not a coroutine, and that is load-bearing**, as the controller's local read
+        is not one: no decision can
         interleave with a commit, so whoever the commit wakes reads state that has
         folded all of ``action`` rather than part of it. A control plane moving several
         sensors as one decision rests its atomicity on that

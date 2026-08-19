@@ -1,19 +1,17 @@
-"""Dedup's promised directory and fan-out observations.
+"""Dedup's publication and fan-out observations.
 
-Both sensors fold capability actions through one dispatcher. The directory sensor owns
-controller reads and the promises it writes back into the controller; the fan-out
-sensor owns routes, dependencies, and source load.
+Both sensors fold capability actions through one dispatcher. The directory sensor
+resolves publication ids; the fan-out sensor owns arrival scores and source load.
 """
 
-from ._directory import Asked, DedupDirectorySensor, PlannedFetch, Published
-from ._fanout import FanoutSensor, Retired, Routed
+from ._directory import Asked, DedupDirectorySensor, Pub, Published
+from ._fanout import FanoutSensor, Routed
 
 __all__ = [
     "Asked",
     "DedupDirectorySensor",
     "FanoutSensor",
-    "PlannedFetch",
+    "Pub",
     "Published",
-    "Retired",
     "Routed",
 ]

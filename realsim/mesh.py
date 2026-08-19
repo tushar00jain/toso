@@ -63,6 +63,7 @@ from sim_common.cost_model import (
 )
 from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
+from torchstore.client import LocalClient
 
 __all__ = ["OnTransfer", "Mesh"]
 
@@ -172,22 +173,12 @@ class Mesh:
         *,
         prefer: Optional[Sequence[str]] = None,
     ) -> Any:
-        """:class:`proposed.deployment.Deployment` -- the client for ``node_id``.
-
-        Binds the calling coroutine to ``node_id`` first, so a capability's data
-        plane never has to know that many clients share this process. A real
-        deployment has one client and no binding to do.
-
-        ``prefer`` is bound the same way, because the real client has no
-        source-preference parameter for a caller to pass it through: the directory read
-        applies what it finds bound (:func:`realsim.seams.factory.bind_prefer`). It is
-        bound on every call, ``None`` included, so a client vended without one reads as
-        an unrouted client's does rather than inheriting whatever this coroutine last
-        asked for.
-        """
+        """:class:`proposed.deployment.Deployment` -- one configured client."""
         self.bind_source(node_id)
-        factory.bind_prefer(prefer)
-        return self.client(node_id)
+        client = self.client(node_id)
+        if prefer is None:
+            return client
+        return LocalClient(client._controller, client.strategy, tuple(prefer))
 
     def volume_handle(self, node_id: str) -> Any:
         """:class:`proposed.deployment.Deployment` -- ``node_id``'s volume."""

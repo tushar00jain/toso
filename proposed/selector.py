@@ -75,7 +75,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import (
-    Any, Awaitable, Callable, Dict, Generic, Mapping, Optional, Protocol, Sequence,
+    Any, Awaitable, Callable, Generic, Mapping, Optional, Protocol, Sequence,
     Tuple, TypeVar, TypeVarTuple, Unpack, get_args, get_origin,
 )
 
@@ -84,7 +84,7 @@ from proposed.environment import Environment
 from proposed.sensors import LoadSensor, Sensing
 
 __all__ = [
-    "Ready", "Ks", "Fold", "Readings", "Selection", "prefer", "DecisionLog",
+    "Ready", "Ks", "Fold", "Readings", "Selection", "DecisionLog",
     "declares", "Selector", "KeySelector", "NaiveKeySelector", "Stage", "pipe",
     "FirstMatch", "Const", "Annotate", "Balance", "Lift", "WithFold", "Ordered", "Best",
     "Bound", "Bounded",
@@ -365,31 +365,6 @@ class Selection(Generic[Unpack[Ks]]):
         if not self.sources or ok(self.sources[0]):
             return self
         return Selection.abstain()
-
-
-def prefer(
-    located: Dict[str, Dict[str, Any]],
-    sources: Optional[Sequence[VolumeId]],
-) -> Dict[str, Dict[str, Any]]:
-    """A directory answer reordered to put ``sources`` first, best first.
-
-    What the store does with a preference its caller handed it: ``locate_volumes``
-    reads the directory and then applies this, so a client that takes the first
-    volume listed per key reads from the source the caller named. It consults
-    nothing -- ``sources`` is a value, typically :attr:`Selection.sources` from a
-    control plane the caller asked itself.
-
-    ``None`` -- no preference -- is the directory's own answer, returned unchanged.
-    A key none of ``sources`` holds is also left untouched: this is a preference,
-    not a filter that can make data disappear.
-    """
-    if sources is None:
-        return located
-    scoped: Dict[str, Dict[str, Any]] = {}
-    for key, volume_map in located.items():
-        ranked = {vid: volume_map[vid] for vid in sources if vid in volume_map}
-        scoped[key] = ranked if ranked else volume_map
-    return scoped
 
 
 class DecisionLog(Protocol):

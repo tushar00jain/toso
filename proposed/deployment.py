@@ -61,138 +61,56 @@ class StorageFull(Exception):
 
 
 class Controller(Protocol):
-    """The directory service, as a caller reaches it.
+    """Directory metadata, including pending publication state."""
 
-    Named for what it replaces. torchstore has no type for this today, but it has
-    a *name*: ``api.py``'s ``_controller() -> Controller`` annotates the spawned
-    handle as the actor class, and ``spmd.py`` does the same, while ``LocalClient``
-    takes it unannotated altogether. So this is that type, written down.
-
-    Declared as **methods**, matching the actor class, because that is where the
-    signatures live. A caller does not invoke them directly: Monarch's
-    ``@endpoint`` turns each into an ``EndpointProperty``, and a handle exposes it
-    as an ``Endpoint[P, R]`` reached through ``call_one`` (one actor) or ``call``
-    (a mesh) -- so the call site reads
-    ``controller.locate_volumes.call_one(keys, missing_ok=True)``. That
-    indirection is Monarch's own type (``monarch._src.actor.endpoint.Endpoint``)
-    and is not restated here; annotating the handle with the actor's surface is
-    the same convention torchstore already uses.
-
-    The difference between this protocol and torchstore's class *is* the ask, and
-    it is two things. One is members: :meth:`locate_raw`, a directory read with
-    nothing applied to it, which is what a control plane senses through, and
-    :meth:`project` / :meth:`clear_projections`, which let a caller record what a
-    volume *will* hold. The other cannot be declared as a member: ``locate_volumes``
-    gains an optional **source preference** -- a list of volume ids its caller hands it -- and applies it to the
-    answer (:func:`proposed.selector.prefer`) before returning. The store consults
-    nobody to do that; it reorders a value it was given, which is why nothing here
-    declares a plane. Every other member already exists upstream, spelled the same
-    way.
-
-    A caller does not hold one of these -- it holds a reference
-    (:attr:`Deployment.controller_handle`). torchstore's ``Controller`` implements
-    this; under simulation the endpoint bodies Monarch will not let us invoke
-    off-actor are mirrored inside
-    :class:`realsim.seams.controller_service.ControllerService`.
-    """
-
-    def project(self, owner: VolumeId, key: str, info: Any) -> None:
-        """Record that ``owner`` will hold ``info`` for ``key`` once its write lands.
-
-        The directory a control plane routes against is the one that will exist when
-        the reads it is planning finish, not the one that exists now. Keeping that
-        projection here rather than beside the plane is what makes it a lookup
-        instead of a join: a promise is an ordinary entry in the same map, tagged
-        with its owner, and the mutation path maintains it.
-
-        Invisible to every read that did not ask for it -- ``locate_volumes``, a
-        ``get``, the fully-committed check and :meth:`keys` all answer as if it were
-        not there, so a promise cannot send a reader to a volume holding nothing.
-
-        A volume that already holds ``key`` keeps its real entry; the promise is
-        dropped, since hiding data a volume has behind a promise would be worse than
-        offering less than it will have.
-        """
-
-    def clear_projections(self, owner: VolumeId) -> None:
-        """Drop every promise ``owner`` still has outstanding, idempotently.
-
-        What bounds a promise's life. A write landing clears its own promise, so this
-        clears the remainder: a producer may publish fewer keys than it promised, and
-        those entries are otherwise never reclaimed.
-        """
-
-    def locate_raw(
+    def _locate(
         self,
         keys: Sequence[str],
         missing_ok: bool = False,
         require_fully_committed: bool = True,
         *,
-        projected: bool = False,
+        prefer: Optional[Sequence[VolumeId]] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """``{key -> {volume_id -> StorageInfo}}``, with nothing applied to it.
-
-        ``projected`` includes what :meth:`project` recorded, and defaults to off:
-        the promises one control plane made are not another reader's directory.
-
-        A controller implementing this proposal needs both reads. This is the one a
-        control plane senses through a :class:`~proposed.sensors.DirectorySensor`: what it
-        sees has to be the directory as it *is*, not an answer already reordered
-        for somebody.
-
-        **Not a coroutine, and that is load-bearing.** A directory read cannot
-        suspend, so everything a control plane does between reading the directory
-        and writing its own bookkeeping runs to completion before the next
-        requester's does -- which is what lets a routing decision be a
-        read-modify-write with no lock (``dedup_sim.control._selector``) and lets a
-        set of priced candidates be comparable
-        (``kvcache_sim.control.scheduler``). It is a plain local method for the same
-        reason it can be one: the caller's directory sensor is in the same process,
-        so nothing crosses a boundary
-        and there is nothing to wait for.
-        """
+        """Read live metadata synchronously, with an optional source preference."""
 
     async def locate_volumes(
         self,
         keys: Sequence[str],
         missing_ok: bool = False,
         require_fully_committed: bool = True,
+        prefer: Optional[Sequence[VolumeId]] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """``{key -> {volume_id -> StorageInfo}}``, the caller's preference applied.
-
-        That preference is the ask (see the class docstring): upstream, one optional
-        parameter on the read path, applied to the located map before the client
-        picks a volume per key. The simulator carries it in a coroutine binding
-        instead, because the real client has no such parameter yet
-        (:func:`realsim.seams.factory.bind_prefer`).
-
-        A store that is handed no preference answers exactly as it does today, and
-        one that is handed a preference still consults nothing: whoever asked a
-        control plane did so itself, before calling this.
-
-        **How many of the volumes named get read depends on how the key was stored**,
-        which a caller ranking several of them has to know. ``LocalClient`` builds one
-        request per key for an ``OBJECT`` or a ``TENSOR`` and stops at the first volume
-        offering it, so a ranking is a *preference* and only the head is read. For a
-        slice-stored key it expands slices from **every** volume named, so the same
-        ranking is a *fan-out*. A capability moving a whole value once therefore reads
-        one source however many it ranks -- which is what makes ``dedup_sim``'s 1x
-        fabric hold with a ranked answer -- and one storing a key in slices pays for
-        each source it names.
-        """
+        """Read live metadata through the controller endpoint."""
 
     async def notify_put_batch(
-        self, requests: Sequence[Any], storage_volume_id: str
-    ) -> None:
-        """Register that ``storage_volume_id`` now holds the keys in ``requests``."""
+        self,
+        requests: Sequence[Any],
+        storage_volume_id: str,
+        *,
+        pending: bool = True,
+    ) -> int:
+        """Declare or land one batch and return its publication id."""
+
+    def _notify_put(
+        self, request: Any, storage_volume_id: str, *, pending: bool = True
+    ) -> int:
+        """Declare or land one request synchronously."""
 
     async def notify_delete(self, key: str, storage_volume_id: str) -> None:
         """Deregister one key from one volume."""
 
     async def notify_delete_batch(
-        self, volume_to_keys: Dict[str, List[str]]
+        self,
+        volume_to_keys: Optional[Dict[str, List[str]]] = None,
+        *,
+        pub: Optional[int] = None,
     ) -> None:
-        """Deregister ``{volume_id -> keys}``, idempotently."""
+        """Deregister live rows or retire one publication."""
+
+    def serving_union(
+        self, requests: Sequence[Any]
+    ) -> tuple[Dict[Key, set[VolumeId]], Dict[Key, set[int]]]:
+        """Live volumes and publications serving each requested key."""
 
     async def keys(self, prefix: Optional[str] = None) -> List[str]:
         """Every registered key, or those under ``prefix``."""

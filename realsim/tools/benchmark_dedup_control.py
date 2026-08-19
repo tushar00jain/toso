@@ -1,16 +1,4 @@
-"""Benchmark dedup control-plane planning at a peak synchronized burst.
-
-Run from the repository root::
-
-    .venv/bin/python -m realsim.tools.benchmark_dedup_control
-    .venv/bin/python -m realsim.tools.benchmark_dedup_control --preset planned-8b
-
-The workload uses metadata-only TorchStore requests. Runtime and traced Python peak
-allocation are measured in separate passes. Payload allocation, transport, native
-allocators, process RSS, and simulated transfer time are outside the measurement.
-Cold columns measure the first peak-state request; unprefixed planning columns measure
-later requests while live directory metadata is unchanged.
-"""
+"""Benchmark declare, union, rank, and gate at a synchronized dedup burst."""
 
 from __future__ import annotations
 
@@ -24,21 +12,19 @@ import tracemalloc
 from dataclasses import dataclass
 from typing import Callable, Sequence, TypeVar
 
-# Keep TorchStore's import-time setup warning out of the tabular report.
 os.environ.setdefault("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", "910737418240")
 
-from dedup_sim.control._sensor import Asked, DedupDirectorySensor, PlannedFetch, Routed
+from dedup_sim.control._selector import Serving
+from dedup_sim.control._sensor import Asked, DedupDirectorySensor, Published, Routed
 from dedup_sim.control.routing import Dedup
 from proposed import Endpoint, Environment
-from realsim.seams.projection import Projecting
-from torchstore.controller import ObjectType, StorageInfo
+from realsim.adapters.real_controller import RealControllerAdapter
 from torchstore.transport import Request
 
 __all__ = ["main"]
 
 _T = TypeVar("_T")
 _MAX_INDEXED_ENTRIES = 1_000_000
-_MAX_REGION_CHECKS = 150_000_000
 
 
 @dataclass(frozen=True)
@@ -55,37 +41,6 @@ _PRESETS = {
     "dense-70b": _Scale(keys=723, source_ranks=64, generators=128),
     "fleet-worst": _Scale(keys=5_203, source_ranks=128, generators=512),
 }
-
-
-class _StaticDirectory(Projecting):
-    """Unchanging live placement, and the promise bookkeeping a real one has."""
-
-    def __init__(self, requests: Sequence[Request], sources: Sequence[str]) -> None:
-        super().__init__()
-        info = StorageInfo(ObjectType.from_request(requests[0]), {None})
-        self._located = {
-            request.key: {source: info for source in sources} for request in requests
-        }
-
-    @property
-    def entries(self) -> dict[str, dict[str, StorageInfo]]:
-        return self._located
-
-    def locate_raw(
-        self,
-        keys: Sequence[str],
-        missing_ok: bool = False,
-        require_fully_committed: bool = True,
-        *,
-        projected: bool = False,
-    ) -> dict[str, dict[str, StorageInfo]]:
-        if projected:
-            return {key: self._located[key] for key in keys if key in self._located}
-        return {
-            key: self.live_map(key, self._located[key])
-            for key in keys
-            if key in self._located
-        }
 
 
 class _Profile:
@@ -105,63 +60,59 @@ class _Workload:
         self.generators = tuple(
             f"generator-{index}" for index in range(args.generators)
         )
-        self.probe = "probe"
-        topology = {
-            volume: Endpoint(id=volume, host=volume, node=volume)
-            for volume in (*self.sources, *self.generators, self.probe)
-        }
-        self.directory = DedupDirectorySensor(
-            _StaticDirectory(self.requests, self.sources)
-        )
+        self.declare_probe = "probe-declare"
+        self.full_probe = "probe-full"
+        ids = (*self.sources, *self.generators, self.declare_probe, self.full_probe)
+        topology = {volume: Endpoint(volume, volume, volume) for volume in ids}
+        service = RealControllerAdapter().service
+        for source in self.sources:
+            service.notify_put_batch(self.requests, source, pending=False)
+        self.directory = DedupDirectorySensor(service)
         self.plane = Dedup(fanout_cap=args.fanout_cap).attach(
             Environment(topology, _Profile()),
             {DedupDirectorySensor: self.directory},
         )
-        assert self.plane.dispatcher is not None
-        self.regions = tuple((request.key, None) for request in self.requests)
+        self.dispatcher = self.plane.dispatcher
 
     def build_pending(self) -> None:
-        assert self.plane.dispatcher is not None
-        # Stamped as a real decision stamps a route: taken under the pin the pending
-        # set was read in. One stamp for all of them because the live placement here
-        # never moves, which is the peak state being staged.
-        with self.directory.pinned([request.key for request in self.requests]):
-            stamp = self.directory.stamp()
         for index, generator in enumerate(self.generators):
             source = self.sources[index % len(self.sources)]
-            self.plane.dispatcher.dispatch_sync(Asked(generator, self.requests))
-            self.plane.dispatcher.dispatch_sync(
-                Routed(
-                    requester=generator,
-                    sources=(source,),
-                    required=((source, self.regions),),
-                    stamp=stamp,
-                )
+            pub = self.directory.declare(generator, self.requests)
+            self.dispatcher.dispatch_sync(Asked(pub))
+            self.dispatcher.dispatch_sync(
+                Routed(pub, (source,), frozenset(), 10.0)
             )
 
-    def snapshot(self) -> None:
-        with self.directory.pinned([request.key for request in self.requests]):
-            pass
+    def declare(self):
+        pub = self.directory.declare(self.declare_probe, self.requests)
+        self.dispatcher.dispatch_sync(Asked(pub))
+        return pub
 
-    def serving_sources(self) -> tuple[set[str], set[str]]:
-        return self.directory.serving_sources(self.requests)
+    def union(self) -> Serving:
+        live, pending = self.directory.serving_union(self.requests)
+        return Serving(
+            frozenset().union(*live.values()),
+            frozenset().union(*pending.values()),
+        )
 
-    def plan_fetch(self) -> PlannedFetch:
-        order = (*self.generators, *self.sources)
-        return self.directory.plan_fetch(self.requests, order, requester=self.probe)
+    def rank(self, serving: Serving):
+        return self.plane._chain.select(serving, self.full_probe)
+
+    def gate(self, serving: Serving) -> None:
+        actions = tuple(Published(*pub) for pub in serving.pending)
+        self.dispatcher.gate(lambda: True, actions)
 
     def decide(self) -> None:
-        asyncio.run(self.plane._decide(self.requests, self.probe))
+        asyncio.run(self.plane._decide(self.requests, self.full_probe))
 
 
 @dataclass(frozen=True)
 class _Runtime:
-    pending_build_ms: float
-    snapshot_ms: float
-    cold_serving_sources_ms: float
-    cold_plan_fetch_ms: float
-    serving_sources_ms: float
-    plan_fetch_ms: float
+    declare_burst_ms: float
+    declare_ms: float
+    union_ms: float
+    rank_ms: float
+    gate_ms: float
     full_decision_ms: float
     candidates: int
     pending_candidates: int
@@ -170,13 +121,12 @@ class _Runtime:
 
 @dataclass(frozen=True)
 class _Memory:
-    pending_build_python_peak_kib: float
-    snapshot_python_peak_kib: float
-    cold_serving_sources_python_peak_kib: float
-    cold_plan_fetch_python_peak_kib: float
-    serving_sources_python_peak_kib: float
-    plan_fetch_python_peak_kib: float
-    full_decision_python_peak_kib: float
+    declare_burst_kib: float
+    declare_kib: float
+    union_kib: float
+    rank_kib: float
+    gate_kib: float
+    full_decision_kib: float
 
 
 def _median_ms(
@@ -199,6 +149,13 @@ def _median_ms(
     return statistics.median(samples), result
 
 
+def _once_ms(operation: Callable[[], _T]) -> tuple[float, _T]:
+    gc.collect()
+    started = time.perf_counter()
+    result = operation()
+    return (time.perf_counter() - started) * 1_000, result
+
+
 def _python_peak_kib(operation: Callable[[], object]) -> float:
     gc.collect()
     tracemalloc.start()
@@ -212,46 +169,6 @@ def _python_peak_kib(operation: Callable[[], object]) -> float:
     return (peak - baseline) / 1024
 
 
-def _planning_ms(
-    workload: _Workload, *, warmups: int, repeats: int
-) -> tuple[float, float, float, float, tuple[set[str], set[str]], PlannedFetch]:
-    keys = [request.key for request in workload.requests]
-
-    def sample() -> tuple[float, float, tuple[set[str], set[str]], PlannedFetch]:
-        with workload.directory.pinned(keys):
-            started = time.perf_counter()
-            serving = workload.serving_sources()
-            serving_ms = (time.perf_counter() - started) * 1_000
-            started = time.perf_counter()
-            fetch = workload.plan_fetch()
-            plan_ms = (time.perf_counter() - started) * 1_000
-        return serving_ms, plan_ms, serving, fetch
-
-    cold_serving_ms, cold_plan_ms, serving, fetch = sample()
-    for _ in range(warmups):
-        sample()
-    serving_samples = []
-    plan_samples = []
-    enabled = gc.isenabled()
-    gc.disable()
-    try:
-        for _ in range(repeats):
-            serving_ms, plan_ms, serving, fetch = sample()
-            serving_samples.append(serving_ms)
-            plan_samples.append(plan_ms)
-    finally:
-        if enabled:
-            gc.enable()
-    return (
-        cold_serving_ms,
-        cold_plan_ms,
-        statistics.median(serving_samples),
-        statistics.median(plan_samples),
-        serving,
-        fetch,
-    )
-
-
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=tuple(_PRESETS), default="smoke")
@@ -261,11 +178,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--fanout-cap", type=int, default=2)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument(
-        "--allow-large",
-        action="store_true",
-        help="permit workloads above the default memory or work guard",
-    )
+    parser.add_argument("--allow-large", action="store_true")
     args = parser.parse_args(argv)
     customized = any(
         value is not None for value in (args.keys, args.source_ranks, args.generators)
@@ -282,101 +195,80 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmups < 0:
         parser.error("--warmups cannot be negative")
-    indexed_entries = args.keys * (args.source_ranks + 2 * args.generators)
-    region_checks = args.keys * args.keys * (args.source_ranks + args.generators)
-    if not args.allow_large and (
-        indexed_entries > _MAX_INDEXED_ENTRIES or region_checks > _MAX_REGION_CHECKS
-    ):
+    indexed_entries = args.keys * (args.source_ranks + args.generators)
+    if not args.allow_large and indexed_entries > _MAX_INDEXED_ENTRIES:
         parser.error(
-            "workload exceeds the default allocation/work guard; use "
-            "--allow-large on a suitably sized host"
+            "workload exceeds the default allocation guard; use --allow-large "
+            "on a suitably sized host"
         )
     return args
 
 
 def _runtime(args: argparse.Namespace) -> _Runtime:
     workload = _Workload(args)
-    gc.collect()
-    started = time.perf_counter()
-    workload.build_pending()
-    pending_build_ms = (time.perf_counter() - started) * 1_000
-    snapshot_ms, _ = _median_ms(
-        workload.snapshot, warmups=args.warmups, repeats=args.repeats
+    declare_burst_ms, _ = _once_ms(workload.build_pending)
+    declare_ms, _pub = _once_ms(workload.declare)
+    union_ms, serving = _median_ms(
+        workload.union, warmups=args.warmups, repeats=args.repeats
     )
-    cold_serving_ms, cold_plan_ms, serving_ms, plan_ms, serving, fetch = _planning_ms(
-        workload, warmups=args.warmups, repeats=args.repeats
+    rank_ms, ranking = _median_ms(
+        lambda: workload.rank(serving),
+        warmups=args.warmups,
+        repeats=args.repeats,
     )
-    gc.collect()
-    started = time.perf_counter()
-    workload.decide()
-    decision_ms = (time.perf_counter() - started) * 1_000
-    candidates, pending = serving
+    gate_ms, _ = _median_ms(
+        lambda: workload.gate(serving),
+        warmups=args.warmups,
+        repeats=args.repeats,
+    )
+    full_decision_ms, _ = _once_ms(workload.decide)
     return _Runtime(
-        pending_build_ms,
-        snapshot_ms,
-        cold_serving_ms,
-        cold_plan_ms,
-        serving_ms,
-        plan_ms,
-        decision_ms,
-        len(candidates),
-        len(pending),
-        len(fetch.sources),
+        declare_burst_ms,
+        declare_ms,
+        union_ms,
+        rank_ms,
+        gate_ms,
+        full_decision_ms,
+        len(serving.live | {pub[0] for pub in serving.pending}),
+        len(serving.pending),
+        len(ranking.sources or ()),
     )
 
 
 def _memory(args: argparse.Namespace) -> _Memory:
     workload = _Workload(args)
-    pending_build = _python_peak_kib(workload.build_pending)
-    snapshot = _python_peak_kib(workload.snapshot)
-    with workload.directory.pinned([request.key for request in workload.requests]):
-        cold_serving = _python_peak_kib(workload.serving_sources)
-        cold_plan = _python_peak_kib(workload.plan_fetch)
-    with workload.directory.pinned([request.key for request in workload.requests]):
-        serving = _python_peak_kib(workload.serving_sources)
-        plan = _python_peak_kib(workload.plan_fetch)
+    declare_burst = _python_peak_kib(workload.build_pending)
+    declare = _python_peak_kib(workload.declare)
+    serving = workload.union()
+    union = _python_peak_kib(workload.union)
+    rank = _python_peak_kib(lambda: workload.rank(serving))
+    gate = _python_peak_kib(lambda: workload.gate(serving))
     decision = _python_peak_kib(workload.decide)
-    return _Memory(
-        pending_build,
-        snapshot,
-        cold_serving,
-        cold_plan,
-        serving,
-        plan,
-        decision,
-    )
+    return _Memory(declare_burst, declare, union, rank, gate, decision)
 
 
 def _run(args: argparse.Namespace) -> None:
     runtime = _runtime(args)
     memory = _memory(args)
-    indexed_entries = args.keys * (args.source_ranks + 2 * args.generators)
+    indexed_entries = args.keys * (args.source_ranks + args.generators)
     print(
         "case\tkeys\tsource_ranks\tgenerators\tindexed_metadata_entries\t"
-        "pending_build_ms\tsnapshot_ms\tcold_serving_sources_ms\t"
-        "cold_plan_fetch_ms\tserving_sources_ms\tplan_fetch_ms\t"
-        "full_decision_ms\tpending_build_python_peak_kib\t"
-        "snapshot_python_peak_kib\tcold_serving_sources_python_peak_kib\t"
-        "cold_plan_fetch_python_peak_kib\tserving_sources_python_peak_kib\t"
-        "plan_fetch_python_peak_kib\tfull_decision_python_peak_kib\t"
-        "candidates\tpending_candidates\tselected_sources"
+        "declare_burst_ms\tdeclare_ms\tunion_ms\trank_ms\tgate_ms\t"
+        "full_decision_ms\tdeclare_burst_python_peak_kib\t"
+        "declare_python_peak_kib\tunion_python_peak_kib\trank_python_peak_kib\t"
+        "gate_python_peak_kib\tfull_decision_python_peak_kib\tcandidates\t"
+        "pending_candidates\tselected_sources"
     )
     print(
         f"{args.case}\t{args.keys}\t{args.source_ranks}\t{args.generators}\t"
-        f"{indexed_entries}\t{runtime.pending_build_ms:.3f}\t"
-        f"{runtime.snapshot_ms:.3f}\t{runtime.cold_serving_sources_ms:.3f}\t"
-        f"{runtime.cold_plan_fetch_ms:.3f}\t"
-        f"{runtime.serving_sources_ms:.3f}\t"
-        f"{runtime.plan_fetch_ms:.3f}\t{runtime.full_decision_ms:.3f}\t"
-        f"{memory.pending_build_python_peak_kib:.3f}\t"
-        f"{memory.snapshot_python_peak_kib:.3f}\t"
-        f"{memory.cold_serving_sources_python_peak_kib:.3f}\t"
-        f"{memory.cold_plan_fetch_python_peak_kib:.3f}\t"
-        f"{memory.serving_sources_python_peak_kib:.3f}\t"
-        f"{memory.plan_fetch_python_peak_kib:.3f}\t"
-        f"{memory.full_decision_python_peak_kib:.3f}\t"
-        f"{runtime.candidates}\t{runtime.pending_candidates}\t"
-        f"{runtime.selected_sources}"
+        f"{indexed_entries}\t{runtime.declare_burst_ms:.3f}\t"
+        f"{runtime.declare_ms:.3f}\t{runtime.union_ms:.3f}\t"
+        f"{runtime.rank_ms:.3f}\t{runtime.gate_ms:.3f}\t"
+        f"{runtime.full_decision_ms:.3f}\t{memory.declare_burst_kib:.3f}\t"
+        f"{memory.declare_kib:.3f}\t{memory.union_kib:.3f}\t"
+        f"{memory.rank_kib:.3f}\t{memory.gate_kib:.3f}\t"
+        f"{memory.full_decision_kib:.3f}\t{runtime.candidates}\t"
+        f"{runtime.pending_candidates}\t{runtime.selected_sources}"
     )
 
 

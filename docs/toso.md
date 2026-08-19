@@ -87,14 +87,13 @@ C asks for W
   -> selector chooses B
   -> answer waits at a readiness gate
 
-B finishes get_batch -> local put_batch -> directory registers B -> Published(B)
+B finishes get_batch -> local put_batch -> directory registers B -> Published(B, pub)
   -> C receives B as a usable source
 ```
 
 - The gate delays the control-plane answer, not the storage operation.
-- A promised source is released only after the directory confirms every requested key.
-- One producer has one publication in flight, and its completion releases all
-  compatible waiters without repeating the request plan in each gate.
+- A promised source is released only after its atomic publication lands or is retired.
+- Publication ids let one producer carry several batches and wake only their waiters.
 - The local `put` turns a consumer into a source; repeated read-through fills create
   the tree.
 
@@ -202,14 +201,12 @@ requests = tuple(
     for key, value in entries.items()
 )
 plan = await control.sources.call_one(requests, requester)
-client = deployment.client_for(requester)
-routed = LocalClient(
-    _ScopedController(client._controller, plan.by_key), client.strategy
-)
-values = await routed.get_batch(entries)
+values = await deployment.client_for(
+    requester, prefer=plan.sources
+).get_batch(entries)
 await deployment.client_for(requester).put_batch(values)
 await deployment.dispatcher_handle.dispatch.call_one(
-    Published(requester, frozenset(values))
+    Published(*plan.publication)
 )
 ```
 

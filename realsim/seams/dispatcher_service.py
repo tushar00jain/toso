@@ -24,7 +24,7 @@ This endpoint carries what a *host* reports. What a control plane dispatches to 
 takes the synchronous half instead
 (:meth:`proposed.dispatch.Dispatcher.dispatch_sync`), by plain local call -- the same
 co-location a :class:`~proposed.selector.KeySelector` has with the directory it senses
-through ``locate_raw``, and for the same reason: a decision formed against a read that
+through its synchronous read, and for the same reason: a decision formed against a read that
 could suspend is a decision formed against a picture that changed halfway through.
 """
 

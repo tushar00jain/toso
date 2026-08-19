@@ -476,8 +476,8 @@ def _proposed_ports(trees: Dict[str, ast.Module]) -> Set[str]:
     member a caller invokes here and now, and reading a field off a value the other
     plane handed over is exactly what values are for. That is what keeps the answer
     a selector gives readable: a ``Selection`` crossed the wire, so the sources it
-    names are the data plane's to read. Nor is ``Controller`` a port, whose
-    ``locate_raw`` is exactly such a member; nothing in a ``data/`` module holds one
+    names are the data plane's to read. Nor is ``Controller`` a port, whose sync
+    ``_locate`` is exactly such a member; nothing in a ``data/`` module holds one
     anyway, since reaching the store is what a ``Deployment`` is for.
 
     **What is missing:** :class:`proposed.dispatch.Dispatcher` is not found, and a
