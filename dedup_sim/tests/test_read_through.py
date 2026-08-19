@@ -77,7 +77,7 @@ def test_a_batch_put_dispatches_one_publication(monkeypatch):
             fetches.append(entries)
             return {key: f"read-{key}" for key in entries}
 
-    monkeypatch.setattr("dedup_sim.data.read_through.LocalClient", _Routed)
+    monkeypatch.setattr("dedup_sim.data.read_through.GreedyClient", _Routed)
 
     result, _trace = run_sim(plane.read_through("r0", {"K0": None, "K1": None}))
 

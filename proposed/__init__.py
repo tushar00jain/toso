@@ -71,7 +71,8 @@ from .routed import routed, RoutedPlane
 from .selector import declares, DecisionLog, KeySelector, Selection
 from .topology import Endpoint, locality, nearest, Tier, TIER_LABEL
 from .environment import Environment
-from .sensors import DirectoryCoverage, DirectorySensor, LoadSensor, Sensing
+from .planner import GreedyClient
+from .sensors import DirectorySensor, LoadSensor, Sensing
 
 __all__ = [
     # the torchstore ask
@@ -83,7 +84,7 @@ __all__ = [
     "declares",
     "Environment",
     "DirectorySensor",
-    "DirectoryCoverage",
+    "GreedyClient",
     "LoadSensor",
     "Sensing",
     "Action",

@@ -1,9 +1,9 @@
 """Read-through: a finished reader becomes a real directory source.
 
-Ask, read, put, then commit, and the order is load-bearing. ``LocalClient.get_batch``
-uses TorchStore's fetch planner against the per-key sources control selected. The put is awaited
-before the commit so the directory observation and the action agree that the batch
-landed.
+Ask, read, put, then commit, and the order is load-bearing. ``get_batch`` runs the
+fetch planner control planned with (:class:`~proposed.planner.GreedyClient`) against
+the per-key sources control selected. The put is awaited before the commit so the
+directory observation and the action agree that the batch landed.
 """
 
 from __future__ import annotations
@@ -12,9 +12,8 @@ import asyncio
 from collections.abc import Mapping
 from typing import Any, Optional
 
-from proposed import ControlPlane, DataPlane, Deployment, endpoint
+from proposed import ControlPlane, DataPlane, Deployment, endpoint, GreedyClient
 from proposed.selector import prefer
-from torchstore.client import LocalClient
 from torchstore.transport import Request
 
 from ..control._sensor import Published
@@ -77,7 +76,9 @@ class ReadThroughPlane(DataPlane):
         control: ControlPlane = self.deployment.control_plane_handle
         plan = await control.sources.call_one(requests, requester)
         client = self.deployment.client_for(requester)
-        routed = LocalClient(
+        # The same planner control dry-ran the plan with, so the two agree on which
+        # source serves which region given the same located map.
+        routed = GreedyClient(
             _ScopedController(client._controller, plan.by_key), client.strategy
         )
         results = await routed.get_batch(batch)

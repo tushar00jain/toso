@@ -17,7 +17,7 @@ from dedup_sim.control._sensor import (
     Routed,
 )
 from dedup_sim.control.routing import Dedup
-from proposed import DirectorySensor, Dispatcher, Endpoint, Environment
+from proposed import DirectorySensor, Dispatcher, Endpoint, Environment, sensors
 from proposed.selector import Balance, FirstMatch, Ordered
 from realsim.seams.projection import Projecting
 from torchstore.controller import ObjectType, StorageInfo
@@ -329,7 +329,7 @@ def test_one_pass_source_expansion_matches_torchstore_projection():
         ]
 
 
-def test_dense_coverage_visits_each_entry_and_expands_equal_metadata_once(monkeypatch):
+def test_dense_requirements_plan_every_source_once(monkeypatch):
     requests = tuple(_request(f"K{index}") for index in range(3))
     info = StorageInfo(ObjectType.TENSOR, {None})
     live = {
@@ -341,32 +341,24 @@ def test_dense_coverage_visits_each_entry_and_expands_equal_metadata_once(monkey
             return {key: dict(live[key]) for key in keys}
 
     directory = DirectorySensor(_Directory())
-    visits = 0
-    expansions = 0
-    visit = directory.expand_regions
-    expand = directory._expand_request
+    plans = 0
+    original = sensors.plan
 
-    def counted_visit(request, storage_info):
-        nonlocal visits
-        visits += 1
-        return visit(request, storage_info)
+    def counted(planned_requests, volume_maps):
+        nonlocal plans
+        plans += 1
+        return original(planned_requests, volume_maps)
 
-    def counted_expand(request, storage_info):
-        nonlocal expansions
-        expansions += 1
-        return expand(request, storage_info)
-
-    monkeypatch.setattr(directory, "expand_regions", counted_visit)
-    monkeypatch.setattr(directory, "_expand_request", counted_expand)
+    monkeypatch.setattr(sensors, "plan", counted)
     with directory.pinned([request.key for request in requests]):
-        coverage = directory.coverage(requests)
+        required = directory.requirements(requests)
 
-    assert coverage.sources == {f"v{source}" for source in range(4)}
-    assert visits == 12
-    assert expansions == 3
+    assert set(required) == {f"v{source}" for source in range(4)}
+    assert all(len(regions) == 3 for regions in required.values())
+    assert plans == 4
 
 
-def test_live_coverage_cache_observes_slice_mutation():
+def test_live_requirements_observe_slice_mutation():
     left = TensorSlice((0,), (0,), (8,), (4,), (2,))
     right = TensorSlice((4,), (1,), (8,), (4,), (2,))
     info = StorageInfo(ObjectType.TENSOR_SLICE, {left})
@@ -378,13 +370,13 @@ def test_live_coverage_cache_observes_slice_mutation():
     directory = DirectorySensor(_Directory())
     request = _request("K")
     with directory.pinned(["K"]):
-        first = directory.coverage((request,))
+        first = directory.requirements((request,))
     info.tensor_slices.add(right)
     with directory.pinned(["K"]):
-        second = directory.coverage((request,))
+        second = directory.requirements((request,))
 
     assert first is not second
-    assert second.requirements()["origin"] == Counter(
+    assert second["origin"] == Counter(
         {
             ("K", ((0,), (4,), (8,))): 1,
             ("K", ((4,), (4,), (8,))): 1,
@@ -415,104 +407,106 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
     assert without_peer.by_key == {"K": ("replica",)}
 
 
-def test_one_pinned_decision_expands_matching_coverage_once(monkeypatch):
+def test_one_pinned_decision_derives_live_requirements_once(monkeypatch):
     directory = DedupDirectorySensor(_Holds("origin"))
     requests = [_request("K0"), _request("K1")]
-    expansions = 0
-    original = directory._expand_request
+    builds = 0
+    original = directory._requirements
 
-    def counted(request, storage_info):
-        nonlocal expansions
-        expansions += 1
-        return original(request, storage_info)
+    def counted(batch):
+        nonlocal builds
+        builds += 1
+        return original(batch)
 
-    monkeypatch.setattr(directory, "_expand_request", counted)
+    monkeypatch.setattr(directory, "_requirements", counted)
     with directory.pinned([request.key for request in requests]):
         directory.serving_sources(tuple(requests))
         directory.plan_fetch(tuple(requests), ("origin",))
 
-    assert expansions == 2
+    assert builds == 1
 
 
-def test_unchanged_live_coverage_is_reused_across_pinned_decisions():
+def test_unchanged_live_requirements_are_reused_across_pinned_decisions():
     directory = DedupDirectorySensor(_Holds("origin"))
     requests = [_request("K")]
     observed = []
     for _ in range(2):
         with directory.pinned(["K"]):
-            observed.append(directory.coverage(tuple(requests)))
+            observed.append(directory.requirements(tuple(requests)))
 
     assert observed[0] is observed[1]
 
 
-def test_pinned_coverage_recomputes_after_request_content_changes(monkeypatch):
+def test_pinned_requirements_recompute_after_request_content_changes(monkeypatch):
     directory = DedupDirectorySensor(_Holds("origin"))
     request = _request("K")
-    expansions = 0
-    original = directory._expand_request
+    builds = 0
+    original = directory._requirements
 
-    def counted(request, storage_info):
-        nonlocal expansions
-        expansions += 1
-        return original(request, storage_info)
+    def counted(batch):
+        nonlocal builds
+        builds += 1
+        return original(batch)
 
-    monkeypatch.setattr(directory, "_expand_request", counted)
+    monkeypatch.setattr(directory, "_requirements", counted)
     with directory.pinned(["K"]):
         directory.serving_sources((request,))
         request.tensor_slice = TensorSlice((0,), (0,), (8,), (4,), (2,))
         directory.plan_fetch((request,), ("origin",))
 
-    assert expansions == 2
+    assert builds == 2
 
 
-def test_unpinned_coverage_is_never_cached():
+def test_unpinned_requirements_are_never_cached():
     directory = DedupDirectorySensor(_Holds("origin"))
     requests = [_request("K")]
 
-    first = directory.coverage(tuple(requests))
-    second = directory.coverage(tuple(requests))
+    first = directory.requirements(tuple(requests))
+    second = directory.requirements(tuple(requests))
 
     assert first is not second
 
 
-def test_live_coverage_cache_observes_directory_mutation():
+def test_live_requirements_observe_directory_mutation():
     info = StorageInfo(ObjectType.TENSOR, {None})
     state = _Live({"K": {"origin": info}})
     directory = DedupDirectorySensor(state)
     request = _request("K")
     with directory.pinned(["K"]):
-        first = directory.coverage((request,))
+        first = directory.requirements((request,))
         assert directory.serving_sources((request,))[0] == {"origin"}
     state.evict("K", "origin")
     state.publish("K", "replica", info)
     with directory.pinned(["K"]):
-        second = directory.coverage((request,))
+        second = directory.requirements((request,))
         assert directory.serving_sources((request,))[0] == {"replica"}
 
     assert first is not second
 
 
-def test_pending_producer_coverage_is_expanded_when_asked(monkeypatch):
+def test_a_promise_of_the_asked_shape_is_never_expanded(monkeypatch):
     directory = DedupDirectorySensor(_Live())
     dispatcher = _dispatcher(directory, FanoutSensor())
-    expansions = 0
-    original = directory._expand_request
+    overlaps = 0
+    original = directory._overlap
 
-    def counted(request, storage_info):
-        nonlocal expansions
-        expansions += 1
-        return original(request, storage_info)
+    def counted(producer, batch, requests):
+        nonlocal overlaps
+        overlaps += 1
+        return original(producer, batch, requests)
 
-    monkeypatch.setattr(directory, "_expand_request", counted)
+    monkeypatch.setattr(directory, "_overlap", counted)
     dispatcher.dispatch_sync(Asked("p0", (_request("K"),)))
     dispatcher.dispatch_sync(Asked("p1", (_request("K"),)))
-    for _ in range(2):
-        request = _request("K")
-        with directory.pinned(["K"]):
-            directory.serving_sources((request,))
-            directory.plan_fetch((request,), ("p0", "p1"))
+    request = _request("K")
+    with directory.pinned(["K"]):
+        candidates, pending = directory.serving_sources((request,))
+        planned = directory.plan_fetch((request,), ("p0", "p1"))
 
-    assert expansions == 1
+    assert (candidates, pending) == ({"p0", "p1"}, {"p0", "p1"})
+    # A whole value, so the planner takes the best-ranked promise and stops.
+    assert planned.by_key == {"K": ("p0",)}
+    assert overlaps == 0
 
 
 def test_multi_key_coverage_keeps_regions_under_their_sources():
@@ -579,21 +573,21 @@ def test_sparse_candidate_discovery_visits_only_present_entries(monkeypatch):
     }
 
     directory = DedupDirectorySensor(_Live(live))
-    visited = 0
-    original = directory._expand_request
+    plans = 0
+    original = sensors.plan
 
-    def counted(request, storage_info):
-        nonlocal visited
-        visited += 1
-        return original(request, storage_info)
+    def counted(planned_requests, volume_maps):
+        nonlocal plans
+        plans += 1
+        return original(planned_requests, volume_maps)
 
-    monkeypatch.setattr(directory, "_expand_request", counted)
+    monkeypatch.setattr(sensors, "plan", counted)
 
     candidates, pending = directory.serving_sources(requests)
 
     assert candidates == {f"v{i}" for i in range(20)}
     assert pending == set()
-    assert visited == 20
+    assert plans == 20
 
 
 def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():

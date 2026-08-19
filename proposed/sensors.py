@@ -6,8 +6,10 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
+    AbstractSet,
     Any,
     Callable,
+    Collection,
     Dict,
     FrozenSet,
     Iterator,
@@ -21,18 +23,15 @@ from typing import (
 
 from proposed.deployment import Controller, Sensor, VolumeId
 from proposed.environment import Environment
-from torchstore.client import LocalClient
-from torchstore.controller import ObjectType, StorageInfo
+from proposed.planner import plan, region
+from torchstore.controller import StorageInfo
 from torchstore.transport import Request
 
 __all__ = [
-    "DirectoryCoverage",
     "DirectorySensor",
     "FetchPlan",
-    "KeyCoverage",
     "LoadSensor",
     "Sensing",
-    "SourceCoverage",
 ]
 
 _Attached = TypeVar("_Attached", bound="Sensing")
@@ -41,59 +40,88 @@ _V = TypeVar("_V")
 _Located = Mapping[str, Mapping[VolumeId, StorageInfo]]
 _Region = Tuple[str, object]
 _RequestSpec = Tuple[str, object, bool]
-_StorageSpec = Tuple[ObjectType, Tuple[object, ...]]
+_EMPTY: Mapping[VolumeId, StorageInfo] = {}
 
 
-class _NoInplace:
-    supports_inplace_resharding = False
+class _Ranked(Mapping):
+    """One key's directory entries, iterated best first by a shared ranking.
 
+    Lazily, and that is the point: the planner takes the first entry and stops where
+    a key is stored whole, so a key its top-ranked source holds costs one membership
+    test rather than a walk of the ranking. Materializing a ranked dict per key would
+    be ``O(K x V)`` for every decision.
 
-_PLANNER: LocalClient = LocalClient.__new__(LocalClient)
-_NO_INPLACE = _NoInplace()
-
-
-@dataclass(frozen=True)
-class SourceCoverage:
-    """One source's independently serviceable regions for a key."""
-
-    source: VolumeId
-    regions: Tuple[_Region, ...]
-
-
-@dataclass(frozen=True)
-class KeyCoverage:
-    """Independently serviceable sources for one key, in directory order.
-
-    Every source the directory lists appears, including one whose slices serve none
-    of the request: ``regions`` empty is "listed here, serves nothing of this".
+    A source in ``owners`` is planned against what it *promised*; anything else
+    against what it holds. A key no ranked source lists falls back to the directory's
+    own order, which is what keeps an unroutable ask answerable.
     """
 
-    key: str
-    sources: Tuple[SourceCoverage, ...]
+    __slots__ = ("_live", "_promised", "_owners", "_order")
+
+    def __init__(
+        self,
+        live: Mapping[VolumeId, StorageInfo],
+        promised: Mapping[VolumeId, StorageInfo],
+        owners: AbstractSet[VolumeId],
+        order: Sequence[VolumeId],
+    ) -> None:
+        self._live = live
+        self._promised = promised
+        self._owners = owners
+        self._order = order
+
+    def __getitem__(self, source: VolumeId) -> StorageInfo:
+        if source in self._owners:
+            info = self._promised.get(source)
+            if info is not None:
+                return info
+        return self._live[source]
+
+    def __contains__(self, source: object) -> bool:
+        return source in self._live or (
+            source in self._owners and source in self._promised
+        )
+
+    def __iter__(self) -> Iterator[VolumeId]:
+        listed = False
+        for source in self._order:
+            if source in self:
+                listed = True
+                yield source
+        if not listed:
+            yield from self._live
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
 
 
-@dataclass(frozen=True)
-class DirectoryCoverage:
-    """Expanded source coverage for one ordered request batch."""
+class _Alone(Mapping):
+    """One source's entries, each key's map holding only that source.
 
-    entries: Tuple[KeyCoverage, ...]
+    A located map for asking what one source could serve by itself. The one-entry
+    map per key is built on the lookup and not retained, so ``K x T`` entries cost
+    ``T`` dicts rather than ``K x T``.
+    """
 
-    @property
-    def sources(self) -> set[VolumeId]:
-        return {
-            source.source
-            for entry in self.entries
-            for source in entry.sources
-            if source.regions
-        }
+    __slots__ = ("_source", "_entries")
 
-    def requirements(self) -> Dict[VolumeId, Counter[_Region]]:
-        required: Dict[VolumeId, Counter[_Region]] = defaultdict(Counter)
-        for entry in self.entries:
-            for source in entry.sources:
-                if source.regions:
-                    required[source.source].update(source.regions)
-        return dict(required)
+    def __init__(
+        self, source: VolumeId, entries: Mapping[str, StorageInfo]
+    ) -> None:
+        self._source = source
+        self._entries = entries
+
+    def __getitem__(self, key: str) -> Mapping[VolumeId, StorageInfo]:
+        return {self._source: self._entries[key]}
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._entries
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 @dataclass(frozen=True)
@@ -176,12 +204,6 @@ class DirectorySensor(Sensor):
         self._derived: Dict[object, Any] = {}
         self._stamp: object = None
         self._checked = False
-        self._expansions: Dict[
-            Tuple[_RequestSpec, _StorageSpec], Tuple[_Region, ...]
-        ] = {}
-        self._storage_specs: Optional[
-            Dict[int, Tuple[StorageInfo, _StorageSpec]]
-        ] = None
 
     def locate(self, keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """``key -> {volume_id -> StorageInfo}``, pinned when inside a decision."""
@@ -210,45 +232,76 @@ class DirectorySensor(Sensor):
         requests: Sequence[Request],
         located: Optional[_Located] = None,
     ) -> Dict[VolumeId, List[Request]]:
-        """Expand requests by volume using TorchStore's own slice planner."""
+        """``volume -> the sub-requests it is asked for``, as the store would plan it.
+
+        A dry run of the same :class:`~proposed.planner.GreedyClient` method the
+        fetch itself runs, so a plan and the fetch it plans cannot disagree about
+        which volume serves which region of one located map.
+        """
         if located is None:
             located = self.locate([request.key for request in requests])
-        maps = {request.key: dict(located.get(request.key, {})) for request in requests}
-        volumes = {source for by_source in maps.values() for source in by_source}
-        transports = dict.fromkeys(volumes, _NO_INPLACE)
-        planned, _whole = _PLANNER._build_volume_requests(
-            list(requests), maps, transports
-        )
-        return planned
+        return plan(requests, located)
 
     def requests_by_source(
         self,
         requests: Sequence[Request],
         located: Optional[_Located] = None,
+        sources: Optional[Collection[VolumeId]] = None,
     ) -> Dict[VolumeId, List[Request]]:
-        """Return every source's independently serviceable request regions."""
+        """Every source's *independently* serviceable request regions.
+
+        One plan per source over a map holding only that source, so no source is
+        dropped for adding nothing over another. That is the question a route's
+        recorded requirement asks (:meth:`covers`): can *this* source still serve
+        what it was asked for, whoever else could.
+        """
         if located is None:
             located = self.locate([request.key for request in requests])
-        planned: Dict[VolumeId, List[Request]] = defaultdict(list)
-        for request in requests:
-            for source, info in located.get(request.key, {}).items():
-                planned[source].extend(self._expand_request(request, info))
-        return {source: parts for source, parts in planned.items() if parts}
+        # Walked entry by entry, not source by key: sparse placement costs the
+        # entries that exist rather than every (key, source) pair that could.
+        by_source: Dict[VolumeId, Dict[str, StorageInfo]] = defaultdict(dict)
+        for key, entries in located.items():
+            for source, info in entries.items():
+                if sources is None or source in sources:
+                    by_source[source][key] = info
+        planned: Dict[VolumeId, List[Request]] = {}
+        for source, entries in by_source.items():
+            parts = plan(requests, _Alone(source, entries)).get(source)
+            if parts:
+                planned[source] = parts
+        return planned
 
-    def coverage(
+    def ranked(
         self,
-        requests: Sequence[Request],
-        located: Optional[_Located] = None,
-    ) -> DirectoryCoverage:
-        """Expand independent source coverage in one pass over directory entries."""
-        keys = tuple(dict.fromkeys(request.key for request in requests))
-        if located is not None:
-            return self._expand_coverage(requests, located, keys)
-        pinned = self.locate(keys)
-        return self.derived(
-            ("coverage", self.batch_spec(requests)),
-            lambda: self._expand_coverage(requests, pinned, keys),
-        )
+        keys: Sequence[str],
+        order: Sequence[VolumeId],
+        *,
+        requester: Optional[VolumeId] = None,
+    ) -> Dict[str, Mapping[VolumeId, StorageInfo]]:
+        """The located map for ``keys``, each key's entries in ranking order.
+
+        Ranking order is how a preference reaches the planner: it takes the first
+        volume listed per key for a whole value, and the first offering each region
+        for a sliced one.
+        """
+        live = self.locate(keys)
+        promised = self.promised(keys)
+        owners = self.owners() - {requester}
+        return {
+            key: _Ranked(
+                live.get(key, _EMPTY), promised.get(key, _EMPTY), owners, order
+            )
+            for key in keys
+        }
+
+    def owners(self) -> AbstractSet[VolumeId]:
+        """Volumes whose *promised* entries this sensor may plan against.
+
+        Empty here, and the membership test rather than the promise itself: the
+        directory is shared, so a plane must not plan onto a promise it did not make
+        and will never hear the publication of.
+        """
+        return frozenset()
 
     def derived(self, spec: object, build: Callable[[], _V]) -> _V:
         """Reuse one value derived from the pinned directory and ``spec``.
@@ -260,7 +313,7 @@ class DirectorySensor(Sensor):
             return build()
         if not self._checked:
             # Once per pin, and only for a decision that derives anything: a plane
-            # that reads holders and no coverage never signs the directory.
+            # that reads holders and nothing else never signs the directory.
             self._checked = True
             stamp = self._directory_stamp()
             if stamp != self._stamp:
@@ -272,38 +325,15 @@ class DirectorySensor(Sensor):
             self._derived[spec] = cached
         return cached
 
-    def _expand_coverage(
-        self,
-        requests: Sequence[Request],
-        located: _Located,
-        keys: Sequence[str],
-    ) -> DirectoryCoverage:
-        by_key: Dict[str, Dict[VolumeId, List[_Region]]] = {
-            key: {source: [] for source in located.get(key, {})} for key in keys
-        }
-        for request in requests:
-            for source, info in located.get(request.key, {}).items():
-                by_key[request.key][source].extend(self.expand_regions(request, info))
-        return DirectoryCoverage(
-            tuple(
-                KeyCoverage(
-                    key,
-                    tuple(
-                        SourceCoverage(source, tuple(regions))
-                        for source, regions in by_key[key].items()
-                    ),
-                )
-                for key in keys
-            )
-        )
-
     def requirements(
         self, requests: Sequence[Request]
     ) -> Mapping[VolumeId, Counter[_Region]]:
         """``source -> the regions it live-serves`` for ``requests``.
 
-        Answers for keys the pin does not hold, reading those live: a peer's promised
-        batch is not the batch this decision asked about.
+        Independent per source, so this is what a source *can* serve rather than
+        what a plan asked it for. Answers for keys the pin does not hold by reading
+        those live: a peer's promised batch is not the batch this decision asked
+        about.
         """
         return self.derived(
             ("requirements", self.batch_spec(requests)),
@@ -316,109 +346,58 @@ class DirectorySensor(Sensor):
         keys = tuple(dict.fromkeys(request.key for request in requests))
         outside = [key for key in keys if self._keys is None or key not in self._keys]
         if not outside:
-            return self.coverage(requests).requirements()
+            return self.regions_by_source(requests, self.locate(keys))
         located = {key: self._located[key] for key in keys if key in self._located}
         located.update(self.locate_live(outside))
-        return self.coverage(requests, located).requirements()
+        return self.regions_by_source(requests, located)
 
-    def project(
+    def regions_by_source(
+        self,
+        requests: Sequence[Request],
+        located: _Located,
+        sources: Optional[Collection[VolumeId]] = None,
+    ) -> Dict[VolumeId, Counter[_Region]]:
+        """:meth:`requests_by_source` counted by region rather than by sub-request."""
+        return {
+            source: Counter(region(part) for part in parts)
+            for source, parts in self.requests_by_source(
+                requests, located, sources
+            ).items()
+        }
+
+    def _planned(
         self,
         requests: Sequence[Request],
         order: Sequence[VolumeId],
-        *,
-        requester: Optional[VolumeId] = None,
+        requester: Optional[VolumeId],
     ) -> Tuple[Dict[str, Tuple[VolumeId, ...]], Dict[VolumeId, Counter[_Region]]]:
-        """Per key, the ranked sources that add regions, and what each must provide.
+        """Per key the sources the planner chose, in ranking order, and what each owes.
 
-        Walks ``order`` per key and stops once the key's whole requested value is
-        covered (:meth:`whole_regions`), which is after the first serving source
-        wherever one source holds a whole value. A key split across sources has no
-        such target and is walked to the end of ``order``.
-
-        A key no ranked source serves falls back to its live holders in directory
-        order, which is what keeps an unroutable ask answerable.
+        Taken under the pin, while the real fetch runs later against a fresh
+        directory read that this plan is applied to as a *preference*: a source that
+        evicted in between drops out of the preference and the read still answers
+        from whoever holds the key.
         """
-        live = self.coverage(requests)
-        promised = self.promised(tuple(entry.key for entry in live.entries))
-        by_request: Dict[str, List[Request]] = defaultdict(list)
-        for request in requests:
-            by_request[request.key].append(request)
-        by_key: Dict[str, Tuple[VolumeId, ...]] = {}
-        required: Dict[VolumeId, Counter[_Region]] = defaultdict(Counter)
-        for entry in live.entries:
-            key_requests = by_request[entry.key]
-            live_regions = {source.source: source.regions for source in entry.sources}
-            target: set[_Region] = set()
-            for request in key_requests:
-                target.update(self.whole_regions(request))
-            seen: set[_Region] = set()
-            selected: List[VolumeId] = []
-            offered = False
-            for source in order:
-                if source == requester:
-                    # Its own copy, never its pending promise to itself.
-                    regions = live_regions.get(source)
-                else:
-                    regions = self.servable(
-                        entry.key, source, key_requests, live_regions, promised
-                    )
-                if regions is None:
-                    continue
-                offered = True
-                if self._take(source, regions, seen, selected, required):
-                    if target <= seen:
-                        break
-            if not offered:
-                for source, regions in live_regions.items():
-                    if self._take(source, regions, seen, selected, required):
-                        if target <= seen:
-                            break
-            by_key[entry.key] = tuple(selected)
-        # Sources ranked for a key they do not serve leave no requirement behind.
-        return by_key, {
-            source: regions for source, regions in required.items() if regions
-        }
-
-    @staticmethod
-    def _take(
-        source: VolumeId,
-        parts: Tuple[_Region, ...],
-        seen: set[_Region],
-        selected: List[VolumeId],
-        required: Dict[VolumeId, Counter[_Region]],
-    ) -> bool:
-        """Select ``source`` if it adds a region nothing ahead of it serves."""
-        regions = Counter(parts)
-        if all(region in seen for region in regions):
-            return False
-        selected.append(source)
-        seen.update(regions)
-        required[source].update(regions)
-        return True
+        keys = tuple(dict.fromkeys(request.key for request in requests))
+        maps = self.ranked(keys, order, requester=requester)
+        required: Dict[VolumeId, Counter[_Region]] = {}
+        chosen: Dict[str, set[VolumeId]] = defaultdict(set)
+        for source, parts in self.plan_requests(requests, maps).items():
+            counts: Counter[_Region] = Counter()
+            for part in parts:
+                counts[region(part)] += 1
+                chosen[part.key].add(source)
+            required[source] = counts
+        return {key: _in_order(maps[key], chosen[key]) for key in keys}, required
 
     def promised(self, keys: Sequence[str]) -> _Located:
         """Entries volumes have promised for ``keys`` and not yet published.
 
         Empty here: an ordinary directory read answers with holders, and a sensor
-        that promises nothing has nothing more to offer :meth:`servable`. Read once
-        per :meth:`project`, so an override pays one directory read per plan.
+        that promises nothing has nothing more to offer :meth:`ranked`. Read once per
+        plan, so an override pays one directory read per decision.
         """
         return {}
-
-    def servable(
-        self,
-        key: str,
-        source: VolumeId,
-        requests: Sequence[Request],
-        live_regions: Mapping[VolumeId, Tuple[_Region, ...]],
-        promised: _Located,
-    ) -> Optional[Tuple[_Region, ...]]:
-        """Regions ``source`` can serve of ``requests`` on ``key``.
-
-        ``None`` when the directory does not list ``source`` under ``key`` at all,
-        which is different from listing it with nothing of this request to serve.
-        """
-        return live_regions.get(source)
 
     def plan_fetch(
         self,
@@ -428,45 +407,7 @@ class DirectorySensor(Sensor):
         requester: Optional[VolumeId] = None,
     ) -> FetchPlan:
         """Plan an ordered fetch from the current live directory."""
-        by_key, required = self.project(requests, order, requester=requester)
-        return FetchPlan(by_key, required)
-
-    @classmethod
-    def whole_regions(cls, request: Request) -> Tuple[_Region, ...]:
-        """The regions ``request`` denotes when one source holds all of it.
-
-        The one region the request itself names: expanding it against a source
-        holding exactly it gives that back, for an object, a tensor and a slice
-        alike. A key's object type is one per key -- TorchStore's
-        ``StorageInfo.update`` refuses to change it -- so where a source holds whole
-        values this is what every source of the key serves, and the first of them
-        ends the walk in :meth:`project`. Where sources hold pieces, no source serves
-        it and the walk runs to the end of the ranking.
-        """
-        return (cls._region(request),)
-
-    def _expand_request(
-        self, request: Request, storage_info: StorageInfo
-    ) -> List[Request]:
-        if storage_info.object_type == ObjectType.OBJECT:
-            return [Request(key=request.key, is_object=True)]
-        if storage_info.object_type == ObjectType.TENSOR:
-            return [request]
-        return _PLANNER._expand_tensor_slices(request, storage_info, False)
-
-    def expand_regions(
-        self, request: Request, storage_info: StorageInfo
-    ) -> Tuple[_Region, ...]:
-        """Exact regions one metadata entry can serve for ``request``."""
-        spec = self.request_spec(request), self._storage_spec(storage_info)
-        cached = self._expansions.get(spec)
-        if cached is not None:
-            return cached
-        regions = tuple(
-            self._region(part) for part in self._expand_request(request, storage_info)
-        )
-        self._expansions[spec] = regions
-        return regions
+        return FetchPlan(*self._planned(requests, order, requester))
 
     @staticmethod
     def request_spec(request: Request) -> _RequestSpec:
@@ -489,26 +430,6 @@ class DirectorySensor(Sensor):
             tuple(tensor_slice.mesh_shape),
         )
 
-    def _storage_spec(self, storage_info: StorageInfo) -> _StorageSpec:
-        memo = self._storage_specs
-        if memo is None:
-            return self._build_storage_spec(storage_info)
-        # Keyed by identity, so the entry holds the object: an id freed mid-pin could
-        # otherwise be handed to a different StorageInfo. Directory metadata does not
-        # move while a decision holds the pin.
-        cached = memo.get(id(storage_info))
-        if cached is None:
-            cached = storage_info, self._build_storage_spec(storage_info)
-            memo[id(storage_info)] = cached
-        return cached[1]
-
-    @classmethod
-    def _build_storage_spec(cls, storage_info: StorageInfo) -> _StorageSpec:
-        return (
-            storage_info.object_type,
-            tuple(cls._slice_spec(part) for part in storage_info.tensor_slices),
-        )
-
     def batch_spec(self, requests: Sequence[Request]) -> Tuple[_RequestSpec, ...]:
         """What a batch asks for, independent of the request objects carrying it."""
         return tuple(self.request_spec(request) for request in requests)
@@ -523,30 +444,24 @@ class DirectorySensor(Sensor):
         revision = getattr(self.directory, "revision", None)
         if revision is not None:
             return "revision", revision
+        # Keyed by identity and holding the object, so an id freed mid-walk cannot be
+        # handed to a second StorageInfo. One entry object shared by every slot -- a
+        # fixture's usual shape -- is then signed once.
+        signed: Dict[int, Tuple[StorageInfo, object]] = {}
+
+        def sign(info: StorageInfo) -> object:
+            entry = signed.get(id(info))
+            if entry is None:
+                entry = info, (info.object_type, frozenset(info.tensor_slices))
+                signed[id(info)] = entry
+            return entry[1]
+
         # Holder order is directory order, and a fallback plan reads it, so a
         # reordering is a move.
         return tuple(
-            (
-                key,
-                tuple(
-                    (source, self._storage_spec(info))
-                    for source, info in entries.items()
-                ),
-            )
+            (key, tuple((source, sign(info)) for source, info in entries.items()))
             for key, entries in self._located.items()
         )
-
-    @staticmethod
-    def _region(request: Request) -> _Region:
-        tensor_slice = request.tensor_slice
-        region: object = None
-        if tensor_slice is not None:
-            region = (
-                tuple(tensor_slice.offsets),
-                tuple(tensor_slice.local_shape),
-                tuple(tensor_slice.global_shape),
-            )
-        return request.key, region
 
     def covers(
         self,
@@ -561,10 +476,12 @@ class DirectorySensor(Sensor):
             return True
         actual: Mapping[VolumeId, Counter[_Region]]
         if located is not None:
-            actual = self.coverage(requests, located).requirements()
+            actual = self.regions_by_source(requests, located, set(required))
         elif live:
             keys = tuple(dict.fromkeys(request.key for request in requests))
-            actual = self.coverage(requests, self.locate_live(keys)).requirements()
+            actual = self.regions_by_source(
+                requests, self.locate_live(keys), set(required)
+            )
         else:
             actual = self.requirements(requests)
         empty: Counter[_Region] = Counter()
@@ -586,13 +503,30 @@ class DirectorySensor(Sensor):
             key: dict(volumes) for key, volumes in self.locate_live(keys).items()
         }
         self._keys, self._located = frozenset(keys), located
-        self._storage_specs = {}
         self._checked = False
         try:
             yield
         finally:
             self._keys, self._located = None, {}
-            self._storage_specs = None
+
+
+def _in_order(
+    entries: Mapping[VolumeId, StorageInfo], chosen: AbstractSet[VolumeId]
+) -> Tuple[VolumeId, ...]:
+    """``chosen`` in ``entries`` order, stopping once all of them are placed.
+
+    One source is the common answer and needs no walk at all, so a whole-value key
+    costs nothing here however long the ranking is.
+    """
+    if len(chosen) <= 1:
+        return tuple(chosen)
+    ordered = []
+    for source in entries:
+        if source in chosen:
+            ordered.append(source)
+            if len(ordered) == len(chosen):
+                break
+    return tuple(ordered)
 
 
 class LoadSensor(Sensor):

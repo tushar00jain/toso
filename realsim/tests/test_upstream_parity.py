@@ -16,7 +16,9 @@ All are deliberate and all can rot silently:
 * :class:`realsim.seams.controller_service.ControllerService` mirrors the bodies of
   ``locate_volumes`` and ``keys`` **verbatim**, because ``@endpoint`` makes them
   ``EndpointProperty`` descriptors that cannot be invoked off-actor, and torchstore
-  has not extracted sync helpers for them the way it has for ``_notify_put``.
+  has not extracted sync helpers for them the way it has for ``_notify_put``;
+* :class:`proposed.planner.GreedyClient` mirrors ``_build_volume_requests`` with one
+  branch changed, which is the client half of the ask (``CLIENT_THE_ASK``).
 
 Nothing compared either against the original until this file. Tests here may
 import torchstore, so they can: a signature that gains an argument upstream, or a
@@ -81,8 +83,31 @@ COPIED_FROM_UPSTREAM = [
 #: Not every part of the ask is a member: ``locate_volumes`` takes a source preference
 #: and applies it, and ``locate_raw`` takes ``projected=``; both change a signature
 #: rather than adding one. The preference half is pinned on the client instead -- see
-#: :data:`CLIENT_READ_PARAMETERS`.
+#: :data:`CLIENT_READ_PARAMETERS`, and the planning half -- see
+#: :data:`CLIENT_THE_ASK` -- is a changed branch rather than any signature at all.
 THE_ASK = ["clear_projections", "locate_raw", "project"]
+
+#: The client half of the ask: a **source choice for sliced keys**, which is the same
+#: ask as upstream's own ``TODO`` inside ``_expand_tensor_slices``. Today
+#: ``_build_volume_requests`` takes the first volume listed and stops for an
+#: ``OBJECT`` or a ``TENSOR``, so map order chooses; for a ``TENSOR_SLICE`` it walks
+#: every volume and fetches every intersecting slice, so map order chooses nothing
+#: and a replicated shard is fetched once per replica.
+#:
+#: :class:`proposed.planner.GreedyClient` is that method with a covered-region set
+#: threaded through the sliced branch. It is what lets a control plane express a
+#: ranking as a located map and have the store honor it for sliced and whole keys
+#: alike; while it lives here, its source is pinned against upstream's by
+#: :data:`CLIENT_MIRRORED_BODIES`.
+CLIENT_THE_ASK = "greedy source selection for TENSOR_SLICE"
+
+#: ``LocalClient`` bodies :mod:`proposed.planner` copies or calls into, and the digest
+#: of the source it was written against. A failure means upstream edited the planner:
+#: re-read it, re-copy what ``GreedyClient`` mirrors, and update the digest.
+CLIENT_MIRRORED_BODIES = {
+    "_build_volume_requests": "f1111e0c3ff1861f5ddffe5a58e51178",
+    "_expand_tensor_slices": "9765db95694d7ba0fe6fdfe4d7d83b9c",
+}
 
 #: What ``LocalClient``'s read path takes today, in full. Part of the ask is that it
 #: takes one thing more: an optional **source preference**, applied to the
@@ -213,6 +238,38 @@ def test_the_mirrored_bodies_are_still_the_ones_we_mirrored():
             f"mirrors it verbatim, so re-copy the body and update the digest in "
             f"MIRRORED_BODIES."
         )
+
+
+def test_the_mirrored_planner_is_still_the_one_we_mirrored():
+    """``GreedyClient`` is upstream's planner plus one branch; pin the original."""
+    for name, expected in CLIENT_MIRRORED_BODIES.items():
+        source = inspect.getsource(getattr(RealClient, name))
+        digest = hashlib.md5(source.encode("utf-8")).hexdigest()[:32]
+        assert digest == expected, (
+            f"LocalClient.{name} changed upstream. proposed.planner.GreedyClient "
+            f"mirrors it with one branch of its own, so re-copy the body, keep the "
+            f"lines marked OURS, and update the digest in CLIENT_MIRRORED_BODIES."
+        )
+
+
+def test_the_sliced_read_still_has_no_source_choice():
+    """The client half of the ask, checked against the method that would answer it.
+
+    A failure is good news the same way :func:`test_the_ask_is_still_an_ask` is:
+    upstream started tracking what a sliced read has already covered, so
+    ``GreedyClient`` stops being a proposal and becomes a duplicate to delete.
+    """
+    source = inspect.getsource(RealClient._build_volume_requests)
+    assert "covered" not in source, (
+        f"LocalClient._build_volume_requests now tracks covered regions: "
+        f"{CLIENT_THE_ASK} has landed upstream, so drop proposed.planner."
+    )
+    todo = inspect.getsource(RealClient._expand_tensor_slices)
+    assert "we have already fetched this region" in todo, (
+        "upstream's over-fetch TODO is gone from _expand_tensor_slices; check "
+        "whether the sliced read now chooses a source, and retire GreedyClient if "
+        "it does"
+    )
 
 
 def test_the_service_implements_the_surface_and_the_handle_refers_to_it():

@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import AbstractSet, Any, Dict, Mapping, Sequence
 
 from proposed import (
     Controller,
@@ -26,6 +26,7 @@ from proposed import (
     Key,
     VolumeId,
 )
+from proposed.planner import region
 from proposed.sensors import FetchPlan
 from proposed.dispatch import Action, Fold
 from torchstore.controller import ObjectType, StorageInfo
@@ -145,29 +146,43 @@ class DedupDirectorySensor(DirectorySensor):
             return {}
         return self.directory.locate_raw(list(keys), missing_ok=True, projected=True)
 
+    def owners(self) -> AbstractSet[VolumeId]:
+        """The producers whose promises this plane may plan a reader onto.
+
+        This plane's own, and that membership is the whole point. The directory is
+        shared, so two dedup planes over one store see each other's promises; a plane
+        that routed onto a foreign one would gate on a publication it never hears.
+        """
+        return self._batches.keys()
+
     def serving_sources(
         self, requests: Sequence[Request]
     ) -> tuple[set[VolumeId], set[VolumeId]]:
         """Sources serving any requested region, and the pending subset.
 
-        Costs one live coverage plus one test per producer, and never a walk of the
-        promised entries: a producer that promised this exact batch is answered from
-        that fact; one that promised a different shape is checked region by region
-        over the keys the two share, so a promise whose slices miss the request is
-        not offered.
+        Costs one live per-source expansion plus one test per producer, and never a
+        walk of the promised entries: a producer that promised this exact batch is
+        answered from that fact; one that promised a different shape is planned
+        against its own metadata over the keys the two share, so a promise whose
+        slices miss the request is not offered.
+
+        The pending subset here is the *pricing* question -- whose copy has not
+        arrived, so a wait has to be priced for it. What the chosen sources still owe
+        is a different question, answered by :meth:`plan_fetch` once a plan exists.
         """
-        candidates = self.coverage(requests).sources
         actual = self.requirements(requests)
+        candidates = set(actual)
         wanted = self._shapes.get(self.batch_spec(requests))
         whole = None
         pending: set[VolumeId] = set()
         for producer, batch in self._batches.items():
             if batch.shape is wanted:
                 if whole is None:
-                    whole = self._whole_batch(requests)
+                    # A promise of exactly this batch serves exactly its regions.
+                    whole = Counter(region(request) for request in requests)
                 regions = whole
             else:
-                regions = self._overlap(batch, requests)
+                regions = self._overlap(producer, batch, requests)
             if not regions:
                 continue
             candidates.add(producer)
@@ -175,50 +190,12 @@ class DedupDirectorySensor(DirectorySensor):
                 pending.add(producer)
         return candidates, pending
 
-    def _whole_batch(self, requests: Sequence[Request]) -> Counter[_Region]:
-        """Every region ``requests`` asks for, which is what a matching promise owes."""
-        regions: Counter[_Region] = Counter()
-        for request in requests:
-            regions.update(self.whole_regions(request))
-        return regions
-
-    def _overlap(self, batch: _Batch, requests: Sequence[Request]) -> Counter[_Region]:
+    def _overlap(
+        self, producer: VolumeId, batch: _Batch, requests: Sequence[Request]
+    ) -> Counter[_Region]:
         """Regions ``batch``'s differently shaped promise serves of ``requests``."""
-        regions: Counter[_Region] = Counter()
-        for request in requests:
-            info = batch.infos.get(request.key)
-            if info is not None:
-                regions.update(self.expand_regions(request, info))
-        return regions
-
-    def servable(
-        self,
-        key: Key,
-        source: VolumeId,
-        requests: Sequence[Request],
-        live_regions: Mapping[VolumeId, tuple[_Region, ...]],
-        promised: Mapping[Key, Mapping[VolumeId, StorageInfo]],
-    ) -> Optional[tuple[_Region, ...]]:
-        """What ``source`` holds for ``key``, plus what it has promised to hold.
-
-        A promised entry already covers the live one it landed on, so expanding it
-        answers for a volume holding part of the key and promising the rest without
-        merging anything here.
-
-        A promise this plane did not make is not a source for it. The directory is
-        shared, so two dedup planes over one store see each other's promises here;
-        the membership test is what keeps a plane answering only from its own
-        decisions and waiting only on publications it will hear about.
-        """
-        if source in self._batches:
-            info = promised.get(key, {}).get(source)
-            if info is not None:
-                return tuple(
-                    region
-                    for request in requests
-                    for region in self.expand_regions(request, info)
-                )
-        return live_regions.get(source)
+        promised = {key: {producer: info} for key, info in batch.infos.items()}
+        return self.regions_by_source(requests, promised).get(producer, Counter())
 
     def plan_fetch(
         self,
@@ -228,9 +205,12 @@ class DedupDirectorySensor(DirectorySensor):
         requester: VolumeId | None = None,
     ) -> PlannedFetch:
         """Materialize an ordered fetch from live and promised metadata."""
-        by_key, required = self.project(requests, order, requester=requester)
+        by_key, required = self._planned(requests, order, requester)
         actual = self.requirements(requests)
         empty: Counter[_Region] = Counter()
+        # The gating question: of the sources the plan chose, which owe a region the
+        # directory does not live-hold yet. Not the pricing question above -- a
+        # producer already holding the half this reader wants owes nothing.
         pending = frozenset(
             source
             for source, expected in required.items()

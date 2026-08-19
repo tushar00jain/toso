@@ -29,18 +29,22 @@ additional Python peak reported for any measured phase, not process RSS.
 
 | Workload (`K/T/G`) | Peak decision | Promise burst build | Largest Python phase peak | Assessment |
 | --- | ---: | ---: | ---: | --- |
-| Current executable test (`1/1/64`) | 1.3 ms | 0.5 ms | 0.1 MiB | Trivial |
-| Planned 8B (`290/4/16`) | 7.1 ms | 7.7 ms | 2.2 MiB | Comfortable |
-| 70B key count, small burst (`723/4/16`) | 17 ms | 19 ms | 6 MiB | Comfortable |
-| Wider 8B burst (`290/16/64`) | 15 ms | 29 ms | 9 MiB | Comfortable |
-| Wide 8B placement (`290/64/128`) | 33 ms | 170 ms | 18 MiB | Usable for burst routing |
-| Dense 70B (`723/64/128`) | 75 ms | 396 ms | 49 MiB | Inside a 100 ms envelope |
-| Fleet/MoE worst (`5,203/128/512`) | Projected 1.5–2.2 s | Projected ~11 s | Projected ~1.4 GiB | Guarded; unsupported |
+| Current executable test (`1/1/64`) | 1.3 ms | 0.6 ms | 0.1 MiB | Trivial |
+| Planned 8B (`290/4/16`) | 5.9 ms | 8.7 ms | 2.2 MiB | Comfortable |
+| 70B key count, small burst (`723/4/16`) | 13 ms | 20 ms | 6 MiB | Comfortable |
+| Wider 8B burst (`290/16/64`) | 16 ms | 35 ms | 9 MiB | Comfortable |
+| Wide 8B placement (`290/64/128`) | 29 ms | 173 ms | 18 MiB | Usable for burst routing |
+| Dense 70B (`723/64/128`) | 69 ms | 402 ms | 50 MiB | Inside a 100 ms envelope |
+| Fleet/MoE worst (`5,203/128/512`) | Projected 1.4–2.0 s | Projected ~11 s | Projected ~1.4 GiB | Guarded; unsupported |
+
+Promise burst build is unchanged code and the noisiest column on a shared host:
+repeated single observations of dense 70B ranged 362–540 ms. Read it as an order of
+magnitude, not a delta.
 
 The measured rows are synthetic capacity points, not observations of a particular
 deployment. The fleet row is an extrapolation from dense 70B: 7.2 times the keys,
-4 times the burst and twice the holders per key, so the `K*T` coverage term scales
-14x and the `G*K` promise terms 29x. It has 6.0 million indexed entries. The default
+4 times the burst and twice the holders per key, so the `K*T` live-expansion term
+scales 14x and the `G*K` promise terms 29x. It has 6.0 million indexed entries. The default
 benchmark guard prevents running it accidentally. Production runs should substitute
 their state-dict key count, holders per requested region, and synchronized generator
 count.
@@ -77,10 +81,10 @@ all `G` pending requests above.
 | Component | Time | Peak space | Benchmark coverage |
 | --- | --- | --- | --- |
 | Pinned live-directory snapshot | `O(KT)`; promised entries are not walked | `O(KT)` transient copied mapping slots | `snapshot_ms` |
-| Cold source coverage | `O(KT)` over live entries plus one overlap test per generator; slice intersection work is `O(U)` expansions for `U` distinct request/metadata pairs | `O(KT)` source coverage plus `O(U)` retained expansion tuples | Cold `serving_sources_ms` |
-| Reused live coverage | `O(KT)` metadata signature, or `O(1)` where the directory counts its own mutations, plus `O(G)` overlap tests | Reuses `O(KT)` live coverage and `O(U)` expansion tuples | Reused `serving_sources_ms` |
+| Cold live requirements | `O(KT)`: one planner run per source over that source's own entries, so slice intersection runs once per `(key, source)` | `O(KT)` region counters and one `K`-entry map per source | Cold `serving_sources_ms` |
+| Reused live requirements | `O(KT)` metadata signature, or `O(1)` where the directory counts its own mutations, plus `O(G)` overlap tests | Reuses the `O(KT)` counters | Reused `serving_sources_ms` |
 | Candidate readiness and scoring | `O(P(S + K) + V log V)`: each pending peer's route is probed source by source against the cached live requirements | `O(V)` transient wait memo | Part of `full_decision_ms` |
-| Fetch materialization | `O(KS)` where one source holds a whole value, `O(KV)` where the ranking is walked to its end | Up to `O(KS)` required-region output | `plan_fetch_ms` |
+| Fetch materialization | One planner run over `K` lazily ranked maps: `O(K)` where one source holds a whole value, `O(KV)` where every volume of a sliced key is walked | Up to `O(KS)` required-region output, and `K` map views rather than `K` ranked dicts | `plan_fetch_ms` |
 | Gate registration | `O(P)` | `O(P)` waiter links, up to `O(GP)` for blocked burst requests | Part of `full_decision_ms` |
 | Total synchronous control decision | `O(KT + G + P(S + K) + KS + V log V)` | Adds `O(K + R + P)` retained requester state plus `O(KT)` transient planning state | `full_decision_ms` |
 
@@ -91,14 +95,14 @@ the fetched batch.
 `O(G)` rather than `O(KG)` for candidate discovery rests on the batch shape being
 interned: every generator in a synchronized burst promises the same `K` keys with the
 same slices, so "does this generator promise what I am asking for" is one pointer
-comparison. A generator promising a *different* shape costs one region test per key
-the two batches share.
+comparison. A generator promising a *different* shape is instead planned against its
+own promised metadata, at one expansion per key the two batches share.
 
-Live reuse is keyed by ordered sources, `ObjectType`, every stored slice field, and
-the request slice. A put, delete, eviction, slice mutation, source reorder, or request
-mutation changes that signature before cached coverage can be returned. Making or
-clearing a promise does not: it cannot change which volumes hold a key, so the live
-view of a promised key is rebuilt only by a live mutation of that key.
+Live reuse is keyed by ordered sources, `ObjectType`, the stored slice set, and the
+request slice. A put, delete, eviction, slice mutation, source reorder, or request
+mutation changes that signature before the cached requirements can be returned.
+Making or clearing a promise does not: it cannot change which volumes hold a key, so
+the live view of a promised key is rebuilt only by a live mutation of that key.
 
 `indexed_metadata_entries` counts entries in the large key-multiplied mappings and
 counters, not bytes or Python objects:
@@ -123,8 +127,8 @@ bookkeeping, but do not isolate fixed framework cost from sensor folds.
 Each matching `*_python_peak_kib` column is `tracemalloc`'s additional peak for
 Python metadata allocated during that phase. It excludes native allocations, tensor
 allocators, process RSS, and the workload state live before tracing starts. The
-cached coverage built by `serving_sources` is therefore baseline state for the
-`plan_fetch_python_peak_kib` phase.
+cached live requirements built by `serving_sources` are therefore baseline state for
+the `plan_fetch_python_peak_kib` phase.
 
 ## Reusable benchmark
 
@@ -139,23 +143,24 @@ and Python build.
 
 | case | keys | sources | burst requests | indexed entries | pending build ms | cold serving ms | reused serving ms | plan fetch ms | full decision ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| smoke | 8 | 2 | 8 | 144 | 0.270 | 0.232 | 0.046 | 0.057 | 0.912 |
+| smoke | 8 | 2 | 8 | 144 | 0.265 | 0.189 | 0.043 | 0.051 | 0.935 |
 
 | pending build peak KiB | cold serving peak KiB | reused serving peak KiB | plan fetch peak KiB | full decision peak KiB | candidates | pending candidates | selected sources |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 44.898 | 18.383 | 6.242 | 8.039 | 30.211 | 10 | 8 | 1 |
+| 45.469 | 9.906 | 5.672 | 6.234 | 28.477 | 10 | 8 | 1 |
 
 The planned-8B measurements below isolate the implementation steps on one host. The
 first three rows are carried over from earlier hosts and runs; values are approximate
-rather than a performance contract, and only the last row was measured against the
-current tree.
+rather than a performance contract. The last two were measured against the current
+tree, back to back on one host.
 
 | Planner | pending build ms | serving ms | plan fetch ms | full decision ms | serving peak KiB | full peak KiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Singleton-map planning | 5.56 | 29.68 | 10.10 | 55.27 | 3046 | 3387 |
 | One-pass TorchStore expansion | 5.92 | 13.06 | 6.31 | 42.59 | 3361 | 3727 |
 | Shared expansions and live reuse | 13.06 | 10.46 | 7.09 | 37.81 | 1318 | 2484 |
-| Promises held in the directory | 7.59 | 1.66 | 1.69 | 6.58 | 145 | 433 |
+| Promises held in the directory | 8.00 | 1.68 | 1.67 | 6.56 | 145 | 436 |
+| Greedy planner as the dry run | 8.71 | 1.39 | 1.09 | 5.87 | 144 | 462 |
 
 Run the intended 8B scale or supply a deployment-specific point:
 
@@ -180,8 +185,9 @@ Python build, and machine before and after a change. The tool measures runtime f
 then creates a fresh workload for the traced-memory pass. Tracing starts separately
 for each phase, so its overhead cannot affect the `*_ms` columns. The first planning
 sample reports `cold_*`; later fresh-pin samples report reuse against unchanged live
-metadata. Every sample measures `serving_sources`, then cached `plan_fetch`, before
-leaving its pin. Wall-clock reuse values are medians; pending-state construction,
+metadata. Every sample measures `serving_sources`, then `plan_fetch` against the live
+requirements that call cached, before leaving its pin. Wall-clock reuse values are
+medians; pending-state construction,
 cold planning, and the full decision are single observations. Memory phases run once
 in the same cold-then-reused order.
 
@@ -227,7 +233,8 @@ pinned([w0,w1])                     copy of the live read: K dicts, K*T slots
 Candidates.select
     |  plan(r)                      the promise record's own mapping, not rebuilt
     |  serving_sources
-    |     live coverage             K KeyCoverage + K*T SourceCoverage, reused
+    |     live requirements         one GreedyClient run per source over that
+    |                               source's own K entries -> K*T regions, reused
     |     one test per generator    shape identity, then K-cell Counter subtraction
     |  _wait(g) per pending peer    per route source: a K-cell subtraction against
     |                               the cached live requirements
@@ -235,13 +242,25 @@ Candidates.select
     |
 Balance -> WithFold -> Ordered      V-entry key mapping rebuilt three times, sort V log V
     |
-plan_fetch(order)                   one projected read, then per key a walk of the
-    |                               ranking that stops at the first whole-value
-    |                               source -> K*S, plus required Counters
+plan_fetch(order)                   one projected read, then one GreedyClient run
+    |                               over K ranked map views: it takes the first
+    |                               listed volume for a whole value and every
+    |                               volume offering a fresh region for a sliced one
 dispatch_sync(Routed(r, ...))       Counter -> elements() tuple -> Counter again
     |
 gate(not fetch.pending)             no second directory read
 ```
+
+The ranked views are why the middle of that step is `O(K)` and not `O(K*V)`: a view
+yields its key's entries in ranking order without materializing a dict, so the
+planner's `break` on a whole value stops it after one membership test.
+
+The plan is a dry run of the method the fetch itself runs, so control and the reader
+cannot disagree about which volume serves which region of one located map. They can
+still see *different* maps — the plan is taken under the pin and the reader's
+`locate_volumes` happens after the gate opens — and that is why the plan reaches the
+reader as a preference rather than a filter: a source that evicted in between drops
+out and the read still answers from whoever holds the key.
 
 ### Reusable state
 
@@ -249,8 +268,7 @@ Outlives the decision; sizes are for one requester unless stated.
 
 | Structure | Owner | Size | Released by |
 | --- | --- | --- | --- |
-| `_expansions` | `DirectorySensor` | one region tuple per distinct (request spec, storage spec) | never |
-| `_derived` | `DirectorySensor` | one coverage and one requirements per batch spec | the directory's `revision` moving |
+| `_derived` | `DirectorySensor` | one live requirements map per batch spec | the directory's `revision` moving |
 | `Promised` entries | the controller's own directory | `K` slots, one each | a put on the same slot, or `Published` |
 | `_batches` | `DedupDirectorySensor` | `K` requests plus `K` `StorageInfo`, and one shape reference | `Published` |
 | `_route`, `_route_pending` | `FanoutSensor` | `S` + `P` | `Routed`, `Retired`, `Published` |
@@ -272,9 +290,9 @@ Dies with the pin, except the derived cache, which outlives it.
 | Structure | Size |
 | --- | --- |
 | Pinned `_located` copy | `K` dicts, `K*T` slots |
-| Live `DirectoryCoverage` | `K` + `K*T` objects, reused across decisions |
 | `promised()` read | `K` references into the directory's own maps, one per decision |
-| `requirements()` Counters | `T` Counters, `K*T` cells, cached with the coverage |
+| Live requirements | `T` `K`-entry maps and `T` Counters of `K` cells, reused across decisions |
+| Ranked map views | `K` slotted views over the pinned and promised maps, no ranked dict |
 | `_wait` memo and its probes | `V` memo entries; one `K`-cell subtraction per (peer, source) |
 | `Selection.key` | `V` entries, rebuilt by `priced`, `annotated` and `only` |
 | `FetchPlan` | `K` source tuples plus `S` Counters |
@@ -286,18 +304,19 @@ One decision at `planned-8b` (`290/4/16`), counted by wrapping the sensor:
 
 | Operation | Calls | Per key |
 | --- | ---: | ---: |
-| `request_spec` | 8,120 | 28 |
-| `_storage_spec` | 2,610 | 9 |
-| `expand_regions` | 1,450 | 5 |
-| `_expand_request` | 290 | 1 |
+| `request_spec` | 5,800 | 20 |
+| `requirements` | 18 | |
 | `covers` | 16 | |
-| `coverage` | 3 | |
+| `GreedyClient` runs | 5 | |
 | `locate_live` | 1 | |
 | `promised` | 1 | |
 
 The sixteen `covers` calls are `_wait` probes, one per pending peer, and each is a
-cache lookup plus one `K`-cell Counter subtraction. `request_spec` is now the top
-line: it is rebuilt to key the expansion cache and to form each batch spec.
+cache lookup plus one `K`-cell Counter subtraction; the eighteen `requirements` calls
+are those plus the two planning reads, and all but one hit the cache. Four of the five
+planner runs are the per-source live expansion and the fifth is the fetch plan.
+`request_spec` is the top line: it is rebuilt only to form each batch spec, which is
+the cache key.
 
 ## Potential improvement
 
@@ -307,14 +326,14 @@ In profile order against the numbers above:
   hashing `(key, slice spec)` tuples. Interning a region to an int shrinks
   `_route_required` and speeds every probe; nothing else touches the region's
   contents.
-- `request_spec` is rebuilt 28 times per key, mostly to key `_expansions`. Caching it
-  on the request would make the expansion lookup a pair of pointers.
+- `request_spec` is rebuilt 20 times per key, all of it to key the derived cache.
+  Caching it on the request would make that lookup a pair of pointers.
 - `Routed` flattens each source's Counter through `elements()` so `_routed` can rebuild
   the same Counter. Carry the counts.
-- `project()` scans the whole ranking per key where no single source holds a whole
-  value (`O(K*V)`). A rank dict makes it `O(t log t)` for `t` sources present on a key,
-  which matters for sparse or sliced placement and is invisible in this dense
-  benchmark.
-- `_expansions` is never cleared. It is bounded by the distinct (request spec, storage
-  spec) pairs a run sees, which is small for a weight sync and unbounded for a run that
-  keeps minting slices.
+- a sliced key is walked to the end of the ranking, because the planner has no early
+  stop once a request is fully covered — upstream's own limitation, kept. Stopping
+  needs box subtraction across misaligned grids; walking the rest costs metadata only,
+  and is invisible in this whole-value benchmark.
+- the ranked view falls back to directory order by walking the whole ranking first and
+  finding nothing. A key no ranked source lists therefore costs `O(V)`, which is the
+  unroutable case and rare.
