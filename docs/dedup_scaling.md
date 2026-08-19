@@ -23,39 +23,68 @@ asks for all `K` keys before earlier generators publish, and every source rank i
 visible for every key. Sharded or sparse placement reduces the holders per key, so
 `T` in the benchmark is deliberately the dense upper bound.
 
-The repository currently establishes these burst envelopes. Each row means `K` keys
-per generator request, `G` synchronized requests, and `T` live sources per key.
+These dense-placement measurements use `K/T/G`: keys per generator request, live
+sources per key, and synchronized generator requests. Allocation is the largest
+additional Python peak reported for any measured phase, not process RSS.
 
-| Workload | Keys | Source ranks | Generator ranks | Status |
+| Workload (`K/T/G`) | Peak decision | Pending burst build | Largest Python phase peak | Assessment |
 | --- | ---: | ---: | ---: | --- |
-| Largest executable dedup test | 1 | 1 | 64 | Covered by `test_a_chain_deeper_than_the_fabric_charge_starts_a_new_one` |
-| Planned dense 8B sync | about 290 | 4 | 16 | Key and reader counts documented in `domain/llm.py`; not yet an executable scale test |
-| Dense 70B planning case | about 723 | 64 | 128 | Capacity-planning assumption |
-| Fleet/MoE worst case | 5,203 | 128 | 512 | Deliberately severe planning envelope; the key count matches the fleet example in `tui_design.md` |
+| Current executable test (`1/1/64`) | 1.7 ms | 0.7 ms | <0.1 MiB | Trivial |
+| Planned 8B (`290/4/16`) | 38 ms | 13 ms | 3 MiB | Comfortable |
+| 70B key count, small burst (`723/4/16`) | 95 ms | 33 ms | 8 MiB | Near a 100 ms envelope |
+| Wider 8B burst (`290/16/64`) | 142 ms | 52 ms | 11 MiB | Usable, noticeable |
+| Wide 8B placement (`290/64/128`) | 662 ms | 199 ms | 26 MiB | Too slow for burst routing |
+| Dense 70B (`723/64/128`) | 1.51 s | 588 ms | 65 MiB | Completes, but is not practical |
+| Fleet/MoE worst (`5,203/128/512`) | Projected 30–40 s | Not run | Projected >1 GiB per phase | Guarded; currently unsupported |
 
-The 70B and fleet rows are planning envelopes, not measurements of a particular
-deployment. Production runs should replace them with the state-dict key count,
-holders per requested region, and synchronized generator count from that deployment.
+The measured rows are synthetic capacity points, not observations of a particular
+deployment. The fleet row is an extrapolation from dense 70B: it has 8.66 million
+indexed entries and about 24 times as many key/source pairs. The default benchmark
+guard prevents running it accidentally; its combined retained and transient metadata
+would likely require several GiB. Production runs should substitute their state-dict
+key count, holders per requested region, and synchronized generator count.
 
 ## State and work at the burst peak
 
-The table assumes one independently serviceable region per `(key, source)`. More
+The tables assume one independently serviceable region per `(key, source)`. More
 slices increase `R` and the TorchStore expansion terms without changing the ownership
 of the state.
 
-| Scope | Component | Time | Peak space | Benchmark coverage |
-| --- | --- | --- | --- | --- |
-| Whole burst | Dispatcher commits | `O(G(Fₐ + Wₐ))` for the synthetic `Asked` and `Routed` actions | Registered folds plus outstanding waiter links | `pending_build_ms` |
-| Whole burst | Pending directory indexes and primed coverage | `O(GK)` | `O(GK)` index/cache references; equal request/metadata pairs share immutable region tuples | `pending_build_ms` |
-| Whole burst | Fan-out route state | `O(G(R + S))` | `O(GR + GS + V)` requirements, route edges, and source loads | `pending_build_ms` |
-| One request at peak | Pinned live-directory snapshot | `O(KT)` | `O(KT)` transient copied mapping slots | `snapshot_ms` |
-| One request at peak | Source coverage visits | `O(KV)`; slice intersection work is `O(U)` expansions for `U` distinct request/metadata pairs | `O(KV)` source coverage plus `O(U)` retained expansion tuples | `pending_build_ms` and cold `serving_sources_ms` |
-| Later request, unchanged live directory | Live coverage validation and reuse | `O(KT)` metadata signature plus `O(KG)` pending overlay assembly | Reuses `O(KT)` live coverage and `O(U)` expansion tuples | Reused `serving_sources_ms` |
-| One request at peak | Candidate readiness and scoring | `O(GK + V + V log V)` for dense pending routes | `O(V + K)` transient wait memo and one pending route's coverage work | Part of `full_decision_ms` |
-| One request at peak | Fetch materialization | `O(KV)` over pinned combined coverage | Up to `O(KV)` required-region output | `plan_fetch_ms` |
-| One request at peak | Gate registration | `O(P)` | `O(P)` waiter links, up to `O(GP)` for blocked burst requests | Part of `full_decision_ms` |
-| One publication | `Published` commit | `O(K + R + Wₐ)` | Releases pending requirements and waiter links | Not measured |
-| One request at peak | Whole serialized decision | `O(KV + GK + V log V)` | Adds `O(K + R + P)` retained requester state plus `O(KV)` transient planning state | `full_decision_ms` |
+### Whole burst
+
+| Component | Total time across `G` requests | Peak or retained space | Benchmark coverage |
+| --- | --- | --- | --- |
+| Dispatcher commits | `O(GFₐ + ΣWₐ)` for the synthetic `Asked` and `Routed` actions | Registered folds plus outstanding waiter links | `pending_build_ms` |
+| Pending directory indexes and primed coverage | `O(GK)` | `O(GK)` index/cache references; equal request/metadata pairs share immutable region tuples | `pending_build_ms` |
+| Fan-out route state | `O(G(R + S))` | `O(GR + GS + V)` requirements, route edges, and source loads | `pending_build_ms` |
+| Total burst construction | `O(G(K + R + S + Fₐ) + ΣWₐ)` | `O(KT + GK + GR + GS + GP + V)` | `pending_build_ms` |
+| Generator completions (`Published`) | `O(G(K + R) + ΣWₐ)` | Each completion releases its pending requirements and waiter links | Not measured |
+| Total lifecycle including completion | `O(G(K + R + S + Fₐ) + ΣWₐ)` | Same construction peak; completion releases pending state | Not measured |
+
+A generator completion means its read-through finished, its local `put_batch`
+registered all fetched keys, and it dispatched `Published(generator)`. That action
+removes the generator's pending directory and route requirements and wakes requests
+that selected it as a source. A burst has at most `G` such completions. In each total
+row, `ΣWₐ` is the waiter wake-up work across the actions included by that row.
+
+### One request at peak
+
+This is one additional generator request evaluated after the benchmark has constructed
+all `G` pending requests above.
+
+| Component | Time | Peak space | Benchmark coverage |
+| --- | --- | --- | --- |
+| Pinned live-directory snapshot | `O(KT)` | `O(KT)` transient copied mapping slots | `snapshot_ms` |
+| Cold source coverage | `O(KV)`; slice intersection work is `O(U)` expansions for `U` distinct request/metadata pairs | `O(KV)` source coverage plus `O(U)` retained expansion tuples | Cold `serving_sources_ms` |
+| Reused live coverage | `O(KT)` metadata signature plus `O(KG)` pending overlay assembly | Reuses `O(KT)` live coverage and `O(U)` expansion tuples | Reused `serving_sources_ms` |
+| Candidate readiness and scoring | `O(GK + V + V log V)` for dense pending routes | `O(V + K)` transient wait memo and one pending route's coverage work | Part of `full_decision_ms` |
+| Fetch materialization | `O(KV)` over pinned combined coverage | Up to `O(KV)` required-region output | `plan_fetch_ms` |
+| Gate registration | `O(P)` | `O(P)` waiter links, up to `O(GP)` for blocked burst requests | Part of `full_decision_ms` |
+| Total synchronous control decision | `O(KV + GK + V log V)` | Adds `O(K + R + P)` retained requester state plus `O(KV)` transient planning state | `full_decision_ms` |
+
+The total request row ends after the route and readiness gate are constructed. It
+does not include waiting for a pending source, transferring payloads, or publishing
+the fetched batch.
 
 Live reuse is keyed by ordered sources, `ObjectType`, every stored slice field, and
 the request slice. A put, delete, eviction, slice mutation, source reorder, or request
@@ -88,8 +117,7 @@ Each matching `*_python_peak_kib` column is `tracemalloc`'s additional peak for
 Python metadata allocated during that phase. It excludes native allocations, tensor
 allocators, process RSS, and the workload state live before tracing starts. The
 cached coverage built by `serving_sources` is therefore baseline state for the
-`plan_fetch_python_peak_kib` phase. The benchmark does not dispatch `Published`, so
-it does not cover completion cleanup or waking `Wₐ` blocked decisions.
+`plan_fetch_python_peak_kib` phase.
 
 ## Reusable benchmark
 
