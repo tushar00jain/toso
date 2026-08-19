@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from contextlib import contextmanager
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, Iterator, Mapping, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
-from proposed import Controller, DirectorySensor, Key, VolumeId
+from proposed import (
+    Controller,
+    DirectoryCoverage,
+    DirectorySensor,
+    Key,
+    VolumeId,
+)
+from proposed.sensors import KeyCoverage, SourceCoverage
 from proposed.dispatch import Action, Fold
 from torchstore.controller import ObjectType, StorageInfo
 from torchstore.transport import Request
@@ -16,7 +22,6 @@ from torchstore.transport import Request
 __all__ = ["Asked", "DedupDirectorySensor", "PlannedFetch", "Published"]
 
 _Region = tuple[Key, object]
-_RequestSignature = tuple[str, int, object, int, bool]
 
 
 @dataclass(frozen=True)
@@ -58,23 +63,9 @@ class PlannedFetch:
 class _PendingEntry:
     request: Request
     info: StorageInfo
-
-
-@dataclass(frozen=True)
-class _SourceCoverage:
-    source: VolumeId
-    # Regions visible after overlaying pending entries on the pinned directory.
-    combined: tuple[_Region, ...]
-    # Regions registered in the pinned directory now.
-    live: tuple[_Region, ...]
-
-
-@dataclass(frozen=True)
-class _KeyCoverage:
-    key: Key
-    # Raw live holders preserve the directory's fallback order.
-    holders: tuple[VolumeId, ...]
-    sources: tuple[_SourceCoverage, ...]
+    request_spec: object
+    regions: tuple[_Region, ...]
+    alternate_regions: Dict[object, tuple[_Region, ...]] = field(default_factory=dict)
 
 
 class DedupDirectorySensor(DirectorySensor):
@@ -84,19 +75,11 @@ class DedupDirectorySensor(DirectorySensor):
         super().__init__(directory)
         self._pending: Dict[VolumeId, Dict[Key, _PendingEntry]] = {}
         self._pending_by_key: Dict[Key, Dict[VolumeId, _PendingEntry]] = {}
+        self._pending_generation = 0
         self._folds: Dict[type, Fold] = {
             Asked: self._asked,
             Published: self._published,
         }
-        # Expanded metadata is reusable only within one pinned directory snapshot.
-        self._coverage_cache: (
-            tuple[
-                tuple[Request, ...],
-                tuple[_RequestSignature, ...],
-                tuple[_KeyCoverage, ...],
-            ]
-            | None
-        ) = None
 
     @property
     def folds(self) -> Mapping[type, Fold]:
@@ -109,16 +92,21 @@ class DedupDirectorySensor(DirectorySensor):
         requests = {request.key: request for request in action.requests}
         if len(requests) != len(action.requests):
             raise ValueError("a publication names each key once")
-        entries = {
-            key: _PendingEntry(
+        entries = {}
+        for key, request in requests.items():
+            info = StorageInfo(ObjectType.from_request(request), {request.tensor_slice})
+            spec = self.request_spec(request)
+            entry = _PendingEntry(
                 request,
-                StorageInfo(ObjectType.from_request(request), {request.tensor_slice}),
+                info,
+                spec,
+                self.expand_regions(request, info),
             )
-            for key, request in requests.items()
-        }
+            entries[key] = entry
         self._pending[action.requester] = entries
         for key, entry in entries.items():
             self._pending_by_key.setdefault(key, {})[action.requester] = entry
+        self._pending_generation += 1
 
     def _published(self, action: Published) -> None:
         entries = self._pending.pop(action.producer, {})
@@ -127,6 +115,8 @@ class DedupDirectorySensor(DirectorySensor):
             del producers[action.producer]
             if not producers:
                 del self._pending_by_key[key]
+        if entries:
+            self._pending_generation += 1
 
     def plan(self, producer: VolumeId) -> Mapping[Key, Request]:
         """``producer``'s pending read-through requests, by key."""
@@ -150,33 +140,13 @@ class DedupDirectorySensor(DirectorySensor):
         """Producers with pending directory entries."""
         return set(self._pending)
 
-    @contextmanager
-    def pinned(self, keys: Sequence[Key]) -> Iterator[None]:
-        """Pin live metadata and one matching coverage expansion."""
-        with super().pinned(keys):
-            self._coverage_cache = None
-            try:
-                yield
-            finally:
-                self._coverage_cache = None
-
     def serving_sources(
         self, requests: Sequence[Request]
     ) -> tuple[set[VolumeId], set[VolumeId]]:
         """Sources serving any requested region, and the pending subset."""
-        coverage = self._coverage(requests)
-        candidates = {
-            source.source
-            for entry in coverage
-            for source in entry.sources
-            if source.combined
-        }
-        pending = {
-            source.source
-            for entry in coverage
-            for source in entry.sources
-            if Counter(source.combined) - Counter(source.live)
-        }
+        combined, live = self._coverages(requests)
+        candidates = combined.sources
+        pending = live.missing_sources(combined.requirements())
         return candidates, pending
 
     def plan_fetch(
@@ -187,153 +157,101 @@ class DedupDirectorySensor(DirectorySensor):
         requester: VolumeId | None = None,
     ) -> PlannedFetch:
         """Materialize an ordered fetch from live and pending metadata."""
-        allowed = set(order)
-        by_key: Dict[Key, tuple[VolumeId, ...]] = {}
-        required: dict[VolumeId, Counter[_Region]] = defaultdict(Counter)
-        pending: set[VolumeId] = set()
-        for key_coverage in self._coverage(requests):
-            holders = set(key_coverage.holders)
-            present = {
-                source.source
-                for source in key_coverage.sources
-                if source.source in holders
-                or (source.source in allowed and source.source != requester)
-            }
-            # Ranked-out and self promises cannot become fallback; live regions remain.
-            effective = {
-                source.source: (
-                    source.combined
-                    if source.source in allowed and source.source != requester
-                    else source.live
-                )
-                for source in key_coverage.sources
-            }
-            ranked = [
-                (source, effective[source]) for source in order if source in present
-            ]
-            choices = ranked or [
-                (source.source, effective[source.source])
-                for source in key_coverage.sources
-                if source.source in present
-            ]
-            seen: set[_Region] = set()
-            selected: list[VolumeId] = []
-            live = {
-                source.source: Counter(source.live) for source in key_coverage.sources
-            }
-            for source, parts in choices:
-                regions = Counter(parts)
-                novel = [region for region in regions if region not in seen]
-                if not novel:
-                    continue
-                selected.append(source)
-                seen.update(novel)
-                required[source].update(regions)
-                if regions - live.get(source, Counter()):
-                    pending.add(source)
-            by_key[key_coverage.key] = tuple(selected)
-        return PlannedFetch(by_key, dict(required), frozenset(pending))
+        combined, live = self._coverages(requests)
+        fetch = self.plan_coverage(combined, live, order, requester=requester)
+        pending = live.missing_sources(fetch.required)
+        return PlannedFetch(fetch.by_key, fetch.required, frozenset(pending))
 
-    def _coverage(self, requests: Sequence[Request]) -> tuple[_KeyCoverage, ...]:
-        current = tuple(requests)
-        signature = tuple(self._request_signature(request) for request in current)
-        if self._keys is not None and self._coverage_cache is not None:
-            cached_requests, cached_signature, cached = self._coverage_cache
-            if (
-                len(current) == len(cached_requests)
-                and all(
-                    request is previous
-                    for request, previous in zip(current, cached_requests)
-                )
-                and signature == cached_signature
-            ):
-                return cached
-        coverage = self._compute_coverage(current)
-        if self._keys is not None:
-            self._coverage_cache = current, signature, coverage
-        return coverage
-
-    def _compute_coverage(
+    def _coverages(
         self, requests: Sequence[Request]
-    ) -> tuple[_KeyCoverage, ...]:
+    ) -> tuple[DirectoryCoverage, DirectoryCoverage]:
         keys = tuple(dict.fromkeys(request.key for request in requests))
         live = self.locate(keys)
-        combined = self._merged(live, self.pending(keys), keys)
-        combined_by_key = self._regions_by_key(
-            self.requests_by_source(requests, combined)
+        live_coverage = (
+            self.coverage(requests)
+            if self._keys is not None
+            else self.coverage(requests, live)
         )
-        live_by_key = self._regions_by_key(self.requests_by_source(requests, live))
-        return tuple(
-            _KeyCoverage(
-                key,
-                tuple(live.get(key, {})),
-                tuple(
-                    _SourceCoverage(
-                        source,
-                        combined_by_key.get(key, {}).get(source, ()),
-                        live_by_key.get(key, {}).get(source, ()),
-                    )
-                    for source in combined[key]
-                ),
-            )
-            for key in keys
+        overlay_spec = (
+            "dedup-pending",
+            tuple(self.request_spec(request) for request in requests),
+            self._pending_generation,
         )
-
-    @staticmethod
-    def _request_signature(request: Request) -> _RequestSignature:
-        tensor_slice = request.tensor_slice
-        slice_signature: object = None
-        if tensor_slice is not None:
-            slice_signature = (
-                tuple(tensor_slice.offsets),
-                tuple(tensor_slice.coordinates),
-                tuple(tensor_slice.global_shape),
-                tuple(tensor_slice.local_shape),
-                tuple(tensor_slice.mesh_shape),
-            )
-        return (
-            request.key,
-            id(request.tensor_val),
-            slice_signature,
-            id(request.objects),
-            request.is_object,
+        combined = self.decision_coverage(
+            overlay_spec,
+            lambda: self._overlay_coverage(requests, live, live_coverage),
         )
+        return combined, live_coverage
 
-    def _regions_by_key(
-        self, plan: Mapping[VolumeId, Sequence[Request]]
-    ) -> Dict[Key, Dict[VolumeId, tuple[_Region, ...]]]:
-        indexed: Dict[Key, Dict[VolumeId, tuple[_Region, ...]]] = defaultdict(dict)
-        for source, parts in plan.items():
-            source_by_key: Dict[Key, list[_Region]] = defaultdict(list)
-            for region in self.regions(parts).elements():
-                source_by_key[region[0]].append(region)
-            for key, regions in source_by_key.items():
-                indexed[key][source] = tuple(regions)
-        return indexed
-
-    @staticmethod
-    def _merged(
+    def _overlay_coverage(
+        self,
+        requests: Sequence[Request],
         live: Mapping[Key, Mapping[VolumeId, StorageInfo]],
-        pending: Mapping[Key, Mapping[VolumeId, StorageInfo]],
-        keys: Sequence[Key],
-    ) -> Dict[Key, Dict[VolumeId, StorageInfo]]:
-        merged: Dict[Key, Dict[VolumeId, StorageInfo]] = {}
-        for key in keys:
-            entries = dict(live.get(key, {}))
-            for source, info in pending.get(key, {}).items():
-                previous = entries.get(source)
-                if previous is None:
-                    entries[source] = StorageInfo(
-                        info.object_type, set(info.tensor_slices)
+        live_coverage: DirectoryCoverage,
+    ) -> DirectoryCoverage:
+        requests_by_key: Dict[Key, list[Request]] = {}
+        for request in requests:
+            requests_by_key.setdefault(request.key, []).append(request)
+        combined = []
+        for live_entry in live_coverage.entries:
+            live_sources = {source.source: source for source in live_entry.sources}
+            pending = self._pending_by_key.get(live_entry.key, {})
+            sources = tuple(dict.fromkeys((*live_sources, *pending)))
+            combined_sources = []
+            for source in sources:
+                live_source = live_sources.get(source)
+                pending_entry = pending.get(source)
+                if live_source is None:
+                    assert pending_entry is not None
+                    regions = tuple(
+                        region
+                        for request in requests_by_key[live_entry.key]
+                        for region in self._pending_regions(request, pending_entry)
                     )
-                elif (
-                    previous.object_type == info.object_type
-                    and info.tensor_slices - previous.tensor_slices
-                ):
-                    updated = StorageInfo(
-                        previous.object_type, set(previous.tensor_slices)
+                elif pending_entry is None:
+                    regions = live_source.regions
+                else:
+                    regions = self._merged_regions(
+                        requests_by_key[live_entry.key],
+                        live[live_entry.key][source],
+                        pending_entry.info,
+                        live_source.regions,
                     )
-                    updated.update(info)
-                    entries[source] = updated
-            merged[key] = entries
-        return merged
+                combined_sources.append(SourceCoverage(source, regions))
+            combined.append(
+                KeyCoverage(live_entry.key, sources, tuple(combined_sources))
+            )
+        return DirectoryCoverage(tuple(combined))
+
+    def _pending_regions(
+        self, request: Request, entry: _PendingEntry
+    ) -> tuple[_Region, ...]:
+        spec = self.request_spec(request)
+        if spec == entry.request_spec:
+            return entry.regions
+        regions = entry.alternate_regions.get(spec)
+        if regions is None:
+            regions = self.expand_regions(request, entry.info)
+            entry.alternate_regions[spec] = regions
+        return regions
+
+    def _merged_regions(
+        self,
+        requests: Sequence[Request],
+        live: StorageInfo,
+        pending: StorageInfo,
+        live_regions: tuple[_Region, ...],
+    ) -> tuple[_Region, ...]:
+        if live.object_type != pending.object_type:
+            return live_regions
+        added = pending.tensor_slices - live.tensor_slices
+        if not added:
+            return live_regions
+        merged_slices = set(live.tensor_slices)
+        merged_slices.update(pending.tensor_slices)
+        merged = StorageInfo(live.object_type, merged_slices)
+        return tuple(
+            region
+            for request in requests
+            for region in self.expand_regions(request, merged)
+        )

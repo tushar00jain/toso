@@ -195,8 +195,9 @@ proposed/       every contract that outlives the simulator; imports nothing
                   data plane asks it and passes the answer to an ordinary read
                   (prefer(): what the store does with a preference)
   environment.py  Environment -- topology, profile, transfer pricing and clock
-  sensors.py      DirectorySensor -- locate_raw once per pinned decision, or live;
-                  LoadSensor -- the common load reading used by Balance
+  sensors.py      DirectorySensor -- pinned directory reads, one-pass TorchStore
+                  coverage and ordered fetch planning, with unchanged live coverage
+                  reused; LoadSensor -- the common load reading used by Balance
   deployment.py   Deployment -- how data-plane code reaches its store, the one
                   control plane it asks (control_plane_handle, whatever that plane
                   declares) and another node's data plane (plane_handle, for whoever

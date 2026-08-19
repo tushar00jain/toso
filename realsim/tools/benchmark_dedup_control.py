@@ -8,6 +8,8 @@ Run from the repository root::
 The workload uses metadata-only TorchStore requests. Runtime and traced Python peak
 allocation are measured in separate passes. Payload allocation, transport, native
 allocators, process RSS, and simulated transfer time are outside the measurement.
+Cold columns measure the first peak-state request; unprefixed planning columns measure
+later requests while live directory metadata is unchanged.
 """
 
 from __future__ import annotations
@@ -134,6 +136,8 @@ class _Workload:
 class _Runtime:
     pending_build_ms: float
     snapshot_ms: float
+    cold_serving_sources_ms: float
+    cold_plan_fetch_ms: float
     serving_sources_ms: float
     plan_fetch_ms: float
     full_decision_ms: float
@@ -146,6 +150,8 @@ class _Runtime:
 class _Memory:
     pending_build_python_peak_kib: float
     snapshot_python_peak_kib: float
+    cold_serving_sources_python_peak_kib: float
+    cold_plan_fetch_python_peak_kib: float
     serving_sources_python_peak_kib: float
     plan_fetch_python_peak_kib: float
     full_decision_python_peak_kib: float
@@ -186,7 +192,7 @@ def _python_peak_kib(operation: Callable[[], object]) -> float:
 
 def _planning_ms(
     workload: _Workload, *, warmups: int, repeats: int
-) -> tuple[float, float, tuple[set[str], set[str]], PlannedFetch]:
+) -> tuple[float, float, float, float, tuple[set[str], set[str]], PlannedFetch]:
     keys = [request.key for request in workload.requests]
 
     def sample() -> tuple[float, float, tuple[set[str], set[str]], PlannedFetch]:
@@ -199,6 +205,7 @@ def _planning_ms(
             plan_ms = (time.perf_counter() - started) * 1_000
         return serving_ms, plan_ms, serving, fetch
 
+    cold_serving_ms, cold_plan_ms, serving, fetch = sample()
     for _ in range(warmups):
         sample()
     serving_samples = []
@@ -214,6 +221,8 @@ def _planning_ms(
         if enabled:
             gc.enable()
     return (
+        cold_serving_ms,
+        cold_plan_ms,
         statistics.median(serving_samples),
         statistics.median(plan_samples),
         serving,
@@ -272,7 +281,7 @@ def _runtime(args: argparse.Namespace) -> _Runtime:
     snapshot_ms, _ = _median_ms(
         workload.snapshot, warmups=args.warmups, repeats=args.repeats
     )
-    serving_ms, plan_ms, serving, fetch = _planning_ms(
+    cold_serving_ms, cold_plan_ms, serving_ms, plan_ms, serving, fetch = _planning_ms(
         workload, warmups=args.warmups, repeats=args.repeats
     )
     gc.collect()
@@ -283,6 +292,8 @@ def _runtime(args: argparse.Namespace) -> _Runtime:
     return _Runtime(
         pending_build_ms,
         snapshot_ms,
+        cold_serving_ms,
+        cold_plan_ms,
         serving_ms,
         plan_ms,
         decision_ms,
@@ -297,10 +308,21 @@ def _memory(args: argparse.Namespace) -> _Memory:
     pending_build = _python_peak_kib(workload.build_pending)
     snapshot = _python_peak_kib(workload.snapshot)
     with workload.directory.pinned([request.key for request in workload.requests]):
+        cold_serving = _python_peak_kib(workload.serving_sources)
+        cold_plan = _python_peak_kib(workload.plan_fetch)
+    with workload.directory.pinned([request.key for request in workload.requests]):
         serving = _python_peak_kib(workload.serving_sources)
         plan = _python_peak_kib(workload.plan_fetch)
     decision = _python_peak_kib(workload.decide)
-    return _Memory(pending_build, snapshot, serving, plan, decision)
+    return _Memory(
+        pending_build,
+        snapshot,
+        cold_serving,
+        cold_plan,
+        serving,
+        plan,
+        decision,
+    )
 
 
 def _run(args: argparse.Namespace) -> None:
@@ -309,19 +331,25 @@ def _run(args: argparse.Namespace) -> None:
     indexed_entries = args.keys * (args.source_ranks + 3 * args.generators)
     print(
         "case\tkeys\tsource_ranks\tgenerators\tindexed_metadata_entries\t"
-        "pending_build_ms\tsnapshot_ms\tserving_sources_ms\tplan_fetch_ms\t"
+        "pending_build_ms\tsnapshot_ms\tcold_serving_sources_ms\t"
+        "cold_plan_fetch_ms\tserving_sources_ms\tplan_fetch_ms\t"
         "full_decision_ms\tpending_build_python_peak_kib\t"
-        "snapshot_python_peak_kib\tserving_sources_python_peak_kib\t"
+        "snapshot_python_peak_kib\tcold_serving_sources_python_peak_kib\t"
+        "cold_plan_fetch_python_peak_kib\tserving_sources_python_peak_kib\t"
         "plan_fetch_python_peak_kib\tfull_decision_python_peak_kib\t"
         "candidates\tpending_candidates\tselected_sources"
     )
     print(
         f"{args.case}\t{args.keys}\t{args.source_ranks}\t{args.generators}\t"
         f"{indexed_entries}\t{runtime.pending_build_ms:.3f}\t"
-        f"{runtime.snapshot_ms:.3f}\t{runtime.serving_sources_ms:.3f}\t"
+        f"{runtime.snapshot_ms:.3f}\t{runtime.cold_serving_sources_ms:.3f}\t"
+        f"{runtime.cold_plan_fetch_ms:.3f}\t"
+        f"{runtime.serving_sources_ms:.3f}\t"
         f"{runtime.plan_fetch_ms:.3f}\t{runtime.full_decision_ms:.3f}\t"
         f"{memory.pending_build_python_peak_kib:.3f}\t"
         f"{memory.snapshot_python_peak_kib:.3f}\t"
+        f"{memory.cold_serving_sources_python_peak_kib:.3f}\t"
+        f"{memory.cold_plan_fetch_python_peak_kib:.3f}\t"
         f"{memory.serving_sources_python_peak_kib:.3f}\t"
         f"{memory.plan_fetch_python_peak_kib:.3f}\t"
         f"{memory.full_decision_python_peak_kib:.3f}\t"

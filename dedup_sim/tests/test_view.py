@@ -255,6 +255,91 @@ def test_region_planning_is_torchstores_expansion():
     assert crossing_plan["origin"][0].tensor_slice.offsets == (3,)
 
 
+def test_one_pass_source_expansion_matches_torchstore_projection():
+    directory = DirectorySensor(_Holds("origin"))
+    stored_slice = TensorSlice((0,), (0,), (8,), (4,), (2,))
+    requested_slice = TensorSlice((2,), (0,), (8,), (4,), (2,))
+    cases = (
+        (_request("object"), StorageInfo(ObjectType.OBJECT, {None})),
+        (_request("tensor"), StorageInfo(ObjectType.TENSOR, {None})),
+        (
+            _request("slice", requested_slice),
+            StorageInfo(ObjectType.TENSOR_SLICE, {stored_slice}),
+        ),
+    )
+
+    for request, info in cases:
+        located = {request.key: {"origin": info}}
+        projected = directory.plan_requests((request,), located)["origin"]
+        independent = directory.requests_by_source((request,), located)["origin"]
+        assert [directory.request_spec(part) for part in independent] == [
+            directory.request_spec(part) for part in projected
+        ]
+
+
+def test_dense_coverage_visits_each_entry_and_expands_equal_metadata_once(monkeypatch):
+    requests = tuple(_request(f"K{index}") for index in range(3))
+    info = StorageInfo(ObjectType.TENSOR, {None})
+    live = {
+        request.key: {f"v{source}": info for source in range(4)} for request in requests
+    }
+
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: dict(live[key]) for key in keys}
+
+    directory = DirectorySensor(_Directory())
+    visits = 0
+    expansions = 0
+    visit = directory.expand_regions
+    expand = directory._expand_request
+
+    def counted_visit(request, storage_info):
+        nonlocal visits
+        visits += 1
+        return visit(request, storage_info)
+
+    def counted_expand(request, storage_info):
+        nonlocal expansions
+        expansions += 1
+        return expand(request, storage_info)
+
+    monkeypatch.setattr(directory, "expand_regions", counted_visit)
+    monkeypatch.setattr(directory, "_expand_request", counted_expand)
+    with directory.pinned([request.key for request in requests]):
+        coverage = directory.coverage(requests)
+
+    assert coverage.sources == {f"v{source}" for source in range(4)}
+    assert visits == 12
+    assert expansions == 3
+
+
+def test_live_coverage_cache_observes_slice_mutation():
+    left = TensorSlice((0,), (0,), (8,), (4,), (2,))
+    right = TensorSlice((4,), (1,), (8,), (4,), (2,))
+    info = StorageInfo(ObjectType.TENSOR_SLICE, {left})
+
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: {"origin": info} for key in keys}
+
+    directory = DirectorySensor(_Directory())
+    request = _request("K")
+    with directory.pinned(["K"]):
+        first = directory.coverage((request,))
+    info.tensor_slices.add(right)
+    with directory.pinned(["K"]):
+        second = directory.coverage((request,))
+
+    assert first is not second
+    assert second.requirements()["origin"] == Counter(
+        {
+            ("K", ((0,), (4,), (8,))): 1,
+            ("K", ((4,), (4,), (8,))): 1,
+        }
+    )
+
+
 def test_every_whole_value_source_is_rankable_before_narrowing():
     request = _request("K")
     live = {
@@ -286,99 +371,112 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
 def test_one_pinned_decision_expands_matching_coverage_once(monkeypatch):
     directory = DedupDirectorySensor(_Holds("origin"))
     requests = [_request("K0"), _request("K1")]
-    computations = 0
-    original = directory._compute_coverage
+    expansions = 0
+    original = directory._expand_request
 
-    def counted(requests):
-        nonlocal computations
-        computations += 1
-        return original(requests)
+    def counted(request, storage_info):
+        nonlocal expansions
+        expansions += 1
+        return original(request, storage_info)
 
-    monkeypatch.setattr(directory, "_compute_coverage", counted)
+    monkeypatch.setattr(directory, "_expand_request", counted)
     with directory.pinned([request.key for request in requests]):
         directory.serving_sources(tuple(requests))
         directory.plan_fetch(tuple(requests), ("origin",))
 
-    assert computations == 1
+    assert expansions == 2
 
 
-def test_each_pinned_decision_recomputes_matching_coverage(monkeypatch):
+def test_unchanged_live_coverage_is_reused_across_pinned_decisions():
     directory = DedupDirectorySensor(_Holds("origin"))
     requests = [_request("K")]
-    computations = 0
-    original = directory._compute_coverage
-
-    def counted(requests):
-        nonlocal computations
-        computations += 1
-        return original(requests)
-
-    monkeypatch.setattr(directory, "_compute_coverage", counted)
+    observed = []
     for _ in range(2):
         with directory.pinned(["K"]):
-            directory.serving_sources(tuple(requests))
-            directory.plan_fetch(tuple(requests), ("origin",))
+            observed.append(directory.coverage(tuple(requests)))
 
-    assert computations == 2
+    assert observed[0] is observed[1]
 
 
 def test_pinned_coverage_recomputes_after_request_content_changes(monkeypatch):
     directory = DedupDirectorySensor(_Holds("origin"))
     request = _request("K")
-    computations = 0
-    original = directory._compute_coverage
+    expansions = 0
+    original = directory._expand_request
 
-    def counted(requests):
-        nonlocal computations
-        computations += 1
-        return original(requests)
+    def counted(request, storage_info):
+        nonlocal expansions
+        expansions += 1
+        return original(request, storage_info)
 
-    monkeypatch.setattr(directory, "_compute_coverage", counted)
+    monkeypatch.setattr(directory, "_expand_request", counted)
     with directory.pinned(["K"]):
         directory.serving_sources((request,))
         request.tensor_slice = TensorSlice((0,), (0,), (8,), (4,), (2,))
         directory.plan_fetch((request,), ("origin",))
 
-    assert computations == 2
+    assert expansions == 2
 
 
-def test_unpinned_coverage_is_never_cached(monkeypatch):
+def test_unpinned_coverage_is_never_cached():
     directory = DedupDirectorySensor(_Holds("origin"))
     requests = [_request("K")]
-    computations = 0
-    original = directory._compute_coverage
 
-    def counted(requests):
-        nonlocal computations
-        computations += 1
-        return original(requests)
+    first = directory.coverage(tuple(requests))
+    second = directory.coverage(tuple(requests))
 
-    monkeypatch.setattr(directory, "_compute_coverage", counted)
-    directory.serving_sources(tuple(requests))
-    directory.plan_fetch(tuple(requests), ("origin",))
-
-    assert computations == 2
+    assert first is not second
 
 
-def test_pending_merge_copies_only_live_metadata_that_grows():
-    left = TensorSlice((0,), (0,), (8,), (4,), (2,))
-    right = TensorSlice((4,), (1,), (8,), (4,), (2,))
-    whole = StorageInfo(ObjectType.TENSOR, {None})
-    partial = StorageInfo(ObjectType.TENSOR_SLICE, {left})
-    live = {"K": {"whole": whole, "partial": partial}}
-    pending = {
-        "K": {
-            "whole": StorageInfo(ObjectType.TENSOR, {None}),
-            "partial": StorageInfo(ObjectType.TENSOR_SLICE, {right}),
-        }
-    }
+def test_live_coverage_cache_observes_directory_mutation():
+    info = StorageInfo(ObjectType.TENSOR, {None})
 
-    merged = DedupDirectorySensor._merged(live, pending, ("K",))
+    class _Directory:
+        def __init__(self):
+            self.entries = {"origin": info}
 
-    assert merged["K"]["whole"] is whole
-    assert merged["K"]["partial"] is not partial
-    assert merged["K"]["partial"].tensor_slices == {left, right}
-    assert partial.tensor_slices == {left}
+        def locate_raw(self, keys, missing_ok=False):
+            return {key: dict(self.entries) for key in keys}
+
+    state = _Directory()
+    directory = DedupDirectorySensor(state)
+    request = _request("K")
+    with directory.pinned(["K"]):
+        first = directory.coverage((request,))
+        assert directory.serving_sources((request,))[0] == {"origin"}
+    state.entries = {"replica": info}
+    with directory.pinned(["K"]):
+        second = directory.coverage((request,))
+        assert directory.serving_sources((request,))[0] == {"replica"}
+
+    assert first is not second
+
+
+def test_pending_producer_coverage_is_expanded_when_asked(monkeypatch):
+    class _Directory:
+        def locate_raw(self, keys, missing_ok=False):
+            return {}
+
+    directory = DedupDirectorySensor(_Directory())
+    dispatcher = _dispatcher(directory, FanoutSensor())
+    expansions = 0
+    original = directory._expand_request
+
+    def counted(request, storage_info):
+        nonlocal expansions
+        expansions += 1
+        return original(request, storage_info)
+
+    monkeypatch.setattr(directory, "_expand_request", counted)
+    dispatcher.dispatch_sync(Asked("p0", (_request("K"),)))
+    dispatcher.dispatch_sync(Asked("p1", (_request("K"),)))
+    for _ in range(2):
+        request = _request("K")
+        with directory.pinned(["K"]):
+            directory.serving_sources((request,))
+            directory.plan_fetch((request,), ("p0", "p1"))
+
+    assert expansions == 1
 
 
 def test_multi_key_coverage_keeps_regions_under_their_sources():
@@ -464,20 +562,20 @@ def test_sparse_candidate_discovery_visits_only_present_entries(monkeypatch):
 
     directory = DedupDirectorySensor(_Directory())
     visited = 0
-    original = directory.plan_requests
+    original = directory._expand_request
 
-    def counted(requests, located=None):
+    def counted(request, storage_info):
         nonlocal visited
-        visited += sum(len(entries) for entries in located.values())
-        return original(requests, located)
+        visited += 1
+        return original(request, storage_info)
 
-    monkeypatch.setattr(directory, "plan_requests", counted)
+    monkeypatch.setattr(directory, "_expand_request", counted)
 
     candidates, pending = directory.serving_sources(requests)
 
     assert candidates == {f"v{i}" for i in range(20)}
     assert pending == set()
-    assert visited == 40
+    assert visited == 20
 
 
 def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():

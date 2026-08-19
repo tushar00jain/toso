@@ -38,10 +38,10 @@ optimize the final microseconds of a fused one-hop engine; or change the
 ┌────────────── CONTROL ──────────────┐      ┌──────────── DATA ─────────────┐      ┌────────── TORCHSTORE ──────────┐
 │ Dedup ControlPlane                  │      │ ReadThroughPlane              │      │ Controller: current holders    │
 │ source rank + readiness + load      │answer│ preferred batch → local put   │─────►│ LocalClient: slice planning    │
-│ DirectorySensor: live + pending     │      │ dispatch Published            │      │ StorageVolume: resident bytes  │
-│ FanoutSensor: tree / load           │      │                               │      │                                │
-│ reads Environment + Sensors         │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
-└─────────────────────────────────────┘      └───────────────────────────────┘      └────────────────────────────────┘
+│ DirectorySensor: TorchStore coverage│      │ dispatch Published            │      │ StorageVolume: resident bytes  │
+│ Dedup overlay + FanoutSensor        │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
+│ reads Environment + Sensors         │      └───────────────────────────────┘      └────────────────────────────────┘
+└─────────────────────────────────────┘
 ┌──────────────── DIRECTORY TRUTH ─────────────────┐   ┌──────────────────── SENSOR TRUTH ────────────────────┐
 │ batch put registers reader as a current holder   │   │ Published settles its plan and wakes dependents      │
 └──────────────────────────────────────────────────┘   └──────────────────────────────────────────────────────┘
@@ -181,9 +181,10 @@ actions hold only the producer. Copies stay pinned within one sync window; optio
 deletion reclaims them after the version changes.
 
 The executable plane builds existing meta-only `Request` values from the caller's
-`key -> tensor/DTensor/None` batch. `ObjectType.from_request`, `StorageInfo`, and
-`LocalClient._build_volume_requests` interpret both live and promised entries. One
-key may select several slice producers; its gate names only their `Published` actions.
+`key -> tensor/DTensor/None` batch. `DirectorySensor` applies `ObjectType` semantics
+and `LocalClient._expand_tensor_slices` once per distinct request/metadata pair for
+both live and promised entries. One key may select several slice producers; its gate
+names only their `Published` actions.
 
 ## 6. Correctness and failure handling
 
