@@ -94,7 +94,7 @@ all `G` pending publications above.
 | Serving union | `O(K·T)` live overlap plus `O(D)` shape probes; returns `frozenset[Publication]` with `V + G` sources at the peak | `O(V + G)` flat set of `(pub_id, volume)` tuples | `union_ms` |
 | Candidate scoring | `O(V + G)` `arrival` reads plus `O(V + G)` `read_time` calls; per-volume max collapses `V + G → V` | `O(V)` priced tuples | `rank_ms` |
 | Balance and ordering | `O(V + V log V)` | `O(V)` keyed selection | `rank_ms` |
-| `greedy_cover` on the ranked preference | `O(C · K)` region-overlap checks; breaks early at full coverage. `C = 1` under whole-value single-source coverage | `O(C)` chosen publications, `O(K)` covered-region set | Part of `full_decision_ms` |
+| `greedy_cover` (per key, per slice via the shared walker) | `O(C · K)` region-overlap checks; breaks early at full coverage. `C = 1` under whole-value single-source coverage | `O(C)` chosen publications, `O(K)` covered-region set | Part of `full_decision_ms` |
 | Route dispatch and arrival record | `O(C)` load edges plus one arrival float | `O(1)` retained on the requester publication | `full_decision_ms` |
 | Gate registration | `O(C)` waiter links | `O(C)` links, up to `O(GC)` across a blocked burst | `gate_ms` |
 | Total synchronous control decision | `O(K·T + D + V log V + C·K)` | Adds `O(K + C)` retained requester state plus `O(V + G)` transient union state | `full_decision_ms` |
@@ -113,11 +113,11 @@ common synchronized burst uses one exact-shape bucket lookup for all `G` publica
 in one probe. A workload with several slice layouts pays for those distinct layouts;
 slice intersection remains proportional to the metadata in each probed shape.
 
-The greedy walk on the control plane is `Controller.greedy_cover`. Given the ranked
-publications, it takes each in order and adds it to the chosen set if it uncovers a
-region the earlier picks did not. Under whole-value synchronized bursts the first pick
-covers the whole request and `greedy_cover` returns after one iteration -- `C = 1`.
-Sliced or sparse workloads walk until covered; the break keeps it linear in `C·K`.
+The greedy walk on the control plane is `Controller.greedy_cover`. It builds ranked
+source maps and delegates to the same per-key, per-slice walker the client uses for
+volume requests. Under whole-value synchronized bursts the first pick covers the whole
+request and `greedy_cover` returns after one source -- `C = 1`. Sliced or sparse
+workloads walk until every requested slice region is covered.
 
 `indexed_metadata_entries` counts entries in the large key-multiplied structures, not
 bytes or Python objects:
@@ -217,8 +217,8 @@ trie (live only)                       controller sidecars
 ```
 
 Ordinary reads (`locate_volumes`, `get`, `keys`, DTensor commit check) traverse only
-the trie. Pending entries live in the separate `_pending` map and are consulted only
-by `serving_union` and `regions_covered`.
+the trie. Pending entries live in the separate `_pending` map and are consulted by
+`serving_union`, `regions_covered`, and `greedy_cover` when it builds source maps.
 
 `Dedup.sources([w0, w1], "r")` is one synchronous turn: nothing suspends between
 declaration and gate.
@@ -239,9 +239,9 @@ Candidates.select
     |
 Balance -> WithFold -> Ordered           V-entry keyed selection, sort V log V
     |
-greedy_cover(requests, ranked)          walk in order; take each publication whose
-                                        regions_covered ∖ covered is non-empty;
-                                        break when the request is fully covered.
+greedy_cover(requests, ranked)          per key, per slice via the shared walker;
+                                        take each source with a fresh overlap and
+                                        stop each whole-value key at its first source.
                                         For whole-value keys the first pick covers
                                         everything -- C = 1.
     |
@@ -298,7 +298,7 @@ One decision at `planned-8b` (`290/4/16`), counted by wrapping the sensor:
 | `serving_union` | 1 | |
 | `arrival` reads | one per priced publication | |
 | `read_time` | one per priced publication | |
-| `regions_covered` | one per source `greedy_cover` visits | |
+| `greedy_cover` shared-walker overlap | one per requested key and visited source | |
 | `is_in_flight` (gate probe) | one per pending publication named | |
 
 There is no cache to key, no batch-spec build, no `covers` fallback, no per-source
@@ -320,10 +320,3 @@ In profile order against the numbers above:
   `723/64/128`) is dominated by the per-key live-directory read and its per-key
   hashing. Interning `(key, region)` to an int shrinks the retained state and speeds
   the reads; nothing else touches the region contents.
-- `greedy_cover` under a DTensor workload with a volume holding slice A live and slice
-  B pending on the same key would under-wait on that publication: the flat serving
-  union collapses `{(0, V), (pub, V)}` and the greedy walk takes the live pick first,
-  believing the whole slice is covered. Not exercised by current whole-value
-  benchmarks; per-slice granularity in the return shape would fix it, at the cost of
-  the `K · V` blowup the flat form removed. See the TODO in `dedup_sim/control/
-  routing.py`.

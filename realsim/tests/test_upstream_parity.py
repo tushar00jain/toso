@@ -6,7 +6,7 @@ import inspect
 
 from proposed import Controller as ControllerProtocol
 from realsim.adapters.real_controller import RealControllerAdapter
-from torchstore import Publication
+from torchstore import coverage, Publication
 from torchstore.client import LocalClient
 from torchstore.controller import Controller, ObjectType, StorageInfo
 from torchstore.transport import Request, TensorSlice
@@ -22,6 +22,7 @@ def test_controller_exposes_publication_and_preference_parameters():
     assert delete.parameters["pub"].default is None
     assert hasattr(Controller, "serving_union")
     assert hasattr(Controller, "regions_covered")
+    assert callable(coverage.cover)
     assert hasattr(Controller, "greedy_cover")
     assert hasattr(Controller, "_locate")
     assert hasattr(Controller, "_notify_put")

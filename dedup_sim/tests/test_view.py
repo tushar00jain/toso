@@ -33,6 +33,11 @@ def _slice_request(key: str, coordinate: int = 0) -> Request:
     return Request.from_tensor_slice(key, tensor_slice).meta_only()
 
 
+def _full_slice_request(key: str) -> Request:
+    tensor_slice = TensorSlice((0,), (0,), (8,), (8,), (1,))
+    return Request.from_tensor_slice(key, tensor_slice).meta_only()
+
+
 def _directory() -> DedupDirectorySensor:
     return DedupDirectorySensor(RealControllerAdapter().service)
 
@@ -140,6 +145,37 @@ def test_greedy_walk_chooses_one_source_per_disjoint_region():
 
     assert chosen == [first, second]
     assert _gate_publications(chosen) == {first, second}
+
+
+def test_mixed_live_pending_slices_on_one_volume_gate_the_pending_publication():
+    ids = ("origin", "p0", "r0")
+    environment = Environment({v: Endpoint(v, v, v) for v in ids}, _Profile())
+    directory = _directory()
+    plane = Dedup().attach(
+        environment,
+        {DedupDirectorySensor: directory},
+    )
+    fanout = plane.sensor(FanoutSensor)
+    directory.directory.notify_put_batch(
+        (_slice_request("K", 0),), "p0", pending=False
+    )
+    pub1 = directory.declare("p0", (_slice_request("K", 1),))
+    plane.dispatcher.dispatch_sync(Asked(pub1))
+    plane.dispatcher.dispatch_sync(
+        Routed(pub1, ("origin",), frozenset(), 7.0)
+    )
+    requests = (_full_slice_request("K"),)
+    ranking = plane._chain.select(directory.serving_union(requests), "r0")
+
+    chosen = directory.greedy_cover(requests, ranking.sources)
+
+    assert chosen == [(0, "p0"), pub1]
+    assert _gate_publications(chosen) == {pub1}
+
+    plan, _trace = run_sim(plane._decide(requests, "r0"))
+    pub1_arrival = fanout.arrival(pub1)
+    assert pub1_arrival == 7.0
+    assert fanout.arrival(plan.publication) == pub1_arrival + 1.0
 
 
 def test_batch_one_publication_does_not_open_batch_twos_gate():
