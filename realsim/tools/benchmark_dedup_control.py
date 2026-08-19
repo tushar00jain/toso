@@ -30,6 +30,7 @@ os.environ.setdefault("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", "910737418240")
 from dedup_sim.control._sensor import Asked, DedupDirectorySensor, PlannedFetch, Routed
 from dedup_sim.control.routing import Dedup
 from proposed import Endpoint, Environment
+from realsim.seams.projection import Projecting
 from torchstore.controller import ObjectType, StorageInfo
 from torchstore.transport import Request
 
@@ -56,20 +57,35 @@ _PRESETS = {
 }
 
 
-class _StaticDirectory:
+class _StaticDirectory(Projecting):
+    """Unchanging live placement, and the promise bookkeeping a real one has."""
+
     def __init__(self, requests: Sequence[Request], sources: Sequence[str]) -> None:
+        super().__init__()
         info = StorageInfo(ObjectType.from_request(requests[0]), {None})
         self._located = {
             request.key: {source: info for source in sources} for request in requests
         }
+
+    @property
+    def entries(self) -> dict[str, dict[str, StorageInfo]]:
+        return self._located
 
     def locate_raw(
         self,
         keys: Sequence[str],
         missing_ok: bool = False,
         require_fully_committed: bool = True,
+        *,
+        projected: bool = False,
     ) -> dict[str, dict[str, StorageInfo]]:
-        return {key: self._located[key] for key in keys if key in self._located}
+        if projected:
+            return {key: self._located[key] for key in keys if key in self._located}
+        return {
+            key: self.live_map(key, self._located[key])
+            for key in keys
+            if key in self._located
+        }
 
 
 class _Profile:
@@ -260,7 +276,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmups < 0:
         parser.error("--warmups cannot be negative")
-    indexed_entries = args.keys * (args.source_ranks + 3 * args.generators)
+    indexed_entries = args.keys * (args.source_ranks + 2 * args.generators)
     region_checks = args.keys * args.keys * (args.source_ranks + args.generators)
     if not args.allow_large and (
         indexed_entries > _MAX_INDEXED_ENTRIES or region_checks > _MAX_REGION_CHECKS
@@ -328,7 +344,7 @@ def _memory(args: argparse.Namespace) -> _Memory:
 def _run(args: argparse.Namespace) -> None:
     runtime = _runtime(args)
     memory = _memory(args)
-    indexed_entries = args.keys * (args.source_ranks + 3 * args.generators)
+    indexed_entries = args.keys * (args.source_ranks + 2 * args.generators)
     print(
         "case\tkeys\tsource_ranks\tgenerators\tindexed_metadata_entries\t"
         "pending_build_ms\tsnapshot_ms\tcold_serving_sources_ms\t"

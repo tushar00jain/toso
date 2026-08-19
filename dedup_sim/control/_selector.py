@@ -38,7 +38,8 @@ releases the next reader's withheld answer (:mod:`dedup_sim.data`).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Unpack
+from collections import Counter
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Unpack
 
 from proposed import Key, KeySelector, Selection, VolumeId
 
@@ -98,10 +99,8 @@ class Candidates(KeySelector[float]):
         fanout = self.sensor(FanoutSensor)
         directory = self.sensor(DedupDirectorySensor)
         requested = tuple(directory.plan(requester).values())
-        located = directory.locate(keys)
         candidates, pending = directory.serving_sources(requested)
         queued = fanout.named()
-        located_by_key: Dict[str, Mapping[VolumeId, Any]] = dict(located)
         # Discounted from the cap below: a second ask costs no slot, so a reader
         # re-asking after an eviction is not shut out by its own place in the queue.
         mine = set(fanout.planned(requester))
@@ -116,15 +115,7 @@ class Candidates(KeySelector[float]):
             wait = (
                 0.0
                 if volume in live
-                else self._wait(
-                    volume,
-                    fanout,
-                    in_flight,
-                    directory,
-                    located_by_key,
-                    waits,
-                    set(),
-                )
+                else self._wait(volume, fanout, in_flight, directory, waits, set())
             )
             if wait is None:
                 continue
@@ -146,7 +137,6 @@ class Candidates(KeySelector[float]):
         fanout: FanoutSensor,
         in_flight: Set[VolumeId],
         directory: DedupDirectorySensor,
-        located: Dict[Key, Mapping[VolumeId, Any]],
         waits: Dict[VolumeId, Optional[float]],
         visiting: Set[VolumeId],
     ) -> Optional[float]:
@@ -165,24 +155,15 @@ class Candidates(KeySelector[float]):
         visiting.add(volume)
         pending = fanout.route_pending(volume)
         requests = tuple(directory.plan(volume).values())
+        # Read, not remembered: a source that published and has since evicted owes
+        # this route nothing, and the route's own pending flag would still say wait.
         arrivals: List[float] = []
         for source, expected in required.items():
-            required_keys = {key for key, _region in expected}
-            for key in required_keys:
-                if key not in located:
-                    located.update(directory.locate_live([key]))
-            ready = directory.covers(requests, {source: expected}, located)
-            if ready:
+            if directory.covers(requests, {source: Counter(expected)}):
                 wait = 0.0
             elif source in pending and source in in_flight:
                 wait = self._wait(
-                    source,
-                    fanout,
-                    in_flight,
-                    directory,
-                    located,
-                    waits,
-                    visiting,
+                    source, fanout, in_flight, directory, waits, visiting
                 )
             else:
                 wait = None

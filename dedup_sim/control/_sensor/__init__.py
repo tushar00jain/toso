@@ -1,8 +1,8 @@
-"""Dedup's pending directory and fan-out observations.
+"""Dedup's promised directory and fan-out observations.
 
 Both sensors fold capability actions through one dispatcher. The directory sensor owns
-live controller reads plus pending entries; the fan-out sensor owns routes, dependencies,
-and source load.
+controller reads and the promises it writes back into the controller; the fan-out
+sensor owns routes, dependencies, and source load.
 """
 
 from ._directory import Asked, DedupDirectorySensor, PlannedFetch, Published

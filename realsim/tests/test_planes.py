@@ -334,8 +334,14 @@ def test_the_directory_holds_nothing_that_decides():
     """
     service = Simulation(_topology()).mesh.directory.service
     assert {name for name in dir(service) if not name.startswith("_")} == {
-        "controller", "keys", "locate_raw", "locate_volumes",
+        # revision counts this service's own mutations; a reader compares it to
+        # decide whether what it derived still holds. It decides nothing here.
+        "controller", "entries", "keys", "locate_raw", "locate_volumes", "revision",
         "notify_delete", "notify_delete_batch", "notify_put_batch",
+        # project/clear_projections record what a volume will hold. The directory
+        # stores what it is told and answers ordinary reads as if it were not there;
+        # who promised what, and what to do about it, stays with the caller.
+        "clear_projections", "project", "projected_owners", "live_map", "unpromise",
     }
 
 

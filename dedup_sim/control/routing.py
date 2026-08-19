@@ -110,9 +110,11 @@ class Dedup(ControlPlane):
     ) -> "Dedup":
         """Build this plane's sensors and attach the chain that reads them.
 
-        The pending overlay and fan-out state are plane-owned: two planes sharing either
+        The promise record and fan-out state are plane-owned: two planes sharing either
         would answer from the other's decisions and wait on publications only the other
-        plane hears about.
+        plane hears about. Promises themselves go into the shared directory, so that
+        boundary is enforced on the way back out
+        (:meth:`~dedup_sim.control._sensor.DedupDirectorySensor.servable`).
 
         Sorted rather than cut to the winner: a reader reads its preference down, so a
         source ranked behind the head still serves the read if the head evicted the key
@@ -203,9 +205,11 @@ class Dedup(ControlPlane):
             )
         )
 
-        required = {source: fetch.required[source] for source in fetch.pending}
+        # The pin is the read: nothing suspends between planning the fetch and this
+        # gate, so a second live directory read would answer what fetch.pending
+        # already says. Dispatcher.gate probes synchronously and never re-probes.
         gate = self.dispatcher.gate(
-            lambda: directory.covers(requested, required, live=True),
+            lambda: not fetch.pending,
             (Published(source) for source in fetch.pending),
         )
 

@@ -1,20 +1,32 @@
-"""Dedup's pending overlay on the live TorchStore directory."""
+"""What dedup promises the directory, and what a decision reads back out of it.
+
+A reader routed onto a peer is routed against the directory as it *will be*, so this
+sensor writes each in-flight batch into the directory as a promise
+(:meth:`~proposed.deployment.Controller.project`) and reads it back through the same
+lookup as a live holder. No overlay is joined per request: a promise landing on a
+volume that already holds part of the key covers both halves in the one entry, and a
+real put replaces the promise rather than merging into it.
+
+What stays here is what a ``StorageInfo`` cannot carry: the :class:`Request` a
+producer promised, which is what its own route is planned from, and the *shape* of
+its batch, which is what answers "does this producer promise what I am asking for"
+in one identity test rather than a walk.
+"""
 
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from proposed import (
     Controller,
-    DirectoryCoverage,
     DirectorySensor,
     Key,
     VolumeId,
 )
-from proposed.sensors import KeyCoverage, SourceCoverage
+from proposed.sensors import FetchPlan
 from proposed.dispatch import Action, Fold
 from torchstore.controller import ObjectType, StorageInfo
 from torchstore.transport import Request
@@ -22,6 +34,7 @@ from torchstore.transport import Request
 __all__ = ["Asked", "DedupDirectorySensor", "PlannedFetch", "Published"]
 
 _Region = tuple[Key, object]
+_BatchSpec = tuple[object, ...]
 
 
 @dataclass(frozen=True)
@@ -43,39 +56,34 @@ class Published(Action):
 
 
 @dataclass(frozen=True)
-class PlannedFetch:
-    """Per-key sources, exact requirements, and pending producers."""
+class PlannedFetch(FetchPlan):
+    """A fetch plan and the producers whose copies have not landed yet."""
 
-    by_key: Mapping[Key, tuple[VolumeId, ...]]
-    required: Mapping[VolumeId, Counter[_Region]]
     pending: frozenset[VolumeId]
-
-    @property
-    def sources(self) -> tuple[VolumeId, ...]:
-        return tuple(
-            dict.fromkeys(
-                source for sources in self.by_key.values() for source in sources
-            )
-        )
 
 
 @dataclass(frozen=True)
-class _PendingEntry:
-    request: Request
-    info: StorageInfo
-    request_spec: object
-    regions: tuple[_Region, ...]
-    alternate_regions: Dict[object, tuple[_Region, ...]] = field(default_factory=dict)
+class _Batch:
+    """One producer's in-flight promise."""
+
+    #: ``key -> the request it promised``, which is what :meth:`plan` answers.
+    requests: Mapping[Key, Request]
+    #: ``key -> the metadata handed to the directory``. The same objects the
+    #: directory holds, so what is read back out of it is what was promised.
+    infos: Mapping[Key, StorageInfo]
+    #: One shared object per distinct batch shape, so "does this producer promise
+    #: exactly what is being asked for" is an identity test (:meth:`_shape`).
+    shape: _BatchSpec
 
 
 class DedupDirectorySensor(DirectorySensor):
-    """Live directory metadata plus dedup's separately committed pending entries."""
+    """Live directory metadata plus dedup's own promises to the same directory."""
 
     def __init__(self, directory: Controller) -> None:
         super().__init__(directory)
-        self._pending: Dict[VolumeId, Dict[Key, _PendingEntry]] = {}
-        self._pending_by_key: Dict[Key, Dict[VolumeId, _PendingEntry]] = {}
-        self._pending_generation = 0
+        self._batches: Dict[VolumeId, _Batch] = {}
+        self._shapes: Dict[_BatchSpec, _BatchSpec] = {}
+        self._shape_uses: Counter[_BatchSpec] = Counter()
         self._folds: Dict[type, Fold] = {
             Asked: self._asked,
             Published: self._published,
@@ -83,71 +91,134 @@ class DedupDirectorySensor(DirectorySensor):
 
     @property
     def folds(self) -> Mapping[type, Fold]:
-        """What moves the pending overlay, by action type."""
+        """What moves the promised directory, by action type."""
         return MappingProxyType(self._folds)
 
     def _asked(self, action: Asked) -> None:
-        if action.requester in self._pending:
+        if action.requester in self._batches:
             raise ValueError(f"{action.requester} already has an in-flight publication")
         requests = {request.key: request for request in action.requests}
         if len(requests) != len(action.requests):
             raise ValueError("a publication names each key once")
-        entries = {}
+        infos: Dict[Key, StorageInfo] = {}
+        specs = []
         for key, request in requests.items():
             info = StorageInfo(ObjectType.from_request(request), {request.tensor_slice})
-            spec = self.request_spec(request)
-            entry = _PendingEntry(
-                request,
-                info,
-                spec,
-                self.expand_regions(request, info),
-            )
-            entries[key] = entry
-        self._pending[action.requester] = entries
-        for key, entry in entries.items():
-            self._pending_by_key.setdefault(key, {})[action.requester] = entry
-        self._pending_generation += 1
+            infos[key] = info
+            specs.append(self.request_spec(request))
+            self.directory.project(action.requester, key, info)
+        self._batches[action.requester] = _Batch(
+            MappingProxyType(requests), infos, self._shape(tuple(specs))
+        )
 
     def _published(self, action: Published) -> None:
-        entries = self._pending.pop(action.producer, {})
-        for key in entries:
-            producers = self._pending_by_key[key]
-            del producers[action.producer]
-            if not producers:
-                del self._pending_by_key[key]
-        if entries:
-            self._pending_generation += 1
+        # A producer may publish fewer keys than it promised, and the directory keeps
+        # a promise until it is told otherwise, so the remainder is cleared here.
+        self.directory.clear_projections(action.producer)
+        batch = self._batches.pop(action.producer, None)
+        if batch is None:
+            return
+        self._shape_uses[batch.shape] -= 1
+        if not self._shape_uses[batch.shape]:
+            del self._shape_uses[batch.shape]
+            del self._shapes[batch.shape]
+
+    def _shape(self, spec: _BatchSpec) -> _BatchSpec:
+        """The one object standing for every batch asking for ``spec``."""
+        shared = self._shapes.setdefault(spec, spec)
+        self._shape_uses[shared] += 1
+        return shared
 
     def plan(self, producer: VolumeId) -> Mapping[Key, Request]:
         """``producer``'s pending read-through requests, by key."""
-        return MappingProxyType(
-            {key: entry.request for key, entry in self._pending[producer].items()}
-        )
-
-    def pending(self, keys: Sequence[Key]) -> Dict[Key, Mapping[VolumeId, StorageInfo]]:
-        """Pending-only directory metadata for ``keys``."""
-        return {
-            key: MappingProxyType(
-                {
-                    producer: entry.info
-                    for producer, entry in self._pending_by_key.get(key, {}).items()
-                }
-            )
-            for key in keys
-        }
+        return self._batches[producer].requests
 
     def in_flight(self) -> set[VolumeId]:
-        """Producers with pending directory entries."""
-        return set(self._pending)
+        """Producers with promises the directory is still holding."""
+        return set(self._batches)
+
+    def promised(
+        self, keys: Sequence[Key]
+    ) -> Mapping[Key, Mapping[VolumeId, StorageInfo]]:
+        """The directory for ``keys`` with promised entries left in."""
+        if not keys or not self._batches:
+            return {}
+        return self.directory.locate_raw(list(keys), missing_ok=True, projected=True)
 
     def serving_sources(
         self, requests: Sequence[Request]
     ) -> tuple[set[VolumeId], set[VolumeId]]:
-        """Sources serving any requested region, and the pending subset."""
-        combined, live = self._coverages(requests)
-        candidates = combined.sources
-        pending = live.missing_sources(combined.requirements())
+        """Sources serving any requested region, and the pending subset.
+
+        Costs one live coverage plus one test per producer, and never a walk of the
+        promised entries: a producer that promised this exact batch is answered from
+        that fact; one that promised a different shape is checked region by region
+        over the keys the two share, so a promise whose slices miss the request is
+        not offered.
+        """
+        candidates = self.coverage(requests).sources
+        actual = self.requirements(requests)
+        wanted = self._shapes.get(self.batch_spec(requests))
+        whole = None
+        pending: set[VolumeId] = set()
+        for producer, batch in self._batches.items():
+            if batch.shape is wanted:
+                if whole is None:
+                    whole = self._whole_batch(requests)
+                regions = whole
+            else:
+                regions = self._overlap(batch, requests)
+            if not regions:
+                continue
+            candidates.add(producer)
+            if regions - actual.get(producer, Counter()):
+                pending.add(producer)
         return candidates, pending
+
+    def _whole_batch(self, requests: Sequence[Request]) -> Counter[_Region]:
+        """Every region ``requests`` asks for, which is what a matching promise owes."""
+        regions: Counter[_Region] = Counter()
+        for request in requests:
+            regions.update(self.whole_regions(request))
+        return regions
+
+    def _overlap(self, batch: _Batch, requests: Sequence[Request]) -> Counter[_Region]:
+        """Regions ``batch``'s differently shaped promise serves of ``requests``."""
+        regions: Counter[_Region] = Counter()
+        for request in requests:
+            info = batch.infos.get(request.key)
+            if info is not None:
+                regions.update(self.expand_regions(request, info))
+        return regions
+
+    def servable(
+        self,
+        key: Key,
+        source: VolumeId,
+        requests: Sequence[Request],
+        live_regions: Mapping[VolumeId, tuple[_Region, ...]],
+        promised: Mapping[Key, Mapping[VolumeId, StorageInfo]],
+    ) -> Optional[tuple[_Region, ...]]:
+        """What ``source`` holds for ``key``, plus what it has promised to hold.
+
+        A promised entry already covers the live one it landed on, so expanding it
+        answers for a volume holding part of the key and promising the rest without
+        merging anything here.
+
+        A promise this plane did not make is not a source for it. The directory is
+        shared, so two dedup planes over one store see each other's promises here;
+        the membership test is what keeps a plane answering only from its own
+        decisions and waiting only on publications it will hear about.
+        """
+        if source in self._batches:
+            info = promised.get(key, {}).get(source)
+            if info is not None:
+                return tuple(
+                    region
+                    for request in requests
+                    for region in self.expand_regions(request, info)
+                )
+        return live_regions.get(source)
 
     def plan_fetch(
         self,
@@ -156,102 +227,13 @@ class DedupDirectorySensor(DirectorySensor):
         *,
         requester: VolumeId | None = None,
     ) -> PlannedFetch:
-        """Materialize an ordered fetch from live and pending metadata."""
-        combined, live = self._coverages(requests)
-        fetch = self.plan_coverage(combined, live, order, requester=requester)
-        pending = live.missing_sources(fetch.required)
-        return PlannedFetch(fetch.by_key, fetch.required, frozenset(pending))
-
-    def _coverages(
-        self, requests: Sequence[Request]
-    ) -> tuple[DirectoryCoverage, DirectoryCoverage]:
-        keys = tuple(dict.fromkeys(request.key for request in requests))
-        live = self.locate(keys)
-        live_coverage = (
-            self.coverage(requests)
-            if self._keys is not None
-            else self.coverage(requests, live)
+        """Materialize an ordered fetch from live and promised metadata."""
+        by_key, required = self.project(requests, order, requester=requester)
+        actual = self.requirements(requests)
+        empty: Counter[_Region] = Counter()
+        pending = frozenset(
+            source
+            for source, expected in required.items()
+            if expected - actual.get(source, empty)
         )
-        overlay_spec = (
-            "dedup-pending",
-            tuple(self.request_spec(request) for request in requests),
-            self._pending_generation,
-        )
-        combined = self.decision_coverage(
-            overlay_spec,
-            lambda: self._overlay_coverage(requests, live, live_coverage),
-        )
-        return combined, live_coverage
-
-    def _overlay_coverage(
-        self,
-        requests: Sequence[Request],
-        live: Mapping[Key, Mapping[VolumeId, StorageInfo]],
-        live_coverage: DirectoryCoverage,
-    ) -> DirectoryCoverage:
-        requests_by_key: Dict[Key, list[Request]] = {}
-        for request in requests:
-            requests_by_key.setdefault(request.key, []).append(request)
-        combined = []
-        for live_entry in live_coverage.entries:
-            live_sources = {source.source: source for source in live_entry.sources}
-            pending = self._pending_by_key.get(live_entry.key, {})
-            sources = tuple(dict.fromkeys((*live_sources, *pending)))
-            combined_sources = []
-            for source in sources:
-                live_source = live_sources.get(source)
-                pending_entry = pending.get(source)
-                if live_source is None:
-                    assert pending_entry is not None
-                    regions = tuple(
-                        region
-                        for request in requests_by_key[live_entry.key]
-                        for region in self._pending_regions(request, pending_entry)
-                    )
-                elif pending_entry is None:
-                    regions = live_source.regions
-                else:
-                    regions = self._merged_regions(
-                        requests_by_key[live_entry.key],
-                        live[live_entry.key][source],
-                        pending_entry.info,
-                        live_source.regions,
-                    )
-                combined_sources.append(SourceCoverage(source, regions))
-            combined.append(
-                KeyCoverage(live_entry.key, sources, tuple(combined_sources))
-            )
-        return DirectoryCoverage(tuple(combined))
-
-    def _pending_regions(
-        self, request: Request, entry: _PendingEntry
-    ) -> tuple[_Region, ...]:
-        spec = self.request_spec(request)
-        if spec == entry.request_spec:
-            return entry.regions
-        regions = entry.alternate_regions.get(spec)
-        if regions is None:
-            regions = self.expand_regions(request, entry.info)
-            entry.alternate_regions[spec] = regions
-        return regions
-
-    def _merged_regions(
-        self,
-        requests: Sequence[Request],
-        live: StorageInfo,
-        pending: StorageInfo,
-        live_regions: tuple[_Region, ...],
-    ) -> tuple[_Region, ...]:
-        if live.object_type != pending.object_type:
-            return live_regions
-        added = pending.tensor_slices - live.tensor_slices
-        if not added:
-            return live_regions
-        merged_slices = set(live.tensor_slices)
-        merged_slices.update(pending.tensor_slices)
-        merged = StorageInfo(live.object_type, merged_slices)
-        return tuple(
-            region
-            for request in requests
-            for region in self.expand_regions(request, merged)
-        )
+        return PlannedFetch(by_key, required, pending)

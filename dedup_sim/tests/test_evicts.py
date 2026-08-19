@@ -41,6 +41,7 @@ from typing import Any, Callable, List
 
 from putget_sim.workload.put_get import DEFAULT_N, KEY, PutGetBurst
 from realsim.run import Result, Run
+from realsim.seams.projection import Projecting
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.simulation import Simulation
 from sim_common.async_engine import run_sim
@@ -222,7 +223,7 @@ def test_the_fabric_is_1x_per_read_for_any_fanout_cap():
 # --------------------------------------------------------------------------
 
 
-class Directory:
+class Directory(Projecting):
     """The reads a chain makes, over a ``key -> volumes`` map a test controls.
 
     Waiting is the part of routing that fails by *not* happening, and the two
@@ -238,7 +239,15 @@ class Directory:
     """
 
     def __init__(self, **holders: str) -> None:
-        self.by_key = {key: set(vols.split()) for key, vols in holders.items()}
+        super().__init__()
+        self._entries: dict[str, dict[str, StorageInfo]] = {}
+        for key, volumes in holders.items():
+            for volume in sorted(volumes.split()):
+                self.publish(volume, key)
+
+    @property
+    def entries(self):
+        return self._entries
 
     def read_time(self, src: Endpoint, dst: Endpoint, nbytes: int) -> float:
         """The origin far, the peers near -- the shape a chain forms in, staged.
@@ -251,14 +260,23 @@ class Directory:
             return 0.0
         return 10.0 if src.id == "p" else 1.0
 
-    def locate_raw(self, keys, missing_ok: bool = False):
-        return {
-            k: {
-                v: StorageInfo(ObjectType.TENSOR, {None})
-                for v in sorted(self.by_key.get(k, ()))
-            }
-            for k in keys
-        }
+    def locate_raw(
+        self,
+        keys,
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+        *,
+        projected: bool = False,
+    ):
+        located = {}
+        for key in keys:
+            volumes = self._entries.get(key)
+            if not volumes:
+                continue
+            answer = volumes if projected else self.live_map(key, volumes)
+            if answer:
+                located[key] = dict(answer)
+        return located
 
     # -- what the volumes do to it ------------------------------------------ #
     def publish(self, volume: str, key: str) -> None:
@@ -266,13 +284,22 @@ class Directory:
 
         What a real ``client.put`` does before it returns, which is why every caller
         below does this and *then* dispatches: observing this map before parking tells
-        a gate which publications are still missing.
+        a gate which publications are still missing. It replaces whatever ``volume``
+        promised for ``key``, as ``notify_put_batch`` does.
         """
-        self.by_key.setdefault(key, set()).add(volume)
+        self.unpromise(key, volume)
+        volumes = self._entries.setdefault(key, {})
+        volumes[volume] = StorageInfo(ObjectType.TENSOR, {None})
+        # Directory order is holder order, and a fallback plan reads it.
+        self._entries[key] = {v: volumes[v] for v in sorted(volumes)}
 
     def evict(self, volume: str, key: str) -> None:
         """``volume`` drops ``key`` (a newer version took the room)."""
-        self.by_key[key].discard(volume)
+        self.unpromise(key, volume)
+        volumes = self._entries.get(key, {})
+        volumes.pop(volume, None)
+        if not volumes:
+            self._entries.pop(key, None)
 
 
 def _sensing(directory: Directory, *, fanout_cap: int) -> Dedup:
@@ -407,7 +434,7 @@ def test_the_sensor_remembers_no_registrations():
     """The sensors retain routes, not settled directory registrations.
 
     Two rounds of ``W`` and a round of ``W2`` went through these sensors, and what is
-    left names neither: the pending entries are settled, and the routes are one per
+    left names neither: no promise is outstanding, and the routes are one per
     reader whatever the run read. Nothing accumulates per
     ``(volume, key)`` -- not a registration, and not a waiter either, since who is
     waiting is not recorded anywhere at all
@@ -417,7 +444,9 @@ def test_the_sensor_remembers_no_registrations():
     directory = plane.sensor(DedupDirectorySensor)
     fanout = plane.sensor(FanoutSensor)
     assert directory.in_flight() == set(), "a put owed by a run that finished"
-    assert directory._pending_by_key == {}, "a settled pending directory entry"
+    service = result.sim.mesh.directory.service
+    assert service.projected_owners() == {}, "a promise no publication cleared"
+    assert directory._batches == {}, "a settled promise the sensor still holds"
     assert fanout._route_required == {}, "completed routes retain no regions"
     assert set(fanout._route) == set(result.workload.reader_ids)
     assert not hasattr(fanout, "_ready"), "the waiting is the commit, and is nobody's"

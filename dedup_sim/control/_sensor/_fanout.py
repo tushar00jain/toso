@@ -54,7 +54,9 @@ class FanoutSensor(LoadSensor):
         # requester -> the sources it was routed through.
         self._route: Dict[VolumeId, tuple[VolumeId, ...]] = {}
         self._route_pending: Dict[VolumeId, set[VolumeId]] = {}
-        self._route_required: Dict[VolumeId, Dict[VolumeId, Counter[_Region]]] = {}
+        # Regions, not a Counter of them: one shared tuple per (requester, source)
+        # against a dict cell per region, and the readiness probe counts them once.
+        self._route_required: Dict[VolumeId, Dict[VolumeId, tuple[_Region, ...]]] = {}
         # source -> how many are behind it, carried rather than counted on demand:
         # every decision reads it, and re-deriving it walks the whole tree. Moved only
         # by the two members that move a route, so the two cannot disagree.
@@ -90,11 +92,11 @@ class FanoutSensor(LoadSensor):
         """
         if len(set(action.sources)) != len(action.sources):
             raise ValueError("a route names each source once")
-        required: Dict[VolumeId, Counter[_Region]] = {}
+        required: Dict[VolumeId, tuple[_Region, ...]] = {}
         for source, regions in action.required:
             if source in required:
                 raise ValueError("a route names each source requirement once")
-            required[source] = Counter(regions)
+            required[source] = regions
         if set(required) != set(action.sources) or any(
             not regions for regions in required.values()
         ):
@@ -140,6 +142,8 @@ class FanoutSensor(LoadSensor):
         """Sources ``producer`` is waiting to publish."""
         return set(self._route_pending.get(producer, set()))
 
-    def route_required(self, producer: VolumeId) -> Mapping[VolumeId, Counter[_Region]]:
+    def route_required(
+        self, producer: VolumeId
+    ) -> Mapping[VolumeId, tuple[_Region, ...]]:
         """Exact regions each source must provide to ``producer``."""
         return MappingProxyType(self._route_required.get(producer, {}))

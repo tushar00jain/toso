@@ -19,18 +19,73 @@ from dedup_sim.control._sensor import (
 from dedup_sim.control.routing import Dedup
 from proposed import DirectorySensor, Dispatcher, Endpoint, Environment
 from proposed.selector import Balance, FirstMatch, Ordered
+from realsim.seams.projection import Projecting
 from torchstore.controller import ObjectType, StorageInfo
 from torchstore.transport import Request, TensorSlice
 from sim_common.async_engine import run_sim
 
 
-class _Holds:
+class _Live(Projecting):
+    """A directory over a fixed live map, plus whatever a plane projects onto it.
+
+    The half of :class:`realsim.seams.controller_service.ControllerService` these
+    tests need: the same promise bookkeeping over a plain dict instead of the real
+    ``Controller``'s trie, so a fold that projects has somewhere real to write.
+    """
+
+    def __init__(self, entries=None) -> None:
+        super().__init__()
+        self._store = {key: dict(volumes) for key, volumes in (entries or {}).items()}
+
+    @property
+    def entries(self):
+        return self._store
+
+    def locate_raw(
+        self,
+        keys,
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+        *,
+        projected: bool = False,
+    ):
+        located = {}
+        for key in keys:
+            volumes = self._store.get(key)
+            if not volumes:
+                continue
+            answer = volumes if projected else self.live_map(key, volumes)
+            if answer:
+                located[key] = dict(answer)
+        return located
+
+    def publish(self, key: str, volume: str, info: StorageInfo | None = None) -> None:
+        """``volume``'s write lands, replacing whatever it promised for ``key``."""
+        self.unpromise(key, volume)
+        held = info if info is not None else StorageInfo(ObjectType.TENSOR, {None})
+        self._store.setdefault(key, {})[volume] = held
+
+    def evict(self, key: str, volume: str) -> None:
+        self.unpromise(key, volume)
+        volumes = self._store.get(key, {})
+        volumes.pop(volume, None)
+        if not volumes:
+            self._store.pop(key, None)
+
+
+class _Holds(_Live):
+    """One volume holding every key anyone asks about."""
+
     def __init__(self, volume: str) -> None:
+        super().__init__()
         self.volume = volume
 
-    def locate_raw(self, keys, missing_ok: bool = False):
-        info = StorageInfo(ObjectType.TENSOR, {None})
-        return {key: {self.volume: info} for key in keys}
+    def locate_raw(self, keys, *args, **kwargs):
+        for key in keys:
+            self._store.setdefault(key, {}).setdefault(
+                self.volume, StorageInfo(ObjectType.TENSOR, {None})
+            )
+        return super().locate_raw(keys, *args, **kwargs)
 
 
 _TOPOLOGY = {
@@ -96,15 +151,15 @@ def test_a_fanout_nobody_supplied_raises():
 
 
 def test_holders_preserve_directory_order_and_name_each_source_once():
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            info = StorageInfo(ObjectType.TENSOR, {None})
-            return {
+    info = StorageInfo(ObjectType.TENSOR, {None})
+    directory = DedupDirectorySensor(
+        _Live(
+            {
                 "K0": {"replica": info, "origin": info},
                 "K1": {"origin": info, "r0": info},
             }
-
-    directory = DedupDirectorySensor(_Directory())
+        )
+    )
     selector = Holders().attach(
         Environment(_TOPOLOGY, _PROFILE),
         {DedupDirectorySensor: directory},
@@ -152,19 +207,24 @@ def test_a_route_requires_regions_for_every_source():
     assert fanout.routes() == {}
 
 
-def test_pending_entries_are_indexed_only_under_their_keys():
-    directory = DedupDirectorySensor(_Holds("origin"))
+def test_promised_entries_are_indexed_only_under_their_keys():
+    state = _Holds("origin")
+    directory = DedupDirectorySensor(state)
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     requests = {_key: _request(_key) for _key in ("K0", "K1")}
     dispatcher.dispatch_sync(Asked("r0", tuple(requests.values())))
 
     assert directory.plan("r0") == requests
-    pending = directory.pending(["K0"])["K0"]
-    assert set(pending) == {"r0"}
-    assert pending["r0"].object_type is ObjectType.TENSOR
-    assert pending["r0"].tensor_slices == {None}
-    assert directory.pending(["K2"]) == {"K2": {}}
+    promised = directory.promised(["K0", "K1"])
+    assert promised["K0"]["r0"].object_type is ObjectType.TENSOR
+    assert promised["K0"]["r0"].tensor_slices == {None}
+    assert state.projected_owners() == {"r0": {"K0", "K1"}}
+    # The same directory, read the ordinary way: holders only.
+    assert {
+        key: set(volumes)
+        for key, volumes in state.locate_raw(["K0", "K1"], missing_ok=True).items()
+    } == {"K0": {"origin"}, "K1": {"origin"}}
 
 
 def test_a_producer_has_one_publication_in_flight():
@@ -208,15 +268,7 @@ def test_publication_folds_directory_and_fanout_before_one_waiter_wakes():
 
 def test_pending_sources_do_not_satisfy_live_coverage():
     info = StorageInfo(ObjectType.TENSOR, {None})
-
-    class _Directory:
-        def __init__(self):
-            self.entries = {}
-
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(self.entries.get(key, {})) for key in keys}
-
-    state = _Directory()
+    state = _Live()
     directory = DedupDirectorySensor(state)
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
@@ -227,12 +279,12 @@ def test_pending_sources_do_not_satisfy_live_coverage():
     assert directory.serving_sources([request]) == ({"p"}, {"p"})
     assert not directory.covers([request], planned.required, live=True)
 
-    state.entries["K"] = {"p": info}
+    state.publish("K", "p", info)
     assert directory.covers([request], planned.required, live=True)
     assert directory.serving_sources([request]) == ({"p"}, set())
 
     dispatcher.dispatch_sync(Published("p"))
-    assert directory.pending(["K"]) == {"K": {}}
+    assert state.projected_owners() == {}
     assert directory.serving_sources([request]) == ({"p"}, set())
 
 
@@ -348,12 +400,7 @@ def test_every_whole_value_source_is_rankable_before_narrowing():
             "replica": StorageInfo(ObjectType.TENSOR, {None}),
         }
     }
-
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(live.get(key, {})) for key in keys}
-
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Live(live))
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("r0", (request,)))
@@ -430,21 +477,14 @@ def test_unpinned_coverage_is_never_cached():
 
 def test_live_coverage_cache_observes_directory_mutation():
     info = StorageInfo(ObjectType.TENSOR, {None})
-
-    class _Directory:
-        def __init__(self):
-            self.entries = {"origin": info}
-
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(self.entries) for key in keys}
-
-    state = _Directory()
+    state = _Live({"K": {"origin": info}})
     directory = DedupDirectorySensor(state)
     request = _request("K")
     with directory.pinned(["K"]):
         first = directory.coverage((request,))
         assert directory.serving_sources((request,))[0] == {"origin"}
-    state.entries = {"replica": info}
+    state.evict("K", "origin")
+    state.publish("K", "replica", info)
     with directory.pinned(["K"]):
         second = directory.coverage((request,))
         assert directory.serving_sources((request,))[0] == {"replica"}
@@ -453,11 +493,7 @@ def test_live_coverage_cache_observes_directory_mutation():
 
 
 def test_pending_producer_coverage_is_expanded_when_asked(monkeypatch):
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {}
-
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Live())
     dispatcher = _dispatcher(directory, FanoutSensor())
     expansions = 0
     original = directory._expand_request
@@ -482,12 +518,7 @@ def test_pending_producer_coverage_is_expanded_when_asked(monkeypatch):
 def test_multi_key_coverage_keeps_regions_under_their_sources():
     info = StorageInfo(ObjectType.TENSOR, {None})
     live = {"K0": {"v0": info}, "K1": {"v1": info}}
-
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(live.get(key, {})) for key in keys}
-
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Live(live))
     planned = directory.plan_fetch([_request("K0"), _request("K1")], ("v0", "v1"))
 
     assert planned.by_key == {"K0": ("v0",), "K1": ("v1",)}
@@ -502,14 +533,9 @@ def test_sliced_coverage_preserves_region_order_and_multiplicity():
     quarter = TensorSlice((1,), (0,), (8,), (2,), (4,))
     crossing = TensorSlice((3,), (0,), (8,), (2,), (4,))
 
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {
-                key: {"origin": StorageInfo(ObjectType.TENSOR_SLICE, {half})}
-                for key in keys
-            }
-
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(
+        _Live({"K": {"origin": StorageInfo(ObjectType.TENSOR_SLICE, {half})}})
+    )
     planned = directory.plan_fetch(
         [_request("K", quarter), _request("K", quarter), _request("K", crossing)],
         ("origin",),
@@ -523,11 +549,7 @@ def test_sliced_coverage_preserves_region_order_and_multiplicity():
 
 
 def test_two_pending_slices_form_one_torchstore_fetch_plan():
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {}
-
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Live())
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     left = TensorSlice((0,), (0,), (8,), (4,), (2,))
@@ -556,11 +578,7 @@ def test_sparse_candidate_discovery_visits_only_present_entries(monkeypatch):
         for i, request in enumerate(requests)
     }
 
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(live.get(key, {})) for key in keys}
-
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Live(live))
     visited = 0
     original = directory._expand_request
 
@@ -582,25 +600,18 @@ def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():
     left = TensorSlice((0,), (0,), (8,), (4,), (2,))
     right = TensorSlice((4,), (1,), (8,), (4,), (2,))
 
-    class _Directory:
-        def __init__(self):
-            self.entries = {
+    def _sliced():
+        return _Live(
+            {
                 "K": {
                     "t0": StorageInfo(ObjectType.TENSOR_SLICE, {left}),
                     "t1": StorageInfo(ObjectType.TENSOR_SLICE, {right}),
                 }
             }
-
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(self.entries.get(key, {})) for key in keys}
-
-        def publish(self, source, tensor_slice):
-            self.entries["K"][source] = StorageInfo(
-                ObjectType.TENSOR_SLICE, {tensor_slice}
-            )
+        )
 
     async def decide():
-        directory = _Directory()
+        directory = _sliced()
         ids = ("t0", "t1", "p0", "p1", "r")
         topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
 
@@ -626,14 +637,14 @@ def test_a_multi_slice_plan_waits_for_exactly_its_two_producers():
         assert all(len(waiters) == 1 for waiters in plane.dispatcher._waiters.values())
         task = asyncio.create_task(planned.settled())
         await asyncio.sleep(0)
-        directory.publish("p0", left)
+        directory.publish("K", "p0", StorageInfo(ObjectType.TENSOR_SLICE, {left}))
         plane.dispatcher.dispatch_sync(Published("p0"))
         await asyncio.sleep(0)
         assert not task.done()
         plane.dispatcher.dispatch_sync(Published("other"))
         await asyncio.sleep(0)
         assert not task.done()
-        directory.publish("p1", right)
+        directory.publish("K", "p1", StorageInfo(ObjectType.TENSOR_SLICE, {right}))
         plane.dispatcher.dispatch_sync(Published("p1"))
         return await task
 
@@ -645,15 +656,6 @@ def test_a_partial_reader_can_follow_a_peer_fetching_more_regions():
     left = TensorSlice((0,), (0,), (8,), (4,), (2,))
     right = TensorSlice((4,), (1,), (8,), (4,), (2,))
 
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {
-                "K": {
-                    "t0": StorageInfo(ObjectType.TENSOR_SLICE, {left}),
-                    "t1": StorageInfo(ObjectType.TENSOR_SLICE, {right}),
-                }
-            }
-
     class _SliceProfile:
         def read_time(self, src, dst, nbytes):
             if src.id == dst.id:
@@ -662,7 +664,16 @@ def test_a_partial_reader_can_follow_a_peer_fetching_more_regions():
 
     ids = ("t0", "t1", "p0", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(
+        _Live(
+            {
+                "K": {
+                    "t0": StorageInfo(ObjectType.TENSOR_SLICE, {left}),
+                    "t1": StorageInfo(ObjectType.TENSOR_SLICE, {right}),
+                }
+            }
+        )
+    )
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p0", (_request("K"),)))
@@ -679,11 +690,6 @@ def test_a_partial_reader_can_follow_a_peer_fetching_more_regions():
 def test_a_subset_reader_accounts_for_the_peers_other_keys():
     info = StorageInfo(ObjectType.TENSOR, {None})
 
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            all_entries = {"K0": {"t0": info}, "K1": {"t1": info}}
-            return {key: all_entries[key] for key in keys}
-
     class _Profile:
         def read_time(self, src, dst, nbytes):
             if src.id == dst.id:
@@ -692,7 +698,7 @@ def test_a_subset_reader_accounts_for_the_peers_other_keys():
 
     ids = ("t0", "t1", "p0", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(_Live({"K0": {"t0": info}, "K1": {"t1": info}}))
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p0", (_request("K0"), _request("K1"))))
@@ -709,13 +715,6 @@ def test_a_subset_reader_accounts_for_the_peers_other_keys():
 def test_a_route_accepts_a_dependency_that_has_since_published():
     info = StorageInfo(ObjectType.TENSOR, {None})
 
-    class _Directory:
-        def __init__(self):
-            self.entries = {"K0": {"t0": info}, "K1": {"t1": info}}
-
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(self.entries[key]) for key in keys}
-
     class _Profile:
         def read_time(self, src, dst, nbytes):
             if src.id == dst.id:
@@ -724,7 +723,7 @@ def test_a_route_accepts_a_dependency_that_has_since_published():
 
     ids = ("t0", "t1", "q", "p", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
-    state = _Directory()
+    state = _Live({"K0": {"t0": info}, "K1": {"t1": info}})
     directory = DedupDirectorySensor(state)
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
@@ -732,7 +731,7 @@ def test_a_route_accepts_a_dependency_that_has_since_published():
     dispatcher.dispatch_sync(_routed(directory, "q", ("t1",)))
     dispatcher.dispatch_sync(Asked("p", (_request("K0"), _request("K1"))))
     dispatcher.dispatch_sync(_routed(directory, "p", ("t0", "q")))
-    state.entries["K1"]["q"] = info
+    state.publish("K1", "q", info)
     dispatcher.dispatch_sync(Published("q"))
     dispatcher.dispatch_sync(Asked("r", (_request("K0"),)))
     ranking = Ordered(Candidates()).attach(
@@ -749,20 +748,14 @@ def test_a_route_rejects_a_registered_source_with_the_wrong_slice():
     request = _request("K", left)
     original = {"K": {"t": StorageInfo(ObjectType.TENSOR_SLICE, {left})}}
 
-    class _Original:
-        def locate_raw(self, keys, missing_ok=False):
-            return {key: dict(original.get(key, {})) for key in keys}
-
-    planning_directory = DedupDirectorySensor(_Original())
+    planning_directory = DedupDirectorySensor(_Live(original))
     route = planning_directory.plan_fetch([request], ("t",))
-
-    class _Directory:
-        def locate_raw(self, keys, missing_ok=False):
-            return {"K": {"t": StorageInfo(ObjectType.TENSOR_SLICE, {right})}}
 
     ids = ("t", "p", "r")
     topology = {i: Endpoint(id=i, host=i, node=i) for i in ids}
-    directory = DedupDirectorySensor(_Directory())
+    directory = DedupDirectorySensor(
+        _Live({"K": {"t": StorageInfo(ObjectType.TENSOR_SLICE, {right})}})
+    )
     fanout = FanoutSensor()
     dispatcher = _dispatcher(directory, fanout)
     dispatcher.dispatch_sync(Asked("p", (request,)))

@@ -79,10 +79,11 @@ class Controller(Protocol):
     the same convention torchstore already uses.
 
     The difference between this protocol and torchstore's class *is* the ask, and
-    it is two things. One is a member: :meth:`locate_raw`, a directory read with
-    nothing applied to it, which is what a control plane senses through. The other
-    cannot be declared as a member: ``locate_volumes`` gains an optional **source
-    preference** -- a list of volume ids its caller hands it -- and applies it to the
+    it is two things. One is members: :meth:`locate_raw`, a directory read with
+    nothing applied to it, which is what a control plane senses through, and
+    :meth:`project` / :meth:`clear_projections`, which let a caller record what a
+    volume *will* hold. The other cannot be declared as a member: ``locate_volumes``
+    gains an optional **source preference** -- a list of volume ids its caller hands it -- and applies it to the
     answer (:func:`proposed.selector.prefer`) before returning. The store consults
     nobody to do that; it reorders a value it was given, which is why nothing here
     declares a plane. Every other member already exists upstream, spelled the same
@@ -95,13 +96,44 @@ class Controller(Protocol):
     :class:`realsim.seams.controller_service.ControllerService`.
     """
 
+    def project(self, owner: VolumeId, key: str, info: Any) -> None:
+        """Record that ``owner`` will hold ``info`` for ``key`` once its write lands.
+
+        The directory a control plane routes against is the one that will exist when
+        the reads it is planning finish, not the one that exists now. Keeping that
+        projection here rather than beside the plane is what makes it a lookup
+        instead of a join: a promise is an ordinary entry in the same map, tagged
+        with its owner, and the mutation path maintains it.
+
+        Invisible to every read that did not ask for it -- ``locate_volumes``, a
+        ``get``, the fully-committed check and :meth:`keys` all answer as if it were
+        not there, so a promise cannot send a reader to a volume holding nothing.
+
+        A volume that already holds ``key`` keeps its real entry; the promise is
+        dropped, since hiding data a volume has behind a promise would be worse than
+        offering less than it will have.
+        """
+
+    def clear_projections(self, owner: VolumeId) -> None:
+        """Drop every promise ``owner`` still has outstanding, idempotently.
+
+        What bounds a promise's life. A write landing clears its own promise, so this
+        clears the remainder: a producer may publish fewer keys than it promised, and
+        those entries are otherwise never reclaimed.
+        """
+
     def locate_raw(
         self,
         keys: Sequence[str],
         missing_ok: bool = False,
         require_fully_committed: bool = True,
+        *,
+        projected: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """``{key -> {volume_id -> StorageInfo}}``, with nothing applied to it.
+
+        ``projected`` includes what :meth:`project` recorded, and defaults to off:
+        the promises one control plane made are not another reader's directory.
 
         A controller implementing this proposal needs both reads. This is the one a
         control plane senses through a :class:`~proposed.sensors.DirectorySensor`: what it

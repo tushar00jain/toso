@@ -46,6 +46,10 @@ from realsim.seams.volume_service import VolumeService
 #: Endpoints whose bodies are mirrored verbatim, and the digest of the source we
 #: mirrored. A failure here is not a bug: it means upstream edited the body and the
 #: mirror in ``ControllerService`` has to be re-copied (then update the digest).
+#:
+#: "Verbatim" is qualified in one direction: a mirror may carry insertions that are
+#: part of :data:`THE_ASK`, each marked ``OURS`` at the line. The digest is over
+#: upstream's source, so it tracks upstream and says nothing about those.
 MIRRORED_BODIES = {
     "locate_volumes": "9604ec9210bbb386841f4c0cb447900a",
     "keys": "f3b003d0a74bf6e671bc2242cf2cb114",
@@ -62,15 +66,23 @@ COPIED_FROM_UPSTREAM = [
 ]
 
 #: Members that are the *ask* -- declared here because torchstore would have to gain
-#: them. ``locate_raw`` is ``locate_volumes`` with no caller's preference applied,
-#: which is what a control plane senses through a directory sensor, and it is asked for as a
-#: plain **synchronous local method**: a directory read that cannot suspend is what
-#: makes a routing decision atomic without a lock.
+#: them. All three are asked for as plain **synchronous local methods**: a directory
+#: read or write that cannot suspend is what makes a routing decision atomic without a
+#: lock.
 #:
-#: One member, because the rest of the ask is not a member: ``locate_volumes`` takes a
-#: source preference and applies it, which changes a signature rather than adding one.
-#: That half is pinned on the client instead -- see :data:`CLIENT_READ_PARAMETERS`.
-THE_ASK = ["locate_raw"]
+#: * ``locate_raw`` is ``locate_volumes`` with no caller's preference applied, which
+#:   is what a control plane senses through a directory sensor;
+#: * ``project`` / ``clear_projections`` record what a volume *will* hold, in the
+#:   directory's own key-to-volume map, so a plane routing readers onto in-flight
+#:   writers looks entries up instead of joining a private overlay per request. The
+#:   implementation is :mod:`realsim.seams.projection`, mixed into
+#:   :class:`~realsim.seams.controller_service.ControllerService`.
+#:
+#: Not every part of the ask is a member: ``locate_volumes`` takes a source preference
+#: and applies it, and ``locate_raw`` takes ``projected=``; both change a signature
+#: rather than adding one. The preference half is pinned on the client instead -- see
+#: :data:`CLIENT_READ_PARAMETERS`.
+THE_ASK = ["clear_projections", "locate_raw", "project"]
 
 #: What ``LocalClient``'s read path takes today, in full. Part of the ask is that it
 #: takes one thing more: an optional **source preference**, applied to the

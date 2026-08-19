@@ -37,11 +37,11 @@ __all__ = [
 
 _Attached = TypeVar("_Attached", bound="Sensing")
 _S = TypeVar("_S", bound=Sensor)
+_V = TypeVar("_V")
 _Located = Mapping[str, Mapping[VolumeId, StorageInfo]]
 _Region = Tuple[str, object]
 _RequestSpec = Tuple[str, object, bool]
 _StorageSpec = Tuple[ObjectType, Tuple[object, ...]]
-_CoverageSpec = Tuple[Tuple[_RequestSpec, ...], Tuple[object, ...]]
 
 
 class _NoInplace:
@@ -62,10 +62,13 @@ class SourceCoverage:
 
 @dataclass(frozen=True)
 class KeyCoverage:
-    """Directory order and independently serviceable sources for one key."""
+    """Independently serviceable sources for one key, in directory order.
+
+    Every source the directory lists appears, including one whose slices serve none
+    of the request: ``regions`` empty is "listed here, serves nothing of this".
+    """
 
     key: str
-    holders: Tuple[VolumeId, ...]
     sources: Tuple[SourceCoverage, ...]
 
 
@@ -91,16 +94,6 @@ class DirectoryCoverage:
                 if source.regions:
                     required[source.source].update(source.regions)
         return dict(required)
-
-    def missing_sources(
-        self, required: Mapping[VolumeId, Counter[_Region]]
-    ) -> set[VolumeId]:
-        actual = self.requirements()
-        return {
-            source
-            for source, expected in required.items()
-            if expected - actual.get(source, Counter())
-        }
 
 
 @dataclass(frozen=True)
@@ -178,11 +171,17 @@ class DirectorySensor(Sensor):
         self.directory = directory
         self._keys: Optional[FrozenSet[str]] = None
         self._located: Dict[str, Dict[str, Any]] = {}
-        self._decision_coverages: Dict[object, DirectoryCoverage] = {}
-        self._live_coverage: Optional[Tuple[_CoverageSpec, DirectoryCoverage]] = None
+        # Derived values keyed by request content. One store, one invalidation rule:
+        # :meth:`pinned` clears it when the directory it was derived from has moved.
+        self._derived: Dict[object, Any] = {}
+        self._stamp: object = None
+        self._checked = False
         self._expansions: Dict[
             Tuple[_RequestSpec, _StorageSpec], Tuple[_Region, ...]
         ] = {}
+        self._storage_specs: Optional[
+            Dict[int, Tuple[StorageInfo, _StorageSpec]]
+        ] = None
 
     def locate(self, keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """``key -> {volume_id -> StorageInfo}``, pinned when inside a decision."""
@@ -243,31 +242,52 @@ class DirectorySensor(Sensor):
     ) -> DirectoryCoverage:
         """Expand independent source coverage in one pass over directory entries."""
         keys = tuple(dict.fromkeys(request.key for request in requests))
-        live = located is None
-        if located is None:
-            located = self.locate(keys)
-        spec = self._coverage_spec(requests, located, keys)
-        if self._keys is not None:
-            cached = self._decision_coverages.get(spec)
-            if cached is not None:
-                return cached
-            if live and self._live_coverage is not None:
-                cached_spec, cached = self._live_coverage
-                if spec == cached_spec:
-                    self._decision_coverages[spec] = cached
-                    return cached
-                self._expansions = {}
+        if located is not None:
+            return self._expand_coverage(requests, located, keys)
+        pinned = self.locate(keys)
+        return self.derived(
+            ("coverage", self.batch_spec(requests)),
+            lambda: self._expand_coverage(requests, pinned, keys),
+        )
+
+    def derived(self, spec: object, build: Callable[[], _V]) -> _V:
+        """Reuse one value derived from the pinned directory and ``spec``.
+
+        Only inside a pin: outside one nothing bounds how stale a value may be, and
+        :meth:`pinned` is where the directory is checked for movement.
+        """
+        if self._keys is None:
+            return build()
+        if not self._checked:
+            # Once per pin, and only for a decision that derives anything: a plane
+            # that reads holders and no coverage never signs the directory.
+            self._checked = True
+            stamp = self._directory_stamp()
+            if stamp != self._stamp:
+                self._derived.clear()
+                self._stamp = stamp
+        cached = self._derived.get(spec)
+        if cached is None:
+            cached = build()
+            self._derived[spec] = cached
+        return cached
+
+    def _expand_coverage(
+        self,
+        requests: Sequence[Request],
+        located: _Located,
+        keys: Sequence[str],
+    ) -> DirectoryCoverage:
         by_key: Dict[str, Dict[VolumeId, List[_Region]]] = {
             key: {source: [] for source in located.get(key, {})} for key in keys
         }
         for request in requests:
             for source, info in located.get(request.key, {}).items():
                 by_key[request.key][source].extend(self.expand_regions(request, info))
-        coverage = DirectoryCoverage(
+        return DirectoryCoverage(
             tuple(
                 KeyCoverage(
                     key,
-                    tuple(located.get(key, {})),
                     tuple(
                         SourceCoverage(source, tuple(regions))
                         for source, regions in by_key[key].items()
@@ -276,77 +296,129 @@ class DirectorySensor(Sensor):
                 for key in keys
             )
         )
-        if self._keys is not None:
-            self._decision_coverages[spec] = coverage
-            if live:
-                self._live_coverage = spec, coverage
-        return coverage
 
-    def decision_coverage(
-        self, spec: object, build: Callable[[], DirectoryCoverage]
-    ) -> DirectoryCoverage:
-        """Reuse one derived coverage value within the current pin."""
-        if self._keys is None:
-            return build()
-        cached = self._decision_coverages.get(spec)
-        if cached is None:
-            cached = build()
-            self._decision_coverages[spec] = cached
-        return cached
+    def requirements(
+        self, requests: Sequence[Request]
+    ) -> Mapping[VolumeId, Counter[_Region]]:
+        """``source -> the regions it live-serves`` for ``requests``.
 
-    def plan_coverage(
+        Answers for keys the pin does not hold, reading those live: a peer's promised
+        batch is not the batch this decision asked about.
+        """
+        return self.derived(
+            ("requirements", self.batch_spec(requests)),
+            lambda: self._requirements(requests),
+        )
+
+    def _requirements(
+        self, requests: Sequence[Request]
+    ) -> Dict[VolumeId, Counter[_Region]]:
+        keys = tuple(dict.fromkeys(request.key for request in requests))
+        outside = [key for key in keys if self._keys is None or key not in self._keys]
+        if not outside:
+            return self.coverage(requests).requirements()
+        located = {key: self._located[key] for key in keys if key in self._located}
+        located.update(self.locate_live(outside))
+        return self.coverage(requests, located).requirements()
+
+    def project(
         self,
-        combined: DirectoryCoverage,
-        live: DirectoryCoverage,
+        requests: Sequence[Request],
         order: Sequence[VolumeId],
         *,
         requester: Optional[VolumeId] = None,
-    ) -> FetchPlan:
-        """Project ordered sources from combined coverage with live fallback."""
-        allowed = set(order)
-        live_by_key = {entry.key: entry for entry in live.entries}
+    ) -> Tuple[Dict[str, Tuple[VolumeId, ...]], Dict[VolumeId, Counter[_Region]]]:
+        """Per key, the ranked sources that add regions, and what each must provide.
+
+        Walks ``order`` per key and stops once the key's whole requested value is
+        covered (:meth:`whole_regions`), which is after the first serving source
+        wherever one source holds a whole value. A key split across sources has no
+        such target and is walked to the end of ``order``.
+
+        A key no ranked source serves falls back to its live holders in directory
+        order, which is what keeps an unroutable ask answerable.
+        """
+        live = self.coverage(requests)
+        promised = self.promised(tuple(entry.key for entry in live.entries))
+        by_request: Dict[str, List[Request]] = defaultdict(list)
+        for request in requests:
+            by_request[request.key].append(request)
         by_key: Dict[str, Tuple[VolumeId, ...]] = {}
         required: Dict[VolumeId, Counter[_Region]] = defaultdict(Counter)
-        for entry in combined.entries:
-            live_entry = live_by_key[entry.key]
-            holders = set(live_entry.holders)
-            live_regions = {
-                source.source: source.regions for source in live_entry.sources
-            }
-            present = {
-                source.source
-                for source in entry.sources
-                if source.source in holders
-                or (source.source in allowed and source.source != requester)
-            }
-            effective = {
-                source.source: (
-                    source.regions
-                    if source.source in allowed and source.source != requester
-                    else live_regions.get(source.source, ())
-                )
-                for source in entry.sources
-            }
-            ranked = [
-                (source, effective[source]) for source in order if source in present
-            ]
-            choices = ranked or [
-                (source.source, effective[source.source])
-                for source in entry.sources
-                if source.source in present
-            ]
+        for entry in live.entries:
+            key_requests = by_request[entry.key]
+            live_regions = {source.source: source.regions for source in entry.sources}
+            target: set[_Region] = set()
+            for request in key_requests:
+                target.update(self.whole_regions(request))
             seen: set[_Region] = set()
             selected: List[VolumeId] = []
-            for source, parts in choices:
-                regions = Counter(parts)
-                novel = [region for region in regions if region not in seen]
-                if not novel:
+            offered = False
+            for source in order:
+                if source == requester:
+                    # Its own copy, never its pending promise to itself.
+                    regions = live_regions.get(source)
+                else:
+                    regions = self.servable(
+                        entry.key, source, key_requests, live_regions, promised
+                    )
+                if regions is None:
                     continue
-                selected.append(source)
-                seen.update(novel)
-                required[source].update(regions)
+                offered = True
+                if self._take(source, regions, seen, selected, required):
+                    if target <= seen:
+                        break
+            if not offered:
+                for source, regions in live_regions.items():
+                    if self._take(source, regions, seen, selected, required):
+                        if target <= seen:
+                            break
             by_key[entry.key] = tuple(selected)
-        return FetchPlan(by_key, dict(required))
+        # Sources ranked for a key they do not serve leave no requirement behind.
+        return by_key, {
+            source: regions for source, regions in required.items() if regions
+        }
+
+    @staticmethod
+    def _take(
+        source: VolumeId,
+        parts: Tuple[_Region, ...],
+        seen: set[_Region],
+        selected: List[VolumeId],
+        required: Dict[VolumeId, Counter[_Region]],
+    ) -> bool:
+        """Select ``source`` if it adds a region nothing ahead of it serves."""
+        regions = Counter(parts)
+        if all(region in seen for region in regions):
+            return False
+        selected.append(source)
+        seen.update(regions)
+        required[source].update(regions)
+        return True
+
+    def promised(self, keys: Sequence[str]) -> _Located:
+        """Entries volumes have promised for ``keys`` and not yet published.
+
+        Empty here: an ordinary directory read answers with holders, and a sensor
+        that promises nothing has nothing more to offer :meth:`servable`. Read once
+        per :meth:`project`, so an override pays one directory read per plan.
+        """
+        return {}
+
+    def servable(
+        self,
+        key: str,
+        source: VolumeId,
+        requests: Sequence[Request],
+        live_regions: Mapping[VolumeId, Tuple[_Region, ...]],
+        promised: _Located,
+    ) -> Optional[Tuple[_Region, ...]]:
+        """Regions ``source`` can serve of ``requests`` on ``key``.
+
+        ``None`` when the directory does not list ``source`` under ``key`` at all,
+        which is different from listing it with nothing of this request to serve.
+        """
+        return live_regions.get(source)
 
     def plan_fetch(
         self,
@@ -356,8 +428,22 @@ class DirectorySensor(Sensor):
         requester: Optional[VolumeId] = None,
     ) -> FetchPlan:
         """Plan an ordered fetch from the current live directory."""
-        coverage = self.coverage(requests)
-        return self.plan_coverage(coverage, coverage, order, requester=requester)
+        by_key, required = self.project(requests, order, requester=requester)
+        return FetchPlan(by_key, required)
+
+    @classmethod
+    def whole_regions(cls, request: Request) -> Tuple[_Region, ...]:
+        """The regions ``request`` denotes when one source holds all of it.
+
+        The one region the request itself names: expanding it against a source
+        holding exactly it gives that back, for an object, a tensor and a slice
+        alike. A key's object type is one per key -- TorchStore's
+        ``StorageInfo.update`` refuses to change it -- so where a source holds whole
+        values this is what every source of the key serves, and the first of them
+        ends the walk in :meth:`project`. Where sources hold pieces, no source serves
+        it and the walk runs to the end of the ranking.
+        """
+        return (cls._region(request),)
 
     def _expand_request(
         self, request: Request, storage_info: StorageInfo
@@ -403,32 +489,52 @@ class DirectorySensor(Sensor):
             tuple(tensor_slice.mesh_shape),
         )
 
+    def _storage_spec(self, storage_info: StorageInfo) -> _StorageSpec:
+        memo = self._storage_specs
+        if memo is None:
+            return self._build_storage_spec(storage_info)
+        # Keyed by identity, so the entry holds the object: an id freed mid-pin could
+        # otherwise be handed to a different StorageInfo. Directory metadata does not
+        # move while a decision holds the pin.
+        cached = memo.get(id(storage_info))
+        if cached is None:
+            cached = storage_info, self._build_storage_spec(storage_info)
+            memo[id(storage_info)] = cached
+        return cached[1]
+
     @classmethod
-    def _storage_spec(cls, storage_info: StorageInfo) -> _StorageSpec:
+    def _build_storage_spec(cls, storage_info: StorageInfo) -> _StorageSpec:
         return (
             storage_info.object_type,
             tuple(cls._slice_spec(part) for part in storage_info.tensor_slices),
         )
 
-    @classmethod
-    def _coverage_spec(
-        cls,
-        requests: Sequence[Request],
-        located: _Located,
-        keys: Sequence[str],
-    ) -> _CoverageSpec:
-        request_spec = tuple(cls.request_spec(request) for request in requests)
-        located_spec = tuple(
+    def batch_spec(self, requests: Sequence[Request]) -> Tuple[_RequestSpec, ...]:
+        """What a batch asks for, independent of the request objects carrying it."""
+        return tuple(self.request_spec(request) for request in requests)
+
+    def _directory_stamp(self) -> object:
+        """What must not have moved for a derived value to still hold.
+
+        ``O(1)`` where the directory counts its own mutations. A directory that does
+        not -- a stub, a fixture -- is signed instead, at ``O(keys x holders)`` once
+        per pin.
+        """
+        revision = getattr(self.directory, "revision", None)
+        if revision is not None:
+            return "revision", revision
+        # Holder order is directory order, and a fallback plan reads it, so a
+        # reordering is a move.
+        return tuple(
             (
                 key,
                 tuple(
-                    (source, cls._storage_spec(info))
-                    for source, info in located.get(key, {}).items()
+                    (source, self._storage_spec(info))
+                    for source, info in entries.items()
                 ),
             )
-            for key in keys
+            for key, entries in self._located.items()
         )
-        return request_spec, located_spec
 
     @staticmethod
     def _region(request: Request) -> _Region:
@@ -442,11 +548,6 @@ class DirectorySensor(Sensor):
             )
         return request.key, region
 
-    @staticmethod
-    def regions(requests: Sequence[Request]) -> Counter[_Region]:
-        """Count the exact key regions represented by expanded requests."""
-        return Counter(DirectorySensor._region(request) for request in requests)
-
     def covers(
         self,
         requests: Sequence[Request],
@@ -458,29 +559,40 @@ class DirectorySensor(Sensor):
         """Whether directory metadata covers every required source region."""
         if not required:
             return True
-        if located is None:
-            keys = [request.key for request in requests]
-            located = self.locate_live(keys) if live else self.locate(keys)
-        sources = set(required)
-        relevant = {
-            key: {source: info for source, info in entries.items() if source in sources}
-            for key, entries in located.items()
-        }
-        return not self.coverage(requests, relevant).missing_sources(required)
+        actual: Mapping[VolumeId, Counter[_Region]]
+        if located is not None:
+            actual = self.coverage(requests, located).requirements()
+        elif live:
+            keys = tuple(dict.fromkeys(request.key for request in requests))
+            actual = self.coverage(requests, self.locate_live(keys)).requirements()
+        else:
+            actual = self.requirements(requests)
+        empty: Counter[_Region] = Counter()
+        return not any(
+            expected - actual.get(source, empty)
+            for source, expected in required.items()
+        )
 
     @contextmanager
     def pinned(self, keys: Sequence[str]) -> Iterator[None]:
-        """Serve one copied directory answer for the duration of a decision."""
+        """Serve one copied directory answer for the duration of a decision.
+
+        Nothing suspends between the read and the release, so no mutation can land
+        inside a pin: values derived here are checked against the directory once, on
+        the way in, and held unchecked for the rest of the decision.
+        """
         assert self._keys is None, "a decision already holds the directory read"
         located = {
             key: dict(volumes) for key, volumes in self.locate_live(keys).items()
         }
         self._keys, self._located = frozenset(keys), located
-        self._decision_coverages = {}
+        self._storage_specs = {}
+        self._checked = False
         try:
             yield
         finally:
-            self._keys, self._located, self._decision_coverages = None, {}, {}
+            self._keys, self._located = None, {}
+            self._storage_specs = None
 
 
 class LoadSensor(Sensor):

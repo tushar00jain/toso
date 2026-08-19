@@ -39,7 +39,7 @@ optimize the final microseconds of a fused one-hop engine; or change the
 │ Dedup ControlPlane                  │      │ ReadThroughPlane              │      │ Controller: current holders    │
 │ source rank + readiness + load      │answer│ preferred batch → local put   │─────►│ LocalClient: slice planning    │
 │ DirectorySensor: TorchStore coverage│      │ dispatch Published            │      │ StorageVolume: resident bytes  │
-│ Dedup overlay + FanoutSensor        │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
+│ Dedup promises + FanoutSensor       │◄─────│ moves bytes through Deployment│─────►│ transport: peer / origin copy  │
 │ reads Environment + Sensors         │      └───────────────────────────────┘      └────────────────────────────────┘
 └─────────────────────────────────────┘
 ┌──────────────── DIRECTORY TRUTH ─────────────────┐   ┌──────────────────── SENSOR TRUTH ────────────────────┐
@@ -49,8 +49,9 @@ optimize the final microseconds of a fused one-hop engine; or change the
 <!-- text-diagram:shape:end -->
 
 The `Controller` remains the authority for current residency. The dedup directory
-sensor overlays separately committed pending entries for planning, while its live
-reads still come only from the controller. `FanoutSensor` holds the planned tree,
+sensor writes each in-flight batch back into the controller as a *promised* entry,
+which only a read that asks for promises can see; ordinary reads, the DTensor commit
+check and `keys()` answer as though it were not there. `FanoutSensor` holds the planned tree,
 source load, and route dependencies. Selectors read both sensors directly; they move
 no bytes.
 
