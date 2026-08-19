@@ -179,3 +179,133 @@ in the same cold-then-reused order.
 The tool does not measure controller RPC, payload transfer, publication latency, or
 the simulation scheduler. It answers whether one serialized dedup controller can
 construct a routing decision at the requested metadata scale.
+
+## Anatomy of one request
+
+Toy scale for this section: keys `w0, w1` (`K=2`), live sources `s0, s1` (`T=2`),
+generators `g0, g1` already asked (`G=2`), requester `r`, so `V=4`.
+
+State before `r` asks:
+
+```text
+live directory              dedup pending overlay
+  w0 -> {s0, s1}              _pending      g0 -> {w0: e0, w1: e1}
+  w1 -> {s0, s1}                            g1 -> {w0: e2, w1: e3}
+                              _pending_by_key  w0 -> {g0: e0, g1: e2}
+                                               w1 -> {g0: e1, g1: e3}
+```
+
+The two pending indexes point at the same `_PendingEntry` objects.
+
+`Dedup.sources([w0, w1], "r")` is one synchronous turn: the pin is taken after `Asked`
+commits and released after `Routed` commits, with no await between, so no put, publish
+or eviction can interleave.
+
+```text
+dispatch_sync(Asked(r, [w0,w1]))    K entries, each written to both pending indexes
+    |
+pinned([w0,w1])                     copy of the live read: K dicts, K*T slots
+    |
+Candidates.select
+    |  plan(r)                      fresh K-entry dict
+    |  serving_sources
+    |     live coverage             K KeyCoverage + K*T SourceCoverage
+    |     overlay coverage          K KeyCoverage + K*V SourceCoverage
+    |     requirements x2           V Counters, K*V cells, for combined and live
+    |  _wait(g) per pending peer    plan(g) + covers(): a fresh K-key coverage each
+    |  price V candidates           env.read_time per candidate
+    |
+Balance -> WithFold -> Ordered      V-entry key mapping rebuilt three times, sort V log V
+    |
+plan_fetch(order)                   per key: holders, present, effective, a walk of
+    |                               the whole order -> K*V, plus required Counters
+dispatch_sync(Routed(r, ...))       Counter -> elements() tuple -> Counter again
+    |
+gate(covers(..., live=True))        a second directory read of the same K keys
+```
+
+### Reusable state
+
+Outlives the decision; sizes are for one requester unless stated.
+
+| Structure | Owner | Size | Released by |
+| --- | --- | --- | --- |
+| `_expansions` | `DirectorySensor` | one region tuple per distinct (request spec, storage spec) | first live-coverage signature change |
+| `_pending`, `_pending_by_key` | `DedupDirectorySensor` | `K` entries, two index slots each | `Published` |
+| `_PendingEntry.regions`, `alternate_regions` | `DedupDirectorySensor` | one tuple per key, shared by every reader that sees it | `Published` |
+| `_route`, `_route_pending` | `FanoutSensor` | `S` + `P` | `Routed`, `Retired`, `Published` |
+| `_route_required` | `FanoutSensor` | `S` Counters of up to `K` region cells; `G*K*S` cells across the burst | `Published` |
+| `_load` | `FanoutSensor` | one counter per source | `_drop` |
+| `_waiters` | `Dispatcher` | one link per (pending source, gate) | commit |
+
+`_route_required` is the largest retained item: 92,544 cells at dense 70B, 2.66 million
+at the fleet envelope, each a `(key, slice spec)` tuple hashed on every probe.
+
+### Per-request state
+
+Dies with the pin, except the decision cache which is cleared on pin exit.
+
+| Structure | Size |
+| --- | --- |
+| Pinned `_located` copy | `K` dicts, `K*T` slots |
+| Live `DirectoryCoverage` | `K` + `K*T` objects |
+| Combined overlay coverage | `K` + `K*V` objects |
+| Coverage cache keys (`_coverage_spec`) | `K` request-spec plus `K*T` storage-spec tuples, per `coverage()` call |
+| `requirements()` Counters | `V` Counters, `K*V` cells, per coverage asked |
+| `_wait` memo and its probes | `V` memo entries; one `K`-key coverage per pending peer |
+| `Selection.key` | `V` entries, rebuilt by `priced`, `annotated` and `only` |
+| `FetchPlan` | `K` source tuples plus `S` Counters |
+| `Routed.required` | every required region flattened into one tuple |
+
+### What that costs in calls
+
+One decision at `planned-8b` (`290/4/16`), counted by wrapping the sensor:
+
+| Operation | Calls | Per key |
+| --- | ---: | ---: |
+| `request_spec` | 13,920 | 48 |
+| `_storage_spec` | 9,570 | 33 |
+| `expand_regions` | 2,610 | 9 |
+| `coverage` | 19 | |
+| `covers` | 17 | |
+| `locate_live` | 2 | |
+
+Sixteen of the seventeen `covers` calls are `_wait` probes, one per pending peer, and
+each rebuilds a whole `K`-key coverage plus its `O(K*T)` cache key. That is where the
+48 spec constructions per key come from.
+
+## Potential improvement
+
+Two localized changes, prototyped by monkeypatching and measured on the full decision:
+
+| Change | `planned-8b` | `dense-70b` |
+| --- | ---: | ---: |
+| Probe readiness from the pin's live requirements instead of rebuilding a coverage | 1.4–1.5x | 1.5–1.7x |
+| Memoize `_storage_spec` per `StorageInfo` identity | 1.1x | 1.2–1.3x |
+| Both | 1.6x | 2.0–2.1x |
+
+Ratios are stable across runs; absolute times are not, so only the ratios are reported.
+That would put wide 8B placement near 330 ms and dense 70B near 750 ms.
+
+Remaining, in profile order after those two:
+
+- `_overlay_coverage` is rebuilt from scratch every decision (`O(K*V)`, 0.59 s of a 1.7 s
+  dense-70B decision) although one `Asked` or `Published` changes one generator's
+  entries. An overlay retained across decisions and moved by those two folds makes it
+  `O(K)` per decision, and is the only change that removes the `G` factor from the
+  burst.
+- `_coverage_spec` is `O(K*T)` per call and is paid to *look up* a cache. Within a pin
+  the located mapping cannot change, so a pin generation counter plus request identity
+  is an equivalent key.
+- The gate's `covers(..., live=True)` reads the directory a second time for the same `K`
+  keys. `_committed` runs inside the pin with no await, so the pinned snapshot is
+  provably identical.
+- `plan()` builds a fresh `K`-entry dict per call, `G+2` times per decision. Cache the
+  mapping per producer and invalidate it in the two folds that move it.
+- `Routed` flattens each source's Counter through `elements()` so `_routed` can rebuild
+  the same Counter. Carry the counts.
+- A region is a nested tuple hashed on every Counter and set operation. Interning
+  regions to ints shrinks `_route_required` and speeds every probe.
+- `plan_coverage` scans the whole ranking per key (`O(K*V)`). A rank dict makes it
+  `O(t log t)` for `t` sources present on a key, which matters for sparse placement and
+  is invisible in this dense benchmark.
