@@ -2,57 +2,57 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from proposed import Selection, VolumeId
-from proposed.selector import Selector
+from proposed import Selection
+from proposed.selector import Annotate, Selector
+from torchstore import Publication
 
-from ._sensor import DedupDirectorySensor, FanoutSensor, Pub
+from ._sensor import FanoutSensor
 
-__all__ = ["Candidates", "Serving", "CHAIN", "SPREAD"]
+__all__ = ["Candidates", "SourceBalance", "CHAIN", "SPREAD"]
 
 CHAIN = 10.0
 SPREAD = 0.0
 
 
-@dataclass(frozen=True)
-class Serving:
-    """The store candidates read for one decision."""
-
-    live: frozenset[VolumeId]
-    pending: frozenset[Pub]
+def _source_load(selector, _serving):
+    load = selector.sensor(FanoutSensor).named()
+    return lambda source: load.get(source[1], 0)
 
 
-class Candidates(Selector[Serving, float]):
-    """Every serving volume, priced by arrival plus one transfer."""
+SourceBalance = Annotate(_source_load, senses=(FanoutSensor,))
 
-    sensors = (DedupDirectorySensor, FanoutSensor)
+
+class Candidates(Selector[frozenset[Publication], float]):
+    """Every serving source, priced by arrival plus one transfer."""
+
+    sensors = (FanoutSensor,)
 
     def __init__(self, fabric: float = CHAIN, payload_bytes: int = 1) -> None:
         self.fabric = fabric
         self.payload_bytes = payload_bytes
 
-    def select(self, serving: Serving, requester: str) -> Selection[float]:
+    def select(
+        self, serving: frozenset[Publication], requester: str
+    ) -> Selection[float]:
         fanout = self.sensor(FanoutSensor)
-        pending: dict[VolumeId, list[float]] = {}
-        for pub in serving.pending:
-            arrival = fanout.arrival(pub)
-            if arrival is not None:
-                pending.setdefault(pub[0], []).append(arrival)
-
-        priced: list[tuple[VolumeId, float]] = []
-        candidates = serving.live | pending.keys()
-        for volume in candidates:
+        load = fanout.named()
+        priced: list[tuple[Publication, float]] = []
+        for source in serving:
+            pub, volume = source
             if volume == requester:
                 continue
-            live = volume in serving.live
-            arrivals = pending.get(volume, ())
-            if not live and not arrivals:
-                continue
-            if not live and fanout.named().get(volume, 0) >= fanout.cap:
-                continue
-            wait = 0.0 if live else max(arrivals)
+            if pub == 0:
+                wait = 0.0
+            else:
+                if load.get(volume, 0) >= fanout.cap:
+                    continue
+                arrival = fanout.arrival(source)
+                if arrival is None:
+                    continue
+                wait = arrival
             hop = self.env.read_time(volume, requester, self.payload_bytes)
-            priced.append((volume, wait + hop + self.fabric * hop))
+            priced.append((source, wait + hop + self.fabric * hop))
         if not priced:
             return Selection.abstain()
+        priced.sort(key=lambda candidate: (candidate[1], candidate[0]))
         return Selection.priced(priced)

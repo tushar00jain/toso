@@ -45,7 +45,7 @@ class ReadThroughPlane(DataPlane):
                 ).get_batch(batch)
             except KeyError:
                 await self.deployment.dispatcher_handle.dispatch.call_one(
-                    Published(*plan.publication)
+                    Published(plan.publication)
                 )
                 continue
             if self.trace is not None:
@@ -56,6 +56,6 @@ class ReadThroughPlane(DataPlane):
                 )
             await self.deployment.client_for(requester).put_batch(results)
             await self.deployment.dispatcher_handle.dispatch.call_one(
-                Published(*plan.publication)
+                Published(plan.publication)
             )
             return results

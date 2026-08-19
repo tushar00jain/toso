@@ -4,14 +4,13 @@ Both sensors fold capability actions through one dispatcher. The directory senso
 resolves publication ids; the fan-out sensor owns arrival scores and source load.
 """
 
-from ._directory import Asked, DedupDirectorySensor, Pub, Published
+from ._directory import Asked, DedupDirectorySensor, Published
 from ._fanout import FanoutSensor, Routed
 
 __all__ = [
     "Asked",
     "DedupDirectorySensor",
     "FanoutSensor",
-    "Pub",
     "Published",
     "Routed",
 ]

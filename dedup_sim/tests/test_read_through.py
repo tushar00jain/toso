@@ -68,7 +68,7 @@ class _Deployment:
 
 
 def test_a_batch_put_dispatches_one_publication():
-    plan = ReadPlan(("source",), ("r0", 7))
+    plan = ReadPlan(("source",), (7, "r0"))
     deployment = _Deployment(
         [plan], [{"K0": "read-K0", "K1": "read-K1"}]
     )
@@ -87,13 +87,13 @@ def test_a_batch_put_dispatches_one_publication():
         ("K1", None),
     ]
     assert deployment.client.puts == [result]
-    assert deployment.dispatcher_handle.actions == [Published("r0", 7)]
+    assert deployment.dispatcher_handle.actions == [Published((7, "r0"))]
     assert deployment.vends == [("r0", ("source",)), ("r0", None)]
 
 
 def test_an_evicted_preference_reasks_and_retires_both_publications():
-    first = ReadPlan(("stale", "origin"), ("r0", 7))
-    second = ReadPlan(("origin",), ("r0", 8))
+    first = ReadPlan(("stale", "origin"), (7, "r0"))
+    second = ReadPlan(("origin",), (8, "r0"))
     deployment = _Deployment(
         [first, second],
         [KeyError("stale source"), {"K": "read-K"}],
@@ -106,8 +106,8 @@ def test_an_evicted_preference_reasks_and_retires_both_publications():
     assert result == {"K": "read-K"}
     assert len(deployment.control_plane_handle.asked) == 2
     assert deployment.dispatcher_handle.actions == [
-        Published("r0", 7),
-        Published("r0", 8),
+        Published((7, "r0")),
+        Published((8, "r0")),
     ]
     assert deployment.vends == [
         ("r0", ("stale", "origin")),

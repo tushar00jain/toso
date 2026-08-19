@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
+from torchstore import Publication
 
 __all__ = ["ControllerService"]
 
@@ -79,5 +80,15 @@ class ControllerService:
 
     def serving_union(
         self, requests: Sequence[Any]
-    ) -> tuple[dict[str, set[str]], dict[str, set[int]]]:
+    ) -> frozenset[Publication]:
         return self.controller.serving_union(requests)
+
+    def regions_covered(
+        self, source: Publication, requests: Sequence[Any]
+    ) -> frozenset[tuple[str, Any]]:
+        return self.controller.regions_covered(source, requests)
+
+    def greedy_cover(
+        self, requests: Sequence[Any], ranked: Iterable[Publication]
+    ) -> list[Publication]:
+        return self.controller.greedy_cover(requests, ranked)

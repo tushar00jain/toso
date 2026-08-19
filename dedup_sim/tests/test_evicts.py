@@ -146,7 +146,7 @@ class _RetryDeployment:
 
     async def _sources(self, requests, requester):
         self.asks += 1
-        return ReadPlan(("peer",), (requester, self.asks))
+        return ReadPlan(("peer",), (self.asks, requester))
 
     async def _dispatch(self, action):
         self.actions.append(action)
@@ -173,7 +173,7 @@ def test_an_eviction_after_ranking_makes_the_requester_reask():
 
     assert result == {KEY: "value"}
     assert deployment.asks == 2
-    assert deployment.actions == [Published("r0", 1), Published("r0", 2)]
+    assert deployment.actions == [Published((1, "r0")), Published((2, "r0"))]
 
 
 def test_the_sensor_retains_no_publications_after_the_run():

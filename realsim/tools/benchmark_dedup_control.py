@@ -14,12 +14,12 @@ from typing import Callable, Sequence, TypeVar
 
 os.environ.setdefault("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", "910737418240")
 
-from dedup_sim.control._selector import Serving
 from dedup_sim.control._sensor import Asked, DedupDirectorySensor, Published, Routed
 from dedup_sim.control.routing import Dedup
 from proposed import Endpoint, Environment
 from realsim.adapters.real_controller import RealControllerAdapter
 from sim_common.perfcount import InstructionCount
+from torchstore import Publication
 from torchstore.transport import Request
 
 __all__ = ["main"]
@@ -89,18 +89,17 @@ class _Workload:
         self.dispatcher.dispatch_sync(Asked(pub))
         return pub
 
-    def union(self) -> Serving:
-        live, pending = self.directory.serving_union(self.requests)
-        return Serving(
-            frozenset().union(*live.values()),
-            frozenset().union(*pending.values()),
-        )
+    def union(self) -> frozenset[Publication]:
+        return self.directory.serving_union(self.requests)
 
-    def rank(self, serving: Serving):
+    def rank(self, serving: frozenset[Publication]):
         return self.plane._chain.select(serving, self.full_probe)
 
-    def gate(self, serving: Serving) -> None:
-        actions = tuple(Published(*pub) for pub in serving.pending)
+    def gate(self, serving: frozenset[Publication]) -> None:
+        pending = tuple(
+            publication for publication in serving if publication[0] != 0
+        )
+        actions = tuple(Published(publication) for publication in pending)
         self.dispatcher.gate(lambda: True, actions)
 
     def decide(self) -> None:
@@ -241,8 +240,8 @@ def _runtime(args: argparse.Namespace) -> _Runtime:
         gate_ms,
         full_decision_ms,
         full_decision_instructions,
-        len(serving.live | {pub[0] for pub in serving.pending}),
-        len(serving.pending),
+        len(serving),
+        sum(pub != 0 for pub, _volume in serving),
         len(ranking.sources or ()),
     )
 

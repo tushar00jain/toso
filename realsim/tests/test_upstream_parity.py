@@ -6,6 +6,7 @@ import inspect
 
 from proposed import Controller as ControllerProtocol
 from realsim.adapters.real_controller import RealControllerAdapter
+from torchstore import Publication
 from torchstore.client import LocalClient
 from torchstore.controller import Controller, ObjectType, StorageInfo
 from torchstore.transport import Request, TensorSlice
@@ -20,6 +21,8 @@ def test_controller_exposes_publication_and_preference_parameters():
     assert put.parameters["pending"].default is True
     assert delete.parameters["pub"].default is None
     assert hasattr(Controller, "serving_union")
+    assert hasattr(Controller, "regions_covered")
+    assert hasattr(Controller, "greedy_cover")
     assert hasattr(Controller, "_locate")
     assert hasattr(Controller, "_notify_put")
 
@@ -28,14 +31,17 @@ def test_proposed_controller_declares_the_real_surface():
     required = {
         "_locate",
         "_notify_put",
+        "greedy_cover",
         "keys",
         "locate_volumes",
         "notify_delete",
         "notify_delete_batch",
         "notify_put_batch",
+        "regions_covered",
         "serving_union",
     }
     assert required <= set(vars(ControllerProtocol))
+    assert Publication == tuple[int, str]
 
 
 def test_sliced_fetch_uses_the_first_replica_only():

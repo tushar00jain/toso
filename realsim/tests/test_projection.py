@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from realsim.adapters.real_controller import RealControllerAdapter
-from torchstore.controller import ObjectType, Pending
+from torchstore.controller import ObjectType
 from torchstore.transport import Request, TensorSlice
 
 
@@ -29,7 +29,10 @@ def test_pending_rows_are_hidden_from_locate_keys_and_commit_checks():
     assert service._locate(["W"], missing_ok=True) == {}
     assert service.keys() == ["D"]
     raw = service.controller.keys_to_storage_volumes["D"]
-    assert isinstance(raw["v0"], Pending)
+    assert set(raw) == {"v1"}
+    assert service.controller._pending["D"]["v0"][pub].tensor_slices == {
+        _shard("D", 0).tensor_slice
+    }
     assert not service.controller._is_dtensor_fully_committed("D", raw)
     with pytest.raises(KeyError, match="partially committed"):
         service._locate(["D"])
@@ -52,7 +55,7 @@ def test_a_real_put_replaces_the_pending_slot():
     assert held.object_type is ObjectType.TENSOR
 
 
-def test_retiring_a_publication_restores_the_live_entry_it_shadowed():
+def test_retiring_a_publication_keeps_the_live_entry():
     service = RealControllerAdapter().service
     service.notify_put_batch([_shard("D", 0)], "v0", pending=False)
     pub = service.notify_put_batch([_shard("D", 1)], "v0")
@@ -72,6 +75,48 @@ def test_retiring_one_publication_keeps_another_publication_on_the_volume():
 
     service.notify_delete_batch(pub=first)
 
-    volumes, pubs = service.serving_union([_tensor("W1")])
-    assert volumes == {"W1": set()}
-    assert pubs == {"W1": {second}}
+    serving = service.serving_union([_tensor("W1")])
+    assert serving == frozenset({(second, "v0")})
+
+
+def test_one_volume_can_serve_live_and_pending_slices():
+    """A volume can appear as both live and pending in the flat union."""
+    service = RealControllerAdapter().service
+    live = _shard("D", 0)
+    pending = _shard("D", 1)
+    service.notify_put_batch([live], "v0", pending=False)
+    pub = service.notify_put_batch([pending], "v0")
+    requests = [live, pending]
+
+    serving = service.serving_union(requests)
+
+    assert serving == frozenset({(0, "v0"), (pub, "v0")})
+    assert service.regions_covered((0, "v0"), requests) == {
+        ("D", live.tensor_slice)
+    }
+    assert service.regions_covered((pub, "v0"), requests) == {
+        ("D", pending.tensor_slice)
+    }
+
+
+def test_landing_drops_only_overlapping_pending_publications():
+    service = RealControllerAdapter().service
+    first = service.notify_put_batch([_shard("D", 0)], "v0")
+    second = service.notify_put_batch([_shard("D", 1)], "v0")
+
+    service.notify_put_batch([_shard("D", 0)], "v0", pending=False)
+
+    serving = service.serving_union([_shard("D", 0), _shard("D", 1)])
+    assert first not in service.controller._pending["D"]["v0"]
+    assert serving == frozenset({(0, "v0"), (second, "v0")})
+
+
+def test_delete_drops_live_and_pending_on_the_slot():
+    service = RealControllerAdapter().service
+    service.notify_put_batch([_shard("D", 0)], "v0", pending=False)
+    service.notify_put_batch([_shard("D", 1)], "v0")
+
+    service.notify_delete_batch({"v0": ["D"]})
+
+    serving = service.serving_union([_shard("D", 0), _shard("D", 1)])
+    assert serving == frozenset()

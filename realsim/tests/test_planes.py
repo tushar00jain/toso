@@ -335,7 +335,8 @@ def test_the_directory_holds_nothing_that_decides():
     """
     service = Simulation(_topology()).mesh.directory.service
     assert {name for name in dir(service) if not name.startswith("_")} == {
-        "controller", "keys", "locate_volumes", "serving_union",
+        "controller", "greedy_cover", "keys", "locate_volumes",
+        "regions_covered", "serving_union",
         "notify_delete", "notify_delete_batch", "notify_put_batch",
     }
 

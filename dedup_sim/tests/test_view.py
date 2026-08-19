@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from dedup_sim.control._selector import Candidates, Serving
+from dedup_sim.control._selector import Candidates
 from dedup_sim.control._sensor import (
     Asked,
     DedupDirectorySensor,
@@ -73,7 +73,7 @@ def test_a_fanout_nobody_supplied_raises():
         )
 
 
-def test_two_publications_from_one_host_coexist_and_redeclared_keys_defer():
+def test_two_publications_from_one_host_and_redeclared_keys_coexist():
     directory = _directory()
     dispatcher = _dispatcher(directory, FanoutSensor())
     first = directory.declare("r0", (_request("K0"),))
@@ -83,11 +83,16 @@ def test_two_publications_from_one_host_coexist_and_redeclared_keys_defer():
         dispatcher.dispatch_sync(Asked(pub))
 
     assert directory.in_flight() == {first, second, duplicate}
-    assert directory.serving_union((_request("K0"),))[1] == {"K0": {first}}
-    assert directory.serving_union((_request("K1"),))[1] == {"K1": {second}}
+    assert directory.serving_union((_request("K0"),)) == frozenset({
+        first,
+        duplicate,
+    })
+    assert directory.serving_union((_request("K1"),)) == frozenset({
+        second
+    })
 
 
-def test_serving_union_returns_candidates_per_key():
+def test_serving_union_returns_one_flat_candidate_set():
     directory = _directory()
     dispatcher = _dispatcher(directory, FanoutSensor())
     first = directory.declare("r0", (_request("K0"),))
@@ -95,13 +100,12 @@ def test_serving_union_returns_candidates_per_key():
     dispatcher.dispatch_sync(Asked(first))
     dispatcher.dispatch_sync(Asked(second))
 
-    live, pending = directory.serving_union((_request("K0"), _request("K1")))
+    serving = directory.serving_union((_request("K0"), _request("K1")))
 
-    assert live == {"K0": set(), "K1": set()}
-    assert pending == {"K0": {first}, "K1": {second}}
+    assert serving == frozenset({first, second})
 
 
-def test_serving_union_filters_slice_candidates_per_key():
+def test_serving_union_filters_slice_candidates():
     directory = _directory()
     dispatcher = _dispatcher(directory, FanoutSensor())
     first = directory.declare("r0", (_slice_request("K", 0),))
@@ -109,37 +113,33 @@ def test_serving_union_filters_slice_candidates_per_key():
     dispatcher.dispatch_sync(Asked(first))
     dispatcher.dispatch_sync(Asked(second))
 
-    _live, pending = directory.serving_union((_slice_request("K", 0),))
+    serving = directory.serving_union((_slice_request("K", 0),))
 
-    assert pending == {"K": {first}}
-
-
-def test_whole_value_gate_names_only_the_head_candidate_per_key():
-    first = ("r0", 1)
-    second = ("r1", 2)
-
-    gates = _gate_publications(
-        (_request("K"),),
-        ("r0", "r1", "origin"),
-        {"K": {"origin"}},
-        {"K": {first, second}},
-    )
-
-    assert gates == {first}
+    assert serving == frozenset({first})
 
 
-def test_sliced_gate_names_every_intersecting_pending_candidate():
-    first = ("r0", 1)
-    second = ("r1", 2)
+def test_greedy_walk_stops_after_first_synchronized_batch_source():
+    directory = _directory()
+    requests = (_request("K0"), _request("K1"))
+    first = directory.declare("r0", requests)
+    second = directory.declare("r1", requests)
 
-    gates = _gate_publications(
-        (_slice_request("K"),),
-        ("r0", "r1"),
-        {"K": {"r0"}},
-        {"K": {first, second}},
-    )
+    chosen = directory.greedy_cover(requests, (first, second))
 
-    assert gates == {first, second}
+    assert chosen == [first]
+    assert _gate_publications(chosen) == {first}
+
+
+def test_greedy_walk_chooses_one_source_per_disjoint_region():
+    directory = _directory()
+    first = directory.declare("r0", (_request("K0"),))
+    second = directory.declare("r1", (_request("K1"),))
+    requests = (_request("K0"), _request("K1"))
+
+    chosen = directory.greedy_cover(requests, (first, second))
+
+    assert chosen == [first, second]
+    assert _gate_publications(chosen) == {first, second}
 
 
 def test_batch_one_publication_does_not_open_batch_twos_gate():
@@ -150,13 +150,13 @@ def test_batch_one_publication_does_not_open_batch_twos_gate():
         second = directory.declare("r0", (_request("K1"),))
         dispatcher.dispatch_sync(Asked(first))
         dispatcher.dispatch_sync(Asked(second))
-        ready = dispatcher.gate(lambda: False, (Published(*first),))
+        ready = dispatcher.gate(lambda: False, (Published(first),))
         task = asyncio.create_task(ready())
         await asyncio.sleep(0)
-        dispatcher.dispatch_sync(Published(*second))
+        dispatcher.dispatch_sync(Published(second))
         await asyncio.sleep(0)
         assert not task.done()
-        dispatcher.dispatch_sync(Published(*first))
+        dispatcher.dispatch_sync(Published(first))
         await task
 
     run_sim(publish())
@@ -170,10 +170,12 @@ def test_batch_two_rows_survive_batch_one_publication():
     dispatcher.dispatch_sync(Asked(first))
     dispatcher.dispatch_sync(Asked(second))
 
-    dispatcher.dispatch_sync(Published(*first))
+    dispatcher.dispatch_sync(Published(first))
 
-    assert directory.serving_union((_request("K0"),))[1] == {"K0": set()}
-    assert directory.serving_union((_request("K1"),))[1] == {"K1": {second}}
+    assert directory.serving_union((_request("K0"),)) == frozenset()
+    assert directory.serving_union((_request("K1"),)) == frozenset({
+        second
+    })
 
 
 def test_publication_folds_state_before_its_gate_wakes():
@@ -184,10 +186,10 @@ def test_publication_folds_state_before_its_gate_wakes():
         pub = directory.declare("r0", (_request("K"),))
         dispatcher.dispatch_sync(Asked(pub))
         dispatcher.dispatch_sync(Routed(pub, ("origin",), frozenset(), 10.0))
-        ready = dispatcher.gate(lambda: False, (Published(*pub),))
+        ready = dispatcher.gate(lambda: False, (Published(pub),))
         task = asyncio.create_task(ready())
         await asyncio.sleep(0)
-        dispatcher.dispatch_sync(Published(*pub))
+        dispatcher.dispatch_sync(Published(pub))
         await task
         return directory.in_flight(), fanout.arrival(pub)
 
@@ -208,14 +210,74 @@ def test_pending_fanout_cap_excludes_a_full_peer():
     reader = directory.declare("r0", (_request("K"),))
     dispatcher.dispatch_sync(Asked(reader))
     dispatcher.dispatch_sync(Routed(reader, ("p0",), frozenset({peer}), 11.0))
-    live, pending = directory.serving_union((_request("K"),))
+    serving = directory.serving_union((_request("K"),))
     ranking = Ordered(Candidates()).attach(
         environment,
         {DedupDirectorySensor: directory, FanoutSensor: fanout},
     )
 
-    sources = ranking.select(
-        Serving(frozenset(live["K"]), frozenset(pending["K"])), "r1"
-    ).sources
-    assert sources[0] == "r0"
-    assert "p0" not in sources
+    sources = ranking.select(serving, "r1").sources
+    assert sources[0] == reader
+    assert peer not in sources
+
+
+def test_candidate_wait_ranks_both_pubs_and_greedy_picks_the_faster_one():
+    ids = ("origin", "p0", "r0")
+    environment = Environment({v: Endpoint(v, v, v) for v in ids}, _Profile())
+    directory = _directory()
+    fanout = FanoutSensor(fanout_cap=2)
+    dispatcher = _dispatcher(directory, fanout)
+    fast = directory.declare("p0", (_request("K"),))
+    slow = directory.declare("p0", (_request("K"),))
+    for pub, arrival in ((fast, 2.0), (slow, 9.0)):
+        dispatcher.dispatch_sync(Asked(pub))
+        dispatcher.dispatch_sync(Routed(pub, ("origin",), frozenset(), arrival))
+    requests = (_request("K"),)
+    serving = directory.serving_union(requests)
+    candidates = Candidates(fabric=0.0).attach(
+        environment,
+        {DedupDirectorySensor: directory, FanoutSensor: fanout},
+    )
+
+    selection = candidates.select(serving, "r0")
+
+    fast_arrival = fanout.arrival(fast)
+    slow_arrival = fanout.arrival(slow)
+    assert fast_arrival is not None
+    assert slow_arrival is not None
+    assert selection.key is not None
+    assert selection.sources == (fast, slow)
+    assert selection.key[fast] == (fast_arrival + 1.0,)
+    assert selection.key[slow] == (slow_arrival + 1.0,)
+    assert directory.greedy_cover(requests, selection.sources) == [fast]
+
+
+def test_publication_arrival_uses_every_chosen_source():
+    ids = ("origin", "p0", "p1", "r0")
+    environment = Environment({v: Endpoint(v, v, v) for v in ids}, _Profile())
+    directory = _directory()
+    plane = Dedup().attach(
+        environment,
+        {DedupDirectorySensor: directory},
+    )
+    fanout = plane.sensor(FanoutSensor)
+    first = directory.declare("p0", (_request("K0"),))
+    second = directory.declare("p1", (_request("K1"),))
+    for pub, arrival in ((first, 4.0), (second, 9.0)):
+        plane.dispatcher.dispatch_sync(Asked(pub))
+        plane.dispatcher.dispatch_sync(
+            Routed(pub, ("origin",), frozenset(), arrival)
+        )
+
+    plan, _trace = run_sim(
+        plane._decide((_request("K0"), _request("K1")), "r0")
+    )
+
+    first_arrival = fanout.arrival(first)
+    second_arrival = fanout.arrival(second)
+    assert first_arrival is not None
+    assert second_arrival is not None
+    assert fanout.arrival(plan.publication) == max(
+        first_arrival + 1.0,
+        second_arrival + 1.0,
+    )

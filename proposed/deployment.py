@@ -28,7 +28,19 @@ surface declares the methods, which is where the signatures are.
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 __all__ = [
     "Controller", "Deployment", "Key", "Sensor", "StorageFull",
@@ -109,8 +121,20 @@ class Controller(Protocol):
 
     def serving_union(
         self, requests: Sequence[Any]
-    ) -> tuple[Dict[Key, set[VolumeId]], Dict[Key, set[int]]]:
-        """Live volumes and publications serving each requested key."""
+    ) -> FrozenSet[Tuple[int, VolumeId]]:
+        """Live and pending sources overlapping any requested region."""
+
+    def regions_covered(
+        self, source: Tuple[int, VolumeId], requests: Sequence[Any]
+    ) -> FrozenSet[Tuple[Key, Any]]:
+        """Requested regions overlapped by one live or pending source."""
+
+    def greedy_cover(
+        self,
+        requests: Sequence[Any],
+        ranked: Iterable[Tuple[int, VolumeId]],
+    ) -> List[Tuple[int, VolumeId]]:
+        """Greedy minimum cover over ranked publications."""
 
     async def keys(self, prefix: Optional[str] = None) -> List[str]:
         """Every registered key, or those under ``prefix``."""
