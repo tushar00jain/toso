@@ -61,11 +61,6 @@ class DedupDirectorySensor(DirectorySensor):
     ) -> frozenset[Publication]:
         return self.directory.serving_union(requests)
 
-    def regions_covered(
-        self, source: Publication, requests: Sequence[Any]
-    ) -> frozenset[tuple[str, Any]]:
-        return self.directory.regions_covered(source, requests)
-
     def greedy_cover(
         self, requests: Sequence[Any], ranked: Iterable[Publication]
     ) -> list[Publication]:

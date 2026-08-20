@@ -7,11 +7,11 @@
   },
   "instructions": {"full_decision": 51300000},
   "memory_kib": {
-    "declare_burst": 15547.523,
+    "declare_burst": 10577.359,
     "declare": 236.102,
     "union": 107.500,
     "rank": 36.281,
     "gate": 26.105,
-    "full_decision": 461.266
+    "full_decision": 394.578
   }
 }

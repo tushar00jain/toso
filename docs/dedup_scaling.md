@@ -29,13 +29,13 @@ Python peak reported for any measured phase, not process RSS.
 
 | Workload (`K/T/G`) | Peak decision | Whole burst, `G` × peak | Declare burst | Largest Python phase peak | Assessment |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Current executable test (`1/1/64`) | 0.7 ms | 46 ms | 0.5 ms | 0.04 MiB | Trivial |
-| Planned 8B (`290/4/16`) | 2.5 ms | 40 ms | 6 ms | 0.34 MiB | Trivial |
-| 70B key count, small burst (`723/4/16`) | 5.1 ms | 81 ms | 16 ms | 0.84 MiB | Trivial |
-| Wider 8B burst (`290/16/64`) | 4.5 ms | 285 ms | 128 ms | 0.35 MiB | Comfortable |
-| Wide 8B placement (`290/64/128`) | 9 ms | 1.15 s | 173 ms | 0.38 MiB | Comfortable |
-| Dense 70B (`723/64/128`) | 21 ms | 2.74 s | 602 ms | 0.86 MiB | Comfortable |
-| Fleet/MoE worst (`5,203/128/512`) | Projected ~0.65 s † | Projected ~5.5 min † | Projected 15–20 s † | Projected ~30 MiB † | Guarded; unsupported |
+| Current executable test (`1/1/64`) | 0.7 ms | 44 ms | 0.6 ms | 0.04 MiB | Trivial |
+| Planned 8B (`290/4/16`) | 4.4 ms | 70 ms | 14 ms | 0.58 MiB | Comfortable |
+| 70B key count, small burst (`723/4/16`) | 9.4 ms | 150 ms | 34 ms | 1.5 MiB | Comfortable |
+| Wider 8B burst (`290/16/64`) | 7.7 ms | 493 ms | 55 ms | 0.39 MiB | Comfortable |
+| Wide 8B placement (`290/64/128`) | 16.3 ms | 2.09 s | 228 ms | 0.42 MiB | Comfortable |
+| Dense 70B (`723/64/128`) | 43.5 ms | 5.57 s | 624 ms | 1.0 MiB | Comfortable |
+| Fleet/MoE worst (`5,203/128/512`) | Projected ~1.1 s † | Projected ~9.4 min † | Projected 15–20 s † | Projected ~30 MiB † | Guarded; unsupported |
 
 † extrapolated from the dense 70B row rather than measured; the guard rejects the
 workload by default.
@@ -53,7 +53,7 @@ an addition to the whole-burst column: it is the state that column priced agains
 
 The measured rows are synthetic capacity points, not observations of a particular
 deployment. The fleet row extrapolates from dense 70B: 7.2 times the keys, 4 times the
-burst and twice the holders per key. The union term (`K·T` live plus one shape probe
+burst and twice the holders per key. The union term (`K·V` slot probes plus one shape probe
 into `K·G` pending) scales roughly with `K·(T+G)`, so peak decision follows that; the
 declare burst carries `G·K` writes and scales with those. The projected trie holds
 3,329,920 indexed rows. The default benchmark guard prevents running it accidentally.
@@ -69,17 +69,17 @@ increases the per-key candidate set without adding new state kinds.
 
 | Component | Total time across `G` requests | Peak or retained space | Benchmark coverage |
 | --- | --- | --- | --- |
-| Declare | `O(GK)` pending-map inserts, one shape bucket per distinct shape | `O(GK)` pending entries in `_pending`, `O(G)` publication records, one shape reference per publication | `declare_burst_ms` |
+| Declare | `O(GK)` trie-slot inserts, one shape bucket per distinct shape | `O(GK)` pending entries in the unified trie, `O(G)` publication records, one shape reference per publication | `declare_burst_ms` |
 | Route staging | `O(GC)` load edges plus waiter links | `O(GC)` charged load, `O(GC)` waiter links at the ceiling | `declare_burst_ms` |
-| Serving union across `G` decisions | `O(G·K·T)` live plus `O(G·D)` shape probes | Flat `frozenset[Publication]` per decision; publication records reused across decisions | Peak decision `union_ms` |
-| Total burst construction | `O(G(K·T + C) + G·D)` | `O(K·(T+G) + G + V + GC)` | `declare_burst_ms` + peak decision |
-| Generator completions (`Published`) | `O(GK)` pending-map retirements plus `ΣWₐ` waiter releases | Each completion clears its publication and its waiter links | Not measured |
+| Serving union across `G` decisions | `O(G·K·V)` slot walks plus `O(G·D)` shape probes | Flat `frozenset[Publication]` per decision; publication records reused across decisions | Peak decision `union_ms` |
+| Total burst construction | `O(G(K·V + C) + G·D)` | `O(K·(T+G) + G + V + GC)` | `declare_burst_ms` + peak decision |
+| Generator completions (`Published`) | `O(GK)` trie-slot retirements plus `ΣWₐ` waiter releases | Each completion clears its publication and its waiter links | Not measured |
 | Total lifecycle including completion | Adds `O(GK)` retirement work over the burst construction | Same construction peak; completion releases the pending state | Not measured |
 
 A generator completion means its read-through finished, its local `put_batch` landed
-the keys it fetched, and it dispatched `Published(publication)`. Each landed put moves
-its slot from `_pending` into the live trie; `Published` retires whatever the
-publication declared and did not land, releases the load charge, and wakes every gate
+the keys it fetched, and it dispatched `Published(publication)`. Each landed put writes
+the `pub_id=0` live entry beside pending entries in the same trie slot; `Published`
+retires the publication's positive id, releases the load charge, and wakes every gate
 that named this publication. Retirement stays inside the `O(GK)` term: it is one pass
 over the publication's own keys.
 
@@ -90,23 +90,23 @@ all `G` pending publications above.
 
 | Component | Time | Peak space | Benchmark coverage |
 | --- | --- | --- | --- |
-| Declare the requester's publication | `O(K)` pending-map inserts | `O(K)` entries in `_pending` plus one publication record | `declare_ms` |
-| Serving union | `O(K·T)` live overlap plus `O(D)` shape probes; returns `frozenset[Publication]` with `V + G` sources at the peak | `O(V + G)` flat set of `(pub_id, volume)` tuples | `union_ms` |
+| Declare the requester's publication | `O(K)` trie-slot inserts | `O(K)` pending entries in the unified trie plus one publication record | `declare_ms` |
+| Serving union | `O(K·V)` slot walk plus `O(D)` shape probes; returns `frozenset[Publication]` with `V + G` sources at the peak | `O(V + G)` flat set of `(pub_id, volume)` tuples | `union_ms` |
 | Candidate scoring | `O(V + G)` `arrival` reads plus `O(V + G)` `read_time` calls; per-volume max collapses `V + G → V` | `O(V)` priced tuples | `rank_ms` |
 | Balance and ordering | `O(V + V log V)` | `O(V)` keyed selection | `rank_ms` |
 | `greedy_cover` (per key, per slice via the shared walker) | `O(C · K)` region-overlap checks; breaks early at full coverage. `C = 1` under whole-value single-source coverage | `O(C)` chosen publications, `O(K)` covered-region set | Part of `full_decision_ms` |
 | Route dispatch and arrival record | `O(C)` load edges plus one arrival float | `O(1)` retained on the requester publication | `full_decision_ms` |
 | Gate registration | `O(C)` waiter links | `O(C)` links, up to `O(GC)` across a blocked burst | `gate_ms` |
-| Total synchronous control decision | `O(K·T + D + V log V + C·K)` | Adds `O(K + C)` retained requester state plus `O(V + G)` transient union state | `full_decision_ms` |
+| Total synchronous control decision | `O(K·V + D + V log V + C·K)` | Adds `O(K + C)` retained requester state plus `O(V + G)` transient union state | `full_decision_ms` |
 
 The total request row ends after the route and readiness gate are constructed. It does
 not include waiting for a pending publication, transferring payloads, or landing the
 fetched batch.
 
-Peer readiness is `O(1)` per publication: an arrival score was computed when the peer
-was routed and is read back through `FanoutSensor.arrival`. Dependencies point at
-publications declared earlier in the serialized decision stream, so the recursion the
-old readiness walk carried is unnecessary -- the score is defined by construction.
+Peer readiness is `O(1)` per publication: an arrival score is computed when the peer
+is routed and read back through `FanoutSensor.arrival`. Dependencies point at
+publications declared earlier in the serialized decision stream, so the score is
+defined by construction with no readiness walk at decision time.
 
 Candidate discovery scales with distinct shapes rather than pending publications. The
 common synchronized burst uses one exact-shape bucket lookup for all `G` publications
@@ -124,7 +124,7 @@ bytes or Python objects:
 
 ```text
 K·T live rows in the controller trie
-+ K·G pending entries in the controller's _pending map
++ K·G pending rows in the same trie slots
 = K·(T + G) indexed entries
 ```
 
@@ -151,11 +151,11 @@ and Python build.
 
 | case | keys | sources | burst requests | indexed entries | declare burst ms | declare ms | union ms | rank ms | gate ms | full decision ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| smoke | 8 | 2 | 8 | 80 | 0.229 | 0.067 | 0.029 | 0.031 | 0.011 | 0.650 |
+| smoke | 8 | 2 | 8 | 80 | 0.350 | 0.090 | 0.023 | 0.028 | 0.011 | 0.715 |
 
 | full decision instructions | declare burst peak KiB | declare peak KiB | union peak KiB | rank peak KiB | gate peak KiB | full decision peak KiB | candidates | pending candidates | selected sources |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,594,571 | 63.055 | 7.414 | 5.000 | 5.430 | 5.629 | 23.195 | 11 | 9 | 10 |
+| 1,929,874 | 51.820 | 11.406 | 4.945 | 5.430 | 5.629 | 23.344 | 11 | 9 | 10 |
 
 Run the intended 8B scale or supply a deployment-specific point:
 
@@ -197,38 +197,36 @@ construct a routing decision at the requested metadata scale.
 Toy scale for this section: keys `w0, w1` (`K=2`), live sources `s0, s1` (`T=2`),
 generators `g0, g1` already declared (`G=2`), requester `r`, so `V=4`.
 
-State before `r` declares. Live entries sit in the controller trie; pending entries
-live in a separate `_pending` map keyed by `(key, volume, pub)`. One interned shape
-represents both generators because they declared the same batch:
+State before `r` declares. Live and pending entries share each controller trie slot.
+`pub_id=0` marks live storage; positive ids name outstanding publications. One
+interned shape represents both generators because they declared the same batch:
 
 ```text
-trie (live only)                       controller sidecars
-  w0 -> {s0, s1}                         _pending[w0]
-  w1 -> {s0, s1}                           g0 -> {1: StorageInfo}
-                                           g1 -> {2: StorageInfo}
-                                         _pending[w1]
-                                           g0 -> {1: StorageInfo}
-                                           g1 -> {2: StorageInfo}
-                                         publications
-                                           1 -> volume=g0, entries={w0,w1}, shape=#1
-                                           2 -> volume=g1, entries={w0,w1}, shape=#1
-                                         shape_pubs
-                                           #1 -> {1, 2}
+keys_to_storage_volumes: Trie[k, {vol: {pub_id: StorageInfo}}]
+  w0 -> s0:{0: live}, s1:{0: live}, g0:{1: pending}, g1:{2: pending}
+  w1 -> s0:{0: live}, s1:{0: live}, g0:{1: pending}, g1:{2: pending}
+
+controller sidecars
+  publications
+    1 -> volume=g0, keys=frozenset({w0,w1}), shape=#1
+    2 -> volume=g1, keys=frozenset({w0,w1}), shape=#1
+  shape_pubs
+    #1 -> {1, 2}
 ```
 
-Ordinary reads (`locate_volumes`, `get`, `keys`, DTensor commit check) traverse only
-the trie. Pending entries live in the separate `_pending` map and are consulted by
-`serving_union`, `regions_covered`, and `greedy_cover` when it builds source maps.
+Ordinary reads (`locate_volumes`, `get`, `keys`, DTensor commit check) project each
+slot to its `pub_id=0` entry. `serving_union` probes live slot values and shape
+buckets; `greedy_cover` reads the ranked publication id directly from each slot.
 
 `Dedup.sources([w0, w1], "r")` is one synchronous turn: nothing suspends between
 declaration and gate.
 
 ```text
-declare(r, [w0, w1])                    K pending-map inserts, one publication record
+declare(r, [w0, w1])                    K trie-slot inserts, one publication record
     |
 dispatch_sync(Asked(pub_r))             fanout sensor sees the new publication
     |
-serving_union([w0, w1])                 one directory read: K·T live entries;
+serving_union([w0, w1])                 one directory read: K·V volume slots;
                                         exact-shape lookup: {(1,g0),(2,g1)} in one
                                         bucket; return frozenset[Publication] flat
     |
@@ -264,15 +262,14 @@ Outlives the decision; sizes are for one requester unless stated.
 
 | Structure | Owner | Size | Released by |
 | --- | --- | --- | --- |
-| `keys_to_storage_volumes` (live trie) | Controller | `K·T` slots | `notify_delete*` |
-| `_pending` map | Controller | `K·G` entries; `dict[key, dict[vol, dict[pub, StorageInfo]]]` | Landing puts, `retire_publication` |
-| Publication records and shape buckets | Controller | `O(G + D)` plus each publication's accepted keys | `retire_publication` |
+| `keys_to_storage_volumes` unified trie | Controller | `K·(T+G)` entries; `Trie[key, dict[vol, dict[pub_id, StorageInfo]]]` | Live deletes, publication retirement |
+| Publication records and shape buckets | Controller | `O(G + D)` plus each publication's key frozenset | Publication retirement |
 | `_arrival` | `FanoutSensor` | one float per pending publication | `Published(publication)` |
 | `_behind` | `FanoutSensor` | one int per volume currently loaded | `Published`, reroute |
 | `_assigned` gate bookkeeping | `FanoutSensor` | `O(V)` for outstanding load charges plus `O(GC)` for waiter links across the burst | `Published(publication)` |
 | `_waiters` | `Dispatcher` | one link per (pending publication, gate) | Commit |
 
-The largest retained item is the pending map itself, `K·G` entries. There is no
+The largest retained item is the unified trie, `K·(T+G)` entries. There is no
 per-region route requirement structure; readiness is per publication, `O(1)` per peer.
 
 ### Per-request state
@@ -316,7 +313,7 @@ In profile order against the numbers above:
 - `V log V` in `Ordered` is a stable-order sort. Scores collide by construction --
   every price is `wait + hop(1 + fabric)` over a handful of link classes -- so a
   counting-sort over the bucketed score is `O(V)` exact, not approximate.
-- Union work at the widest bursts (`128 ms` declare burst at `290/16/64`, `602 ms` at
-  `723/64/128`) is dominated by the per-key live-directory read and its per-key
+- Union work at the widest bursts (`55 ms` declare burst at `290/16/64`, `624 ms` at
+  `723/64/128`) is dominated by the per-key directory slot walk and its per-key
   hashing. Interning `(key, region)` to an int shrinks the retained state and speeds
   the reads; nothing else touches the region contents.

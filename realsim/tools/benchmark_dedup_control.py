@@ -75,7 +75,7 @@ class _Workload:
         )
         self.dispatcher = self.plane.dispatcher
 
-    def build_pending(self) -> None:
+    def build_declared(self) -> None:
         for index, generator in enumerate(self.generators):
             source = self.sources[index % len(self.sources)]
             pub = self.directory.declare(generator, self.requests)
@@ -207,7 +207,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
 
 def _runtime(args: argparse.Namespace) -> _Runtime:
     workload = _Workload(args)
-    declare_burst_ms, _ = _once_ms(workload.build_pending)
+    declare_burst_ms, _ = _once_ms(workload.build_declared)
     declare_ms, _pub = _once_ms(workload.declare)
     union_ms, serving = _median_ms(
         workload.union, warmups=args.warmups, repeats=args.repeats
@@ -248,7 +248,7 @@ def _runtime(args: argparse.Namespace) -> _Runtime:
 
 def _memory(args: argparse.Namespace) -> _Memory:
     workload = _Workload(args)
-    declare_burst = _python_peak_kib(workload.build_pending)
+    declare_burst = _python_peak_kib(workload.build_declared)
     declare = _python_peak_kib(workload.declare)
     serving = workload.union()
     union = _python_peak_kib(workload.union)

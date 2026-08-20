@@ -325,13 +325,13 @@ class _KeyedCache(TransportCache):
     """
 
     def __init__(self) -> None:
-        self.entries: set[str] = set()
+        self.keys: set[str] = set()
 
     def delete(self, keys: set[str]) -> None:
-        self.entries -= keys
+        self.keys -= keys
 
     def clear(self) -> None:
-        self.entries.clear()
+        self.keys.clear()
 
 
 def test_an_evicted_key_releases_what_a_deleted_key_releases():
@@ -348,15 +348,15 @@ def test_an_evicted_key_releases_what_a_deleted_key_releases():
         svc, _controller = await _put_over_capacity(
             setup=lambda vol: vol.store.transport_context.get(
                 _KeyedCache
-            ).entries.update({"A", "B"})
+            ).keys.update({"A", "B"})
         )
         cache = svc.store.transport_context.get(_KeyedCache)
         # "A" was the coldest and was evicted to make room for "C".
         assert sorted(svc.store.kv) == ["B", "C"]
-        assert cache.entries == {"B"}, "the evicted key's entry outlived it"
+        assert cache.keys == {"B"}, "the evicted key's entry outlived it"
         # ...and the ordinary delete does exactly what that eviction did.
         await svc.delete("B")
-        assert cache.entries == set()
+        assert cache.keys == set()
 
     asyncio.run(_evict_then_delete())
 
@@ -411,5 +411,4 @@ def test_a_volume_with_no_directory_cannot_report_what_it_dropped():
     volume has nobody to tell, so it refuses rather than drop silently."""
     with pytest.raises(StorageCapacityExceeded):
         asyncio.run(_put_over_capacity(wired=False))
-
 

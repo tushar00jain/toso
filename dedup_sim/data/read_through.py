@@ -28,9 +28,9 @@ class ReadThroughPlane(DataPlane):
     async def read_through(
         self,
         requester: str,
-        entries: Mapping[str, Any],
+        requested: Mapping[str, Any],
     ) -> dict[str, Any]:
-        batch = dict(entries)
+        batch = dict(requested)
         if not batch:
             raise ValueError("read_through requires at least one entry")
         requests = tuple(

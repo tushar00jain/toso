@@ -33,7 +33,7 @@ class FanoutSensor(LoadSensor):
         self._arrival: dict[Publication, float] = {}
         self._behind: dict[VolumeId, int] = {}
         self._assigned: dict[VolumeId, set[VolumeId]] = {}
-        self._pending: dict[
+        self._gates: dict[
             Publication, dict[VolumeId, set[Publication]]
         ] = {}
         self._folds: dict[type, Fold] = {
@@ -50,9 +50,9 @@ class FanoutSensor(LoadSensor):
         requester = action.requester_pub[1]
         for source in self._assigned.pop(requester, set()):
             self._decrement(source)
-        for pub in tuple(self._pending):
+        for pub in tuple(self._gates):
             if pub[1] == requester:
-                del self._pending[pub]
+                del self._gates[pub]
         assigned = set(action.sources[:1])
         self._assigned[requester] = assigned
         for source in assigned:
@@ -63,13 +63,13 @@ class FanoutSensor(LoadSensor):
                 by_volume.setdefault(pub[1], set()).add(pub)
         if not by_volume:
             return
-        self._pending[action.requester_pub] = by_volume
+        self._gates[action.requester_pub] = by_volume
 
     def _published(self, action: Published) -> None:
         pub = action.publication
         self._arrival.pop(pub, None)
         volume = pub[1]
-        for requester, by_volume in tuple(self._pending.items()):
+        for requester, by_volume in tuple(self._gates.items()):
             gates = by_volume.get(volume)
             if gates is None or pub not in gates:
                 continue
@@ -81,7 +81,7 @@ class FanoutSensor(LoadSensor):
                 if assigned is not None:
                     assigned.discard(volume)
             if not by_volume:
-                del self._pending[requester]
+                del self._gates[requester]
 
     def _decrement(self, volume: VolumeId) -> None:
         remaining = self._behind[volume] - 1

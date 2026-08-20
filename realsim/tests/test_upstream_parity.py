@@ -21,7 +21,6 @@ def test_controller_exposes_publication_and_preference_parameters():
     assert put.parameters["pending"].default is True
     assert delete.parameters["pub"].default is None
     assert hasattr(Controller, "serving_union")
-    assert hasattr(Controller, "regions_covered")
     assert callable(coverage.cover)
     assert hasattr(Controller, "greedy_cover")
     assert hasattr(Controller, "_locate")
@@ -38,7 +37,6 @@ def test_proposed_controller_declares_the_real_surface():
         "notify_delete",
         "notify_delete_batch",
         "notify_put_batch",
-        "regions_covered",
         "serving_union",
     }
     assert required <= set(vars(ControllerProtocol))

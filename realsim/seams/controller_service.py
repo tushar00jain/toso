@@ -83,11 +83,6 @@ class ControllerService:
     ) -> frozenset[Publication]:
         return self.controller.serving_union(requests)
 
-    def regions_covered(
-        self, source: Publication, requests: Sequence[Any]
-    ) -> frozenset[tuple[str, Any]]:
-        return self.controller.regions_covered(source, requests)
-
     def greedy_cover(
         self, requests: Sequence[Any], ranked: Iterable[Publication]
     ) -> list[Publication]:

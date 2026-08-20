@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from realsim.adapters.real_controller import RealControllerAdapter
-from torchstore.controller import ObjectType
+from torchstore.controller import ObjectType, _live_view
 from torchstore.transport import Request, TensorSlice
 
 
@@ -29,11 +29,13 @@ def test_pending_rows_are_hidden_from_locate_keys_and_commit_checks():
     assert service._locate(["W"], missing_ok=True) == {}
     assert service.keys() == ["D"]
     raw = service.controller.keys_to_storage_volumes["D"]
-    assert set(raw) == {"v1"}
-    assert service.controller._pending["D"]["v0"][pub].tensor_slices == {
+    assert set(raw) == {"v0", "v1"}
+    assert raw["v0"][pub].tensor_slices == {
         _shard("D", 0).tensor_slice
     }
-    assert not service.controller._is_dtensor_fully_committed("D", raw)
+    assert not service.controller._is_dtensor_fully_committed(
+        "D", _live_view(raw)
+    )
     with pytest.raises(KeyError, match="partially committed"):
         service._locate(["D"])
 
@@ -91,15 +93,13 @@ def test_one_volume_can_serve_live_and_pending_slices():
     serving = service.serving_union(requests)
 
     assert serving == frozenset({(0, "v0"), (pub, "v0")})
-    assert service.regions_covered((0, "v0"), requests) == {
-        ("D", live.tensor_slice)
-    }
-    assert service.regions_covered((pub, "v0"), requests) == {
-        ("D", pending.tensor_slice)
+    assert set(service.controller.keys_to_storage_volumes["D"]["v0"]) == {
+        0,
+        pub,
     }
 
 
-def test_landing_drops_only_overlapping_pending_publications():
+def test_landing_keeps_publications_until_their_retirement():
     service = RealControllerAdapter().service
     first = service.notify_put_batch([_shard("D", 0)], "v0")
     second = service.notify_put_batch([_shard("D", 1)], "v0")
@@ -107,16 +107,20 @@ def test_landing_drops_only_overlapping_pending_publications():
     service.notify_put_batch([_shard("D", 0)], "v0", pending=False)
 
     serving = service.serving_union([_shard("D", 0), _shard("D", 1)])
-    assert first not in service.controller._pending["D"]["v0"]
-    assert serving == frozenset({(0, "v0"), (second, "v0")})
+    assert set(service.controller.keys_to_storage_volumes["D"]["v0"]) == {
+        0,
+        first,
+        second,
+    }
+    assert serving == frozenset({(0, "v0"), (first, "v0"), (second, "v0")})
 
 
-def test_delete_drops_live_and_pending_on_the_slot():
+def test_delete_drops_live_and_keeps_pending_on_the_slot():
     service = RealControllerAdapter().service
     service.notify_put_batch([_shard("D", 0)], "v0", pending=False)
-    service.notify_put_batch([_shard("D", 1)], "v0")
+    pub = service.notify_put_batch([_shard("D", 1)], "v0")
 
     service.notify_delete_batch({"v0": ["D"]})
 
     serving = service.serving_union([_shard("D", 0), _shard("D", 1)])
-    assert serving == frozenset()
+    assert serving == frozenset({(pub, "v0")})

@@ -124,11 +124,6 @@ class Controller(Protocol):
     ) -> FrozenSet[Tuple[int, VolumeId]]:
         """Live and pending sources overlapping any requested region."""
 
-    def regions_covered(
-        self, source: Tuple[int, VolumeId], requests: Sequence[Any]
-    ) -> FrozenSet[Tuple[Key, Any]]:
-        """Requested regions overlapped by one live or pending source."""
-
     def greedy_cover(
         self,
         requests: Sequence[Any],
