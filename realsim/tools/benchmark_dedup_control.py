@@ -20,7 +20,7 @@ from proposed import Endpoint, Environment
 from realsim.adapters.real_controller import RealControllerAdapter
 from sim_common.perfcount import InstructionCount
 from torchstore import Publication
-from torchstore.transport import Request
+from torchstore.transport import Request, TensorSlice
 
 __all__ = ["main"]
 
@@ -37,9 +37,12 @@ class _Scale:
 
 _PRESETS = {
     "smoke": _Scale(keys=8, source_ranks=2, generators=8),
-    "current-test": _Scale(keys=1, source_ranks=1, generators=64),
-    "planned-8b": _Scale(keys=290, source_ranks=4, generators=16),
-    "dense-70b": _Scale(keys=723, source_ranks=64, generators=128),
+    "1b": _Scale(keys=120, source_ranks=2, generators=8),
+    "8b": _Scale(keys=290, source_ranks=8, generators=16),
+    "70b": _Scale(keys=723, source_ranks=8, generators=64),
+    "70b-wide": _Scale(keys=723, source_ranks=64, generators=128),
+    "405b": _Scale(keys=1_500, source_ranks=32, generators=128),
+    "moe": _Scale(keys=3_000, source_ranks=32, generators=128),
     "fleet-worst": _Scale(keys=5_203, source_ranks=128, generators=512),
 }
 
@@ -53,21 +56,59 @@ class _Profile:
 
 class _Workload:
     def __init__(self, args: argparse.Namespace) -> None:
-        self.requests = tuple(
-            Request.from_any(f"model.weight.{index}", None).meta_only()
-            for index in range(args.keys)
-        )
         self.sources = tuple(f"source-{index}" for index in range(args.source_ranks))
         self.generators = tuple(
             f"generator-{index}" for index in range(args.generators)
         )
         self.declare_probe = "probe-declare"
         self.full_probe = "probe-full"
+        chunk = 1
+
+        def shard_requests(rank: int, mesh: int) -> tuple[Request, ...]:
+            tensor_slice = TensorSlice(
+                offsets=(rank * chunk,),
+                coordinates=(rank,),
+                global_shape=(mesh * chunk,),
+                local_shape=(chunk,),
+                mesh_shape=(mesh,),
+            )
+            return tuple(
+                Request.from_tensor_slice(
+                    f"model.weight.{index}", tensor_slice
+                ).meta_only()
+                for index in range(args.keys)
+            )
+
+        def full_requests(coordinate: int) -> tuple[Request, ...]:
+            tensor_slice = TensorSlice(
+                offsets=(0,),
+                coordinates=(coordinate,),
+                global_shape=(args.generators * chunk,),
+                local_shape=(args.generators * chunk,),
+                mesh_shape=(args.generators,),
+            )
+            return tuple(
+                Request.from_tensor_slice(
+                    f"model.weight.{index}", tensor_slice
+                ).meta_only()
+                for index in range(args.keys)
+            )
+
+        self.source_requests = tuple(
+            shard_requests(rank, args.source_ranks)
+            for rank in range(args.source_ranks)
+        )
+        self.generator_requests = tuple(
+            shard_requests(rank, args.generators)
+            for rank in range(args.generators)
+        )
+        self.declare_requests = full_requests(args.generators)
+        self.full_requests = full_requests(args.generators + 1)
         ids = (*self.sources, *self.generators, self.declare_probe, self.full_probe)
         topology = {volume: Endpoint(volume, volume, volume) for volume in ids}
         service = RealControllerAdapter().service
-        for source in self.sources:
-            service.notify_put_batch(self.requests, source, pending=False)
+        for source, requests in zip(self.sources, self.source_requests):
+            service.notify_put_batch(requests, source, pending=False)
         self.directory = DedupDirectorySensor(service)
         self.plane = Dedup(fanout_cap=args.fanout_cap).attach(
             Environment(topology, _Profile()),
@@ -78,19 +119,19 @@ class _Workload:
     def build_declared(self) -> None:
         for index, generator in enumerate(self.generators):
             source = self.sources[index % len(self.sources)]
-            pub = self.directory.declare(generator, self.requests)
+            pub = self.directory.declare(generator, self.generator_requests[index])
             self.dispatcher.dispatch_sync(Asked(pub))
             self.dispatcher.dispatch_sync(
                 Routed(pub, (source,), frozenset(), 10.0)
             )
 
     def declare(self):
-        pub = self.directory.declare(self.declare_probe, self.requests)
+        pub = self.directory.declare(self.declare_probe, self.declare_requests)
         self.dispatcher.dispatch_sync(Asked(pub))
         return pub
 
     def union(self) -> frozenset[Publication]:
-        return self.directory.serving_union(self.requests)
+        return self.directory.serving_union(self.full_requests)
 
     def rank(self, serving: frozenset[Publication]):
         return self.plane._chain.select(serving, self.full_probe)
@@ -103,7 +144,7 @@ class _Workload:
         self.dispatcher.gate(lambda: True, actions)
 
     def decide(self) -> None:
-        asyncio.run(self.plane._decide(self.requests, self.full_probe))
+        asyncio.run(self.plane._decide(self.full_requests, self.full_probe))
 
 
 @dataclass(frozen=True)

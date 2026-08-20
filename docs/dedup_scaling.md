@@ -9,56 +9,55 @@ TorchStore planning; payload bytes never enter the process.
 Let:
 
 - `K` be keys in each generator's request;
-- `T` be trainer/source ranks visible for each requested key;
+- `T` be trainer/source ranks indexed for each requested key;
 - `G` be generator requests in the synchronized burst;
-- `V = T + G` be candidate volumes at the peak of the burst;
+- `V = T + G` be indexed volumes at the peak of the burst;
 - `D` be distinct pending batch shapes across the burst;
-- `C` be publications retained in one requester's greedy cover (`C ≤ K`, `C = 1`
-  for whole-value keys with any single-source that covers the request);
+- `C` be publications retained in one requester's greedy cover (`C = G` for the
+  benchmark's full-span probe);
 - `Wₐ` be waiters released when action `a` commits.
 
-The worst metadata shape is a synchronized full-state-dict request: every generator
-asks for all `K` keys before earlier generators publish, and every source rank is
-visible for every key. Sharded or sparse placement reduces the holders per key, so `T`
-in the benchmark is the dense upper bound. Identical synchronized requests keep `D = 1`
-even at large `G` -- one interned shape bucket answers candidate discovery in one
-lookup.
+Every generator asks for all `K` FQNs before earlier generators publish. Generator
+rank `g` requests offset `g` in a one-dimensional `G`-rank mesh, and trainer rank `t`
+publishes offset `t` in its own `T`-rank mesh. The pending burst therefore has `D = G`:
+each generator has a distinct DTensor placement signature. The peak probe covers the
+full generator span and carries an unused coordinate, so it overlaps every generator
+without matching a pending shape bucket.
 
-Dense-placement measurements below use `K/T/G`. Allocation is the largest additional
+Sliced-placement measurements below use `K/T/G`. Allocation is the largest additional
 Python peak reported for any measured phase, not process RSS.
 
 | Workload (`K/T/G`) | Peak decision | Whole burst, `G` × peak | Declare burst | Largest Python phase peak | Assessment |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Current executable test (`1/1/64`) | 0.7 ms | 44 ms | 0.6 ms | 0.04 MiB | Trivial |
-| Planned 8B (`290/4/16`) | 4.4 ms | 70 ms | 14 ms | 0.58 MiB | Comfortable |
-| 70B key count, small burst (`723/4/16`) | 9.4 ms | 150 ms | 34 ms | 1.5 MiB | Comfortable |
-| Wider 8B burst (`290/16/64`) | 7.7 ms | 493 ms | 55 ms | 0.39 MiB | Comfortable |
-| Wide 8B placement (`290/64/128`) | 16.3 ms | 2.09 s | 228 ms | 0.42 MiB | Comfortable |
-| Dense 70B (`723/64/128`) | 43.5 ms | 5.57 s | 624 ms | 1.0 MiB | Comfortable |
-| Fleet/MoE worst (`5,203/128/512`) | Projected ~1.1 s † | Projected ~9.4 min † | Projected 15–20 s † | Projected ~30 MiB † | Guarded; unsupported |
+| `smoke` synthetic sanity (`8/2/8`) | 1.4 ms | 11 ms | 0.4 ms | 0.06 MiB | Trivial |
+| `1b` Llama-1B-class (`120/2/8`) | 10 ms | 83 ms | 3.4 ms | 0.84 MiB | Comfortable |
+| `8b` Llama-8B-class, JSON baseline (`290/8/16`) | 51 ms | 0.81 s | 17 ms | 3.9 MiB | Comfortable |
+| `70b` Llama-70B RL (`723/8/64`) | 500 ms | 32.0 s | 562 ms | 38.8 MiB | Burst latency matters |
+| `70b-wide` 70B with wider fanout (`723/64/128`) | 994 ms | 2.12 min | 786 ms | 79.9 MiB | Expensive burst |
+| `405b` Llama-405B (`1,500/32/128`) | 2.02 s | 4.31 min | 1.50 s | 168.8 MiB | Expensive burst |
+| `moe` Mixtral / DeepSeek scale (`3,000/32/128`) | 4.59 s | 9.79 min | 3.54 s | 321.4 MiB | Expensive burst |
+| `fleet-worst` fleet-scale envelope (`5,203/128/512`) | Projected ~31.8 s † | Projected ~4.53 h † | Projected ~24.6 s † | Projected ~2.18 GiB † | Guarded; unsupported |
 
-† extrapolated from the dense 70B row rather than measured; the guard rejects the
-workload by default.
+† extrapolated by `K·G` from the `moe` row rather than measured; the guard rejects
+the workload by default.
 
-The whole-burst column is `G` × the peak decision and is an **upper bound**: peak
-decision prices union against `T + G` candidates, while the first generator ranks
-against `T` alone. It is also the number that decides whether a burst is servable at
-all, because one serialized control plane answers the `G` requests one after another.
-Nothing here overlaps it: a decision dispatches its own `Asked` and `Routed`, so the
-fold work is already inside it.
+The whole-burst column is `G` × the full-span peak decision and is an **upper bound**
+for a serialized controller. It repeats the most expensive coverage walk for every
+generator; local-shard requests can terminate after covering one rank slice. Nothing
+inside one decision overlaps: it dispatches its own `Asked` and `Routed`, so the fold
+work is already included.
 
 Declare burst is the setup cost -- constructing all `G` pending publications and
 staging their routes into the fan-out sensor before the peak decision runs. It is not
 an addition to the whole-burst column: it is the state that column priced against.
 
 The measured rows are synthetic capacity points, not observations of a particular
-deployment. The fleet row extrapolates from dense 70B: 7.2 times the keys, 4 times the
-burst and twice the holders per key. The union term (`K·V` slot probes plus one shape probe
-into `K·G` pending) scales roughly with `K·(T+G)`, so peak decision follows that; the
-declare burst carries `G·K` writes and scales with those. The projected trie holds
-3,329,920 indexed rows. The default benchmark guard prevents running it accidentally.
-Production runs should substitute their state-dict key count, holders per requested
-region, and synchronized generator count.
+deployment. The fleet row extrapolates from `moe`: 1.7 times the keys and 4 times the
+burst, with the same `T/G` ratio. The peak probe scans `K·T` live slots, probes `D = G`
+pending shapes, and walks `K·G` generator slices for coverage. The declare burst
+carries `G·K` writes. The projected trie holds 3,329,920 indexed rows. The default
+benchmark guard prevents running it accidentally. Production runs should substitute
+their state-dict key count, trainer mesh size, and synchronized generator count.
 
 ## State and work at the burst peak
 
@@ -70,9 +69,9 @@ increases the per-key candidate set without adding new state kinds.
 | Component | Total time across `G` requests | Peak or retained space | Benchmark coverage |
 | --- | --- | --- | --- |
 | Declare | `O(GK)` trie-slot inserts, one shape bucket per distinct shape | `O(GK)` pending entries in the unified trie, `O(G)` publication records, one shape reference per publication | `declare_burst_ms` |
-| Route staging | `O(GC)` load edges plus waiter links | `O(GC)` charged load, `O(GC)` waiter links at the ceiling | `declare_burst_ms` |
-| Serving union across `G` decisions | `O(G·K·V)` slot walks plus `O(G·D)` shape probes | Flat `frozenset[Publication]` per decision; publication records reused across decisions | Peak decision `union_ms` |
-| Total burst construction | `O(G(K·V + C) + G·D)` | `O(K·(T+G) + G + V + GC)` | `declare_burst_ms` + peak decision |
+| Route staging | `O(G)` load edges for the constructed pending burst | `O(G)` charged load | `declare_burst_ms` |
+| Serving union across `G` decisions | `O(G·(K·T + D))`; each distinct pending shape runs one overlap check | Flat `frozenset[Publication]` per decision; publication records reused across decisions | Peak decision `union_ms` |
+| Total burst construction | `O(G·(K·T + D + K·C))`, with `D = C = G` at the peak probe | `O(K·(T+G) + G + V + GC)` | `declare_burst_ms` + peak decision |
 | Generator completions (`Published`) | `O(GK)` trie-slot retirements plus `ΣWₐ` waiter releases | Each completion clears its publication and its waiter links | Not measured |
 | Total lifecycle including completion | Adds `O(GK)` retirement work over the burst construction | Same construction peak; completion releases the pending state | Not measured |
 
@@ -85,19 +84,19 @@ over the publication's own keys.
 
 ### One request at peak
 
-This is one additional generator request evaluated after the benchmark has constructed
-all `G` pending publications above.
+This is one full-span probe evaluated after the benchmark has constructed all `G`
+pending publications above.
 
 | Component | Time | Peak space | Benchmark coverage |
 | --- | --- | --- | --- |
 | Declare the requester's publication | `O(K)` trie-slot inserts | `O(K)` pending entries in the unified trie plus one publication record | `declare_ms` |
-| Serving union | `O(K·V)` slot walk plus `O(D)` shape probes; returns `frozenset[Publication]` with `V + G` sources at the peak | `O(V + G)` flat set of `(pub_id, volume)` tuples | `union_ms` |
-| Candidate scoring | `O(V + G)` `arrival` reads plus `O(V + G)` `read_time` calls; per-volume max collapses `V + G → V` | `O(V)` priced tuples | `rank_ms` |
-| Balance and ordering | `O(V + V log V)` | `O(V)` keyed selection | `rank_ms` |
-| `greedy_cover` (per key, per slice via the shared walker) | `O(C · K)` region-overlap checks; breaks early at full coverage. `C = 1` under whole-value single-source coverage | `O(C)` chosen publications, `O(K)` covered-region set | Part of `full_decision_ms` |
+| Serving union | `O(K·T + D)`; the `D = G` burst buckets and the declare-probe bucket each run `_overlaps`, returning `G + 1` pending publications | `O(G)` flat set of `(pub_id, volume)` tuples | `union_ms` |
+| Candidate scoring | `O(G)` `arrival` reads plus `O(G)` `read_time` calls | `O(G)` priced tuples | `rank_ms` |
+| Balance and ordering | `O(G + G log G)` | `O(G)` keyed selection | `rank_ms` |
+| `greedy_cover` (per key, per slice via the shared walker) | `O(K·G)` region-overlap checks; the full-span probe needs every generator shard | `O(G)` chosen publications, `O(K·G)` covered-region set | Part of `full_decision_ms` |
 | Route dispatch and arrival record | `O(C)` load edges plus one arrival float | `O(1)` retained on the requester publication | `full_decision_ms` |
 | Gate registration | `O(C)` waiter links | `O(C)` links, up to `O(GC)` across a blocked burst | `gate_ms` |
-| Total synchronous control decision | `O(K·V + D + V log V + C·K)` | Adds `O(K + C)` retained requester state plus `O(V + G)` transient union state | `full_decision_ms` |
+| Total synchronous control decision | `O(K·T + D + G log G + K·G)` | Adds `O(K + G)` retained requester state plus `O(G)` transient union state | `full_decision_ms` |
 
 The total request row ends after the route and readiness gate are constructed. It does
 not include waiting for a pending publication, transferring payloads, or landing the
@@ -108,16 +107,16 @@ is routed and read back through `FanoutSensor.arrival`. Dependencies point at
 publications declared earlier in the serialized decision stream, so the score is
 defined by construction with no readiness walk at decision time.
 
-Candidate discovery scales with distinct shapes rather than pending publications. The
-common synchronized burst uses one exact-shape bucket lookup for all `G` publications
-in one probe. A workload with several slice layouts pays for those distinct layouts;
-slice intersection remains proportional to the metadata in each probed shape.
+The benchmark exercises `D = G`: every generator publication occupies a distinct
+shape bucket, and the full-span probe matches none of them exactly. Pending discovery
+therefore visits every bucket and runs `_overlaps` once per publication. The exact-
+shape fast path applies only when generators share a request shape; the hand-crafted
+fast-path test covers that case separately.
 
 The greedy walk on the control plane is `Controller.greedy_cover`. It builds ranked
 source maps and delegates to the same per-key, per-slice walker the client uses for
-volume requests. Under whole-value synchronized bursts the first pick covers the whole
-request and `greedy_cover` returns after one source -- `C = 1`. Sliced or sparse
-workloads walk until every requested slice region is covered.
+volume requests. The peak probe spans the full generator tensor, so every key needs
+all `G` rank slices and `C = G`.
 
 `indexed_metadata_entries` counts entries in the large key-multiplied structures, not
 bytes or Python objects:
@@ -151,16 +150,16 @@ and Python build.
 
 | case | keys | sources | burst requests | indexed entries | declare burst ms | declare ms | union ms | rank ms | gate ms | full decision ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| smoke | 8 | 2 | 8 | 80 | 0.350 | 0.090 | 0.023 | 0.028 | 0.011 | 0.715 |
+| smoke | 8 | 2 | 8 | 80 | 0.353 | 0.098 | 0.069 | 0.025 | 0.011 | 1.358 |
 
 | full decision instructions | declare burst peak KiB | declare peak KiB | union peak KiB | rank peak KiB | gate peak KiB | full decision peak KiB | candidates | pending candidates | selected sources |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,929,874 | 51.820 | 11.406 | 4.945 | 5.430 | 5.629 | 23.344 | 11 | 9 | 10 |
+| 8,762,079 | 66.484 | 11.570 | 5.953 | 4.898 | 5.629 | 40.680 | 9 | 9 | 8 |
 
 Run the intended 8B scale or supply a deployment-specific point:
 
 ```bash
-.venv/bin/python -m realsim.tools.benchmark_dedup_control --preset planned-8b
+.venv/bin/python -m realsim.tools.benchmark_dedup_control --preset 8b
 .venv/bin/python -m realsim.tools.benchmark_dedup_control \
   --keys 290 --source-ranks 8 --generators 256 --repeats 5
 ```
@@ -194,24 +193,25 @@ construct a routing decision at the requested metadata scale.
 
 ## Anatomy of one request
 
-Toy scale for this section: keys `w0, w1` (`K=2`), live sources `s0, s1` (`T=2`),
-generators `g0, g1` already declared (`G=2`), requester `r`, so `V=4`.
+Toy scale for this section: keys `w0, w1` (`K=2`), live trainer shard `s0` (`T=1`),
+generators `g0, g1` already declared (`G=2`), and full-span requester `r`.
 
 State before `r` declares. Live and pending entries share each controller trie slot.
-`pub_id=0` marks live storage; positive ids name outstanding publications. One
-interned shape represents both generators because they declared the same batch:
+`pub_id=0` marks live storage; positive ids name outstanding publications. Each
+generator rank has its own shape:
 
 ```text
 keys_to_storage_volumes: Trie[k, {vol: {pub_id: StorageInfo}}]
-  w0 -> s0:{0: live}, s1:{0: live}, g0:{1: pending}, g1:{2: pending}
-  w1 -> s0:{0: live}, s1:{0: live}, g0:{1: pending}, g1:{2: pending}
+  w0 -> s0:{0: live}, g0:{1: pending}, g1:{2: pending}
+  w1 -> s0:{0: live}, g0:{1: pending}, g1:{2: pending}
 
 controller sidecars
   publications
-    1 -> volume=g0, keys=frozenset({w0,w1}), shape=#1
-    2 -> volume=g1, keys=frozenset({w0,w1}), shape=#1
+    1 -> volume=g0, keys=frozenset({w0,w1}), shape=#g0
+    2 -> volume=g1, keys=frozenset({w0,w1}), shape=#g1
   shape_pubs
-    #1 -> {1, 2}
+    #g0 -> {1}
+    #g1 -> {2}
 ```
 
 Ordinary reads (`locate_volumes`, `get`, `keys`, DTensor commit check) project each
@@ -224,24 +224,22 @@ declaration and gate.
 ```text
 declare(r, [w0, w1])                    K trie-slot inserts, one publication record
     |
-dispatch_sync(Asked(pub_r))             fanout sensor sees the new publication
+dispatch_sync(Asked(pub_r))             directory sensor records the publication
     |
-serving_union([w0, w1])                 one directory read: K·V volume slots;
-                                        exact-shape lookup: {(1,g0),(2,g1)} in one
-                                        bucket; return frozenset[Publication] flat
+serving_union([w0, w1])                 one directory read: K·T live slots;
+                                        D=G distinct pending shape probes, each
+                                        checked with _overlaps; return flat set
     |
 Candidates.select
-    |  price every publication           `wait = 0 if pub_id == 0 else arrival[pub]`
+    |  price every publication           `wait = arrival[pub]`
     |  cap check pending sources         O(1) per priced publication
     |  aggregate per volume              max wait across a volume's publications
     |
-Balance -> WithFold -> Ordered           V-entry keyed selection, sort V log V
+Balance -> WithFold -> Ordered           G-entry keyed selection, sort G log G
     |
 greedy_cover(requests, ranked)          per key, per slice via the shared walker;
-                                        take each source with a fresh overlap and
-                                        stop each whole-value key at its first source.
-                                        For whole-value keys the first pick covers
-                                        everything -- C = 1.
+                                        take all G generator shards needed to cover
+                                        the full-span request -- C = G.
     |
 record arrival on requester_pub         max over chosen of arrival + hop(source,r)
     |
@@ -266,7 +264,7 @@ Outlives the decision; sizes are for one requester unless stated.
 | Publication records and shape buckets | Controller | `O(G + D)` plus each publication's key frozenset | Publication retirement |
 | `_arrival` | `FanoutSensor` | one float per pending publication | `Published(publication)` |
 | `_behind` | `FanoutSensor` | one int per volume currently loaded | `Published`, reroute |
-| `_assigned` gate bookkeeping | `FanoutSensor` | `O(V)` for outstanding load charges plus `O(GC)` for waiter links across the burst | `Published(publication)` |
+| `_assigned` gate bookkeeping | `FanoutSensor` | `O(G)` for outstanding load charges plus `O(GC)` for waiter links across the burst | `Published(publication)` |
 | `_waiters` | `Dispatcher` | one link per (pending publication, gate) | Commit |
 
 The largest retained item is the unified trie, `K·(T+G)` entries. There is no
@@ -278,42 +276,43 @@ Dies with the decision.
 
 | Structure | Size |
 | --- | --- |
-| `serving_union` answer | `frozenset[Publication]`, `O(V + G)` tuples |
-| Priced candidates | `V` tuples after per-volume aggregation |
-| Keyed selection | `V` entries, rebuilt by `annotated` and `only` |
-| `chosen` from `greedy_cover` | `O(C)` publications |
-| `covered` region set (transient inside `greedy_cover`) | `O(K)` regions |
-| `gate_pubs` | `O(C)` publication references |
-| `ReadPlan.sources` | The ranked flat preference over `V` volumes |
+| `serving_union` answer | `frozenset[Publication]`, `O(G)` tuples |
+| Priced candidates | `O(G)` tuples after per-volume aggregation |
+| Keyed selection | `O(G)` entries, rebuilt by `annotated` and `only` |
+| `chosen` from `greedy_cover` | `O(G)` publications |
+| `covered` region set (transient inside `greedy_cover`) | `O(K·G)` regions |
+| `gate_pubs` | `O(G)` publication references |
+| `ReadPlan.sources` | The ranked flat preference over `G` generator volumes |
 
 ### What that costs in calls
 
-One decision at `planned-8b` (`290/4/16`), counted by wrapping the sensor:
+One decision at `8b` (`290/8/16`), counted by wrapping the sensor:
 
 | Operation | Calls | Per key |
 | --- | ---: | ---: |
 | `serving_union` | 1 | |
-| `arrival` reads | one per priced publication | |
-| `read_time` | one per priced publication | |
-| `greedy_cover` shared-walker overlap | one per requested key and visited source | |
-| `is_in_flight` (gate probe) | one per pending publication named | |
+| pending-discovery `_overlaps` | `G + 1` | |
+| `arrival` reads | `G` | |
+| `read_time` | `G` | |
+| `greedy_cover` shared-walker overlap | `K·G` | `G` |
+| `is_in_flight` (gate probe) | `G` | |
 
 There is no cache to key, no batch-spec build, no `covers` fallback, no per-source
-live expansion. One directory read, `V + G` price lookups, one greedy walk with early
-break, one arrival record.
+live expansion. One directory read, `G + 1` pending-shape checks, `G` price lookups, one
+`K·G` greedy walk, and one arrival record.
 
 ## Potential improvement
 
 In profile order against the numbers above:
 
-- `read_time` is called `V + G` times per decision, once for each priced source.
+- `read_time` is called `G` times per peak decision, once for each generator source.
   Caching the per-(volume, requester) cost across a burst removes one function call
   per source; the cost has no key term, so a burst that reads the same requester many
   times amortizes it.
-- `V log V` in `Ordered` is a stable-order sort. Scores collide by construction --
+- `G log G` in `Ordered` is a stable-order sort. Scores collide by construction --
   every price is `wait + hop(1 + fabric)` over a handful of link classes -- so a
-  counting-sort over the bucketed score is `O(V)` exact, not approximate.
-- Union work at the widest bursts (`55 ms` declare burst at `290/16/64`, `624 ms` at
-  `723/64/128`) is dominated by the per-key directory slot walk and its per-key
-  hashing. Interning `(key, region)` to an int shrinks the retained state and speeds
-  the reads; nothing else touches the region contents.
+  counting-sort over the bucketed score is `O(G)` exact, not approximate.
+- Union work at the widest bursts is 87 ms at `70b-wide` and 284 ms at `moe`;
+  their declare bursts are 786 ms and 3.54 s. The union combines the
+  per-key live-slot walk with one overlap check for each of the `G` pending shapes.
+  Interning `(key, region)` to an int shrinks retained state and speeds the reads.
