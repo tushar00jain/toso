@@ -51,6 +51,8 @@ The indexed controller adds names for state TorchStore does not currently model:
 - `SlicePlan` is the controller answer containing those bound offers;
 - `geometry_epoch` invalidates cached `PlanOffer` values when stored `RegionKey`
   values change;
+- `state_dict_epoch` identifies the weight contents requested or held without
+  changing their `TensorSlice` geometry;
 - a normalized topology is the interned mapping from normalized `RegionKey` values
   to complete `frozenset[Publication]` source sets used to share coverage work across
   compatible keys.
@@ -472,7 +474,84 @@ when `C << H`, with limited improvement when the fetch must emit all `K·H` regi
 - Shard the controller by key while keeping every `Publication` for one `RegionKey`
   under the same authority.
 
-## 13. Regular-layout fast path
+## 13. Weight epochs and source availability
+
+A trainer can publish a new state-dict epoch with the same keys and the same
+`TensorSlice` layout. This changes the contents and eligible `Publication` values,
+not the `RegionKey` values or their intersections with `Request.tensor_slice`.
+
+The directory therefore needs three independent identities:
+
+```text
+geometry_epoch
+  the stored RegionKey set or TensorSliceLayout changed
+
+state_dict_epoch
+  the contents associated with the keys changed
+
+availability_revision[state_dict_epoch]
+  Publications for that content epoch appeared, landed, or disappeared
+```
+
+The persistent state separates the layout catalog from epoch-specific residency:
+
+```text
+Trie[key] -> _KeyEntry
+
+_KeyEntry
+  layouts
+    TensorSliceLayout -> IntervalIndex, geometry_epoch, cached PlanOffer values
+  content_epochs
+    state_dict_epoch -> RegionKey -> frozenset[Publication]
+                       availability_revision
+```
+
+`Request` must identify `state_dict_epoch`, either as an explicit field or through an
+unambiguous versioned key namespace. `publication_id` is not a content epoch: live
+sources are exposed as `(0, volume_id)`, and several pending publications from one
+volume may overlap. The controller must retain the content-epoch association after a
+pending source becomes live.
+
+For a request at epoch `N + 1`, `serving_union` includes only live and pending
+`Publication` values associated with `N + 1`. A generator volume holding epoch `N`
+is not a candidate even when it has identical `RegionKey` values. If epoch `N + 1`
+has no available source, the request waits or fails according to the publication
+contract; it must not fall back to epoch `N`.
+
+| Event | Layout and `PlanOffer` geometry | Epoch availability |
+| --- | --- | --- |
+| Declare epoch `N + 1` with the same slices | Reuse | Add pending Publications to `N + 1` |
+| A pending Publication lands | Reuse | Replace its pending binding with a live binding for the same epoch |
+| A volume becomes unavailable | Reuse | Remove that Publication from its epoch |
+| Every source for one epoch disappears | Retain the registered layout | Mark that epoch unavailable |
+| Stored offsets, shapes, or layout change | Advance `geometry_epoch` and rebuild affected plans | Bind sources to the new layout |
+| An epoch is retired | Reuse while another epoch or layout registration references it | Remove the retired epoch's bindings |
+
+The registered `TensorSliceLayout` need not remain forever. Explicit layout removal
+or bounded cache eviction may discard it; the next declaration reconstructs it. A
+temporary zero-source interval does not by itself discard the layout, so ordinary
+generator churn and successive weight epochs keep the interval index and cached
+intersection geometry warm.
+
+Each request still reads current availability and applies the current TOSO ranking.
+Cached `PlanOffer` geometry survives source churn, while `BoundPlanOffer` values are
+rebound when the requested epoch's availability revision changes. Readiness, load,
+and locality are not retained in the geometry cache.
+
+A same-layout epoch avoids interval-index construction and intersection planning,
+but its sources still need registration. Per-key declarations retain their
+`O(K·G)` write cost when `G` volumes publish all `K` keys. A shared layout or batch
+manifest can represent identical cross-key placement once and reduce repeated index
+maintenance, while preserving the complete per-key `Publication` union required by
+`serving_union`.
+
+The source-derived index in section 4 removes a `RegionKey` when its final source
+disappears. Cross-epoch geometry retention requires the layout catalog above; without
+it, a zero-source gap reconstructs the geometry on the next declaration. Explicit
+content-epoch identity and a source-independent layout catalog are therefore required
+before the controller can reuse plans safely across successive weight versions.
+
+## 14. Regular-layout fast path
 
 The interval index is the general path for arbitrary `StorageInfo.tensor_slices`.
 When a complete set of `TensorSlice` values forms a regular DTensor layout, the
