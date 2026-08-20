@@ -72,6 +72,10 @@ class SimConfig:
     # tests). See realsim.adapters.real_controller.make_controller_adapter.
     real_directory: bool = True
 
+    # Directory implementation used by realsim's controller construction seam.
+    # ``indexed`` owns its logical-region directory and ignores ``real_directory``.
+    controller_backend: str = "legacy"
+
     # Network/storage contention model for the transport seam: one of
     # ``"none"`` (default), ``"serialize"``, or ``"progressive"`` (see
     # sim_common.resources). Unlike the flags above this DOES change measured
@@ -132,6 +136,13 @@ class SimConfig:
     # the TTFT column.
     client_rtt: float = 0.0
 
+    def __post_init__(self) -> None:
+        if self.controller_backend not in ("legacy", "indexed"):
+            raise ValueError(
+                "controller_backend must be 'legacy' or 'indexed', got "
+                f"{self.controller_backend!r}"
+            )
+
 
 _current = SimConfig()
 
@@ -161,6 +172,9 @@ def _from_env() -> dict:
     real_directory = _bool_env("TOSO_REAL_DIRECTORY")
     if real_directory is not None:
         out["real_directory"] = real_directory
+    controller_backend = os.environ.get("TOSO_CONTROLLER_BACKEND")
+    if controller_backend is not None:
+        out["controller_backend"] = controller_backend.strip().lower()
     contention = os.environ.get("TOSO_CONTENTION")
     if contention is not None:
         out["contention"] = contention.strip().lower()

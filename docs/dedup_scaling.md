@@ -316,3 +316,92 @@ In profile order against the numbers above:
   their declare bursts are 786 ms and 3.54 s. The union combines the
   per-key live-slot walk with one overlap check for each of the `G` pending shapes.
   Interning `(key, region)` to an int shrinks retained state and speeds the reads.
+
+## Indexed-controller comparison, 2026-08-19
+
+These measurements use the TOSO `e50ba5f` and TorchStore `97afc30` base revisions
+with the current indexed-controller integration in both worktrees. A construction
+preflight resolved `legacy` to `torchstore.controller.Controller` and `indexed` to
+`torchstore.controllers.indexed.controller.IndexedController` before the benchmark
+ran.
+
+Each measured row used the saved workload unchanged on the same host and Python:
+
+```bash
+TOSO_CONTROLLER_BACKEND=legacy \
+  .venv/bin/python -m realsim.tools.benchmark_dedup_control --preset PRESET
+TOSO_CONTROLLER_BACKEND=indexed \
+  .venv/bin/python -m realsim.tools.benchmark_dedup_control --preset PRESET
+```
+
+`PRESET` was each of `smoke`, `1b`, `8b`, `70b`, `70b-wide`, `405b`, and
+`moe`. The defaults were retained: one warmup and three repeats. `fleet-worst` was
+not run. The benchmark reports medians for repeated phases, but burst construction
+and memory phases remain single observations. In particular, `declare_burst_ms` is
+noisy on a shared host and should be read as an order of magnitude.
+
+### Measured backend comparison
+
+Count parity shows `candidates/pending_candidates/selected_sources`; every pair is
+identical. Speedup is legacy full-decision time divided by indexed full-decision
+time.
+
+| Workload (`K/T/G`) | Legacy full decision | Indexed full decision | Speedup | Legacy declare burst | Indexed declare burst | Union legacy -> indexed | Count parity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `smoke` (`8/2/8`) | 1.309 ms | 1.018 ms | 1.29x | 0.392 ms | 1.253 ms | 0.066 -> 0.046 ms | Yes (`9/9/8`) |
+| `1b` (`120/2/8`) | 10.175 ms | 3.864 ms | 2.63x | 3.309 ms | 14.285 ms | 0.533 -> 0.710 ms | Yes (`9/9/8`) |
+| `8b` (`290/8/16`) | 48.985 ms | 7.368 ms | 6.65x | 16.461 ms | 67.488 ms | 3.103 -> 1.610 ms | Yes (`17/17/16`) |
+| `70b` (`723/8/64`) | 461.261 ms | 17.737 ms | 26.01x | 424.387 ms | 1,277.724 ms | 17.203 -> 4.190 ms | Yes (`65/65/64`) |
+| `70b-wide` (`723/64/128`) | 982.389 ms | 19.172 ms | 51.24x | 779.878 ms | 2,928.057 ms | 86.186 -> 4.299 ms | Yes (`129/129/128`) |
+| `405b` (`1,500/32/128`) | 2,012.535 ms | 38.061 ms | 52.88x | 1,539.403 ms | 5,727.941 ms | 109.162 -> 8.770 ms | Yes (`129/129/128`) |
+| `moe` (`3,000/32/128`) | 4,573.494 ms | 71.801 ms | 63.70x | 3,411.008 ms | 13,138.340 ms | 285.156 -> 17.936 ms | Yes (`129/129/128`) |
+
+The index moves work from the decision path to publication writes. At `moe`, the
+full decision is 63.70x faster while burst declaration is 3.85x slower. Maintaining
+the region index and normalized topology costs more than inserting the same rows in
+the legacy trie, so the indexed backend is useful when the directory serves enough
+decisions to amortize that write cost.
+
+The decision gain comes from sharing normalized topology and source-set incidence
+across compatible keys. That removes the avoidable exhaustive `K·H` controller walk;
+the widening from `G=64` to `G=128` at fixed `K=723` changes the indexed decision
+only from 17.737 ms to 19.172 ms. It does not remove the output lower bound. The
+full-span probe still selects all `G` source publications, and a client plan that
+materializes one fetch for every key and selected region still emits `K·C` entries.
+The benchmark stops after metadata routing and gate construction, so these numbers
+do not claim a payload-transfer or end-to-end fetch speedup.
+
+### Indexed scale dimensions
+
+The largest Python phase is the indexed declare-burst peak for every row.
+
+| Workload (`K/T/G`) | Peak decision | Whole burst, `G` × peak | Declare burst | Largest Python phase peak | Assessment |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `smoke` synthetic sanity (`8/2/8`) | 1.018 ms | 8.1 ms | 1.253 ms | 0.11 MiB | Trivial |
+| `1b` Llama-1B-class (`120/2/8`) | 3.864 ms | 31 ms | 14.285 ms | 1.37 MiB | Comfortable |
+| `8b` Llama-8B-class (`290/8/16`) | 7.368 ms | 118 ms | 67.488 ms | 6.82 MiB | Comfortable |
+| `70b` Llama-70B RL (`723/8/64`) | 17.737 ms | 1.14 s | 1.278 s | 58.40 MiB | Decision cheap; writes dominate |
+| `70b-wide` 70B with wider fanout (`723/64/128`) | 19.172 ms | 2.45 s | 2.928 s | 126.49 MiB | Decision cheap; writes dominate |
+| `405b` Llama-405B (`1,500/32/128`) | 38.061 ms | 4.87 s | 5.728 s | 247.53 MiB | Declaration is expensive |
+| `moe` Mixtral / DeepSeek scale (`3,000/32/128`) | 71.801 ms | 9.19 s | 13.138 s | 494.12 MiB | Declaration and memory matter |
+| `fleet-worst` fleet-scale envelope (`5,203/128/512`) | Projected ~0.13 s | Projected ~1.12 min | Projected ~91 s | Projected ~3.35 GiB | Guarded; unsupported |
+
+The fleet projection uses separate models for the three quantities rather than the
+legacy decision's `K·G` extrapolation:
+
+- Indexed decision measurements at fixed `K` and fixed `G` fit
+  `full_decision_ms = 0.023113·K + 0.022422·G - 0.409`. The fit predicts the
+  measured scale rows from `8b` through `405b` within 10% and gives 131 ms at
+  `5,203/128/512`. A 15% model band is about 0.11--0.15 s. Multiplying the peak by
+  `G=512` gives the 67.2 s serialized upper bound.
+- Declaration retains `K·G` publication writes. Scaling the measured `moe` burst by
+  `(5,203·512)/(3,000·128) = 6.9373` gives 91.1 s. Per-write rates across
+  `70b-wide`, `405b`, and `moe` imply roughly 80--95 s before host noise.
+- The largest peak follows retained `K·(T+G)` indexed state. The fleet and `moe`
+  points have the same `T/G` ratio, so the same 6.9373 factor gives 3.35 GiB from
+  the measured 494.12 MiB. Allowing for allocator and shape-mix effects gives a
+  rough 3.0--3.7 GiB range.
+
+The projection prices controller metadata only. `fleet-worst` remains guarded
+because its declaration and retained-memory costs are large even though normalized
+topology sharing keeps the projected peak decision below one second.

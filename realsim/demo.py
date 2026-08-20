@@ -87,6 +87,13 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "default.",
     )
     parser.add_argument(
+        "--controller-backend",
+        choices=("legacy", "indexed"),
+        default=None,
+        help="controller directory implementation (default: legacy). The indexed "
+        "backend owns its directory and ignores --shim-directory.",
+    )
+    parser.add_argument(
         "--contention", choices=("none", "serialize", "progressive"), default=None,
         help="network/storage contention model (default: none -- independent, "
         "full-bandwidth transfers, the historical behavior). 'serialize' serves a "
@@ -133,6 +140,7 @@ def _apply_run_flags(
     config.configure(
         fingerprint=args.fingerprint or None,
         real_directory=False if args.shim_directory else None,
+        controller_backend=args.controller_backend,
         contention=args.contention,
         collapse_charges=args.collapse_charges or None,
         control_rtt=args.control_rtt,

@@ -18,6 +18,7 @@ from dedup_sim.control._sensor import Asked, DedupDirectorySensor, Published, Ro
 from dedup_sim.control.routing import Dedup
 from proposed import Endpoint, Environment
 from realsim.adapters.real_controller import RealControllerAdapter
+from sim_common import config
 from sim_common.perfcount import InstructionCount
 from torchstore import Publication
 from torchstore.transport import Request, TensorSlice
@@ -328,6 +329,7 @@ def _run(args: argparse.Namespace) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one synthetic scale point and print a tab-separated result."""
+    config.configure()
     args = _arguments(argv)
     _run(args)
     return 0
