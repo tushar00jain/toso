@@ -3,10 +3,11 @@
 **Status:** proposal · **Scope:** TorchStore directory lookup, DTensor reshard
 planning, and TOSO source binding.
 
-TorchStore should index logical tensor regions separately from the volumes that hold
-them. A read can then find the few regions that overlap its requested
-`TensorSlice`, reuse the resulting reshard geometry across model keys and requests,
-and choose a live or pending source only when the read is routed.
+TorchStore should index `RegionKey` values derived from stored `TensorSlice` metadata
+separately from the `Publication` values that name their volumes. A read can then
+find the few stored slices that overlap `Request.tensor_slice`, reuse the resulting
+`PlanOffer` values across model keys and requests, and choose a live or pending
+`Publication` only when the read is routed.
 
 The key trie remains useful. It finds an FQN without scanning unrelated keys. The
 scaling problem is the unindexed value behind each key:
@@ -15,14 +16,47 @@ scaling problem is the unindexed value behind each key:
 Trie[key] -> volume -> StorageInfo[tensor_slices]
 ```
 
-For `K` requested keys and `H` recorded holders per key, the controller validates
+For `K` requested keys and `H` recorded `(publication_id, volume_id)` entries per key,
+the controller validates
 `K·H` entries and the client examines up to `K·H` entries again. The proposed
-directory changes the inner lookup from physical holders to indexed logical regions.
+directory changes the inner lookup from source entries to indexed `RegionKey` values.
 
 See [`torchstore.md`](torchstore.md) for the existing store path,
 [`torchstore_dedup_design.md`](torchstore_dedup_design.md) for pending publications
 and source ranking, and [`dedup_scaling.md`](dedup_scaling.md) for the synchronized
 burst envelope.
+
+## Terminology
+
+The proposal retains TorchStore names for existing concepts:
+
+- `TensorSlice` is stored shard geometry;
+- `StorageInfo.tensor_slices` is the set of slices held by one volume;
+- `Publication = (publication_id, volume_id)` identifies one live or pending source;
+- publication id zero means the volume currently holds the data;
+- a positive publication id means the volume has declared a pending batch;
+- `Request.tensor_slice` is the region a client wants;
+- `Controller`, `LocalClient`, `locate_volumes`, and `get_slice_intersection` retain
+  their existing meanings.
+
+The indexed controller adds names for state TorchStore does not currently model:
+
+- `RegionKey` is the `(global_shape, offsets, local_shape)` projection of one
+  `TensorSlice`; coordinates and mesh shape do not change that global region;
+- `IntervalIndex` finds `RegionKey` values overlapping `Request.tensor_slice`;
+- `PlanOffer` is one cached `get_slice_intersection` result, including source,
+  destination, and length metadata;
+- `BoundPlanOffer` attaches current live and pending `Publication` values to a
+  `PlanOffer`;
+- `SlicePlan` is the controller answer containing those bound offers;
+- `geometry_epoch` invalidates cached `PlanOffer` values when stored `RegionKey`
+  values change;
+- a normalized topology is the interned mapping from normalized `RegionKey` values
+  to complete `frozenset[Publication]` source sets used to share coverage work across
+  compatible keys.
+
+“Region,” “source,” “geometry,” and “binding” below are prose abbreviations for these
+types, not additional APIs.
 
 ## 1. Boundary
 
@@ -43,9 +77,9 @@ collective redistribution, or a new storage transport.
 ## 2. Why the current lookup is `K·H`
 
 A generator `get_batch` carries one requested `TensorSlice` per key. The controller
-receives only the keys, returns every recorded holder, and scans each holder to check
-DTensor completeness. The client then tests every returned stored slice against the
-requested slice.
+receives only the keys, returns every recorded `volume_id -> StorageInfo` entry, and
+scans those entries to check DTensor completeness. The client then tests every
+returned stored slice against the requested slice.
 
 For a 6,400-element tensor:
 
@@ -56,16 +90,17 @@ generator rank 19 requests [1900:2000]
 ```
 
 The request overlaps trainer region `[1600:2400]` and generator region
-`[1900:2000]`. A directory containing all 72 physical holders still examines 72
-entries to discover those two logical regions. At `K = 723`, one pass visits 52,056
-`(key, holder)` entries.
+`[1900:2000]`. A directory containing all 72 `Publication` source entries still
+examines 72 entries to discover those two `RegionKey` values. At `K = 723`, one pass
+visits 52,056 `(key, Publication)` entries.
 
 The work is necessary only when all 72 regions contribute bytes. When two regions
 cover the request, the other 70 intersection checks are discovery overhead.
 
-## 3. Logical regions and physical sources
+## 3. RegionKey values and Publication sources
 
-The directory should give geometry and residency different identities.
+The directory should give `TensorSlice` geometry and `Publication` residency
+different identities.
 
 ```python
 RegionKey = (
@@ -76,23 +111,24 @@ RegionKey = (
 ```
 
 `coordinates` and `mesh_shape` describe the DTensor placement that produced a slice.
-They do not change the global rectangle. Volumes with the same `RegionKey` are
-alternative physical sources for one logical region.
+They do not change the global rectangle. `Publication` values attached to the same
+`RegionKey` are alternative sources for that stored region.
 
 ```text
-Trie[key] -> KeyEntry
+Trie[key] -> _KeyEntry
 
-KeyEntry
+_KeyEntry
   object_type
-  global_shape
   geometry_epoch
-  region_index
+  interval_index: IntervalIndex
+  regions: dict[RegionKey, _RegionEntry]
+  source_infos: dict[Publication, StorageInfo]
   layouts
+  topology: NormalizedTopology
 
-RegionEntry
-  region: RegionKey
-  live_volumes: set[volume_id]
-  pending: map[publication_id, volume_id]
+_RegionEntry
+  sources: dict[Publication, set[TensorSlice]]
+  source_ids: frozenset[Publication]
 ```
 
 Objects and whole tensors use one whole-value region and need no spatial query.
@@ -109,7 +145,7 @@ what bytes are needed.
 For each request it:
 
 1. derives the `RegionKey`;
-2. inserts a new logical region into the spatial index when absent;
+2. inserts a new `RegionKey` into `IntervalIndex` when absent;
 3. adds the volume or publication to the region's source set;
 4. updates the completeness state for the slice's layout.
 
@@ -120,7 +156,7 @@ Two versions keep cache invalidation narrow:
 
 ```text
 geometry_epoch
-  changes when the set or geometry of logical regions changes
+  changes when the set of stored RegionKey values changes
 
 availability
   changes when sources appear, land, disappear, or change load
@@ -165,12 +201,12 @@ O(log S + A·d)
 ```
 
 `A` is the candidate count surviving the sweep dimension and `d` is tensor rank. The
-result contains `C <= A` overlapping logical regions.
+result contains `C <= A` overlapping `RegionKey` values.
 
 For regular DTensor layouts, a placement-aware owner calculation can be cheaper than
 an interval query. `TensorSlice` is sufficient for exact indexing; explicit DTensor
-placements such as `Shard(dim)` and `Replicate()` are needed for reliable layout
-templates and direct coordinate-to-region formulas.
+placements such as `Shard(dim)` and `Replicate()` are needed for reliable
+`TensorSliceLayout` records and direct coordinate-to-`RegionKey` formulas.
 
 ## 6. Cached reshard geometry
 
@@ -180,7 +216,7 @@ intersection offers:
 ```text
 PlanOffer
   source_region
-  requested_region
+  intersection
   storage_offsets
   destination_offsets
   lengths
@@ -204,29 +240,36 @@ The offers are alternatives because either one covers the requested region. A
 request spanning disjoint source shards receives several offers whose union covers
 the destination.
 
-An exact per-key cache key is:
+Each `_KeyEntry` has an exact geometry cache:
 
 ```text
-(key, geometry_epoch, requested RegionKey)
+cache[requested RegionKey] -> (geometry_epoch, tuple[PlanOffer])
 ```
 
-This removes repeated geometry work for recurring reads. A layout template removes
-the key multiplier as well:
+This removes repeated intersection work for recurring reads. The implemented
+normalized topology cache removes the key multiplier when keys have compatible
+layouts and source incidence:
 
 ```text
-(source layout ids, target layout id, target coordinate, shape class)
+NormalizedTopology
+  normalized RegionKey -> frozenset[Publication]
+
+coverage cache key
+  (NormalizedTopology, normalized requested RegionKey, global-shape match)
 ```
 
-The template describes coordinate relationships and is instantiated with each
-key's global shape. Uneven shards require the exact boundary table for their shape
-class.
+Offsets and lengths are normalized by `TensorSlice.global_shape`, so proportionally
+equivalent keys share one coverage template without key-name or model-specific rules.
+Each key retains its exact `RegionKey` and `PlanOffer` values for client execution.
+Uneven or incompatible boundaries form different normalized topologies.
 
-The cache stores geometry only. It never stores the winning volume, arrival time, or
-load score.
+The `_KeyEntry` cache stores `PlanOffer` geometry. The coverage cache stores interned
+`frozenset[Publication]` incidence for one normalized topology. Neither cache stores
+the winning publication, arrival time, or load score.
 
 ## 7. Binding a plan to sources
 
-Routing binds each required logical region to a current source:
+Routing binds each required `RegionKey` to current `Publication` values:
 
 ```text
 cached intersection offers
@@ -241,7 +284,7 @@ readiness, transfer time, load, stable id
 resolved fetch plan
 ```
 
-TOSO ranks the physical sources attached to each offer and chooses a cover of the
+TOSO ranks the `Publication` values attached to each offer and chooses a cover of the
 requested destination. A pending choice contributes its publication to the readiness
 gate. A live choice can execute immediately.
 
@@ -259,13 +302,79 @@ and destination contiguity remain client concerns.
 One resolved plan therefore defines both the control-plane gate and the data-plane
 fetch. They cannot disagree about which publications or regions are required.
 
+### 7.1 Ranking contract
+
+The controller and TOSO have separate responsibilities:
+
+```text
+IndexedController.serving_union
+  every live or pending (publication, volume) overlapping any request
+        |
+        v
+TOSO ranking
+  one total best-first order over that complete union
+        |
+        v
+IndexedController.greedy_cover
+  the first ranked sources whose regions cover every request
+```
+
+The directory must not remove replicas, choose one source per region, or otherwise
+narrow the union before ranking. Indexing may share the work used to construct the
+union, but the returned `frozenset[Publication]` names every eligible source.
+
+For each `(pub, volume)` in the union, TOSO computes:
+
+```text
+if volume == requester:
+  exclude
+
+if pub == 0:
+  wait = 0
+else:
+  exclude when pending_load[volume] >= fanout_cap
+  exclude when arrival[pub, volume] is unknown
+  wait = arrival[pub, volume]
+
+hop = read_time(volume, requester, payload_bytes)
+base = wait + (1 + fabric_weight) * hop
+queued = pending_load[volume]
+```
+
+The chain mode uses `fabric_weight = 10` and orders lexicographically by:
+
+```text
+(base, queued, (pub, volume))
+```
+
+Load therefore breaks equal readiness-and-fabric prices. The spread mode uses
+`fabric_weight = 0` and folds the first two dimensions into:
+
+```text
+base * (1 + queued)
+```
+
+It then orders by `(folded_score, (pub, volume))`. The source tuple is the final
+stable tie-break in both modes.
+
+`greedy_cover` consumes that order without repricing it. It selects a `Publication`
+when the publication contributes at least one uncovered `RegionKey`, marks every
+region it contributes, and continues until all requested regions are covered. Its
+answer is an ordered subset of the ranking. Every selected positive publication
+enters the readiness gate; live sources have publication id zero and need no gate.
+
+An indexed implementation may precompute source-to-region incidence, intern identical
+key layouts, and traverse the ranking once. Those changes are valid only when
+`serving_union` and the ordered greedy subset remain identical to the exhaustive
+contract above.
+
 ## 8. Complexity
 
 Let:
 
 - `K` be requested keys;
-- `H` be physical holders recorded per key;
-- `S` be distinct logical regions per key;
+- `H` be `Publication` source entries recorded per key;
+- `S` be distinct `RegionKey` values per key;
 - `A` be regions surviving the sweep-dimension filter;
 - `C` be regions in the selected cover;
 - `d` be tensor rank.
@@ -317,7 +426,8 @@ plans against the existing exhaustive planner during rollout.
 4. Define `PlanOffer`, `SlicePlan`, and the exact per-key geometry cache.
 5. Make TOSO gate and rank sources from `SlicePlan`.
 6. Make the client execute the resolved plan without recomputing intersections.
-7. Add placement-aware layout templates shared across state-dict keys and ranks.
+7. Add placement-aware `TensorSliceLayout` records shared across state-dict keys and
+   ranks.
 
 Each step retains the exhaustive planner as a parity oracle until randomized slice
 tests and scale benchmarks cover the new path.
@@ -354,9 +464,77 @@ when `C << H`, with limited improvement when the fetch must emit all `K·H` regi
   layout descriptor.
 - Use one sweep dimension, an interval tree, or a multidimensional spatial index for
   irregular layouts.
-- Cache exact key plans, normalized layout templates, or both with separate budgets.
+- Cache exact `RegionKey` plans, normalized topology templates, or both with separate
+  budgets.
 - Return a resolved per-volume fetch plan or logical offers plus a client-side source
   binding token.
 - Bound plan-cache memory and choose eviction independently from directory residency.
-- Shard the controller by key while keeping all replicas of one logical region under
-  the same authority.
+- Shard the controller by key while keeping every `Publication` for one `RegionKey`
+  under the same authority.
+
+## 13. Regular-layout fast path
+
+The interval index is the general path for arbitrary `StorageInfo.tensor_slices`.
+When a complete set of `TensorSlice` values forms a regular DTensor layout, the
+controller can also retain a TorchStore layout record:
+
+```text
+TensorSliceLayout
+  TensorSlice.global_shape
+  TensorSlice.mesh_shape
+  sharded tensor dimensions
+  mesh coordinate -> RegionKey(offsets, local_shape, global_shape)
+  RegionKey -> live (0, volume_id) sources
+            -> pending (publication_id, volume_id) sources
+```
+
+The controller reads the requested region from `Request.tensor_slice`. For each
+sharded tensor dimension it computes the first and last stored mesh coordinates that
+intersect `offsets:offsets + local_shape`, enumerates those coordinates, and looks up
+their `RegionKey` entries directly. It does not call `get_slice_intersection` against
+every `StorageInfo`. The cost is:
+
+```text
+O(d + C·d)
+```
+
+`d` is tensor rank and `C` is the number of intersecting `RegionKey` entries. Replica
+count does not affect geometry discovery because all volumes and publications for
+one region share its source set.
+
+For even shards, the controller derives the coordinate boundaries from
+`global_shape`, `mesh_shape`, and the sharded tensor dimension. Uneven shards retain
+the exact ordered `TensorSlice.offsets` and `local_shape` boundaries. The layout
+record must name the sharded tensor dimensions directly; `TensorSlice` does not carry
+the DTensor `Shard(dim)` placements, and inferring them from key names is not sound.
+
+The controller selects this path only when its live or pending `TensorSlice` metadata
+proves one complete regular layout. Irregular slices, incomplete layouts, and
+overlapping application-defined regions use `IntervalIndex` without changing
+`locate_slices`, `serving_union`, or `greedy_cover` semantics.
+
+The same separation applies to execution caching:
+
+```text
+stable SlicePlan geometry
+  PlanOffer.source_region
+  PlanOffer.storage_offsets
+  PlanOffer.destination_offsets
+  PlanOffer.lengths
+
+dynamic BoundPlanOffer binding
+  live volume_id values
+  pending Publication values
+  TOSO readiness, locality, and load ranking
+```
+
+The controller may construct the `PlanOffer` geometry once for a stored-layout and
+requested-layout pair and reuse it for later weight versions. It binds live volumes
+and pending publications afterward, so source changes do not rebuild geometry.
+`LocalClient` may attach transport buffers and destination views to a resolved
+`SlicePlan`, provided those objects are versioned separately from controller source
+availability.
+
+The regular-layout path is an optimization of region discovery. A request that
+genuinely consumes `C` disjoint shards still emits `K·C` fetch entries; direct lookup
+removes search work but cannot remove that output-size lower bound.
