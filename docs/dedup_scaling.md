@@ -90,13 +90,13 @@ pending publications above.
 | Component | Time | Peak space | Benchmark coverage |
 | --- | --- | --- | --- |
 | Declare the requester's publication | `O(K)` trie-slot inserts | `O(K)` pending entries in the unified trie plus one publication record | `declare_ms` |
-| Serving union | `O(K·T + D)`; the `D = G` burst buckets and the declare-probe bucket each run `_overlaps`, returning `G + 1` pending publications | `O(G)` flat set of `(pub_id, volume)` tuples | `union_ms` |
+| Serving union | `O(K·T + K·D)`; each of the `D = G` non-matching shape buckets iterates its `K` entries running `_overlaps` until it finds an overlapping entry or exhausts the shape, and the declare-probe's own bucket resolves in one identity check | `O(G)` flat set of `(pub_id, volume)` tuples | `union_ms` |
 | Candidate scoring | `O(G)` `arrival` reads plus `O(G)` `read_time` calls | `O(G)` priced tuples | `rank_ms` |
 | Balance and ordering | `O(G + G log G)` | `O(G)` keyed selection | `rank_ms` |
 | `greedy_cover` (per key, per slice via the shared walker) | `O(K·G)` region-overlap checks; the full-span probe needs every generator shard | `O(G)` chosen publications, `O(K·G)` covered-region set | Part of `full_decision_ms` |
 | Route dispatch and arrival record | `O(C)` load edges plus one arrival float | `O(1)` retained on the requester publication | `full_decision_ms` |
 | Gate registration | `O(C)` waiter links | `O(C)` links, up to `O(GC)` across a blocked burst | `gate_ms` |
-| Total synchronous control decision | `O(K·T + D + G log G + K·G)` | Adds `O(K + G)` retained requester state plus `O(G)` transient union state | `full_decision_ms` |
+| Total synchronous control decision | `O(K·(T + D) + G log G + K·G)`; with `D = G` the union and the greedy walker each contribute a `K·G` term, so the ceiling is `O(K·(T + G) + G log G)` | Adds `O(K + G)` retained requester state plus `O(G)` transient union state | `full_decision_ms` |
 
 The total request row ends after the route and readiness gate are constructed. It does
 not include waiting for a pending publication, transferring payloads, or landing the
