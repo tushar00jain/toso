@@ -617,3 +617,64 @@ availability.
 The regular-layout path is an optimization of region discovery. A request that
 genuinely consumes `C` disjoint shards still emits `K·C` fetch entries; direct lookup
 removes search work but cannot remove that output-size lower bound.
+
+## 15. How can source ranking avoid a full sort?
+
+The geometry index removes repeated slice discovery, but the current selector still
+recomputes a score for every eligible source and sorts the complete source union for
+each request:
+
+```text
+serving_union -> score every source -> sort every source -> greedy_cover
+```
+
+Most inputs to the weight-sync score already have explicit update events. Topology and
+volume identity are stable for a run. A pending source receives its readiness estimate
+when it is routed, and assigned load changes only when `Routed` or `Published` is
+folded. The controller also interns identical source sets and coverage templates across
+keys. These properties permit an incremental source-cost index without caching stale
+decisions.
+
+Maintain an ordered source set for each interned replica set, requester-topology class,
+payload or layout class, and ranking policy. Cache the static transfer component, then
+order sources by the dynamic readiness and load components plus the stable source-id
+tie-break. The index changes on the same serialized events that change the ranking:
+
+- a source publication inserts or removes its volume;
+- `Routed` records the new pending source and updates the chosen source's load;
+- `Published` removes pending readiness and releases its assigned load; and
+- a topology, payload class, or policy change invalidates the affected index.
+
+Topology classes avoid one full index per requester when transfer cost depends only on
+a small number of locality tiers. A policy with arbitrary requester-specific state
+must retain the exhaustive path unless it provides its own index and invalidation
+rules.
+
+Let `H` retain its section 8 meaning: eligible `Publication` sources for the request,
+and let `C` be the sources selected by the final cover.
+
+| Operation | Full ranking | Incremental ranking |
+| --- | ---: | ---: |
+| First construction | None | `O(H)` by heap construction, or `O(H log H)` by incremental insertion |
+| Source membership, readiness, or load change | Reflected by the next rescan | `O(log H)` per affected shared index |
+| One source decision | `O(H log H)` | `O(C log H)` best-first selection and updates |
+| `G` requests with `H = Θ(G)` and bounded `C` | `O(G² log G)` | `O(G log G)` |
+
+The existing per-key publication work remains `O(Σ_t |P_t|)`. A separate priority
+index per key would increase it to `O(Σ_t |P_t| log H)` and should not be used.
+Instead, the interned source sets and normalized coverage templates should share one
+priority index across keys with the same placement. A new shared source set then pays
+`O(log H)` per source membership change, while later snapshot versions with unchanged
+placement reuse the index.
+
+This optimization does not remove output work. If a request genuinely needs
+`C = Θ(H)` disjoint sources, selecting and returning them remains linear in `H`, and a
+burst can remain quadratic. The `O(G log G)` burst bound applies to replica selection
+where each request chooses a bounded number of sources from `Θ(G)` equivalent
+candidates.
+
+Two smaller changes are useful before adding persistent state. The current dedup chain
+sorts once while constructing candidates and again after adding load; only the final
+order is required. It can also heapify candidates and consume only the prefix needed by
+`greedy_cover`, reducing one decision from `O(H log H)` to `O(H + C log H)` without
+changing the ranking contract.

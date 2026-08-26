@@ -1,312 +1,285 @@
-# Toso: A Read-Through Cache
+# Scaling TorchStore Weight Synchronization
 
-Weight distribution, LLM scheduling, load balancing, and admission control look like
-different systems problems. Toso expresses them with one question:
+At every RL iteration, trainer ranks publish a new model snapshot and generator ranks
+read it. Both publication and lookup contribute to the cost of each weight update.
+Two questions dominate:
 
-> Which copy should serve this request, when will it be usable, and is using it better
-> than the alternatives?
+1. How does controller work grow as model keys, tensor slices, publishers, and readers
+   increase?
+2. When several sources can serve the same bytes, how can readers avoid choosing the
+   same source and overloading it?
 
-TorchStore supplies the directory, storage, transport, and tensor resharding. Toso
-adds application policy. It is a library for building a cache service per use case,
-not one shared cache deployment for every workload.
+There are two solution paths:
 
-## One read-through loop
+1. Reuse indexed tensor layouts across snapshot versions and select eligible sources
+   by cost.
+2. Reduce or eliminate per-update directory work by electing readers, broadcasting
+   within replica groups, or precomputing direct routes.
 
-```text
-┌──────────────────────────── OBSERVE ────────────────────────────┐
-│ directory: key -> current holders                               │
-│ sensors: promises, queues, reservations, load, budgets          │
-└───────────────────────────────┬─────────────────────────────────┘
-                                v
-┌───────────────────────────── DECIDE ────────────────────────────┐
-│ rank candidates -> apply cost function -> gate or reject        │
-└───────────────────────────────┬─────────────────────────────────┘
-                                v
-┌───────────────────────────── EXECUTE ───────────────────────────┐
-│ get / compute / put / route application work                    │
-└───────────────────────────────┬─────────────────────────────────┘
-                                v
-┌──────────────────────────── FEEDBACK ───────────────────────────┐
-│ publish a new copy -> report facts -> inform the next decision  │
-└───────────────────────────────┴─────────────────────────────────┘
-```
+## 1. Workload: Qwen3.6-27B
 
-- A key can identify a tensor, weight shard, KV block, checkpoint fragment, or
-  immutable application object.
-- A source can hold the key now or be a peer whose read-through copy is in flight.
-- A miss can fetch from an origin, read another storage tier, or recompute the value.
-- A successful read can populate a local copy, create a replica, and change future
-  placement decisions.
-- The data path remains ordinary `get`, `put`, `get_batch`, and `put_batch`.
+The representative workload uses Qwen3.6-27B on two 8-GPU nodes:
 
-## Dedup: turning a read burst into a transfer tree
+| Item | Configuration |
+| --- | ---: |
+| Model | 64 layers, 1,199 checkpoint tensor keys, 55.6 GB |
+| Trainer | 8 ranks: $\mathrm{FSDP}=4$, $\mathrm{TP}=2$ |
+| Generator | 8 ranks: $\mathrm{DP}=2$, $\mathrm{TP}=4$; two model replicas |
 
-Without routing, synchronized readers all observe the same origin before any transfer
-finishes:
+Each iteration publishes one new snapshot from the trainer ranks and distributes it
+to every generator rank. The calculations below use the checkpoint's 1,199 tensors as
+a full-state upper bound; the runtime TorchStore state dict may omit runtime-specific
+or unowned keys.
 
-```text
-NAIVE: m origin reads                 TOSO: one read-through tree
+## 2. What scales poorly in TorchStore?
 
-        ┌────> g0                                    ┌────> g1
-trainer ├────> g1                      trainer ───> g0
-        └────> g2                                    └────> g2
+Let:
 
-origin traffic: 3 copies              origin traffic: 1 copy
-```
+- $T$ be trainer ranks publishing the snapshot;
+- $G$ be generator ranks reading the snapshot;
+- $P_t$ be the `(key, volume, TensorSlice)` records published by trainer rank $t$;
+- $Q_g$ be the keys requested by generator rank $g$;
+- $V_k$ be the storage volumes recorded for key $k$;
+- $S_k$ be the `TensorSlice` records stored for key $k$ across those volumes;
+- $D_k$ be the number of dimensions in key $k$'s tensor ($D_k=2$ for a matrix).
 
-- The first generator reads from a current holder.
-- Once routed, that generator promises to publish the value locally.
-- Later readers rank both current holders and promised peers as possible sources.
-- A fan-out cap produces a chain at `1` or a shallower tree at larger values.
-- No reader cohort, barrier, or model-parallel layout is required.
+### 2.1 Snapshot publication
 
-The implemented selector prices every candidate in seconds:
+The write path inserts or updates every published key and slice in the directory. Its
+cost is $O(\sum_t \lvert P_t \rvert)$ across the trainer ranks. Replacing or retiring
+those records has the same scale.
 
-```text
-score = ready_wait + hop_time + fabric_weight * hop_time
+If every trainer rank publishes one slice for each checkpoint tensor, the example
+workload creates $1{,}199 \times 8 = 9{,}592$ `(key, volume)` associations per
+iteration. This is the worst case: eight volumes with up to 1,199 keys each.
 
-ready_wait    0 for a holder; remaining branch time for a promised peer
-hop_time      modeled transfer time from the source to this reader
-fabric_weight value of scarce link occupancy relative to reader latency
-```
+Snapshot publication therefore scales linearly with the number of directory records
+written. For centralized metadata that materializes each published record, this is the
+necessary lower bound and is acceptable at the current example scale.
 
-- A nearby peer wins when waiting for it is cheaper than another origin transfer.
-- A fresh origin edge wins when extending the branch becomes too slow.
-- Within the selected cost regime, only the first reader pulls from the origin.
-- Every destination still receives the full value; dedup removes repeated origin
-  traffic, not destination bytes.
+### 2.2 Lookup and reshard planning scan every source
 
-### A readiness gate makes future sources safe
+A batched `get_state_dict` then uses one controller call, but that call still performs
+work for every key:
 
 ```text
-B asks for W
-  -> control records: B owes a local copy
-  -> B starts reading W
-
-C asks for W
-  -> selector chooses B
-  -> answer waits at a readiness gate
-
-B finishes get_batch -> local put_batch -> directory registers B -> Published(B, pub)
-  -> C receives B as a usable source
+key trie -> every volume's StorageInfo -> compare every stored TensorSlice with the request
 ```
 
-- The gate delays the control-plane answer, not the storage operation.
-- A promised source is released only after its atomic publication lands or is retired.
-- Publication ids let one producer carry several batches and wake only their waiters.
-- The local `put` turns a consumer into a source; repeated read-through fills create
-  the tree.
+For each requested key $k$, the controller visits its $V_k$ volume records and
+$S_k$ stored slices, while the client compares every slice across $D_k$ dimensions.
+The exact burst cost is:
 
-## Replicas make the cache a load balancer
+$$
+O\left(\sum_g \sum_{k \in Q_g} \left(V_k + S_k D_k\right)\right)
+$$
 
-When two trainers already hold the same weight, locality alone may still overload one
-of them. Toso can annotate equivalent sources with current application load:
+In the uniform case, every generator requests the same keys, every key is stored on a
+number of volumes proportional to the trainer count, each volume contributes one
+slice, and tensor dimensionality is bounded:
+
+$$
+Q_g = Q \quad \forall g,
+\qquad
+V_k = \Theta(T),\quad S_k = V_k,\quad D_k = O(1)
+\quad \forall k \in Q.
+$$
+
+The burst cost becomes:
+
+$$
+O\left(G \lvert Q \rvert T\right)
+$$
+
+When trainer and generator counts grow together, $T=\Theta(G)$, this becomes
+$O(\lvert Q \rvert G^2)$: quadratic in the number of participating ranks at fixed
+model size.
+
+Using the same full-key upper bound, one generator request can inspect up to 9,592
+trainer-volume records, followed by the corresponding tensor-slice intersection
+checks. Eight generator ranks can drive up to 76,736 such entry visits in one
+synchronized refresh.
+
+### 2.3 Deterministic source selection creates a hot source
+
+Replicas do not spread traffic by themselves. In the worst case, deterministic
+ordering sends one slice for every requested key to the same storage volume. That
+volume serves the total number of key slices requested by all generators:
+
+$$
+\sum_{g=1}^{G}\lvert Q_g\rvert
+$$
+
+In the uniform case, every generator requests the same key set:
+
+$$
+Q_g = Q \quad \forall g.
+$$
+
+The hot-volume load therefore grows linearly with the generator count and the number
+of keys in the shared request:
+
+$$
+O\left(G\lvert Q\rvert\right)
+$$
+
+Equivalent volumes remain idle, so source capacity does not scale with the number of
+available replicas.
+
+Equivalent volumes are storage volumes that can serve the same requested
+`TensorSlice`. They exist when trainer DP ranks publish replicated slices. They could
+also arise when a generator fetching a slice publishes its local copy so later
+generators can read through it, but the current weight-sync path does not register
+in-flight generator copies or route later reads through them.
+
+## 3. Two solution paths
+
+### Option A: reuse indexed layouts and select sources by cost
+
+1. Index `TensorSlice` geometry independently from the volumes that currently hold
+   it. The controller can then find overlapping regions and reuse reshard geometry
+   across keys and snapshot versions with the same layout.
+2. Choose between a trainer that already holds the slice and a generator that is
+   fetching it and has promised to publish a copy. Rank them by assigned-request load
+   and network-transfer cost, waiting if the selected generator is still pending.
+
+For this comparison, use the uniform case from section 2: every generator requests
+the same key set, every key is stored on a number of volumes proportional to the
+trainer count, each volume contributes one slice, tensor dimensionality is bounded,
+and trainer and generator counts grow together:
+
+$$
+Q_g = Q \quad \forall g,
+\qquad
+\lvert P_t\rvert = \lvert Q\rvert \quad \forall t,
+\qquad
+V_k = \Theta(T),\quad S_k = V_k,\quad D_k = O(1)
+\quad \forall k \in Q,
+\qquad
+T = \Theta(G).
+$$
+
+For the table, $S = \max_{k \in Q} S_k$ is the largest number of `TensorSlice`
+records stored for any requested key. The index contains at most $S$ distinct
+`TensorSlice` geometries per key because replicas can store duplicate geometries.
+Building the ordered index for a new layout costs $O(S\log S)$; later snapshots with
+the same layout reuse it. Since $D_k=O(1)$, each candidate `TensorSlice` intersection
+check costs $O(1)$. A source-cost index maintains the eligible volumes in cost order.
+Adding a source or changing its readiness or assigned load costs $O(\log G)$, as does
+selecting and updating a source. Across all $G$ generator batches, source selection
+therefore costs $O(G\log G)$. The same index serves every key with the same placement,
+so this cost is not multiplied by $\lvert Q\rvert$.
+
+The table reports cluster-wide controller work: the snapshot must be published and
+generator plans produced before the corresponding data transfers can proceed.
+
+| Operation | Current path | Indexed path |
+| --- | ---: | ---: |
+| Snapshot publication | $O(G\lvert Q\rvert)$ | $O(G\lvert Q\rvert + S\log S + G\log G)$ |
+| Lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $O(G\lvert Q\rvert\log S + G\log G)$ |
+| Hot-volume serving load | $O(G\lvert Q\rvert)$ slice reads on one volume | Distribute those reads across eligible volumes |
+
+#### Implementation
+
+The geometry index maps each requested `TensorSlice` to a shared set of live trainer
+and pending-generator volumes. Each source set maintains those volumes in cost order;
+publication, routing, and completion events update it in $O(\log G)$.
+
+The ordering uses a cost such as:
+
+$$
+\text{cost} = \text{readiness wait} + \text{transfer time}
+              + \text{source load} + \text{fabric penalty}
+$$
+
+The selected source's load is recorded before the next decision. A live trainer can
+serve immediately; selecting a pending generator installs a readiness gate that waits
+for its local publication before returning the plan. The client then executes the plan
+with ordinary `get` and `put` operations.
+
+### Option B: reduce or remove per-update controller work in the application
+
+A dense-DP broadcast design elects one TorchStore reader per TP shard and broadcasts
+the activated shard to its replicas:
+
+$$
+\text{TorchStore readers}: \mathrm{DP} \times \mathrm{TP} \rightarrow \mathrm{TP}
+$$
+
+For the Qwen3.6-27B configuration, this changes eight readers to four and can halve
+the per-rank full-state lookup work and external TorchStore pulls. It does not reduce
+the trainer's 9,592 snapshot-publication mutations or the complexity of each remaining
+lookup. The end-to-end improvement will be smaller than the reader-count reduction
+because broadcast, copies, and other work remain.
+
+An application-managed direct-transfer path can go further. It exchanges shard
+metadata once at connection time, computes sender/receiver overlaps, and reuses
+persistent buffers and direct routes for later updates. Each update then performs no
+TorchStore publication or lookup; its steady-state cost is packing, transfer,
+notification, and consumption. For this model, the 1,199-key overlap computation
+moves from every update to one connection-time plan.
+
+This path has the smaller steady-state control plane for weight synchronization, but
+it moves routing and lifecycle into the application integration. DP broadcast applies
+only when weights are replicated across dense DP ranks; $\mathrm{DP}=1$ and expert-parallel
+layouts retain all-rank reads. Direct transfer can cover different model and runtime
+layouts when they can be described as rectangular regions and pure copy/scatter
+transforms. It remains a weight-transfer subsystem rather than a general cache
+directory.
+
+### Choosing between them
+
+| Goal | Better fit |
+| --- | --- |
+| Improve general TorchStore reads and dynamic replicas | Indexed layouts + cost-based selection |
+| Reduce readers without changing trainer publication | Reader election + DP broadcast |
+| Replace the centralized directory with fixed weight-transfer routes | Precomputed direct transfer |
+| Reduce both reader count and lookup cost | Combine reader election with indexed lookup |
+
+For the concrete $\mathrm{DP}=2$, $\mathrm{TP}=4$ deployment, reader election gives at most a $2\times$ reduction
+in lookup volume but does not reduce trainer publication.
+Direct transfer uses a different metadata architecture, so its write cost is not a
+comparison with centralized TorchStore publication.
+
+## 4. KV cache is a second use of the architecture
+
+The same publication-and-lookup architecture is useful beyond weight synchronization.
+KV-cache keys name reusable prefix blocks; the directory records where blocks reside,
+while application sensors add queueing, reservations, occupancy, and promised copies.
+
+A KV decision can compare remote-prefix transfer with local recomputation, select
+prefill and decode hosts, and reject work that would exceed TTFT or TBT bounds. Reads
+that populate a local cache create new sources for later requests. This is the same
+observe, select, execute, and publish loop, but it should remain a separate use case
+rather than part of the argument for fixing weight lookup.
+
+## 5. Implementation boundary
 
 ```text
-WITHOUT LOAD SPREADING             WITH LOAD SPREADING
-
-t0 ───> g0 ───> g1                t0 ───> g0 ───> g2
-t1          idle                  t1 ───> g1 ───> g3
-
-one hot source                     one tree per useful replica
+publish snapshot or cache fill -> update directory
+                 |
+                 v
+observe directory + application state
+                 |
+                 v
+rank candidates -> apply cost -> wait, reject, or choose
+                 |
+                 v
+execute ordinary get / put / application work
+                 |
+                 v
+publish residency and load for the next decision
 ```
 
-- `Balance` adds source load to an existing ranking.
-- Dedup reuses its fan-out state as the load signal; no second load tracker is needed.
-- The capability decides how load trades against transfer cost and readiness.
-- Spreading spends one first-hop read per replica, reduces tree depth, and avoids a
-  single serving hotspot.
+- The directory sensor supplies current and pending holders from one coherent view.
+- Application sensors supply facts that TorchStore does not own, such as routed load,
+  readiness, queueing, and reservations.
+- Selectors compose measurements into one ordered candidate set.
+- The data plane continues to use ordinary TorchStore operations; successful
+  read-through writes create additional sources.
 
-This is useful for cross-cluster weight caching. Versioned weight
-shards are cache keys; consuming clusters read through and retain them. The directory
-then supports both reuse and load balancing across the resulting replicas.
-
-## The reusable primitives
-
-```text
-┌───────────────┐   reads   ┌────────────────────────────────────┐
-│ ControlPlane  │ <──────── │ DirectorySensor + app Sensors      │
-│ selector      │           │ residency        promises / load   │
-│ chains        │           └────────────────────────────────────┘
-└───────┬───────┘
-        │ decision
-        v
-┌───────────────┐  store calls  ┌───────────────────────────────┐
-│ DataPlane     │ ────────────> │ TorchStore clients / volumes  │
-│ app lifecycle │               └───────────────────────────────┘
-└───────┬───────┘
-        │ typed actions
-        v
-┌───────────────┐  atomic fold  ┌───────────────────────────────┐
-│ Dispatcher    │ ────────────> │ affected Sensors              │
-└───────────────┘               └───────────────────────────────┘
-```
-
-- **Directory sensor:** reads current holders and can pin one coherent snapshot for a
-  decision.
-- **Application sensors:** hold facts the storage directory cannot express, such as
-  promised copies, queues, reservations, or routed load.
-- **Dispatcher:** folds one reported action into every affected sensor, then commits
-  the updates together.
-- **Selectors:** produce candidates, add measurements, fold them into a cost, order
-  them, take the best, or fall back to another strategy.
-- **Data plane:** executes the decision through ordinary store and application APIs.
-
-Most policies reduce to a workload-specific cost function:
-
-```text
-total cost = transfer + readiness wait + queueing + recomputation
-             + penalties for fabric, memory, load, or priority
-```
-
-The selector algebra supplies composition and deterministic tie-breaking. The
-application supplies the measurements and tradeoffs.
-
-### Two kinds of gate
-
-```text
-candidate ranking
-      |
-      +--> admission bound: unacceptable? reject or fall back
-      |
-      +--> readiness gate: selected but not usable? wait
-      v
-safe, admitted answer
-```
-
-- A **readiness gate** waits for a fact that is expected to become true. Dedup waits
-  for a promised cache fill.
-- An **admission bound** rejects an uneconomic or unsafe result. KV serving bounds
-  predicted TTFT and TBT.
-- Other capabilities can bound memory pressure, deadlines, tenant budgets,
-  cross-cluster traffic, or transfer-versus-recompute cost.
-- A bound can filter candidates before selection or reject the winner after selection.
-
-## Customizing Toso for another workload
-
-```text
-APPLICATION DEFINES                         TOSO REUSES
-
-keys + miss behavior                 |      directory and topology
-sensors + reported actions           |      dispatcher and lifecycle
-candidate cost + admission bounds    |      selector composition
-data-plane application steps         |      routed calls and deployment wiring
-```
-
-The minimum read-through path is small:
-
-```python
-requests = tuple(
-    Request.from_any(key, value).meta_only()
-    for key, value in entries.items()
-)
-plan = await control.sources.call_one(requests, requester)
-values = await deployment.client_for(
-    requester, prefer=plan.sources
-).get_batch(entries)
-await deployment.client_for(requester).put_batch(values)
-await deployment.dispatcher_handle.dispatch.call_one(
-    Published(*plan.publication)
-)
-```
-
-- Change the selector chain to change placement or source preference.
-- Add a sensor when the cost function needs a new application fact.
-- Add a bound for admission control.
-- Add application steps around the same read-through data path.
-- Keep each use case in its own deployment and policy boundary.
-
-## KV cache: writing application logic with the same machinery
-
-The KV implementation uses the cache to coordinate a full serving lifecycle:
-
-```text
-request
-  |
-  v
-rank prefix holders + prefill hosts
-  |
-  +--> pull remote prefix or recompute locally
-  |
-  v
-prefill -> publish KV -> choose decode host
-  |
-  v
-fetch full KV chain if remote -> decode -> publish another copy
-  |
-  v
-report queues, completion, occupancy, and source load
-```
-
-- Prefix-block keys turn reusable computation into directory entries.
-- Each prefill candidate is priced as queue wait + transfer + uncached prefill.
-- Pulling a remote prefix is chosen only when it saves enough recomputation.
-- Decode placement uses predicted occupancy at prefill completion.
-- TTFT and TBT bounds reject a request before it consumes compute.
-- Prefill and decode hosts publish KV locally, creating sources for later requests.
-
-The control plane therefore does more than choose bytes. It places compute, reserves
-capacity, enforces SLOs, and coordinates request stages while remaining a read-through
-cache underneath.
-
-## `@routed`: placement that creates replicas
-
-```text
-client -> host A: prefill(request)
-host A -> client: redirect to B
-client -> host B: prefill(request)
-
-existing holder H ──KV pull──> B ──publish──> directory adds B
-decode host D     <──handoff── B ──publish──> directory adds D
-
-later source set: H, B, D
-```
-
-- `@routed` declares where an answer carries the next host address.
-- The caller repeats the same method at that host; the server does not forward to a
-  peer data plane.
-- The decorator does not copy data.
-- Replication emerges because the routed host reads through and publishes locally.
-- Later requests can route to or pull from the new holder, spreading both data and
-  compute load.
-- A hop cap detects cycles or a placement policy that does not converge.
-
-This is demand-driven, best-effort replication. Copies are created by useful work and
-remain subject to the cache’s capacity and eviction policy.
-
-## Other use cases
-
-```text
-reusable work -> stable key -> rank ways to obtain it -> gate -> publish near consumer
-```
-
-- **Cross-cluster model weights:** key by model, version, and shard; optimize topology,
-  startup time, replica load, and tier placement.
-- **RL weight synchronization:** add freshness and bounded fan-out while retaining
-  TorchStore’s resharding path.
-- **Checkpoint restart:** prefer warm distributed-memory copies over durable storage
-  and spread recovery reads across replicas.
-- **Dataset preprocessing:** compare transfer cost with decode or transform cost and
-  admit only reusable results.
-- **Compilation artifacts:** key by graph, shapes, compiler, and target architecture;
-  compare build time with fetch time.
-- **Immutable object caching:** combine capacity, eviction, shard placement, and
-  replica-aware load balancing.
-
-These are mappings of the model, not claims that every capability is implemented.
-
-## What exists today
-
-- `dedup_sim` implements bounded fan-out, cost-based source routing, readiness gates,
-  read-through population, eviction-aware recovery, and optional replica spreading.
-- `kvcache_sim` implements prefix reuse, pull-versus-recompute pricing, prefill/decode
-  placement, source spreading, bounded storage, TTFT/TBT admission, `@routed`
-  prefill, KV handoff, and publication on prefill and decode hosts.
-- `proposed` contains the shared planes, sensors, dispatcher, selector algebra, gates,
-  routed calls, and deployment interfaces.
-- `realsim` exercises the real TorchStore directory, client planning, volumes, and
-  transport under a deterministic virtual clock and target-machine cost model.
-
-These are executable design implementations, not a production-owned cache service.
-Together they show that one read-through substrate can express a small transfer
-optimization and a complete cache-aware application lifecycle.
+The repository contains executable versions of these ideas: `dedup_sim` for bounded
+fan-out and source spreading, `kvcache_sim` for cache-aware serving, `proposed` for the
+shared policy primitives, and `realsim` for measurements against the real TorchStore
+controller and client planning path. They are design prototypes, not a
+production-owned cache service.
