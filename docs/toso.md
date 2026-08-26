@@ -2,6 +2,7 @@
 
 At every RL iteration, trainer ranks publish a new model snapshot and generator ranks
 read it. Both publication and lookup contribute to the cost of each weight update.
+
 Two questions dominate:
 
 1. How does controller work grow as model keys, tensor slices, publishers, and readers
@@ -13,8 +14,8 @@ There are two solution paths:
 
 1. Reuse indexed tensor layouts across snapshot versions and select eligible sources
    by cost.
-2. Reduce or eliminate per-update directory work by electing readers, broadcasting
-   within replica groups, or precomputing direct routes.
+2. Precompute direct trainer-to-generator routes and redistribute weights within
+   generator replica groups.
 
 ## 1. Workload: Qwen3.6-27B
 
@@ -181,6 +182,9 @@ generator plans produced before the corresponding data transfers can proceed.
 
 #### Implementation
 
+The trainer-publication and generator read-through flows are shown in the
+[appendix](#appendix).
+
 The geometry index maps each requested `TensorSlice` to a shared set of live trainer
 and pending-generator volumes. Each source set maintains those volumes in cost order;
 publication, routing, and completion events update it in $O(\log G)$.
@@ -197,89 +201,71 @@ serve immediately; selecting a pending generator installs a readiness gate that 
 for its local publication before returning the plan. The client then executes the plan
 with ordinary `get` and `put` operations.
 
-### Option B: reduce or remove per-update controller work in the application
+The same indexed, cost-based source selection can extend to KV-cache placement and
+reuse.
 
-A dense-DP broadcast design elects one TorchStore reader per TP shard and broadcasts
-the activated shard to its replicas:
+### Option B: precompute direct transfer in the application
 
-$$
-\text{TorchStore readers}: \mathrm{DP} \times \mathrm{TP} \rightarrow \mathrm{TP}
-$$
+Exchange trainer and generator shard metadata once, compute direct sender-to-receiver
+routes, and reuse them for every update. One generator per TP shard receives the
+trainer data and redistributes it to the other DP replicas.
 
-For the Qwen3.6-27B configuration, this changes eight readers to four and can halve
-the per-rank full-state lookup work and external TorchStore pulls. It does not reduce
-the trainer's 9,592 snapshot-publication mutations or the complexity of each remaining
-lookup. The end-to-end improvement will be smaller than the reader-count reduction
-because broadcast, copies, and other work remain.
+At each update, trainer ranks place the planned slices in their local transport
+buffers. After a trainer-side barrier, trainer rank 0 sends the snapshot version to
+the generator coordinator, which tells the elected generators to pull over the
+precomputed routes. The generators redistribute the received slices within their DP
+groups and install the new weights. TorchStore stores no per-update state and is not
+called.
 
-An application-managed direct-transfer path can go further. It exchanges shard
-metadata once at connection time, computes sender/receiver overlaps, and reuses
-persistent buffers and direct routes for later updates. Each update then performs no
-TorchStore publication or lookup; its steady-state cost is packing, transfer,
-notification, and consumption. For this model, the 1,199-key overlap computation
-moves from every update to one connection-time plan.
+| Operation | Current path | Application-managed path |
+| --- | ---: | ---: |
+| Controller snapshot publication | $O(G\lvert Q\rvert)$ | $0$ per update |
+| Controller lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $0$ per update |
+| Trainer-to-generator slice deliveries | $G\lvert Q\rvert$ | $G\lvert Q\rvert/\mathrm{DP}$ |
+| Generator-to-generator slice deliveries | $0$ | $G\lvert Q\rvert(\mathrm{DP}-1)/\mathrm{DP}$ |
 
-This path has the smaller steady-state control plane for weight synchronization, but
-it moves routing and lifecycle into the application integration. DP broadcast applies
-only when weights are replicated across dense DP ranks; $\mathrm{DP}=1$ and expert-parallel
-layouts retain all-rank reads. Direct transfer can cover different model and runtime
-layouts when they can be described as rectangular regions and pure copy/scatter
-transforms. It remains a weight-transfer subsystem rather than a general cache
-directory.
+For the Qwen3.6-27B configuration, four generators receive weights from trainer ranks,
+and the other four receive them from those generators. Before updates begin, the
+application creates an architecture-independent transfer plan from the trainer and
+generator shard specifications. Each generator executes its assigned part of that
+plan for every snapshot.
+
+This path removes the TorchStore control plane from steady-state weight updates. The
+application instead manages route setup and the transfer lifecycle. This remains a
+weight-transfer subsystem rather than a general cache solution.
 
 ### Choosing between them
 
 | Goal | Better fit |
 | --- | --- |
 | Improve general TorchStore reads and dynamic replicas | Indexed layouts + cost-based selection |
-| Reduce readers without changing trainer publication | Reader election + DP broadcast |
-| Replace the centralized directory with fixed weight-transfer routes | Precomputed direct transfer |
-| Reduce both reader count and lookup cost | Combine reader election with indexed lookup |
+| Reuse TorchStore's normal publication and lookup path | Indexed layouts + cost-based selection |
+| Remove per-update controller work for fixed weight routes | Application-managed direct transfer |
+| Reduce trainer-origin traffic across DP replicas | Direct transfer + replica redistribution |
 
-For the concrete $\mathrm{DP}=2$, $\mathrm{TP}=4$ deployment, reader election gives at most a $2\times$ reduction
-in lookup volume but does not reduce trainer publication.
-Direct transfer uses a different metadata architecture, so its write cost is not a
-comparison with centralized TorchStore publication.
+## Appendix
 
-## 4. KV cache is a second use of the architecture
+### Option A Read-Through Flow
 
-The same publication-and-lookup architecture is useful beyond weight synchronization.
-KV-cache keys name reusable prefix blocks; the directory records where blocks reside,
-while application sensors add queueing, reservations, occupancy, and promised copies.
-
-A KV decision can compare remote-prefix transfer with local recomputation, select
-prefill and decode hosts, and reject work that would exceed TTFT or TBT bounds. Reads
-that populate a local cache create new sources for later requests. This is the same
-observe, select, execute, and publish loop, but it should remain a separate use case
-rather than part of the argument for fixing weight lookup.
-
-## 5. Implementation boundary
+Trainer publication:
 
 ```text
-publish snapshot or cache fill -> update directory
-                 |
-                 v
-observe directory + application state
-                 |
-                 v
-rank candidates -> apply cost -> wait, reject, or choose
-                 |
-                 v
-execute ordinary get / put / application work
-                 |
-                 v
-publish residency and load for the next decision
+trainer put_state_dict
+  -> local volume stores TensorSlices
+  -> controller records the trainer volume
+  -> geometry and source-cost indexes update
 ```
 
-- The directory sensor supplies current and pending holders from one coherent view.
-- Application sensors supply facts that TorchStore does not own, such as routed load,
-  readiness, queueing, and reservations.
-- Selectors compose measurements into one ordered candidate set.
-- The data plane continues to use ordinary TorchStore operations; successful
-  read-through writes create additional sources.
+Generator read-through:
 
-The repository contains executable versions of these ideas: `dedup_sim` for bounded
-fan-out and source spreading, `kvcache_sim` for cache-aware serving, `proposed` for the
-shared policy primitives, and `realsim` for measurements against the real TorchStore
-controller and client planning path. They are design prototypes, not a
-production-owned cache service.
+```text
+generator get_state_dict
+  -> register the generator's pending local copy
+  -> find overlapping TensorSlices and select a source by cost
+  -> wait if the selected generator source is still pending
+  -> fetch and reshard into the generator
+  -> store the local copy and mark its publication complete
+```
+
+The controller handles metadata only. Tensor bytes move directly between storage
+volumes, and a completed generator read-through becomes a source for later reads.
