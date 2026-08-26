@@ -47,8 +47,28 @@ Let:
 ### 2.1 Snapshot publication
 
 The write path inserts or updates every published key and slice in the directory. Its
-cost is $O(\sum_t \lvert P_t \rvert)$ across the trainer ranks. Replacing or retiring
-those records has the same scale.
+exact cost across the trainer ranks is:
+
+$$
+O\left(\sum_t \lvert P_t \rvert\right)
+$$
+
+In the uniform case, every trainer rank publishes exactly one slice for every key in
+$Q$, and trainer and generator counts grow together:
+
+$$
+\lvert P_t\rvert = \lvert Q\rvert \quad \forall t,
+\qquad
+T = \Theta(G).
+$$
+
+The publication cost becomes:
+
+$$
+O\left(G\lvert Q\rvert\right)
+$$
+
+Replacing or retiring those records has the same scale.
 
 If every trainer rank publishes one slice for each checkpoint tensor, the example
 workload creates $1{,}199 \times 8 = 9{,}592$ `(key, volume)` associations per
