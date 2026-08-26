@@ -125,33 +125,31 @@ synchronized refresh.
 
 Replicas do not spread traffic by themselves. In the worst case, deterministic
 ordering sends one slice for every requested key to the same storage volume. That
-volume serves the total number of key slices requested by all generators:
-
-$$
-\sum_{g=1}^{G}\lvert Q_g\rvert
-$$
-
-In the uniform case, every generator requests the same key set:
-
-$$
-Q_g = Q \quad \forall g.
-$$
-
-The hot-volume load therefore grows linearly with the generator count and the number
-of keys in the shared request:
-
-$$
-O\left(G\lvert Q\rvert\right)
-$$
-
-Equivalent volumes remain idle, so source capacity does not scale with the number of
-available replicas.
+volume serves all generator requests while the other equivalent volumes remain idle.
 
 Equivalent volumes are storage volumes that can serve the same requested
 `TensorSlice`. They exist when trainer DP ranks publish replicated slices. They could
 also arise when a generator fetching a slice publishes its local copy so later
 generators can read through it, but the current weight-sync path does not register
 in-flight generator copies or route later reads through them.
+
+For the load table, every generator requests the same key set:
+
+$$
+Q_g = Q \quad \forall g.
+$$
+
+The entries count logical slice deliveries and assume one equal-cost slice per
+requested key:
+
+| Role | Count | Ingress per rank or volume | Egress per rank or volume |
+| --- | ---: | ---: | ---: |
+| Hot source volume | $1$ | $0$ | $G\lvert Q\rvert$ |
+| Other equivalent source volumes | All remaining | $0$ | $0$ |
+| Generator rank | $G$ | $\lvert Q\rvert$ | $0$ |
+
+The total serving work is $G\lvert Q\rvert$, but concentrating it on one volume keeps
+source capacity from scaling with the number of available replicas.
 
 ## 3. Two solution paths
 
@@ -164,7 +162,7 @@ in-flight generator copies or route later reads through them.
    fetching it and has promised to publish a copy. Rank them by assigned-request load
    and network-transfer cost, waiting if the selected generator is still pending.
 
-For this comparison, use the uniform case from section 2: every generator requests
+For these estimates, use the uniform case from section 2: every generator requests
 the same key set, every key is stored on a number of volumes proportional to the
 trainer count, each volume contributes one slice, tensor dimensionality is bounded,
 and trainer and generator counts grow together:
@@ -180,25 +178,36 @@ V_k = \Theta(T),\quad S_k = V_k,\quad D_k = O(1)
 T = \Theta(G).
 $$
 
-For the table, $S = \max_{k \in Q} S_k$ is the largest number of `TensorSlice`
-records stored for any requested key. The index contains at most $S$ distinct
-`TensorSlice` geometries per key because replicas can store duplicate geometries.
-Building the ordered index for a new layout costs $O(S\log S)$; later snapshots with
-the same layout reuse it. Since $D_k=O(1)$, each candidate `TensorSlice` intersection
-check costs $O(1)$. A source-cost index maintains the eligible volumes in cost order.
-Adding a source or changing its readiness or assigned load costs $O(\log G)$, as does
-selecting and updating a source. Across all $G$ generator batches, source selection
-therefore costs $O(G\log G)$. The same index serves every key with the same placement,
-so this cost is not multiplied by $\lvert Q\rvert$.
+For the controller-cost table, $S = \max_{k \in Q} S_k$ is the largest number of
+`TensorSlice` records stored for any requested key. The index contains at most $S$
+distinct `TensorSlice` geometries per key because replicas can store duplicate
+geometries. Building the ordered index for a new layout costs $O(S\log S)$; later
+snapshots with the same layout reuse it. Since $D_k=O(1)$, each candidate
+`TensorSlice` intersection check costs $O(1)$. A source-cost index maintains the
+eligible volumes in cost order. Adding a source or changing its readiness or assigned
+load costs $O(\log G)$, as does selecting and updating a source. Across all $G$
+generator batches, source selection therefore costs $O(G\log G)$. The same index
+serves every key with the same placement, so this cost is not multiplied by
+$\lvert Q\rvert$.
 
-The table reports cluster-wide controller work: the snapshot must be published and
-generator plans produced before the corresponding data transfers can proceed.
+The snapshot must be published and generator plans produced before the corresponding
+data transfers can proceed:
 
 | Operation | Current path | Indexed path |
 | --- | ---: | ---: |
 | Snapshot publication | $O(G\lvert Q\rvert)$ | $O(G\lvert Q\rvert + S\log S + G\log G)$ |
 | Lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $O(G\lvert Q\rvert\log S + G\log G)$ |
-| Hot-volume serving load | $O(G\lvert Q\rvert)$ slice reads on one volume | Distribute those reads across eligible volumes |
+
+Using the logical slice unit from section 2.3, consider the representative workload,
+where $\mathrm{DP}=2$, $G=\mathrm{TP}\,\mathrm{DP}$, and trainer egress is balanced
+across the $T$ trainer ranks. For each TP shard, one generator fetches from the
+trainers and its DP peer reads through it. The resulting data-plane load is:
+
+| Role | Count | Ingress per rank | Egress per rank |
+| --- | ---: | ---: | ---: |
+| Trainer rank | $T$ | $0$ | $G\lvert Q\rvert/(2T)$ on average |
+| Fan-in/out generator | $G/2$ | $\lvert Q\rvert$ | $\lvert Q\rvert$ |
+| Other generator | $G/2$ | $\lvert Q\rvert$ | $0$ |
 
 #### Implementation
 
@@ -237,18 +246,30 @@ precomputed routes. The generators redistribute the received slices within their
 groups and install the new weights. TorchStore stores no per-update state and is not
 called.
 
+The application-managed path performs no controller snapshot publication, lookup, or
+reshard planning per update:
+
 | Operation | Current path | Application-managed path |
 | --- | ---: | ---: |
 | Controller snapshot publication | $O(G\lvert Q\rvert)$ | $0$ per update |
 | Controller lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $0$ per update |
-| Trainer-to-generator slice deliveries | $G\lvert Q\rvert$ | $G\lvert Q\rvert/\mathrm{DP}$ |
-| Generator-to-generator slice deliveries | $0$ | $G\lvert Q\rvert(\mathrm{DP}-1)/\mathrm{DP}$ |
 
-For the Qwen3.6-27B configuration, four generators receive weights from trainer ranks,
-and the other four receive them from those generators. Before updates begin, the
-application creates an architecture-independent transfer plan from the trainer and
-generator shard specifications. Each generator executes its assigned part of that
-plan for every snapshot.
+Using the logical slice unit from section 2.3, consider the representative workload,
+where $\mathrm{DP}=2$, $G=\mathrm{TP}\,\mathrm{DP}$, and the direct routes balance
+trainer egress across the $T$ trainer ranks:
+
+| Role | Count | Ingress per rank | Egress per rank |
+| --- | ---: | ---: | ---: |
+| Trainer rank | $T$ | $0$ | $G\lvert Q\rvert/(2T)$ on average |
+| Fan-in/out generator | $G/2$ | $\lvert Q\rvert$ | $\lvert Q\rvert$ |
+| Other generator | $G/2$ | $\lvert Q\rvert$ | $0$ |
+
+For the Qwen3.6-27B configuration, four fan-in/out generators each receive
+$\lvert Q\rvert$ slices from trainer ranks and send $\lvert Q\rvert$ slices to one DP
+peer. The other four generators each receive $\lvert Q\rvert$ slices from those
+generators. Before updates begin, the application creates an architecture-independent
+transfer plan from the trainer and generator shard specifications. Each generator
+executes its assigned part of that plan for every snapshot.
 
 This path removes the TorchStore control plane from steady-state weight updates. The
 application instead manages route setup and the transfer lifecycle. This remains a
