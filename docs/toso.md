@@ -254,15 +254,6 @@ This path removes the TorchStore control plane from steady-state weight updates.
 application instead manages route setup and the transfer lifecycle. This remains a
 weight-transfer subsystem rather than a general cache solution.
 
-### Choosing between them
-
-| Goal | Better fit |
-| --- | --- |
-| Improve general TorchStore reads and dynamic replicas | Indexed layouts + cost-based selection |
-| Reuse TorchStore's normal publication and lookup path | Indexed layouts + cost-based selection |
-| Remove per-update controller work for fixed weight routes | Application-managed direct transfer |
-| Reduce trainer-origin traffic across DP replicas | Direct transfer + replica redistribution |
-
 ## Appendix
 
 ### Option A Read-Through Flow
