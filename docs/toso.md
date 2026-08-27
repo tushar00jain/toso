@@ -130,8 +130,7 @@ Under the uniform assumptions, the load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
-The current path transfers both model replicas across the inter-node link. Its
-bandwidth-only completion time is:
+The completion time is:
 
 $$
 \frac{\mathrm{DP}\,M}{25\ \mathrm{GB/s}}
@@ -218,9 +217,7 @@ through it. The resulting data-plane load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
-One model copy first crosses the inter-node link. After waiting for that fetch, the
-four fan-in/out generators concurrently send their $M/\mathrm{TP}=13.9\ \mathrm{GB}$
-shards over NVLink:
+The completion time is:
 
 $$
 \frac{M}{25\ \mathrm{GB/s}}
