@@ -26,7 +26,7 @@ is exactly what executes.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator
 
 from realsim.seams import factory
 from realsim.seams.transport import Endpoint, InMemoryTransport
@@ -40,6 +40,9 @@ from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 
 __all__ = ["FakeStrategy", "RealClientAdapter"]
+
+
+_OnTransfer = Callable[[str, str, str, int, float], None]
 
 
 class FakeStrategy:
@@ -88,6 +91,8 @@ class RealClientAdapter:
         registry: optional shared :class:`~sim_common.resources.ResourceRegistry`
             for network/storage contention (``None`` -> independent sleeps, the
             historical behavior). Passed to every transport this adapter builds.
+        on_transfer: optional callback invoked for every transport this adapter
+            builds, including direct transports to precomputed volume IDs.
     """
 
     def __init__(
@@ -100,6 +105,7 @@ class RealClientAdapter:
         profile: MachineProfile | None = None,
         trace: Trace | None = None,
         registry: ResourceRegistry | None = None,
+        on_transfer: _OnTransfer | None = None,
     ) -> None:
         self.strategy = FakeStrategy(client_volume_id, volume_handles)
         self.client = LocalClient(controller_handle, self.strategy)
@@ -110,19 +116,28 @@ class RealClientAdapter:
         self._profile = profile if profile is not None else DEFAULT_PROFILE
         self._trace = trace
         self._registry = registry
+        self._on_transfer = on_transfer
 
-    def _transport_factory(self):
-        def factory(storage_volume_ref: StorageVolumeRef) -> InMemoryTransport:
-            return InMemoryTransport(
-                storage_volume_ref,
-                src=self._client_endpoint,
-                dst=self._topology[storage_volume_ref.volume_id],
-                profile=self._profile,
-                trace=self._trace,
-                registry=self._registry,
-            )
+    def transport(self, storage_volume_ref: StorageVolumeRef) -> InMemoryTransport:
+        """Build this client's transport to one already-resolved volume."""
+        return InMemoryTransport(
+            storage_volume_ref,
+            src=self._client_endpoint,
+            dst=self._topology[storage_volume_ref.volume_id],
+            profile=self._profile,
+            trace=self._trace,
+            on_transfer=self._on_transfer,
+            registry=self._registry,
+        )
 
-        return factory
+    def transport_for(self, volume_id: str) -> InMemoryTransport:
+        """Build a direct transport to ``volume_id`` without a controller lookup."""
+        return self.transport(self.strategy.get_storage_volume(volume_id))
+
+    def _transport_factory(
+        self,
+    ) -> Callable[[StorageVolumeRef], InMemoryTransport]:
+        return self.transport
 
     @contextmanager
     def installed(self) -> Iterator["RealClientAdapter"]:

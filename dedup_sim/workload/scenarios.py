@@ -31,10 +31,23 @@ from sim_common.trace import Trace
 
 from ..control import routing
 from ..data.read_through import ReadThroughPlane
-from ..report.summary import BaselineReport, DedupReport, WeightSyncReport
+from ..report.summary import (
+    BaselineReport,
+    DedupReport,
+    OptionBReport,
+    PrecomputedDedupReport,
+    WeightSyncReport,
+)
+from ._option_b import _dedup_option_b_run, _option_b_runs
 from ._weight_sync import WeightSync as WeightSyncWorkload
 
-__all__ = ["NUM_READERS", "FANOUT_CAPS", "Dedup", "WeightSync"]
+__all__ = [
+    "NUM_READERS",
+    "FANOUT_CAPS",
+    "Dedup",
+    "OptionBScenario",
+    "WeightSync",
+]
 
 #: Readers in the burst. Three is enough to show a chain and a shallow tree.
 NUM_READERS = 3
@@ -58,12 +71,11 @@ def _read_through(sim) -> ItemDispatch:
 
 
 class Dedup(Scenario):
-    """The unrouted baseline, then one routed run per fan-out cap.
+    """Compare naive, online dedupe, and precomputed dedupe routes.
 
-    Every run shares one :class:`~putget_sim.workload.put_get.PutGetBurst`, so
-    the baseline and each cap cannot differ in what they simulate. Parameterized
-    by construction rather than by a flag, so a test can ask for a narrower
-    comparison without a command line.
+    The baseline and online runs share one
+    :class:`~putget_sim.workload.put_get.PutGetBurst`. The precomputed run adapts
+    the same logical burst so its initial publication can bypass the controller.
     """
 
     name = "dedup"
@@ -80,7 +92,7 @@ class Dedup(Scenario):
         self.burst = burst
 
     def runs(self, args=None) -> List[Run]:
-        """The runs in comparison order: ``["baseline", "cap=1", "cap=2"]``."""
+        """Return baseline, online fan-out variants, then precomputed routing."""
         burst = self.burst or PutGetBurst(self.num_readers)
         runs = [Run("baseline", burst, profile=burst.profile)]
         for cap in self.caps:
@@ -102,17 +114,22 @@ class Dedup(Scenario):
                     trace=trace,
                 )
             )
+        runs.append(_dedup_option_b_run(burst))
         return runs
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
-        naive, routed = results[0], results[1:]
+        naive = results[0]
+        routed = [result for result in results[1:] if result.label.startswith("cap=")]
+        precomputed = next(
+            result for result in results[1:] if result.label == "precomputed"
+        )
         payload = naive.workload.payload_bytes
         num_readers = naive.workload.num_readers
         console.trace(naive.trace, label="naive run")
 
-        console.section(f"DEDUP on the REAL directory  --  {num_readers} readers get W")
+        console.section(f"DEDUP comparison  --  {num_readers} readers get W")
         console.info(
-            "directory: real torchstore.controller.Controller (real Trie state)"
+            "online paths: real torchstore.controller.Controller (real Trie state)"
         )
         console.info(
             "payload(W): %dB   1x-union target (each unique byte once): %dB",
@@ -128,6 +145,10 @@ class Dedup(Scenario):
             # 1x proven live on the real directory.
             assert result.ledger.origin_bytes == payload
             assert naive.ledger.origin_bytes == num_readers * payload
+
+        console.section("PRECOMPUTED dedupe  --  Option B")
+        console.trace(precomputed.trace, label="precomputed run")
+        console.summary(PrecomputedDedupReport(precomputed, naive))
 
         console.section("NAIVE baseline  --  every reader pulls from the origin")
         console.trace(naive.trace, label="naive run")
@@ -188,3 +209,18 @@ class WeightSync(Scenario):
         for result in results:
             console.trace(result.trace, label=f"{result.label} run")
         console.summary(WeightSyncReport(results))
+
+
+class OptionBScenario(Scenario):
+    """Qwen3.6-27B direct reads versus fixed application-managed routes."""
+
+    name = "option_b"
+
+    def runs(self, args=None) -> List[Run]:
+        return _option_b_runs()
+
+    def show(self, console: Console, results: Sequence[Result]) -> None:
+        console.section("OPTION B  --  precomputed local weight-transfer routes")
+        for result in results:
+            console.trace(result.trace, label=f"{result.label} run")
+        console.summary(OptionBReport(results))

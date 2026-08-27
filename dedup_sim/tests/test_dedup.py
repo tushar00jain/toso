@@ -300,14 +300,36 @@ def test_the_scenario_holds_no_burst_loop():
         "drive"
     ]
     assert len([n for n in ast.walk(tree) if isinstance(n, ast.Await)]) == 1
-    # ...and every run is literally the same workload object, one selector apart:
-    # the baseline and each routed cap cannot differ in what they simulate.
+    # The online runs are literally the same workload object, one selector apart.
+    # The precomputed run is an adapter over the same logical burst because its
+    # publication must bypass the ordinary controller-backed prepare path.
     runs = scenarios.Dedup().runs()
-    assert [r.label for r in runs] == ["baseline", "cap=1", "cap=2"]
-    assert all(isinstance(r.workload, PutGetBurst) for r in runs)
-    assert len({id(r.workload) for r in runs}) == 1
+    assert [r.label for r in runs] == [
+        "baseline",
+        "cap=1",
+        "cap=2",
+        "precomputed",
+    ]
+    assert all(isinstance(r.workload, PutGetBurst) for r in runs[:3])
+    assert len({id(r.workload) for r in runs[:3]}) == 1
+    assert runs[3].workload.payload_bytes == runs[0].workload.payload_bytes
+    assert runs[3].workload.num_readers == runs[0].workload.num_readers
     assert runs[0].control is None and runs[0].data is None
-    assert all(r.control is not None and r.data is not None for r in runs[1:])
+    assert all(r.control is not None and r.data is not None for r in runs[1:3])
+    assert runs[3].control is None and runs[3].data is not None
+
+
+def test_precomputed_dedup_is_1x_without_controller_records():
+    from dedup_sim.workload.scenarios import Dedup as DedupScenario
+
+    runs = DedupScenario(num_readers=4, caps=()).runs()
+    baseline = runs[0].execute(quiet=True)
+    precomputed = runs[1].execute(quiet=True)
+
+    assert baseline.ledger.origin_bytes == 4 * PAYLOAD_BYTES
+    assert precomputed.ledger.origin_bytes == PAYLOAD_BYTES
+    assert precomputed.ledger.transfer_bytes == 4 * PAYLOAD_BYTES
+    assert precomputed.sim.mesh.directory.service.keys() == []
 
 
 # --------------------------------------------------------------------------

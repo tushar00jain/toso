@@ -48,11 +48,23 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import cached_property
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 from realsim.adapters.real_client import RealClientAdapter
 from realsim.adapters.real_controller import make_controller_adapter
 from realsim.seams import factory
+from realsim.seams.link import LocalEndpoint, ServiceHop
 from realsim.seams.transport import Endpoint, InMemoryTransport
 from realsim.seams.volume_handle import LocalVolumeHandle
 from realsim.seams.volume_service import VolumeService
@@ -65,10 +77,43 @@ from sim_common.resources import ResourceRegistry
 from sim_common.trace import Trace
 from torchstore.client import LocalClient
 
-__all__ = ["OnTransfer", "Mesh"]
+__all__ = ["LocalActorMesh", "Mesh", "OnTransfer"]
 
 # A transfer-accounting callback: (kind, src_id, dst_id, nbytes, cost).
 OnTransfer = Callable[[str, str, str, int, float], None]
+_Handle = TypeVar("_Handle")
+
+
+class LocalActorMesh(Generic[_Handle]):
+    """In-process equivalent of a spawned Monarch service mesh.
+
+    It owns one endpoint-shaped handle per rank and exposes the named collective
+    endpoints across all of them. Application-specific service and handle types
+    remain in their seam modules.
+    """
+
+    def __init__(
+        self,
+        handles: Mapping[str, _Handle],
+        collective_endpoints: Sequence[str],
+        *,
+        hop: Optional[ServiceHop] = None,
+    ) -> None:
+        self.handles = dict(handles)
+        self.hop = hop if hop is not None else ServiceHop()
+        for member in collective_endpoints:
+            setattr(self, member, LocalEndpoint(self._fanout(member), self.hop))
+
+    def _fanout(self, member: str) -> Callable[..., None]:
+        def send(*args: Any, **kwargs: Any) -> None:
+            for handle in self.handles.values():
+                getattr(handle, member).broadcast(*args, **kwargs)
+
+        return send
+
+    def for_rank(self, rank: str) -> _Handle:
+        """Return the service handle for one logical rank."""
+        return self.handles[rank]
 
 
 class Mesh:
@@ -153,8 +198,12 @@ class Mesh:
                 profile=self.profile,
                 trace=self.trace,
                 registry=self.registry,
+                on_transfer=self._dispatch_transfer,
             )
             for vid in self.ids
+        }
+        self._adapters_by_endpoint = {
+            self.topology[vid]: self.adapters[vid] for vid in self.ids
         }
 
     # -- accessors ---------------------------------------------------------- #
@@ -220,14 +269,8 @@ class Mesh:
 
     def _build(self, storage_volume_ref) -> InMemoryTransport:
         """The shared ``create_transport_buffer``: one transport per operation."""
-        return InMemoryTransport(
-            storage_volume_ref,
-            src=factory.current_source(),
-            dst=self.topology[storage_volume_ref.volume_id],
-            profile=self.profile,
-            trace=self.trace,
-            on_transfer=self._dispatch_transfer,
-            registry=self.registry,
+        return self._adapters_by_endpoint[factory.current_source()].transport(
+            storage_volume_ref
         )
 
     @contextmanager

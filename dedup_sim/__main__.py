@@ -16,6 +16,8 @@ directory + **real** client/transport (via ``realsim``):
   * ``weight_sync`` -- one key, two trainer replicas holding it. The chain leaves one
     replica idle and queues the second generator behind the first; ``spread`` sends one
     generator to each, for 1x per replica and one hop of depth.
+  * ``option_b`` -- Qwen3.6-27B with TP=4 and DP=2, comparing direct trainer
+    reads with fixed local routes and readiness-signaled generator read-through.
 
 The comparisons themselves -- which runs, and how they are narrated -- are
 :mod:`dedup_sim.workload.scenarios`. This file only declares the demo.
@@ -30,11 +32,11 @@ from __future__ import annotations
 
 from realsim.demo import Console, Demo
 
-from .workload.scenarios import Dedup, WeightSync
+from .workload.scenarios import Dedup, OptionBScenario, WeightSync
 
 
 class DedupDemo(Demo):
-    """The dedup demo: one burst, two comparisons -- one holder, then two."""
+    """Dedup routing plus the fixed-route Option B weight-sync comparison."""
 
     name = "dedup_sim"
     description = (
@@ -42,11 +44,12 @@ class DedupDemo(Demo):
         "synchronized read burst under the naive baseline and the dedup selector "
         "(chain + tree), and -- over a key two trainer replicas hold -- against a "
         "load-spread variant of the same chain, printing the fabric summary + ASCII "
-        "diagram (INFO) and, with -v, the full per-event virtual-time trace (DEBUG)."
+        "diagram (INFO) and, with -v, the full per-event virtual-time trace (DEBUG). "
+        "Also includes the precomputed application-managed Option B path."
     )
 
     def scenarios(self):
-        return [Dedup(), WeightSync()]
+        return [Dedup(), WeightSync(), OptionBScenario()]
 
     def takeaway(self, console: Console) -> None:
         console.section("TAKEAWAY")

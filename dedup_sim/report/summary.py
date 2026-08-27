@@ -15,7 +15,13 @@ from typing import Sequence
 from realsim.run import Report, Result
 from sim_common.report import render_tree
 
-__all__ = ["BaselineReport", "DedupReport", "WeightSyncReport"]
+__all__ = [
+    "BaselineReport",
+    "DedupReport",
+    "OptionBReport",
+    "PrecomputedDedupReport",
+    "WeightSyncReport",
+]
 
 
 class DedupReport(Report):
@@ -75,6 +81,32 @@ class BaselineReport(Report):
         ])
 
 
+class PrecomputedDedupReport(Report):
+    """Precomputed Option B routing against the same logical dedupe burst."""
+
+    def __init__(self, precomputed: Result, naive: Result) -> None:
+        self.precomputed = precomputed
+        self.naive = naive
+
+    def render(self) -> str:
+        result, naive = self.precomputed, self.naive
+        payload = result.workload.payload_bytes
+        lines = [
+            f"readers: {result.workload.num_readers}   payload: {payload}B",
+            f"fabric off origin: precomputed={result.ledger.origin_bytes}B "
+            f"({result.ledger.origin_bytes / payload:.1f}x)   "
+            f"naive={naive.ledger.origin_bytes}B "
+            f"({naive.ledger.origin_bytes / payload:.1f}x)",
+            f"total delivered: precomputed={result.ledger.transfer_bytes}B   "
+            f"naive={naive.ledger.transfer_bytes}B",
+            f"wallclock: precomputed={result.ledger.wallclock:.4f}   "
+            f"naive={naive.ledger.wallclock:.4f}",
+            "source->dest (fixed before the burst):",
+        ]
+        lines += ["    " + line for line in render_tree(result.ledger.edges)]
+        return "\n".join(lines)
+
+
 class WeightSyncReport(Report):
     """The three routings of one weight-sync burst, side by side.
 
@@ -123,4 +155,34 @@ class WeightSyncReport(Report):
         for result in self.results:
             rows.append(f"  source->dest, {result.label}:")
             rows += ["    " + line for line in render_tree(result.ledger.edges)]
+        return "\n".join(rows)
+
+
+class OptionBReport(Report):
+    """Direct trainer reads versus the precomputed generator-relay path."""
+
+    def __init__(self, results: Sequence[Result]) -> None:
+        self.results = list(results)
+
+    def render(self) -> str:
+        workload = self.results[0].workload
+        rows = [
+            f"model: {workload.payload_bytes / 1e9:.1f} GB   "
+            f"TP={workload.tensor_parallel}   DP={workload.data_parallel}",
+            f"  {'path':24}{'trainer bytes':>16}{'relay bytes':>16}"
+            f"{'completion':>14}",
+        ]
+        for result in self.results:
+            trainer = result.ledger.origin_bytes
+            relay = result.ledger.transfer_bytes - trainer
+            rows.append(
+                f"  {result.label:24}{trainer / 1e9:>12.1f} GB"
+                f"{relay / 1e9:>12.1f} GB{result.ledger.wallclock:>12.3f} s"
+            )
+        rows += [
+            "",
+            "Option B builds the routes once from TensorSlice metadata. During an",
+            "update, each rank performs a local lookup; readiness broadcasts carry",
+            "no tensor bytes, and peers fetch from the precomputed generator source.",
+        ]
         return "\n".join(rows)

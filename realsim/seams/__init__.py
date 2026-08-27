@@ -29,6 +29,10 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
 - ``dispatcher_handle.LocalDispatcherHandle`` -- the same for a dispatcher
   (``dispatch``), at that same distance: it is held by the control plane whose sensors
   it folds into.
+- ``option_b_service.OptionBService`` and
+  ``option_b_handle.LocalOptionBServiceHandle`` -- local server/handle stand-ins
+  for the production Option B actor. ``realsim.mesh.LocalActorMesh`` provides its
+  mesh-wide endpoint broadcasts.
 
 Each pair is a server and a reference to it, split because they are different
 shapes: a service has methods, a reference has endpoints, and in a deployment the
