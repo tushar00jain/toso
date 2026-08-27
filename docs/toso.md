@@ -149,6 +149,17 @@ key -> indexed TensorSlice geometries -> source volumes ordered by cost
 3. Each matched geometry has a list of live trainer and pending-generator sources
    ordered by the cost function defined below.
 
+The ordering uses a cost such as:
+
+$$
+\text{cost} = \text{readiness wait} + \text{transfer time}
+              + \text{source load} + \text{fabric penalty}
+$$
+
+The selected source's load is recorded before the next decision. A live trainer can
+serve immediately. If a pending generator is selected, the requester waits until that
+generator has the data.
+
 Trainer publication:
 
 ```text
@@ -192,17 +203,6 @@ through it. The resulting data-plane load is:
 | Trainer rank | $\Theta(G)$ | $0$ | $\lvert Q\rvert/\mathrm{DP}$ on average |
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
-
-The ordering uses a cost such as:
-
-$$
-\text{cost} = \text{readiness wait} + \text{transfer time}
-              + \text{source load} + \text{fabric penalty}
-$$
-
-The selected source's load is recorded before the next decision. A live trainer can
-serve immediately. If a pending generator is selected, the requester waits until that
-generator has the data.
 
 Callers only invoke `get`. The same mechanism can be reused as part of a KV-cache implementation.
 
