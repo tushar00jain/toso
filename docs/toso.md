@@ -208,27 +208,31 @@ Callers only invoke `get`. The same mechanism can be reused as part of a KV-cach
 
 ### Option B: precompute direct transfer in the application
 
-Exchange trainer and generator shard metadata once, compute direct sender-to-receiver
-routes, and reuse them for every update. One generator per TP shard receives the
-trainer data and redistributes it to the other DP replicas.
+Build a route table once from the trainer and generator `TensorSlice` layouts:
 
-At each update, trainer ranks place the planned slices in their local transport
-buffers. After a trainer-side barrier, trainer rank 0 sends the snapshot version to
-the generator coordinator, which tells the elected generators to pull over the
-precomputed routes. The generators redistribute the received slices within their DP
-groups and install the new weights. TorchStore stores no per-update state and is not
-called.
+```text
+generator TensorSlice -> overlapping trainer TensorSlices -> fixed transfer routes
+```
 
-The application-managed path performs no controller snapshot publication, lookup, or
-reshard planning per update:
+1. The shard geometry determines the source and destination byte ranges.
+2. When several trainer volumes hold the same slice, assign one during setup to
+   balance trainer egress.
+3. For each replicated generator slice, route one copy from the trainers and the
+   remaining copies from that generator to its DP peers.
+
+No dynamic cost function is needed: sharding determines the routes, and trainer load
+is balanced once during setup. The route table is distributed; each trainer and
+generator stores only its local send and receive entries. There is no per-update
+controller lookup, route computation, or TorchStore call; each rank traverses its
+saved local routes. Each generator executes its assigned part of the saved plan for every
+snapshot:
 
 | Operation | Current path | Application-managed path |
 | --- | ---: | ---: |
 | Controller snapshot publication | $O(G\lvert Q\rvert)$ | $0$ per update |
-| Controller lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $0$ per update |
+| Route selection and reshard planning | $O(\lvert Q\rvert G^2)$ controller work | $O(\lvert Q\rvert)$ local work per rank |
 
-If the direct routes balance trainer egress across the trainer ranks, the data-plane
-load is:
+The resulting data-plane load is:
 
 | Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
@@ -236,13 +240,5 @@ load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
-For the Qwen3.6-27B configuration, four fan-in/out generators each receive
-$\lvert Q\rvert$ slices from trainer ranks and send $\lvert Q\rvert$ slices to one DP
-peer. The other four generators each receive $\lvert Q\rvert$ slices from those
-generators. Before updates begin, the application creates an architecture-independent
-transfer plan from the trainer and generator shard specifications. Each generator
-executes its assigned part of that plan for every snapshot.
-
-This path removes the TorchStore control plane from steady-state weight updates. The
-application instead manages route setup and the transfer lifecycle. This remains a
-weight-transfer subsystem rather than a general cache solution.
+This path removes the TorchStore control plane. This remains a weight-transfer subsystem
+rather than a general cache solution.
