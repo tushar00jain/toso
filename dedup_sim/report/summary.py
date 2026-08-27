@@ -18,7 +18,7 @@ from sim_common.report import render_tree
 __all__ = [
     "BaselineReport",
     "DedupReport",
-    "OptionBReport",
+    "RoutingReport",
     "PrecomputedDedupReport",
     "WeightSyncReport",
 ]
@@ -82,7 +82,7 @@ class BaselineReport(Report):
 
 
 class PrecomputedDedupReport(Report):
-    """Precomputed Option B routing against the same logical dedupe burst."""
+    """Precomputed routing against the same logical dedupe burst."""
 
     def __init__(self, precomputed: Result, naive: Result) -> None:
         self.precomputed = precomputed
@@ -158,7 +158,7 @@ class WeightSyncReport(Report):
         return "\n".join(rows)
 
 
-class OptionBReport(Report):
+class RoutingReport(Report):
     """Direct trainer reads versus the precomputed generator-relay path."""
 
     def __init__(self, results: Sequence[Result]) -> None:
@@ -181,7 +181,7 @@ class OptionBReport(Report):
             )
         rows += [
             "",
-            "Option B builds the routes once from TensorSlice metadata. During an",
+            "Routing builds the routes once from TensorSlice metadata. During an",
             "update, each rank performs a local lookup; readiness broadcasts carry",
             "no tensor bytes, and peers fetch from the precomputed generator source.",
         ]

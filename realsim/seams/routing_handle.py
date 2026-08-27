@@ -1,21 +1,21 @@
-"""Local handle and actor-mesh stand-ins for Option B services."""
+"""Local handle and actor-mesh stand-ins for routing services."""
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
 from realsim.seams.link import LocalEndpoint, ServiceHop
-from realsim.seams.option_b_service import OptionBService
+from realsim.seams.routing_service import RoutingService
 
-__all__ = ["LocalOptionBServiceHandle"]
+__all__ = ["LocalRoutingServiceHandle"]
 
 
-class LocalOptionBServiceHandle:
-    """Endpoint-shaped reference to one local Option B service."""
+class LocalRoutingServiceHandle:
+    """Endpoint-shaped reference to one local routing service."""
 
     def __init__(
         self,
-        service: OptionBService,
+        service: RoutingService,
         *,
         hop: Optional[ServiceHop] = None,
     ) -> None:
@@ -27,5 +27,5 @@ class LocalOptionBServiceHandle:
         self.notify_ready = LocalEndpoint(service.notify_ready, self.hop)
 
     @property
-    def option_b(self) -> Any:
-        return self.service.option_b
+    def routing(self) -> Any:
+        return self.service.routing

@@ -34,18 +34,18 @@ from ..data.read_through import ReadThroughPlane
 from ..report.summary import (
     BaselineReport,
     DedupReport,
-    OptionBReport,
     PrecomputedDedupReport,
+    RoutingReport,
     WeightSyncReport,
 )
-from ._option_b import _dedup_option_b_run, _option_b_runs
+from ._routing import _dedup_routing_run, _routing_runs
 from ._weight_sync import WeightSync as WeightSyncWorkload
 
 __all__ = [
     "NUM_READERS",
     "FANOUT_CAPS",
     "Dedup",
-    "OptionBScenario",
+    "RoutingScenario",
     "WeightSync",
 ]
 
@@ -114,7 +114,7 @@ class Dedup(Scenario):
                     trace=trace,
                 )
             )
-        runs.append(_dedup_option_b_run(burst))
+        runs.append(_dedup_routing_run(burst))
         return runs
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
@@ -146,7 +146,7 @@ class Dedup(Scenario):
             assert result.ledger.origin_bytes == payload
             assert naive.ledger.origin_bytes == num_readers * payload
 
-        console.section("PRECOMPUTED dedupe  --  Option B")
+        console.section("PRECOMPUTED dedupe  --  routing")
         console.trace(precomputed.trace, label="precomputed run")
         console.summary(PrecomputedDedupReport(precomputed, naive))
 
@@ -211,16 +211,16 @@ class WeightSync(Scenario):
         console.summary(WeightSyncReport(results))
 
 
-class OptionBScenario(Scenario):
+class RoutingScenario(Scenario):
     """Qwen3.6-27B direct reads versus fixed application-managed routes."""
 
-    name = "option_b"
+    name = "routing"
 
     def runs(self, args=None) -> List[Run]:
-        return _option_b_runs()
+        return _routing_runs()
 
     def show(self, console: Console, results: Sequence[Result]) -> None:
-        console.section("OPTION B  --  precomputed local weight-transfer routes")
+        console.section("ROUTING  --  precomputed local weight-transfer routes")
         for result in results:
             console.trace(result.trace, label=f"{result.label} run")
-        console.summary(OptionBReport(results))
+        console.summary(RoutingReport(results))

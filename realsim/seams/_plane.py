@@ -30,7 +30,8 @@ def mount_endpoints(service: Any, target: Any) -> Tuple[str, ...]:
         bound = getattr(target, name)
         if not callable(bound):
             declared = inspect.getattr_static(type(target), name)
-            bound = declared._method.__get__(target, type(target))
+            method = getattr(declared._method, "__wrapped__", declared._method)
+            bound = method.__get__(target, type(target))
         setattr(service, name, bound)
     return names
 

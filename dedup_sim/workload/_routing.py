@@ -1,4 +1,4 @@
-"""Real-TorchStore simulation adapter and Qwen workload for Option B routes."""
+"""Real-TorchStore simulation adapter and Qwen workload for precomputed routes."""
 
 from __future__ import annotations
 
@@ -7,21 +7,22 @@ import math
 from typing import List
 
 import torch
+from torchstore.routing import (
+    RoutingClient,
+    RoutingPlan,
+)
+from torchstore.routing import (
+    RoutingService as ProductionRoutingService,
+)
 from torchstore.transport.types import TensorSlice
 
-from dedup_sim.option_b import (
-    OptionBClient,
-    OptionBPlan,
-    OptionBService as ProductionOptionBService,
-)
 from putget_sim.workload.put_get import FLOPS_PER_ELEMENT, KEY, PutGetBurst
 from realsim.mesh import LocalActorMesh
-from realsim.run import Run
-from realsim.run import Workload
+from realsim.run import Run, Workload
 from realsim.runner import ItemDispatch, WorkItem
-from realsim.seams.option_b_handle import LocalOptionBServiceHandle
-from realsim.seams.option_b_service import OptionBService
-from sim_common.cost_model import compute_time, MachineProfile
+from realsim.seams.routing_handle import LocalRoutingServiceHandle
+from realsim.seams.routing_service import RoutingService
+from sim_common.cost_model import MachineProfile, compute_time
 from sim_common.topology import Tier
 
 from ._weight_sync import WeightSync
@@ -52,7 +53,7 @@ def _profile() -> MachineProfile:
     )
 
 
-class _OptionBWeightSync(WeightSync):
+class _RoutingWeightSync(WeightSync):
     """Qwen3.6-27B represented as four TP shard keys, each with two readers."""
 
     tensor_parallel = _TP
@@ -79,7 +80,7 @@ class _OptionBWeightSync(WeightSync):
     def snapshots(self):
         return {rank: self.snapshot for rank in self.trainer_ids}
 
-    def option_b(self, *, relay_replicas: bool = True) -> OptionBPlan:
+    def routing(self, *, relay_replicas: bool = True) -> RoutingPlan:
         shard_elements = _QWEN_ELEMENTS // _TP
         full = TensorSlice(
             offsets=(0,),
@@ -104,7 +105,7 @@ class _OptionBWeightSync(WeightSync):
             )
             key = _KEYS[tp_rank]
             requesters[rank] = {key: (tensor_slice,)}
-        return OptionBPlan.build(
+        return RoutingPlan.build(
             publishers,
             requesters,
             element_sizes,
@@ -118,11 +119,11 @@ class _OptionBWeightSync(WeightSync):
         ]
 
     async def prepare(self, sim) -> None:
-        """Trainer publication is performed through the Option B client."""
+        """Trainer publication is performed through the routing client."""
 
 
-class _OptionBBurst(Workload):
-    """The ordinary dedupe burst expressed as one precomputed Option B plan."""
+class _RoutingBurst(Workload):
+    """The ordinary dedupe burst expressed as one precomputed routing plan."""
 
     def __init__(self, burst: PutGetBurst) -> None:
         super().__init__(burst.topology)
@@ -133,9 +134,7 @@ class _OptionBBurst(Workload):
         self.expected = (
             burst.expected
             if isinstance(burst.expected, torch.Tensor)
-            else torch.empty(
-                burst.descriptor.shape, dtype=burst.dtype, device="meta"
-            )
+            else torch.empty(burst.descriptor.shape, dtype=burst.dtype, device="meta")
         )
 
     @property
@@ -149,7 +148,7 @@ class _OptionBBurst(Workload):
     def snapshots(self):
         return {"p": {KEY: self.expected}}
 
-    def option_b(self, *, relay_replicas: bool = True) -> OptionBPlan:
+    def routing(self, *, relay_replicas: bool = True) -> RoutingPlan:
         shape = tuple(int(x) for x in self.source.descriptor.shape)
         full = TensorSlice(
             offsets=tuple(0 for _ in shape),
@@ -173,7 +172,7 @@ class _OptionBBurst(Workload):
             for index, rank in enumerate(self.reader_ids)
         }
         element_size = torch.empty(0, dtype=self.source.dtype).element_size()
-        return OptionBPlan.build(
+        return RoutingPlan.build(
             {"p": {KEY: (full,)}},
             requesters,
             {KEY: element_size},
@@ -182,8 +181,7 @@ class _OptionBBurst(Workload):
 
     def items(self, sim) -> List[WorkItem]:
         return [
-            WorkItem(id=rank, release_time=0.0, payload=KEY)
-            for rank in self.reader_ids
+            WorkItem(id=rank, release_time=0.0, payload=KEY) for rank in self.reader_ids
         ]
 
     async def prepare(self, sim) -> None:
@@ -208,11 +206,11 @@ class _OptionBBurst(Workload):
 class _Plane:
     def __init__(self, sim, workload, relay: bool) -> None:
         self.workload = workload
-        self.plan = workload.option_b(relay_replicas=relay)
+        self.plan = workload.routing(relay_replicas=relay)
         service_handles = {
-            rank: LocalOptionBServiceHandle(
-                OptionBService(
-                    ProductionOptionBService(
+            rank: LocalRoutingServiceHandle(
+                RoutingService(
+                    ProductionRoutingService(
                         rank=rank,
                         transport_factory=sim.mesh.adapter(rank).transport_for,
                     )
@@ -220,11 +218,9 @@ class _Plane:
             )
             for rank in self.plan.ranks
         }
-        self.services = LocalActorMesh(
-            service_handles, ("notify_ready",)
-        )
+        self.services = LocalActorMesh(service_handles, ("notify_ready",))
         self.clients = {
-            rank: OptionBClient(
+            rank: RoutingClient(
                 rank,
                 self.plan.for_rank(rank),
                 self.services.for_rank(rank),
@@ -237,7 +233,10 @@ class _Plane:
         # This workload models one shared trainer egress. Reuse the Mesh's
         # existing contention registry even when the demo's optional global
         # fidelity mode is left at its historical "none" default.
-        if isinstance(workload, _OptionBWeightSync) and sim.mesh.registry.mode == "none":
+        if (
+            isinstance(workload, _RoutingWeightSync)
+            and sim.mesh.registry.mode == "none"
+        ):
             sim.mesh.registry.mode = "progressive"
 
     async def _publish(self) -> None:
@@ -258,8 +257,8 @@ def _data(workload: Workload, relay: bool):
     return attach
 
 
-def _option_b_runs() -> List[Run]:
-    workload = _OptionBWeightSync()
+def _routing_runs() -> List[Run]:
+    workload = _RoutingWeightSync()
     return [
         Run(
             "direct current path",
@@ -268,7 +267,7 @@ def _option_b_runs() -> List[Run]:
             profile=workload.profile,
         ),
         Run(
-            "Option B",
+            "routing",
             workload,
             data=_data(workload, True),
             profile=workload.profile,
@@ -276,8 +275,8 @@ def _option_b_runs() -> List[Run]:
     ]
 
 
-def _dedup_option_b_run(burst: PutGetBurst) -> Run:
-    workload = _OptionBBurst(burst)
+def _dedup_routing_run(burst: PutGetBurst) -> Run:
+    workload = _RoutingBurst(burst)
     return Run(
         "precomputed",
         workload,

@@ -9,7 +9,7 @@ real `LocalClient` planning core, the real `Controller` directory and the real i
 transport, all on `realsim`'s deterministic virtual-clock async engine.
 
 The same dedupe scenario now also includes a fixed, application-managed
-`OptionB` run. Its public plan, service, and client classes consume real
+precomputed-routing run. TorchStore's public routing plan, service, and client consume real
 multidimensional `TensorSlice` metadata, compute and distribute the plan once,
 and remove controller lookup and reshard planning from each update. The Qwen
 weight-sync scenario uses the same API.
@@ -196,21 +196,15 @@ dedup_sim/
     read_through.py       #   ReadThroughPlane: apply the flat preference, put, then
                           #   commit Published; a missing source triggers a re-ask
   workload/               # WHAT IS SIMULATED
-    scenarios.py          #   Dedup, WeightSync, and OptionB comparisons
+    scenarios.py          #   Dedup, WeightSync, and routing comparisons
                           #   (the fixture as it is, and with the two planes added)
                           #   + narration
-    _option_b.py           #   Qwen Option B workload + virtual transport adapter
+    _routing.py            #   Qwen routing workload + virtual transport adapter
     _weight_sync.py       #   WeightSync: the same burst over a key that n trainer
                           #   replicas hold, which is where spreading has a choice
-  option_b/               # PRODUCTION-FACING FIXED-ROUTE PROTOTYPE
-    __init__.py            #   exports OptionBPlan, OptionBService, OptionBClient
-    plan.py                #   build, serialize, load, and shard route plans
-    service.py             #   direct-volume I/O and readiness endpoint
-    client.py              #   stable publish/get API
-    _model.py              #   internal TensorSlice metadata and route actions
-    _routing.py            #   internal multidimensional route compiler
+  routing/                # ROUTING NOTES AND INTEGRATED SCENARIO TEST
   report/                 # OUTCOME METRICS
-    summary.py            #   fabric and Option B comparison reports
+    summary.py            #   fabric and routing comparison reports
   __main__.py             # `python -m dedup_sim`: a realsim.Demo declaration
   tests/                  # the dedup-outcome assertions (pytest, deterministic)
 ```
