@@ -86,10 +86,6 @@ With 1,199 keys and eight trainer ranks, the example workload creates
 $1{,}199 \times 8 = 9{,}592$ `(key, volume)` associations per iteration. This is the
 worst case: eight volumes with up to 1,199 keys each.
 
-Snapshot publication therefore scales linearly with the number of directory records
-written. For centralized metadata that materializes each published record, this is the
-necessary lower bound and is acceptable at the current example scale.
-
 ### 2.2 Lookup and reshard planning scan every source
 
 A batched `get_state_dict` then uses one controller call, but that call still performs
@@ -113,24 +109,13 @@ $$
 O\left(\lvert Q \rvert G^2\right)
 $$
 
-This is quadratic in the number of participating ranks at fixed model size.
-
-Using the same full-key upper bound, one generator request can inspect up to 9,592
-trainer-volume records, followed by the corresponding tensor-slice intersection
-checks. Eight generator ranks can drive up to 76,736 such entry visits in one
-synchronized refresh.
+With 1,199 keys, one generator request can inspect up to 9,592 trainer-volume records,
+followed by the corresponding tensor-slice intersection checks. Eight generator ranks
+can drive up to 76,736 such entry visits in one synchronized pull.
 
 ### 2.3 Deterministic source selection creates a hot source
 
-In the example workload, every generator reads its requested slices directly from the
-trainer ranks. The trainer ranks collectively serve all generator requests; generator
-ranks do not serve slices to one another.
-
-Equivalent volumes are storage volumes that can serve the same requested
-`TensorSlice`. They exist when trainer DP ranks publish replicated slices. They could
-also arise when a generator fetching a slice publishes its local copy so later
-generators can read through it, but the current weight-sync path does not register
-in-flight generator copies or route later reads through them.
+In the current path, generators read their requested slices only from trainer ranks.
 
 Under the uniform assumptions, the load is:
 
@@ -140,10 +125,8 @@ Under the uniform assumptions, the load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
-The trainer ranks collectively serve $G\lvert Q\rvert$ slices. Deterministic source
-selection can still skew this load when several volumes hold equivalent slices: one
-volume can serve all $G$ requests for a replicated slice while its equivalents remain
-idle.
+The trainer ranks serve all $G\lvert Q\rvert$ slices, while generators that could
+relay fetched slices remain idle.
 
 ## 3. Two solution paths
 
