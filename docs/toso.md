@@ -130,38 +130,41 @@ relay fetched slices remain idle.
 
 ## 3. Two solution paths
 
-### Option A: reuse indexed layouts and select sources by cost
+### Option A: change the per-key index and select sources by cost
 
-1. Index `TensorSlice` geometry independently from the volumes that currently hold
-   it. The controller can then find overlapping regions and reuse reshard geometry
-   across keys and snapshot versions with the same layout.
-2. Choose between a trainer that already holds the slice and a generator that is
-   fetching it and has promised to publish a copy. Rank them by assigned-request load
-   and network-transfer cost, waiting if the selected generator is still pending.
+Change the directory layout from:
 
-For the controller-cost table, $S = \max_{k \in Q} S_k$ is the largest number of
-`TensorSlice` records stored for any requested key. The index contains at most $S$
-distinct `TensorSlice` geometries per key because replicas can store duplicate
-geometries. Building the ordered index for a new layout costs $O(S\log S)$; later
-snapshots with the same layout reuse it. Since $D_k=O(1)$, each candidate
-`TensorSlice` intersection check costs $O(1)$. A source-cost index maintains the
-eligible volumes in cost order. Adding a source or changing its readiness or assigned
-load costs $O(\log G)$, as does selecting and updating a source. Across all $G$
-generator batches, source selection therefore costs $O(G\log G)$. The same index
-serves every key with the same placement, so this cost is not multiplied by
-$\lvert Q\rvert$.
+```text
+key -> volume -> TensorSlice
+```
+
+to:
+
+```text
+key -> indexed TensorSlice geometries -> source volumes ordered by cost
+```
+
+1. Indexed `TensorSlice` geometries return only slices that overlap the request.
+2. Each matched geometry has a list of live trainer and pending-generator sources
+   ordered by the cost function defined below.
+
+Let $S = \max_{k \in Q} S_k$. Building the geometry index for a new layout costs
+$O(S\log S)$; later snapshots reuse it. The interval index takes $O(\log S)$ to
+locate candidates, so each of the $G\lvert Q\rvert$ key lookups costs $O(\log S)$.
+Selecting or updating one source in the ordered list costs $O(\log G)$.
+With a bounded number of selected sources for each of the $G$ requests, this adds
+$O(G\log G)$.
 
 The snapshot must be published and generator plans produced before the corresponding
 data transfers can proceed:
 
 | Operation | Current path | Indexed path |
 | --- | ---: | ---: |
-| Snapshot publication | $O(G\lvert Q\rvert)$ | $O(G\lvert Q\rvert + S\log S + G\log G)$ |
+| Snapshot publication | $O(G\lvert Q\rvert)$ | $O(G\lvert Q\rvert + G\log G)$ |
 | Lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $O(G\lvert Q\rvert\log S + G\log G)$ |
 
-If trainer egress is balanced across the trainer ranks, one generator per TP shard
-fetches from the trainers and the other DP replicas read through it. The resulting
-data-plane load is:
+One generator per TP shard fetches from the trainers, and the other DP replicas read
+through it. The resulting data-plane load is:
 
 | Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
@@ -173,10 +176,6 @@ data-plane load is:
 
 The trainer-publication and generator read-through flows are shown in the
 [appendix](#appendix).
-
-The geometry index maps each requested `TensorSlice` to a shared set of live trainer
-and pending-generator volumes. Each source set maintains those volumes in cost order;
-publication, routing, and completion events update it in $O(\log G)$.
 
 The ordering uses a cost such as:
 
