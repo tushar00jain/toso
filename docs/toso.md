@@ -29,7 +29,8 @@ The representative workload uses Qwen3.6-27B on two 8-GPU nodes:
 
 Transfer-time estimates use:
 
-- Trainer $\rightarrow$ generator: InfiniBand/RDMA at $200\ \mathrm{Gb/s}=25\ \mathrm{GB/s}$ per node.
+- Trainer $\rightarrow$ generator: InfiniBand/RDMA at $25\ \mathrm{GB/s}$ per node.
+- CPU-staged trainer $\rightarrow$ generator: $17.5\ \mathrm{GB/s}$ effective bandwidth.
 - Generator $\rightarrow$ generator: NVLink/NVSwitch at $1.8\ \mathrm{TB/s}$ bidirectional, or $900\ \mathrm{GB/s}$ one way, per GPU.
 
 Each iteration publishes one new snapshot from the trainer ranks and distributes it
@@ -133,9 +134,9 @@ Under the uniform assumptions, the load is:
 The completion time is:
 
 $$
-\frac{\mathrm{DP}\,M}{25\ \mathrm{GB/s}}
-= \frac{2(55.6\ \mathrm{GB})}{25\ \mathrm{GB/s}}
-= 4.448\ \mathrm{s}.
+\frac{\mathrm{DP}\,M}{17.5\ \mathrm{GB/s}}
+= \frac{2(55.6\ \mathrm{GB})}{17.5\ \mathrm{GB/s}}
+= 6.354\ \mathrm{s}.
 $$
 
 The trainer ranks serve all $G\lvert Q\rvert$ slices, while generators that could
@@ -220,10 +221,10 @@ through it. The resulting data-plane load is:
 The completion time is:
 
 $$
-\frac{M}{25\ \mathrm{GB/s}}
+\frac{M}{17.5\ \mathrm{GB/s}}
   + \frac{M/\mathrm{TP}}{900\ \mathrm{GB/s}}
-= 2.224\ \mathrm{s} + 0.015\ \mathrm{s}
-\approx 2.239\ \mathrm{s}.
+= 3.177\ \mathrm{s} + 0.015\ \mathrm{s}
+\approx 3.193\ \mathrm{s}.
 $$
 
 Callers only invoke `get`. The same mechanism can be reused as part of a KV-cache implementation.
@@ -262,7 +263,7 @@ The resulting data-plane load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
-The transfer time is the same as Option A: approximately $2.239\ \mathrm{s}$.
+The transfer time is the same as Option A: approximately $3.193\ \mathrm{s}$.
 
 This path removes the TorchStore control plane. This remains a weight-transfer subsystem
 rather than a general cache solution.
