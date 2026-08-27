@@ -123,9 +123,9 @@ synchronized refresh.
 
 ### 2.3 Deterministic source selection creates a hot source
 
-Replicas do not spread traffic by themselves. In the worst case, deterministic
-ordering sends one slice for every requested key to the same storage volume. That
-volume serves all generator requests while the other equivalent volumes remain idle.
+In the example workload, every generator reads its requested slices directly from the
+trainer ranks. The trainer ranks collectively serve all generator requests; generator
+ranks do not serve slices to one another.
 
 Equivalent volumes are storage volumes that can serve the same requested
 `TensorSlice`. They exist when trainer DP ranks publish replicated slices. They could
@@ -139,17 +139,19 @@ $$
 Q_g = Q \quad \forall g.
 $$
 
-The entries count logical slice deliveries and assume one equal-cost slice per
-requested key:
+The entries count logical slice deliveries, assume one equal-cost slice per requested
+key, and use $T=\Theta(G)$:
 
-| Role | Count | Ingress per rank or volume | Egress per rank or volume |
+| Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
-| Hot source volume | $1$ | $0$ | $G\lvert Q\rvert$ |
-| Other equivalent source volumes | All remaining | $0$ | $0$ |
-| Generator rank | $G$ | $\lvert Q\rvert$ | $0$ |
+| Trainer rank | $\Theta(G)$ | $0$ | $\lvert Q\rvert$ on average |
+| Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
+| Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
-The total serving work is $G\lvert Q\rvert$, but concentrating it on one volume keeps
-source capacity from scaling with the number of available replicas.
+The trainer ranks collectively serve $G\lvert Q\rvert$ slices. Deterministic source
+selection can still skew this load when several volumes hold equivalent slices: one
+volume can serve all $G$ requests for a replicated slice while its equivalents remain
+idle.
 
 ## 3. Two solution paths
 
@@ -198,16 +200,16 @@ data transfers can proceed:
 | Snapshot publication | $O(G\lvert Q\rvert)$ | $O(G\lvert Q\rvert + S\log S + G\log G)$ |
 | Lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $O(G\lvert Q\rvert\log S + G\log G)$ |
 
-Using the logical slice unit from section 2.3, consider the representative workload,
-where $\mathrm{DP}=2$, $G=\mathrm{TP}\,\mathrm{DP}$, and trainer egress is balanced
-across the $T$ trainer ranks. For each TP shard, one generator fetches from the
-trainers and its DP peer reads through it. The resulting data-plane load is:
+Using the logical slice unit from section 2.3, assume
+$G=\mathrm{TP}\,\mathrm{DP}$ and that trainer egress is balanced across the $T$
+trainer ranks. For each TP shard, one generator fetches from the trainers and the
+other DP replicas read through it. The resulting data-plane load is:
 
 | Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
-| Trainer rank | $T$ | $0$ | $G\lvert Q\rvert/(2T)$ on average |
-| Fan-in/out generator | $G/2$ | $\lvert Q\rvert$ | $\lvert Q\rvert$ |
-| Other generator | $G/2$ | $\lvert Q\rvert$ | $0$ |
+| Trainer rank | $\Theta(G)$ | $0$ | $\lvert Q\rvert/\mathrm{DP}$ on average |
+| Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
+| Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
 #### Implementation
 
@@ -254,15 +256,14 @@ reshard planning per update:
 | Controller snapshot publication | $O(G\lvert Q\rvert)$ | $0$ per update |
 | Controller lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $0$ per update |
 
-Using the logical slice unit from section 2.3, consider the representative workload,
-where $\mathrm{DP}=2$, $G=\mathrm{TP}\,\mathrm{DP}$, and the direct routes balance
-trainer egress across the $T$ trainer ranks:
+Using the logical slice unit from section 2.3, assume $G=\mathrm{TP}\,\mathrm{DP}$
+and that the direct routes balance trainer egress across the $T$ trainer ranks:
 
 | Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
-| Trainer rank | $T$ | $0$ | $G\lvert Q\rvert/(2T)$ on average |
-| Fan-in/out generator | $G/2$ | $\lvert Q\rvert$ | $\lvert Q\rvert$ |
-| Other generator | $G/2$ | $\lvert Q\rvert$ | $0$ |
+| Trainer rank | $\Theta(G)$ | $0$ | $\lvert Q\rvert/\mathrm{DP}$ on average |
+| Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
+| Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
 For the Qwen3.6-27B configuration, four fan-in/out generators each receive
 $\lvert Q\rvert$ slices from trainer ranks and send $\lvert Q\rvert$ slices to one DP
