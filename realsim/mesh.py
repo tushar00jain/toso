@@ -267,7 +267,7 @@ class Mesh:
         if self.on_transfer is not None:
             self.on_transfer(kind, src_id, dst_id, nbytes, cost)
 
-    def _build(self, storage_volume_ref) -> InMemoryTransport:
+    def _build(self, storage_volume_ref, _transport_type=None) -> InMemoryTransport:
         """The shared ``create_transport_buffer``: one transport per operation."""
         return self._adapters_by_endpoint[factory.current_source()].transport(
             storage_volume_ref

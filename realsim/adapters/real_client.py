@@ -75,6 +75,11 @@ class FakeStrategy:
             TransportType.Unset,
         )
 
+    def get_transport_type(
+        self, storage_volume_ref: StorageVolumeRef
+    ) -> TransportType:
+        return storage_volume_ref.default_transport_type
+
 
 class RealClientAdapter:
     """Wires a real ``LocalClient`` to the seams.
@@ -118,7 +123,11 @@ class RealClientAdapter:
         self._registry = registry
         self._on_transfer = on_transfer
 
-    def transport(self, storage_volume_ref: StorageVolumeRef) -> InMemoryTransport:
+    def transport(
+        self,
+        storage_volume_ref: StorageVolumeRef,
+        _transport_type: TransportType = TransportType.Unset,
+    ) -> InMemoryTransport:
         """Build this client's transport to one already-resolved volume."""
         return InMemoryTransport(
             storage_volume_ref,
@@ -136,7 +145,7 @@ class RealClientAdapter:
 
     def _transport_factory(
         self,
-    ) -> Callable[[StorageVolumeRef], InMemoryTransport]:
+    ) -> Callable[[StorageVolumeRef, TransportType], InMemoryTransport]:
         return self.transport
 
     @contextmanager

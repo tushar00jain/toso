@@ -21,8 +21,6 @@ class LocalRoutingServiceHandle:
     ) -> None:
         self.service = service
         self.hop = hop if hop is not None else ServiceHop()
-        self.put = LocalEndpoint(service.put, self.hop)
-        self.get = LocalEndpoint(service.get, self.hop)
         self.wait_ready = LocalEndpoint(service.wait_ready, self.hop)
         self.notify_ready = LocalEndpoint(service.notify_ready, self.hop)
 

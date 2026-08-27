@@ -31,8 +31,8 @@ with an in-process stand-in that dispatches back into real TorchStore logic:
   it folds into.
 - ``routing_service.RoutingService`` and
   ``routing_handle.LocalRoutingServiceHandle`` -- local server/handle stand-ins
-  for the production routing actor. ``realsim.mesh.LocalActorMesh`` provides its
-  mesh-wide endpoint broadcasts.
+  for the production routing-readiness actor. Tensor bytes stay in the local
+  routing client; ``realsim.mesh.LocalActorMesh`` provides readiness broadcasts.
 
 Each pair is a server and a reference to it, split because they are different
 shapes: a service has methods, a reference has endpoints, and in a deployment the

@@ -1,4 +1,4 @@
-"""A production routing actor behind local endpoint-shaped handles."""
+"""A production routing-readiness actor behind local endpoint-shaped handles."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ __all__ = ["RoutingService"]
 
 
 class RoutingService:
-    """Expose a production routing actor through the local simulator."""
+    """Expose the production readiness actor through the local simulator."""
 
     def __init__(self, routing: Any) -> None:
         self.routing = routing

@@ -83,12 +83,13 @@ def current_owner() -> Optional[Any]:
 
 @contextmanager
 def installed(
-    factory: Callable[[Any], Any], *, owner: Any
+    factory: Callable[..., Any], *, owner: Any
 ) -> Iterator[None]:
     """Substitute ``create_transport_buffer`` with ``factory`` for the block.
 
     Args:
-        factory: called with a ``StorageVolumeRef``, returns a transport buffer.
+        factory: called with a ``StorageVolumeRef`` and transport type, returns
+            a transport buffer.
         owner: the object claiming the patch, used to report a conflict.
 
     Raises:

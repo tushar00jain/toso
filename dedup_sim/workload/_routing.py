@@ -110,6 +110,7 @@ class _RoutingWeightSync(WeightSync):
             requesters,
             element_sizes,
             relay_replicas=relay_replicas,
+            rank_volumes={rank: rank for rank in publishers | requesters},
         )
 
     def items(self, sim) -> List[WorkItem]:
@@ -177,6 +178,7 @@ class _RoutingBurst(Workload):
             requesters,
             {KEY: element_size},
             relay_replicas=relay_replicas,
+            rank_volumes={rank: rank for rank in ("p", *self.reader_ids)},
         )
 
     def items(self, sim) -> List[WorkItem]:
@@ -212,7 +214,6 @@ class _Plane:
                 RoutingService(
                     ProductionRoutingService(
                         rank=rank,
-                        transport_factory=sim.mesh.adapter(rank).transport_for,
                     )
                 )
             )
@@ -225,6 +226,7 @@ class _Plane:
                 self.plan.for_rank(rank),
                 self.services.for_rank(rank),
                 self.services,
+                transport_factory=sim.mesh.adapter(rank).transport_for,
             )
             for rank in self.plan.ranks
         }

@@ -36,10 +36,11 @@ bandwidth of 17.5 GB/s, and generator relay bandwidth of 900 GB/s:
 55.6 GB / 17.5 GB/s + (55.6 GB / 4) / 900 GB/s = 3.193 s
 ```
 
-The adapter constructs the existing TorchStore transport directly for the
-source volume named by the local route. Trainer publication and generator
-read-through use direct volume puts, and receives use direct volume gets. The
-controller directory remains empty.
+The routing client constructs the existing TorchStore transport directly for
+the volume named by each local route. Trainer publication, generator
+read-through, and receives all use direct volume I/O; the routing service only
+coordinates readiness for each relay update. The controller directory remains
+empty.
 
 The scenario represents the trainer side as one aggregate constrained egress
 endpoint. If trainer ranks have independent links, their assigned segments can
