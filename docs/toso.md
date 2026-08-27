@@ -243,12 +243,20 @@ generator TensorSlice -> overlapping trainer TensorSlices -> fixed transfer rout
 3. For each replicated generator slice, route one copy from the trainers and the
    remaining copies from that generator to its DP peers.
 
+```text
+build_local_routes(all ranks' (key, TensorSlice) metadata)
+  -> local_routes[key] = {operation, peer or group, source slice, destination slice}
+
+trainer publish(snapshot)
+  -> for each local send entry: send(...)
+
+generator get(key, destination)
+  -> for each local receive entry: receive(...)
+  -> if the local table contains a broadcast entry: broadcast(...)
+```
+
 No dynamic cost function is needed: sharding determines the routes, and trainer load
-is balanced once during setup. The route table is distributed; each trainer and
-generator stores only its local send and receive entries. There is no per-update
-controller lookup, route computation, or TorchStore call; each rank traverses its
-saved local routes. Each generator executes its assigned part of the saved plan for every
-snapshot:
+is balanced once during setup. There is no per-update TorchStore call:
 
 | Operation | Current path | Application-managed path |
 | --- | ---: | ---: |
