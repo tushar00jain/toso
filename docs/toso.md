@@ -23,9 +23,14 @@ The representative workload uses Qwen3.6-27B on two 8-GPU nodes:
 
 | Item | Configuration |
 | --- | ---: |
-| Model | 64 layers, 1,199 checkpoint tensor keys, 55.6 GB |
+| Model | 64 layers, 1,199 checkpoint tensor keys, $M=55.6\ \mathrm{GB}$ |
 | Trainer | 8 ranks: $\mathrm{FSDP}=4$, $\mathrm{TP}=2$ |
 | Generator | 8 ranks: $\mathrm{DP}=2$, $\mathrm{TP}=4$; two model replicas |
+
+Transfer-time estimates use:
+
+- Trainer $\rightarrow$ generator: InfiniBand/RDMA at $200\ \mathrm{Gb/s}=25\ \mathrm{GB/s}$ per node.
+- Generator $\rightarrow$ generator: NVLink/NVSwitch at $1.8\ \mathrm{TB/s}$ bidirectional, or $900\ \mathrm{GB/s}$ one way, per GPU.
 
 Each iteration publishes one new snapshot from the trainer ranks and distributes it
 to every generator rank. The calculations below use the checkpoint's 1,199 tensors as
@@ -125,6 +130,15 @@ Under the uniform assumptions, the load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
+The current path transfers both model replicas across the inter-node link. Its
+bandwidth-only completion time is:
+
+$$
+\frac{\mathrm{DP}\,M}{25\ \mathrm{GB/s}}
+= \frac{2(55.6\ \mathrm{GB})}{25\ \mathrm{GB/s}}
+= 4.448\ \mathrm{s}.
+$$
+
 The trainer ranks serve all $G\lvert Q\rvert$ slices, while generators that could
 relay fetched slices remain idle.
 
@@ -204,6 +218,17 @@ through it. The resulting data-plane load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
+One model copy first crosses the inter-node link. After waiting for that fetch, the
+four fan-in/out generators concurrently send their $M/\mathrm{TP}=13.9\ \mathrm{GB}$
+shards over NVLink:
+
+$$
+\frac{M}{25\ \mathrm{GB/s}}
+  + \frac{M/\mathrm{TP}}{900\ \mathrm{GB/s}}
+= 2.224\ \mathrm{s} + 0.015\ \mathrm{s}
+\approx 2.239\ \mathrm{s}.
+$$
+
 Callers only invoke `get`. The same mechanism can be reused as part of a KV-cache implementation.
 
 ### Option B: precompute direct transfer in the application
@@ -239,6 +264,8 @@ The resulting data-plane load is:
 | Trainer rank | $\Theta(G)$ | $0$ | $\lvert Q\rvert/\mathrm{DP}$ on average |
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
+
+The transfer time is the same as Option A: approximately $2.239\ \mathrm{s}$.
 
 This path removes the TorchStore control plane. This remains a weight-transfer subsystem
 rather than a general cache solution.
