@@ -145,8 +145,29 @@ key -> indexed TensorSlice geometries -> source volumes ordered by cost
 ```
 
 1. Indexed `TensorSlice` geometries return only slices that overlap the request.
-2. Each matched geometry has a list of live trainer and pending-generator sources
+2. A completed generator becomes a read-through cache later reads.
+3. Each matched geometry has a list of live trainer and pending-generator sources
    ordered by the cost function defined below.
+
+Trainer publication:
+
+```text
+trainer put_state_dict
+  -> local volume stores TensorSlices
+  -> controller records the trainer volume
+  -> geometry and source-cost indexes update
+```
+
+Generator read-through:
+
+```text
+generator get_state_dict
+  -> register the generator's pending local copy
+  -> find overlapping TensorSlices and select a source by cost
+  -> wait if the selected generator source is still pending
+  -> fetch and reshard into the generator
+  -> store the local copy and mark its publication complete
+```
 
 Let $S = \max_{k \in Q} S_k$. Building the geometry index for a new layout costs
 $O(S\log S)$; later snapshots reuse it. The interval index takes $O(\log S)$ to
@@ -172,11 +193,6 @@ through it. The resulting data-plane load is:
 | Fan-in/out generator | $G/\mathrm{DP}$ | $\lvert Q\rvert$ | $\lvert Q\rvert(\mathrm{DP}-1)$ |
 | Other generator | $G(\mathrm{DP}-1)/\mathrm{DP}$ | $\lvert Q\rvert$ | $0$ |
 
-#### Implementation
-
-The trainer-publication and generator read-through flows are shown in the
-[appendix](#appendix).
-
 The ordering uses a cost such as:
 
 $$
@@ -185,12 +201,10 @@ $$
 $$
 
 The selected source's load is recorded before the next decision. A live trainer can
-serve immediately; selecting a pending generator installs a readiness gate that waits
-for its local publication before returning the plan. The client then executes the plan
-with ordinary `get` and `put` operations.
+serve immediately. If a pending generator is selected, the requester waits until that
+generator has the data.
 
-The same indexed, cost-based source selection can extend to KV-cache placement and
-reuse.
+Callers only invoke `get`. The same mechanism can be reused as part of a KV-cache implementation.
 
 ### Option B: precompute direct transfer in the application
 
@@ -232,30 +246,3 @@ executes its assigned part of that plan for every snapshot.
 This path removes the TorchStore control plane from steady-state weight updates. The
 application instead manages route setup and the transfer lifecycle. This remains a
 weight-transfer subsystem rather than a general cache solution.
-
-## Appendix
-
-### Option A Read-Through Flow
-
-Trainer publication:
-
-```text
-trainer put_state_dict
-  -> local volume stores TensorSlices
-  -> controller records the trainer volume
-  -> geometry and source-cost indexes update
-```
-
-Generator read-through:
-
-```text
-generator get_state_dict
-  -> register the generator's pending local copy
-  -> find overlapping TensorSlices and select a source by cost
-  -> wait if the selected generator source is still pending
-  -> fetch and reshard into the generator
-  -> store the local copy and mark its publication complete
-```
-
-The controller handles metadata only. Tensor bytes move directly between storage
-volumes, and a completed generator read-through becomes a source for later reads.
