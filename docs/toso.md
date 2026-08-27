@@ -44,6 +44,27 @@ Let:
 - $S_k$ be the `TensorSlice` records stored for key $k$ across those volumes;
 - $D_k$ be the number of dimensions in key $k$'s tensor ($D_k=2$ for a matrix).
 
+**Uniform assumption.** Every generator requests the same key set, every trainer
+publishes one slice for each key, every key is stored on a number of volumes
+proportional to the trainer count, each volume contributes one slice, tensor
+dimensionality is bounded, and trainer and generator counts grow together. The
+generator ranks form DP replicas of TP-sharded models:
+
+$$
+Q_g = Q \quad \forall g,
+\qquad
+\lvert P_t\rvert = \lvert Q\rvert \quad \forall t,
+\qquad
+V_k = \Theta(T),\quad S_k = V_k,\quad D_k = O(1)
+\quad \forall k \in Q,
+\qquad
+T = \Theta(G),
+\qquad
+G = \mathrm{TP}\,\mathrm{DP}.
+$$
+
+The data-plane load tables count one equal-cost logical slice per requested key.
+
 ### 2.1 Snapshot publication
 
 The write path inserts or updates every published key and slice in the directory. Its
@@ -53,16 +74,7 @@ $$
 O\left(\sum_t \lvert P_t \rvert\right)
 $$
 
-In the uniform case, every trainer rank publishes exactly one slice for every key in
-$Q$, and trainer and generator counts grow together:
-
-$$
-\lvert P_t\rvert = \lvert Q\rvert \quad \forall t,
-\qquad
-T = \Theta(G).
-$$
-
-The publication cost becomes:
+Under the uniform assumptions, the publication cost becomes:
 
 $$
 O\left(G\lvert Q\rvert\right)
@@ -70,9 +82,9 @@ $$
 
 Replacing or retiring those records has the same scale.
 
-If every trainer rank publishes one slice for each checkpoint tensor, the example
-workload creates $1{,}199 \times 8 = 9{,}592$ `(key, volume)` associations per
-iteration. This is the worst case: eight volumes with up to 1,199 keys each.
+With 1,199 keys and eight trainer ranks, the example workload creates
+$1{,}199 \times 8 = 9{,}592$ `(key, volume)` associations per iteration. This is the
+worst case: eight volumes with up to 1,199 keys each.
 
 Snapshot publication therefore scales linearly with the number of directory records
 written. For centralized metadata that materializes each published record, this is the
@@ -95,26 +107,13 @@ $$
 O\left(\sum_g \sum_{k \in Q_g} \left(V_k + S_k D_k\right)\right)
 $$
 
-In the uniform case, every generator requests the same keys, every key is stored on a
-number of volumes proportional to the trainer count, each volume contributes one
-slice, and tensor dimensionality is bounded:
+Under the uniform assumptions, the burst cost becomes:
 
 $$
-Q_g = Q \quad \forall g,
-\qquad
-V_k = \Theta(T),\quad S_k = V_k,\quad D_k = O(1)
-\quad \forall k \in Q.
+O\left(\lvert Q \rvert G^2\right)
 $$
 
-The burst cost becomes:
-
-$$
-O\left(G \lvert Q \rvert T\right)
-$$
-
-When trainer and generator counts grow together, $T=\Theta(G)$, this becomes
-$O(\lvert Q \rvert G^2)$: quadratic in the number of participating ranks at fixed
-model size.
+This is quadratic in the number of participating ranks at fixed model size.
 
 Using the same full-key upper bound, one generator request can inspect up to 9,592
 trainer-volume records, followed by the corresponding tensor-slice intersection
@@ -133,14 +132,7 @@ also arise when a generator fetching a slice publishes its local copy so later
 generators can read through it, but the current weight-sync path does not register
 in-flight generator copies or route later reads through them.
 
-For the load table, every generator requests the same key set:
-
-$$
-Q_g = Q \quad \forall g.
-$$
-
-The entries count logical slice deliveries, assume one equal-cost slice per requested
-key, and use $T=\Theta(G)$:
+Under the uniform assumptions, the load is:
 
 | Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
@@ -164,22 +156,6 @@ idle.
    fetching it and has promised to publish a copy. Rank them by assigned-request load
    and network-transfer cost, waiting if the selected generator is still pending.
 
-For these estimates, use the uniform case from section 2: every generator requests
-the same key set, every key is stored on a number of volumes proportional to the
-trainer count, each volume contributes one slice, tensor dimensionality is bounded,
-and trainer and generator counts grow together:
-
-$$
-Q_g = Q \quad \forall g,
-\qquad
-\lvert P_t\rvert = \lvert Q\rvert \quad \forall t,
-\qquad
-V_k = \Theta(T),\quad S_k = V_k,\quad D_k = O(1)
-\quad \forall k \in Q,
-\qquad
-T = \Theta(G).
-$$
-
 For the controller-cost table, $S = \max_{k \in Q} S_k$ is the largest number of
 `TensorSlice` records stored for any requested key. The index contains at most $S$
 distinct `TensorSlice` geometries per key because replicas can store duplicate
@@ -200,10 +176,9 @@ data transfers can proceed:
 | Snapshot publication | $O(G\lvert Q\rvert)$ | $O(G\lvert Q\rvert + S\log S + G\log G)$ |
 | Lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $O(G\lvert Q\rvert\log S + G\log G)$ |
 
-Using the logical slice unit from section 2.3, assume
-$G=\mathrm{TP}\,\mathrm{DP}$ and that trainer egress is balanced across the $T$
-trainer ranks. For each TP shard, one generator fetches from the trainers and the
-other DP replicas read through it. The resulting data-plane load is:
+If trainer egress is balanced across the trainer ranks, one generator per TP shard
+fetches from the trainers and the other DP replicas read through it. The resulting
+data-plane load is:
 
 | Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
@@ -256,8 +231,8 @@ reshard planning per update:
 | Controller snapshot publication | $O(G\lvert Q\rvert)$ | $0$ per update |
 | Controller lookup and reshard planning | $O(\lvert Q\rvert G^2)$ | $0$ per update |
 
-Using the logical slice unit from section 2.3, assume $G=\mathrm{TP}\,\mathrm{DP}$
-and that the direct routes balance trainer egress across the $T$ trainer ranks:
+If the direct routes balance trainer egress across the trainer ranks, the data-plane
+load is:
 
 | Role | Count | Ingress per rank | Egress per rank |
 | --- | ---: | ---: | ---: |
