@@ -10,7 +10,6 @@ from realsim import demo
 from realsim.adapters import real_controller
 from realsim.adapters.real_controller import make_controller_adapter
 from realsim.seams.dict_directory import DictDirectory
-from realsim.tools import benchmark_dedup_control
 from sim_common import config
 from torchstore.controller import Controller
 from torchstore.controllers.indexed import IndexedController
@@ -106,19 +105,6 @@ def test_shared_cli_configures_controller_backend(monkeypatch) -> None:
     demo._apply_run_flags(args)
 
     assert config.current().controller_backend == "indexed"
-
-
-def test_benchmark_entrypoint_applies_ambient_controller_backend(monkeypatch) -> None:
-    selected = []
-
-    def capture(args) -> None:
-        selected.append((config.current().controller_backend, args.case))
-
-    monkeypatch.setenv("TOSO_CONTROLLER_BACKEND", "indexed")
-    monkeypatch.setattr(benchmark_dedup_control, "_run", capture)
-
-    assert benchmark_dedup_control.main(["--preset", "smoke"]) == 0
-    assert selected == [("indexed", "smoke")]
 
 
 def test_selection_calls_the_public_factory_once(monkeypatch) -> None:

@@ -1,0 +1,22 @@
+{
+  "workload": {
+    "keys": 290,
+    "source_ranks": 8,
+    "generators": 16,
+    "generator_shards": 8
+  },
+  "variants": {
+    "legacy": {
+      "total_instructions": 1116785512,
+      "peak_python_kib": 300.171875
+    },
+    "legacy-dedup": {
+      "total_instructions": 2458007801,
+      "peak_python_kib": 3634.7578125
+    },
+    "indexed-dedup": {
+      "total_instructions": 2069660538,
+      "peak_python_kib": 3569.9453125
+    }
+  }
+}
