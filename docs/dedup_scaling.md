@@ -29,54 +29,6 @@ the trainer pre-insert. CPU, retired instructions, and memory are separate runs,
 `tracemalloc` cannot affect either CPU timing or instruction counting. Memory mode
 stops at the `70b` preset because tracing larger lifecycles is disproportionately slow.
 
-## Reusable benchmark
-
-```bash
-# Smoke CPU test: all three controller paths.
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control --preset smoke
-
-# Historical legacy CPU table. Rows print as soon as they finish.
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --historical-torchstore-root ../torchstore \
-  --preset suite --variant legacy --metrics cpu --warmups 1 --repeats 3
-
-# Current legacy+dedupe or indexed+dedupe CPU table.
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --variant legacy-dedup --metrics cpu --warmups 0 --repeats 1
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --variant indexed-dedup --metrics cpu --warmups 0 --repeats 1
-
-# Peak Python memory tables, automatically limited through 70b.
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --historical-torchstore-root ../torchstore \
-  --preset suite --variant legacy --metrics memory
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --variant legacy-dedup --metrics memory
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --variant indexed-dedup --metrics memory
-
-# Retired-instruction tables.
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --metrics instructions
-
-# Kimi-K2: 256 trainer ranks to 128 inference ranks.
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --historical-torchstore-root ../torchstore \
-  --preset kimi-k2 --variant legacy --metrics cpu \
-  --warmups 0 --repeats 1 --allow-large
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset kimi-k2 --variant legacy-dedup --metrics cpu \
-  --warmups 0 --repeats 1 --allow-large
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset kimi-k2 --variant indexed-dedup --metrics cpu \
-  --warmups 0 --repeats 1 --allow-large
-
-# One controller path or a custom topology.
-.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --variant indexed-dedup \
-  --keys 1199 --source-ranks 8 --generators 8 --generator-shards 4
-```
-
 ## Benchmark sharding
 
 | Preset | Model class | Keys (`Q`) | Trainer layout | Generator layout |
@@ -145,3 +97,51 @@ Measured from TorchStore commit `5a4d5d3`.
 | `405b` | 111.710 ms | 3.941 s | 3.881 s | 7.934 s | — |
 | `moe` | 229.369 ms | 8.150 s | 8.380 s | 16.759 s | — |
 | `kimi-k2` | 3.338 s | 24.223 s | 15.652 s | 43.213 s | — |
+
+## Reusable benchmark
+
+```bash
+# Smoke CPU test: all three controller paths.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control --preset smoke
+
+# Historical legacy CPU table. Rows print as soon as they finish.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --historical-torchstore-root ../torchstore \
+  --preset suite --variant legacy --metrics cpu --warmups 1 --repeats 3
+
+# Current legacy+dedupe or indexed+dedupe CPU table.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant legacy-dedup --metrics cpu --warmups 0 --repeats 1
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant indexed-dedup --metrics cpu --warmups 0 --repeats 1
+
+# Peak Python memory tables, automatically limited through 70b.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --historical-torchstore-root ../torchstore \
+  --preset suite --variant legacy --metrics memory
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant legacy-dedup --metrics memory
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant indexed-dedup --metrics memory
+
+# Retired-instruction tables.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --metrics instructions
+
+# Kimi-K2: 256 trainer ranks to 128 inference ranks.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --historical-torchstore-root ../torchstore \
+  --preset kimi-k2 --variant legacy --metrics cpu \
+  --warmups 0 --repeats 1 --allow-large
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset kimi-k2 --variant legacy-dedup --metrics cpu \
+  --warmups 0 --repeats 1 --allow-large
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset kimi-k2 --variant indexed-dedup --metrics cpu \
+  --warmups 0 --repeats 1 --allow-large
+
+# One controller path or a custom topology.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --variant indexed-dedup \
+  --keys 1199 --source-ranks 8 --generators 8 --generator-shards 4
+```
