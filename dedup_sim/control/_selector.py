@@ -54,5 +54,4 @@ class Candidates(Selector[frozenset[Publication], float]):
             priced.append((source, wait + hop + self.fabric * hop))
         if not priced:
             return Selection.abstain()
-        priced.sort(key=lambda candidate: (candidate[1], candidate[0]))
         return Selection.priced(priced)

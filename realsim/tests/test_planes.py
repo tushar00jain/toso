@@ -477,7 +477,9 @@ def test_only_an_ordering_link_puts_a_selection_in_an_order():
     """
     keyed = Selection.keyed([("v0", (9,)), ("v1", (2,))])
     assert keyed.sources == ("v0", "v1")            # built, not ranked
-    assert _select(Ordered(Const(keyed))).sources == ("v1", "v0")
+    ordered = _select(Ordered(Const(keyed)))
+    assert ordered.sources == ("v1", "v0")
+    assert ordered.key is keyed.key
     assert _select(Best(Const(keyed))).sources == ("v1",)
     priced = Const(Selection.priced([("v0", 9), ("v1", 2)]))
     assert _select(Ordered(priced)).sources == ("v1", "v0")

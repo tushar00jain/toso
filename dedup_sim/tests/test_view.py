@@ -276,16 +276,18 @@ def test_candidate_wait_ranks_both_pubs_and_greedy_picks_the_faster_one():
     )
 
     selection = candidates.select(serving, "r0")
+    ordered = Ordered(candidates).select(serving, "r0")
 
     fast_arrival = fanout.arrival(fast)
     slow_arrival = fanout.arrival(slow)
     assert fast_arrival is not None
     assert slow_arrival is not None
     assert selection.key is not None
-    assert selection.sources == (fast, slow)
+    assert set(selection.sources or ()) == {fast, slow}
     assert selection.key[fast] == (fast_arrival + 1.0,)
     assert selection.key[slow] == (slow_arrival + 1.0,)
-    assert directory.greedy_cover(requests, selection.sources) == [fast]
+    assert ordered.sources == (fast, slow)
+    assert directory.greedy_cover(requests, ordered.sources) == [fast]
 
 
 def test_publication_arrival_uses_every_chosen_source():

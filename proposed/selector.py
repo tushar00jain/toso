@@ -234,7 +234,16 @@ class Selection(Generic[Unpack[Ks]]):
     ) -> "Selection[_C]":
         """``(id, price)`` pairs, that price standing as the one dimension: cheapest is
         best."""
-        return Selection.keyed([(i, (p,)) for i, p in candidates], ready=ready)
+        sources: list[VolumeId] = []
+        key: dict[VolumeId, Tuple[_C]] = {}
+        for source, price in candidates:
+            sources.append(source)
+            key[source] = (price,)
+        return Selection(
+            sources=_named_once(tuple(sources)),
+            key=key,
+            ready=ready,
+        )
 
     @classmethod
     def universe(cls) -> "Selection[Unpack[Tuple[()]]]":
@@ -733,7 +742,10 @@ def _ordered(answer: Selection[Unpack[Ks]]) -> Selection[Unpack[Ks]]:
     order = _comparable(answer)
     if order is None:
         return answer
-    return answer.only(sorted(answer.sources or (), key=order))
+    return replace(
+        answer,
+        sources=tuple(sorted(answer.sources or (), key=order)),
+    )
 
 
 def _best(answer: Selection[Unpack[Ks]]) -> Selection[Unpack[Ks]]:

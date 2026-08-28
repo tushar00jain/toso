@@ -115,7 +115,7 @@ class Dedup(ControlPlane):
     ) -> ReadPlan:
         assert ranking.sources is not None, "the dedup chain names an explicit order"
         directory = self.sensor(DedupDirectorySensor)
-        chosen = list(directory.greedy_cover(requests, ranking.sources))
+        chosen = directory.greedy_cover(requests, ranking.sources)
         sources = tuple(dict.fromkeys(volume for _pub, volume in chosen))
         fanout = self.sensor(FanoutSensor)
         gate_pubs = _gate_publications(chosen)
