@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dedup_sim.control._sensor import DedupDirectorySensor
 from realsim.tools import benchmark_weight_sync_control as benchmark
+from torchstore import coverage
 
 
 def test_dedup_sample_retires_pending_and_keeps_live_rows() -> None:
@@ -57,3 +58,19 @@ def test_memory_mode_is_separate_and_stops_at_70b(monkeypatch, capsys) -> None:
     output = capsys.readouterr().out
     assert "Peak Python memory" in output
     assert "70b-wide" not in output
+
+
+def test_legacy_lookup_does_not_run_client_coverage(monkeypatch) -> None:
+    workload = benchmark._Workload(
+        benchmark._PRESETS["smoke"], "legacy", fanout_cap=2
+    )
+    try:
+        workload.publish_trainers()
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("legacy benchmark must stop at the controller boundary")
+
+        monkeypatch.setattr(coverage, "cover", fail_if_called)
+        workload.generator_lookups()
+    finally:
+        workload.close()

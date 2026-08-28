@@ -7,8 +7,8 @@
   },
   "variants": {
     "legacy": {
-      "total_instructions": 1116785512,
-      "peak_python_kib": 300.171875
+      "total_instructions": 371084717,
+      "peak_python_kib": 182.296875
     },
     "legacy-dedup": {
       "total_instructions": 2458007801,

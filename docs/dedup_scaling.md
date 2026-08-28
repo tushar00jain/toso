@@ -35,13 +35,25 @@ stops at the `70b` preset because tracing larger lifecycles is disproportionatel
 # Smoke CPU test: all three controller paths.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control --preset smoke
 
-# CPU tables. Rows print as soon as they finish.
+# Historical legacy CPU table. Rows print as soon as they finish.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --metrics cpu --warmups 0 --repeats 1
+  --historical-torchstore-root ../torchstore \
+  --preset suite --variant legacy --metrics cpu --warmups 1 --repeats 3
+
+# Current legacy+dedupe or indexed+dedupe CPU table.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant legacy-dedup --metrics cpu --warmups 0 --repeats 1
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant indexed-dedup --metrics cpu --warmups 0 --repeats 1
 
 # Peak Python memory tables, automatically limited through 70b.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --metrics memory
+  --historical-torchstore-root ../torchstore \
+  --preset suite --variant legacy --metrics memory
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant legacy-dedup --metrics memory
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --variant indexed-dedup --metrics memory
 
 # Retired-instruction tables.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
@@ -49,7 +61,15 @@ stops at the `70b` preset because tracing larger lifecycles is disproportionatel
 
 # Kimi-K2: 256 trainer ranks to 128 inference ranks.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset kimi-k2 --metrics cpu --warmups 0 --repeats 1 --allow-large
+  --historical-torchstore-root ../torchstore \
+  --preset kimi-k2 --variant legacy --metrics cpu \
+  --warmups 0 --repeats 1 --allow-large
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset kimi-k2 --variant legacy-dedup --metrics cpu \
+  --warmups 0 --repeats 1 --allow-large
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset kimi-k2 --variant indexed-dedup --metrics cpu \
+  --warmups 0 --repeats 1 --allow-large
 
 # One controller path or a custom topology.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
@@ -85,18 +105,20 @@ publication.
 | `G` generator completions | — | `O(GQ + ΣWₐ)` | `O(GQ + ΣWₐ)` |
 | Total | `O(QG²)` | `O(QG² + G² log G + ΣWₐ)` | `O(GQ log S + G² log G + ΣWₐ)` |
 
-## Legacy controller, no dedupe
+## Historical legacy controller, no dedupe
+
+Measured from TorchStore commit `5a4d5d3`.
 
 | Model | Trainer publish CPU | `G` lookups CPU | `G` completions CPU | Total CPU | Peak Python memory |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `1b` | 0.738 ms | 9.498 ms | — | 10.254 ms | 116.914 KiB |
-| `8b` | 6.332 ms | 87.982 ms | — | 94.334 ms | 300.172 KiB |
-| `qwen-27b` | 26.623 ms | 242.357 ms | — | 269.002 ms | 1.004 MiB |
-| `70b` | 16.727 ms | 1.009 s | — | 1.026 s | 625.625 KiB |
-| `70b-wide` | 129.706 ms | 17.308 s | — | 17.438 s | — |
-| `405b` | 134.388 ms | 19.076 s | — | 19.210 s | — |
-| `moe` | 278.223 ms | 31.894 s | — | 32.173 s | — |
-| `kimi-k2` | 4.105 s | 455.423 s | — | 459.528 s | — |
+| `1b` | 0.964 ms | 2.907 ms | — | 3.897 ms | 51.453 KiB |
+| `8b` | 8.576 ms | 21.438 ms | — | 30.209 ms | 107.516 KiB |
+| `qwen-27b` | 35.286 ms | 46.699 ms | — | 81.763 ms | 143.328 KiB |
+| `70b` | 20.770 ms | 210.476 ms | — | 231.426 ms | 139.547 KiB |
+| `70b-wide` | 168.061 ms | 3.037 s | — | 3.205 s | — |
+| `405b` | 176.544 ms | 3.738 s | — | 3.914 s | — |
+| `moe` | 361.005 ms | 8.315 s | — | 8.688 s | — |
+| `kimi-k2` | 5.923 s | 130.706 s | — | 136.628 s | — |
 
 ## Legacy controller + dedupe
 
