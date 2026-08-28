@@ -24,21 +24,32 @@ untimed: create fresh controller
 
 Each repeat uses fresh state. The pre-inserted trainer rows model the persistent
 layout from the preceding update; generator rows start empty for the new version.
-Peak Python memory is the additional traced allocation inside the timed lifecycle.
+Peak Python memory is the additional traced allocation in a fresh lifecycle after
+the trainer pre-insert. CPU, retired instructions, and memory are separate runs, so
+`tracemalloc` cannot affect either CPU timing or instruction counting. Memory mode
+stops at the `70b` preset because tracing larger lifecycles is disproportionately slow.
 
 ## Reusable benchmark
 
 ```bash
-# Smoke test: all three controller paths.
+# Smoke CPU test: all three controller paths.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control --preset smoke
 
-# Standard table suite.
+# CPU tables. Rows print as soon as they finish.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset suite --warmups 0 --repeats 1
+  --preset suite --metrics cpu --warmups 0 --repeats 1
+
+# Peak Python memory tables, automatically limited through 70b.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --metrics memory
+
+# Retired-instruction tables.
+.venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
+  --preset suite --metrics instructions
 
 # Kimi-K2: 256 trainer ranks to 128 inference ranks.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
-  --preset kimi-k2 --warmups 0 --repeats 1 --allow-large
+  --preset kimi-k2 --metrics cpu --warmups 0 --repeats 1 --allow-large
 
 # One controller path or a custom topology.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
@@ -78,37 +89,37 @@ publication.
 
 | Model | Trainer publish CPU | `G` lookups CPU | `G` completions CPU | Total CPU | Peak Python memory |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `1b` | 0.738 ms | 9.498 ms | — | 10.254 ms | pending |
-| `8b` | 6.332 ms | 87.982 ms | — | 94.334 ms | pending |
-| `qwen-27b` | 26.623 ms | 242.357 ms | — | 269.002 ms | pending |
-| `70b` | 16.727 ms | 1.009 s | — | 1.026 s | pending |
-| `70b-wide` | 129.706 ms | 17.308 s | — | 17.438 s | pending |
-| `405b` | 134.388 ms | 19.076 s | — | 19.210 s | pending |
-| `moe` | 278.223 ms | 31.894 s | — | 32.173 s | pending |
-| `kimi-k2` | 4.105 s | 455.423 s | — | 459.528 s | pending |
+| `1b` | 0.738 ms | 9.498 ms | — | 10.254 ms | 116.914 KiB |
+| `8b` | 6.332 ms | 87.982 ms | — | 94.334 ms | 300.172 KiB |
+| `qwen-27b` | 26.623 ms | 242.357 ms | — | 269.002 ms | 1.004 MiB |
+| `70b` | 16.727 ms | 1.009 s | — | 1.026 s | 625.625 KiB |
+| `70b-wide` | 129.706 ms | 17.308 s | — | 17.438 s | — |
+| `405b` | 134.388 ms | 19.076 s | — | 19.210 s | — |
+| `moe` | 278.223 ms | 31.894 s | — | 32.173 s | — |
+| `kimi-k2` | 4.105 s | 455.423 s | — | 459.528 s | — |
 
 ## Legacy controller + dedupe
 
 | Model | Trainer publish CPU | `G` lookups CPU | `G` completions CPU | Total CPU | Peak Python memory |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `1b` | 0.874 ms | 31.087 ms | 4.661 ms | 36.648 ms | pending |
-| `8b` | 6.580 ms | 179.350 ms | 22.996 ms | 208.945 ms | pending |
-| `qwen-27b` | 27.911 ms | 467.542 ms | 50.745 ms | 546.221 ms | pending |
-| `70b` | 16.680 ms | 3.144 s | 238.667 ms | 3.399 s | pending |
-| `70b-wide` | 148.526 ms | 23.287 s | 483.461 ms | 23.919 s | pending |
-| `405b` | 142.011 ms | 31.536 s | 1.178 s | 32.856 s | pending |
-| `moe` | 293.646 ms | 63.034 s | 2.295 s | 65.622 s | pending |
-| `kimi-k2` | 4.448 s | 447.585 s | 4.349 s | 456.382 s | pending |
+| `1b` | 0.874 ms | 31.087 ms | 4.661 ms | 36.648 ms | 771.109 KiB |
+| `8b` | 6.580 ms | 179.350 ms | 22.996 ms | 208.945 ms | 3.550 MiB |
+| `qwen-27b` | 27.911 ms | 467.542 ms | 50.745 ms | 546.221 ms | 8.340 MiB |
+| `70b` | 16.680 ms | 3.144 s | 238.667 ms | 3.399 s | 28.408 MiB |
+| `70b-wide` | 148.526 ms | 23.287 s | 483.461 ms | 23.919 s | — |
+| `405b` | 142.011 ms | 31.536 s | 1.178 s | 32.856 s | — |
+| `moe` | 293.646 ms | 63.034 s | 2.295 s | 65.622 s | — |
+| `kimi-k2` | 4.448 s | 447.585 s | 4.349 s | 456.382 s | — |
 
 ## Indexed controller + dedupe
 
 | Model | Trainer publish CPU | `G` lookups CPU | `G` completions CPU | Total CPU | Peak Python memory |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `1b` | 0.747 ms | 20.254 ms | 17.261 ms | 38.279 ms | pending |
-| `8b` | 5.331 ms | 93.667 ms | 86.403 ms | 185.423 ms | pending |
-| `qwen-27b` | 26.108 ms | 242.603 ms | 198.261 ms | 467.009 ms | pending |
-| `70b` | 12.832 ms | 937.856 ms | 883.553 ms | 1.834 s | pending |
-| `70b-wide` | 109.331 ms | 1.900 s | 1.764 s | 3.774 s | pending |
-| `405b` | 111.710 ms | 3.941 s | 3.881 s | 7.934 s | pending |
-| `moe` | 229.369 ms | 8.150 s | 8.380 s | 16.759 s | pending |
-| `kimi-k2` | 3.338 s | 24.223 s | 15.652 s | 43.213 s | pending |
+| `1b` | 0.747 ms | 20.254 ms | 17.261 ms | 38.279 ms | 938.070 KiB |
+| `8b` | 5.331 ms | 93.667 ms | 86.403 ms | 185.423 ms | 3.486 MiB |
+| `qwen-27b` | 26.108 ms | 242.603 ms | 198.261 ms | 467.009 ms | 11.690 MiB |
+| `70b` | 12.832 ms | 937.856 ms | 883.553 ms | 1.834 s | 34.015 MiB |
+| `70b-wide` | 109.331 ms | 1.900 s | 1.764 s | 3.774 s | — |
+| `405b` | 111.710 ms | 3.941 s | 3.881 s | 7.934 s | — |
+| `moe` | 229.369 ms | 8.150 s | 8.380 s | 16.759 s | — |
+| `kimi-k2` | 3.338 s | 24.223 s | 15.652 s | 43.213 s | — |

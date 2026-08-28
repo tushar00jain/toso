@@ -24,3 +24,36 @@ def test_dedup_sample_retires_pending_and_keeps_live_rows() -> None:
         assert any(volume.startswith("generator-") for _pub, volume in after)
     finally:
         workload.close()
+
+
+def test_memory_mode_is_separate_and_stops_at_70b(monkeypatch, capsys) -> None:
+    calls = []
+
+    def run_case(case, scale, variant, **kwargs):
+        calls.append((case, kwargs))
+        return benchmark._Result(
+            case=case,
+            variant=variant,
+            scale=scale,
+            trainer_publish_cpu_ms=None,
+            generator_lookups_cpu_ms=None,
+            generator_completions_cpu_ms=None,
+            total_cpu_ms=None,
+            total_wall_ms=None,
+            total_instructions=None,
+            peak_python_kib=1.0,
+        )
+
+    monkeypatch.setattr(benchmark, "_run_case", run_case)
+
+    assert benchmark.main(
+        ["--preset", "suite", "--variant", "legacy", "--metrics", "memory"]
+    ) == 0
+
+    assert [case for case, _kwargs in calls] == ["1b", "8b", "qwen-27b", "70b"]
+    assert all(not kwargs["measure_cpu"] for _case, kwargs in calls)
+    assert all(not kwargs["measure_instructions"] for _case, kwargs in calls)
+    assert all(kwargs["measure_memory"] for _case, kwargs in calls)
+    output = capsys.readouterr().out
+    assert "Peak Python memory" in output
+    assert "70b-wide" not in output

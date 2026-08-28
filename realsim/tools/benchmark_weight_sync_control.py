@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import math
 import statistics
+import sys
 import time
 import tracemalloc
 from dataclasses import dataclass
@@ -73,6 +74,11 @@ _PRESETS = {
     ),
 }
 
+_MAX_MEMORY_METADATA_ROWS = (
+    _PRESETS["70b"].keys
+    * (_PRESETS["70b"].source_ranks + _PRESETS["70b"].generators)
+)
+
 _DEFAULT_SUITE = (
     "1b",
     "8b",
@@ -117,13 +123,13 @@ class _Result:
     case: str
     variant: str
     scale: _Scale
-    trainer_publish_cpu_ms: float
-    generator_lookups_cpu_ms: float
-    generator_completions_cpu_ms: float
-    total_cpu_ms: float
-    total_wall_ms: float
+    trainer_publish_cpu_ms: float | None
+    generator_lookups_cpu_ms: float | None
+    generator_completions_cpu_ms: float | None
+    total_cpu_ms: float | None
+    total_wall_ms: float | None
     total_instructions: int | None
-    peak_python_kib: float
+    peak_python_kib: float | None
 
 
 class _Workload:
@@ -330,31 +336,55 @@ def _run_case(
     fanout_cap: int,
     warmups: int,
     repeats: int,
+    measure_cpu: bool = True,
+    measure_instructions: bool = True,
+    measure_memory: bool = True,
+    progress: Callable[[str], None] | None = None,
 ) -> _Result:
+    samples: list[_Sample] = []
+    total_instructions = None
+    peak_python_kib = None
     with ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="weight-sync-controller"
     ) as worker:
-        for _ in range(warmups):
-            worker.submit(_sample, scale, variant, fanout_cap).result()
-        samples = [
-            worker.submit(_sample, scale, variant, fanout_cap).result()
-            for _ in range(repeats)
-        ]
-        total_instructions = worker.submit(
-            _instruction_sample, scale, variant, fanout_cap
-        ).result()
-        peak_python_kib = worker.submit(
-            _memory_sample, scale, variant, fanout_cap
-        ).result()
+        if measure_cpu:
+            if progress is not None:
+                progress("CPU timing")
+            for _ in range(warmups):
+                worker.submit(_sample, scale, variant, fanout_cap).result()
+            samples = [
+                worker.submit(_sample, scale, variant, fanout_cap).result()
+                for _ in range(repeats)
+            ]
+        if measure_instructions:
+            if progress is not None:
+                progress("retired instructions")
+            total_instructions = worker.submit(
+                _instruction_sample, scale, variant, fanout_cap
+            ).result()
+        if measure_memory:
+            if progress is not None:
+                progress("peak Python memory")
+            peak_python_kib = worker.submit(
+                _memory_sample, scale, variant, fanout_cap
+            ).result()
     return _Result(
         case=case,
         variant=variant,
         scale=scale,
-        trainer_publish_cpu_ms=_median_ms(samples, "trainer_publish"),
-        generator_lookups_cpu_ms=_median_ms(samples, "generator_lookups"),
-        generator_completions_cpu_ms=_median_ms(samples, "generator_completions"),
-        total_cpu_ms=_median_ms(samples, "total"),
-        total_wall_ms=_median_ms(samples, "total", "wall_ns"),
+        trainer_publish_cpu_ms=(
+            _median_ms(samples, "trainer_publish") if samples else None
+        ),
+        generator_lookups_cpu_ms=(
+            _median_ms(samples, "generator_lookups") if samples else None
+        ),
+        generator_completions_cpu_ms=(
+            _median_ms(samples, "generator_completions") if samples else None
+        ),
+        total_cpu_ms=_median_ms(samples, "total") if samples else None,
+        total_wall_ms=(
+            _median_ms(samples, "total", "wall_ns") if samples else None
+        ),
         total_instructions=total_instructions,
         peak_python_kib=peak_python_kib,
     )
@@ -390,6 +420,11 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--fanout-cap", type=int, default=2)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--metrics",
+        choices=("cpu", "instructions", "memory", "all"),
+        default="cpu",
+    )
     parser.add_argument("--allow-large", action="store_true")
     args = parser.parse_args(argv)
     customized = any(
@@ -449,73 +484,133 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
             ),
         )
         args.cases = tuple((name, _PRESETS[name]) for name in _DEFAULT_SUITE)
+    if args.metrics == "memory":
+        memory_cases = tuple(
+            (case, scale)
+            for case, scale in args.cases
+            if _metadata_rows(scale) <= _MAX_MEMORY_METADATA_ROWS
+        )
+        if not memory_cases:
+            parser.error("memory measurement is capped at the 70b preset scale")
+        args.cases = memory_cases
     args.variants = _VARIANTS if args.variant == "all" else (args.variant,)
     return args
 
 
-def _duration(milliseconds: float) -> str:
+def _metadata_rows(scale: _Scale) -> int:
+    return scale.keys * (scale.source_ranks + scale.generators)
+
+
+def _duration(milliseconds: float | None) -> str:
+    if milliseconds is None:
+        return "—"
     if milliseconds < 1_000:
         return f"{milliseconds:.3f} ms"
     return f"{milliseconds / 1_000:.3f} s"
 
 
-def _memory_size(kibibytes: float) -> str:
+def _memory_size(kibibytes: float | None) -> str:
+    if kibibytes is None:
+        return "—"
     if kibibytes < 1024:
         return f"{kibibytes:.3f} KiB"
     return f"{kibibytes / 1024:.3f} MiB"
 
 
-def _print_results(results: Sequence[_Result]) -> None:
-    for variant in _VARIANTS:
-        rows = [result for result in results if result.variant == variant]
-        if not rows:
-            continue
-        print(f"## {_VARIANT_TITLES[variant]}")
-        print()
+def _print_table_header(variant: str, metrics: str) -> None:
+    print(f"## {_VARIANT_TITLES[variant]}", flush=True)
+    print(flush=True)
+    if metrics == "cpu":
+        print(
+            "| Workload | Trainer publish CPU | G lookups CPU | "
+            "G completions CPU | Total CPU |",
+            flush=True,
+        )
+        print("| --- | ---: | ---: | ---: | ---: |", flush=True)
+    elif metrics == "instructions":
+        print("| Workload | Retired instructions |", flush=True)
+        print("| --- | ---: |", flush=True)
+    elif metrics == "memory":
+        print("| Workload | Peak Python memory |", flush=True)
+        print("| --- | ---: |", flush=True)
+    else:
         print(
             "| Workload | Trainer publish CPU | G lookups CPU | "
             "G completions CPU | Total CPU | Retired instructions | "
-            "Peak Python memory |"
+            "Peak Python memory |",
+            flush=True,
         )
-        print("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
-        for result in rows:
-            completion = (
-                "—"
-                if result.variant == "legacy"
-                else _duration(result.generator_completions_cpu_ms)
-            )
-            instructions = (
-                "—"
-                if result.total_instructions is None
-                else f"{result.total_instructions:,}"
-            )
-            print(
-                f"| `{result.case}` | "
-                f"{_duration(result.trainer_publish_cpu_ms)} | "
-                f"{_duration(result.generator_lookups_cpu_ms)} | "
-                f"{completion} | {_duration(result.total_cpu_ms)} | "
-                f"{instructions} | {_memory_size(result.peak_python_kib)} |"
-            )
-        print()
+        print(
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            flush=True,
+        )
+
+
+def _print_result(result: _Result, metrics: str) -> None:
+    completion = (
+        "—"
+        if result.variant == "legacy"
+        else _duration(result.generator_completions_cpu_ms)
+    )
+    instructions = (
+        "—"
+        if result.total_instructions is None
+        else f"{result.total_instructions:,}"
+    )
+    if metrics == "cpu":
+        row = (
+            f"| `{result.case}` | "
+            f"{_duration(result.trainer_publish_cpu_ms)} | "
+            f"{_duration(result.generator_lookups_cpu_ms)} | "
+            f"{completion} | {_duration(result.total_cpu_ms)} |"
+        )
+    elif metrics == "instructions":
+        row = f"| `{result.case}` | {instructions} |"
+    elif metrics == "memory":
+        row = f"| `{result.case}` | {_memory_size(result.peak_python_kib)} |"
+    else:
+        row = (
+            f"| `{result.case}` | "
+            f"{_duration(result.trainer_publish_cpu_ms)} | "
+            f"{_duration(result.generator_lookups_cpu_ms)} | "
+            f"{completion} | {_duration(result.total_cpu_ms)} | "
+            f"{instructions} | {_memory_size(result.peak_python_kib)} |"
+        )
+    print(
+        row,
+        flush=True,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the selected comparison cases and print Markdown tables."""
     config.configure()
     args = _arguments(argv)
-    results = [
-        _run_case(
-            case,
-            scale,
-            variant,
-            fanout_cap=args.fanout_cap,
-            warmups=args.warmups,
-            repeats=args.repeats,
-        )
-        for variant in args.variants
-        for case, scale in args.cases
-    ]
-    _print_results(results)
+    measure_cpu = args.metrics in ("cpu", "all")
+    measure_instructions = args.metrics in ("instructions", "all")
+    measure_memory = args.metrics in ("memory", "all")
+    for variant in args.variants:
+        _print_table_header(variant, args.metrics)
+        for case, scale in args.cases:
+            result = _run_case(
+                case,
+                scale,
+                variant,
+                fanout_cap=args.fanout_cap,
+                warmups=args.warmups,
+                repeats=args.repeats,
+                measure_cpu=measure_cpu,
+                measure_instructions=measure_instructions,
+                measure_memory=(
+                    measure_memory
+                    and _metadata_rows(scale) <= _MAX_MEMORY_METADATA_ROWS
+                ),
+                progress=lambda phase, case=case, variant=variant: print(
+                    f"[{variant}/{case}] {phase}", file=sys.stderr, flush=True
+                ),
+            )
+            _print_result(result, args.metrics)
+        print(flush=True)
     return 0
 
 
