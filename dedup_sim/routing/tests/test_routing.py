@@ -5,11 +5,13 @@ import asyncio
 import pytest
 import torch
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
-from torchstore.routing import RoutingClient, RoutingPlan
+import torchstore as ts
+from torchstore.routing import RoutingPlan
 from torchstore.routing import RoutingService as ProductionRoutingService
 from torchstore.transport.types import TensorSlice
 
 from dedup_sim.workload.scenarios import RoutingScenario
+from dedup_sim.routing.client import SimulationRoutingClient
 from realsim.mesh import Mesh
 from realsim.seams.controller_service import ControllerService
 from realsim.seams.routing_handle import LocalRoutingServiceHandle
@@ -32,7 +34,7 @@ def _slice(
 def _routing_clients(
     plan: RoutingPlan,
     rank_volumes: dict[str, str],
-) -> tuple[Mesh, dict[str, RoutingClient]]:
+) -> tuple[Mesh, dict[str, SimulationRoutingClient]]:
     topology = {
         volume_id: Endpoint(id=volume_id, host=volume_id, node=volume_id)
         for volume_id in rank_volumes.values()
@@ -45,12 +47,12 @@ def _routing_clients(
         for rank in plan.ranks
     }
     clients = {
-        rank: RoutingClient(
+        rank: SimulationRoutingClient(
             rank,
             plan.for_rank(rank),
             handles[rank],
             handles,
-            transport_factory=mesh.adapter(rank_volumes[rank]).transport_for,
+            mesh,
         )
         for rank in plan.ranks
     }
@@ -105,14 +107,14 @@ def test_repeated_updates_do_not_reuse_stale_relay_readiness() -> None:
         {"weight": 4},
         rank_volumes=rank_volumes,
     )
-    _mesh, clients = _routing_clients(plan, rank_volumes)
+    mesh, clients = _routing_clients(plan, rank_volumes)
 
     async def run() -> torch.Tensor:
-        await clients["trainer"].publish({"weight": torch.ones(4)})
+        await clients["trainer"].put_batch({"weight": torch.ones(4)})
         await clients["ingress"].get("weight")
         await clients["replica"].get("weight")
 
-        await clients["trainer"].publish({"weight": torch.full((4,), 2.0)})
+        await clients["trainer"].put_batch({"weight": torch.full((4,), 2.0)})
         waiting = asyncio.create_task(clients["replica"].get("weight"))
         await asyncio.sleep(0)
         assert not waiting.done()
@@ -120,10 +122,12 @@ def test_repeated_updates_do_not_reuse_stale_relay_readiness() -> None:
         await clients["ingress"].get("weight")
         return await waiting
 
-    torch.testing.assert_close(asyncio.run(run()), torch.full((4,), 2.0))
+    with mesh.installed():
+        result = asyncio.run(run())
+    torch.testing.assert_close(result, torch.full((4,), 2.0))
 
 
-def test_publish_requires_the_exact_local_key_set() -> None:
+def test_simulation_can_validate_an_exact_local_snapshot() -> None:
     full = _slice((2,))
     rank_volumes = {
         "trainer": "trainer-volume",
@@ -135,10 +139,22 @@ def test_publish_requires_the_exact_local_key_set() -> None:
         {"a": 4, "b": 4},
         rank_volumes=rank_volumes,
     )
-    _mesh, clients = _routing_clients(plan, rank_volumes)
+    mesh, clients = _routing_clients(plan, rank_volumes)
+
+    async def put_exact_snapshot(snapshot: dict[str, torch.Tensor]) -> None:
+        client = clients["trainer"]
+        expected = set(client.routes.published)
+        actual = set(snapshot)
+        if actual != expected:
+            raise KeyError(
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        await client.put_batch(snapshot)
 
     with pytest.raises(KeyError, match="missing=.*b"):
-        asyncio.run(clients["trainer"].publish({"a": torch.ones(2)}))
+        with mesh.installed():
+            asyncio.run(put_exact_snapshot({"a": torch.ones(2)}))
 
 
 def test_state_dict_api_reuses_the_routing_data_path() -> None:
@@ -168,7 +184,7 @@ def test_state_dict_api_reuses_the_routing_data_path() -> None:
         rank_volumes=rank_volumes,
         state_dict_mappings={"model": mapping},
     )
-    _mesh, clients = _routing_clients(plan, rank_volumes)
+    mesh, clients = _routing_clients(plan, rank_volumes)
     destination = {
         "layer": {
             "weight": torch.empty_like(source["layer"]["weight"]),
@@ -177,13 +193,19 @@ def test_state_dict_api_reuses_the_routing_data_path() -> None:
     }
 
     async def run() -> dict[str, object]:
-        await clients["trainer"].put_state_dict(source, "model")
-        return await clients["generator"].get_state_dict(
-            "model",
-            user_state_dict=destination,
+        ts.set_client(clients["trainer"], store_name="routing-trainer")
+        ts.set_client(clients["generator"], store_name="routing-generator")
+        await ts.put_state_dict(source, "model", store_name="routing-trainer")
+        return await ts.get_state_dict(
+            "model", destination, store_name="routing-generator"
         )
 
-    result = asyncio.run(run())
+    try:
+        with mesh.installed():
+            result = asyncio.run(run())
+    finally:
+        ts.reset_client("routing-trainer")
+        ts.reset_client("routing-generator")
     torch.testing.assert_close(
         result["layer"]["weight"], source["layer"]["weight"]
     )

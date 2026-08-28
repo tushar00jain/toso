@@ -8,7 +8,6 @@ from typing import List
 
 import torch
 from torchstore.routing import (
-    RoutingClient,
     RoutingPlan,
 )
 from torchstore.routing import (
@@ -17,6 +16,7 @@ from torchstore.routing import (
 from torchstore.transport.types import TensorSlice
 
 from putget_sim.workload.put_get import FLOPS_PER_ELEMENT, KEY, PutGetBurst
+from dedup_sim.routing.client import SimulationRoutingClient
 from realsim.run import Run, Workload
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.routing_handle import LocalRoutingServiceHandle
@@ -245,12 +245,12 @@ class _RoutingPlane:
             for rank in self.plan.ranks
         }
         self.clients = {
-            rank: RoutingClient(
+            rank: SimulationRoutingClient(
                 rank,
                 self.plan.for_rank(rank),
                 service_handles[rank],
                 service_handles,
-                transport_factory=sim.mesh.adapter(rank).transport_for,
+                sim.mesh,
             )
             for rank in self.plan.ranks
         }
@@ -259,7 +259,7 @@ class _RoutingPlane:
 
     async def _publish(self) -> None:
         for rank, snapshot in self.workload.snapshots().items():
-            await self.clients[rank].publish(snapshot)
+            await self.clients[rank].put_batch(snapshot)
 
     async def execute(self, item: WorkItem) -> object:
         if self._publish_task is None:
