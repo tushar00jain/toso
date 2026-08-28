@@ -17,7 +17,6 @@ from torchstore.routing import (
 from torchstore.transport.types import TensorSlice
 
 from putget_sim.workload.put_get import FLOPS_PER_ELEMENT, KEY, PutGetBurst
-from realsim.mesh import LocalActorMesh
 from realsim.run import Run, Workload
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.routing_handle import LocalRoutingServiceHandle
@@ -80,7 +79,7 @@ class _RoutingWeightSync(WeightSync):
     def snapshots(self):
         return {rank: self.snapshot for rank in self.trainer_ids}
 
-    def routing(self, *, relay_replicas: bool = True) -> RoutingPlan:
+    def routing(self) -> RoutingPlan:
         shard_elements = _QWEN_ELEMENTS // _TP
         full = TensorSlice(
             offsets=(0,),
@@ -109,7 +108,6 @@ class _RoutingWeightSync(WeightSync):
             publishers,
             requesters,
             element_sizes,
-            relay_replicas=relay_replicas,
             rank_volumes={rank: rank for rank in publishers | requesters},
         )
 
@@ -120,7 +118,39 @@ class _RoutingWeightSync(WeightSync):
         ]
 
     async def prepare(self, sim) -> None:
-        """Trainer publication is performed through the routing client."""
+        """Trainer publication is performed by the selected transfer path."""
+
+
+def _configure_sim(sim, workload) -> None:
+    sim.origins(*workload.origin_ids)
+    # This workload models one shared trainer egress. Reuse the Mesh's
+    # contention registry even when global fidelity is left at its default.
+    if isinstance(workload, _RoutingWeightSync) and sim.mesh.registry.mode == "none":
+        sim.mesh.registry.mode = "progressive"
+
+
+class _CurrentWeightSync(_RoutingWeightSync):
+    """The same workload using the existing controller-backed client."""
+
+    def items(self, sim) -> List[WorkItem]:
+        def _get(rank: str, key: str):
+            async def call():
+                sim.mesh.bind_source(rank)
+                return await sim.mesh.client(rank).get(key)
+
+            return call
+
+        return [
+            WorkItem(id=rank, release_time=0.0, run=_get(rank, _KEYS[index % _TP]))
+            for index, rank in enumerate(self.generator_ids)
+        ]
+
+    async def prepare(self, sim) -> None:
+        _configure_sim(sim, self)
+        with sim.mesh.installed():
+            for rank, snapshot in self.snapshots().items():
+                sim.mesh.bind_source(rank)
+                await sim.mesh.client(rank).put_batch(snapshot)
 
 
 class _RoutingBurst(Workload):
@@ -149,7 +179,7 @@ class _RoutingBurst(Workload):
     def snapshots(self):
         return {"p": {KEY: self.expected}}
 
-    def routing(self, *, relay_replicas: bool = True) -> RoutingPlan:
+    def routing(self) -> RoutingPlan:
         shape = tuple(int(x) for x in self.source.descriptor.shape)
         full = TensorSlice(
             offsets=tuple(0 for _ in shape),
@@ -177,7 +207,6 @@ class _RoutingBurst(Workload):
             {"p": {KEY: (full,)}},
             requesters,
             {KEY: element_size},
-            relay_replicas=relay_replicas,
             rank_volumes={rank: rank for rank in ("p", *self.reader_ids)},
         )
 
@@ -205,41 +234,28 @@ class _RoutingBurst(Workload):
         )
 
 
-class _Plane:
-    def __init__(self, sim, workload, relay: bool) -> None:
+class _RoutingPlane:
+    def __init__(self, sim, workload) -> None:
         self.workload = workload
-        self.plan = workload.routing(relay_replicas=relay)
+        self.plan = workload.routing()
         service_handles = {
             rank: LocalRoutingServiceHandle(
-                RoutingService(
-                    ProductionRoutingService(
-                        rank=rank,
-                    )
-                )
+                RoutingService(ProductionRoutingService())
             )
             for rank in self.plan.ranks
         }
-        self.services = LocalActorMesh(service_handles, ("notify_ready",))
         self.clients = {
             rank: RoutingClient(
                 rank,
                 self.plan.for_rank(rank),
-                self.services.for_rank(rank),
-                self.services,
+                service_handles[rank],
+                service_handles,
                 transport_factory=sim.mesh.adapter(rank).transport_for,
             )
             for rank in self.plan.ranks
         }
         self._publish_task = None
-        sim.origins(*workload.origin_ids)
-        # This workload models one shared trainer egress. Reuse the Mesh's
-        # existing contention registry even when the demo's optional global
-        # fidelity mode is left at its historical "none" default.
-        if (
-            isinstance(workload, _RoutingWeightSync)
-            and sim.mesh.registry.mode == "none"
-        ):
-            sim.mesh.registry.mode = "progressive"
+        _configure_sim(sim, workload)
 
     async def _publish(self) -> None:
         for rank, snapshot in self.workload.snapshots().items():
@@ -252,27 +268,27 @@ class _Plane:
         return await self.clients[item.id].get(item.payload)
 
 
-def _data(workload: Workload, relay: bool):
+def _routing_data(workload: Workload):
     def attach(sim) -> ItemDispatch:
-        return ItemDispatch(_Plane(sim, workload, relay).execute)
+        return ItemDispatch(_RoutingPlane(sim, workload).execute)
 
     return attach
 
 
 def _routing_runs() -> List[Run]:
-    workload = _RoutingWeightSync()
+    current = _CurrentWeightSync()
+    routed = _RoutingWeightSync()
     return [
         Run(
             "direct current path",
-            workload,
-            data=_data(workload, False),
-            profile=workload.profile,
+            current,
+            profile=current.profile,
         ),
         Run(
             "routing",
-            workload,
-            data=_data(workload, True),
-            profile=workload.profile,
+            routed,
+            data=_routing_data(routed),
+            profile=routed.profile,
         ),
     ]
 
@@ -282,6 +298,6 @@ def _dedup_routing_run(burst: PutGetBurst) -> Run:
     return Run(
         "precomputed",
         workload,
-        data=_data(workload, True),
+        data=_routing_data(workload),
         profile=workload.profile,
     )

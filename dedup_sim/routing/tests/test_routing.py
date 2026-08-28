@@ -10,7 +10,7 @@ from torchstore.routing import RoutingService as ProductionRoutingService
 from torchstore.transport.types import TensorSlice
 
 from dedup_sim.workload.scenarios import RoutingScenario
-from realsim.mesh import LocalActorMesh, Mesh
+from realsim.mesh import Mesh
 from realsim.seams.controller_service import ControllerService
 from realsim.seams.routing_handle import LocalRoutingServiceHandle
 from realsim.seams.routing_service import RoutingService
@@ -40,19 +40,16 @@ def _routing_clients(
     mesh = Mesh(topology)
     handles = {
         rank: LocalRoutingServiceHandle(
-            RoutingService(
-                ProductionRoutingService(rank=rank)
-            )
+            RoutingService(ProductionRoutingService())
         )
         for rank in plan.ranks
     }
-    services = LocalActorMesh(handles, ("notify_ready",))
     clients = {
         rank: RoutingClient(
             rank,
             plan.for_rank(rank),
-            services.for_rank(rank),
-            services,
+            handles[rank],
+            handles,
             transport_factory=mesh.adapter(rank_volumes[rank]).transport_for,
         )
         for rank in plan.ranks
@@ -60,14 +57,17 @@ def _routing_clients(
     return mesh, clients
 
 
-def test_qwen_scenario_uses_direct_volume_io(monkeypatch) -> None:
+def test_qwen_routing_uses_direct_volume_io(monkeypatch) -> None:
+    direct_run, routed_run = RoutingScenario().runs()
+    direct = direct_run.execute(quiet=True)
+
     def reject_controller_io(*args, **kwargs):
         raise AssertionError("routing data movement must bypass the controller")
 
     monkeypatch.setattr(ControllerService, "locate_volumes", reject_controller_io)
     monkeypatch.setattr(ControllerService, "notify_put_batch", reject_controller_io)
 
-    direct, routed = [run.execute(quiet=True) for run in RoutingScenario().runs()]
+    routed = routed_run.execute(quiet=True)
     payload = 55_600_000_000
 
     assert direct.ledger.origin_bytes == 2 * payload
@@ -78,7 +78,12 @@ def test_qwen_scenario_uses_direct_volume_io(monkeypatch) -> None:
     assert routed.ledger.origin_bytes == payload
     assert routed.ledger.transfer_bytes == 2 * payload
     assert routed.ledger.wallclock == pytest.approx(expected)
-    assert direct.sim.mesh.directory.service.keys() == []
+    assert set(direct.sim.mesh.directory.service.keys()) == {
+        "W0",
+        "W1",
+        "W2",
+        "W3",
+    }
     assert routed.sim.mesh.directory.service.keys() == []
 
 
