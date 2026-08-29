@@ -29,13 +29,19 @@ class SimulationRoutingClient(RoutingClient):
         services: Mapping[str, LocalRoutingServiceHandle],
         mesh: Mesh,
     ) -> None:
-        volume_id = plan._local(rank).volume_id
+        table = plan._local(rank)
+        volume_id = table.volume_id
         adapter = mesh.adapter(volume_id)
+        # The simulator plans up front, so install the routes the coordinator
+        # would otherwise hand back from register_state_dict.
         super().__init__(
             rank,
-            plan,
-            cast(Mapping[str, RoutingService], services),
+            table.role,
+            None,
             cast(TorchStoreStrategy, adapter.strategy),
+        )
+        self._controller.install(
+            plan, cast(Mapping[str, RoutingService], services)
         )
         self._mesh = mesh
         self._volume_id = volume_id

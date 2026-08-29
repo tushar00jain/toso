@@ -13,7 +13,6 @@ __all__ = ["registrations"]
 def registrations(
     entries: Mapping[str, Mapping[str, Sequence[TensorSlice]]],
     element_sizes: Mapping[str, int],
-    key: str = "model",
     mapping: Mapping[str, Sequence[object]] | None = None,
 ) -> dict[str, RankRegistration]:
     """One registration per rank, in the shape that rank's client would report.
@@ -23,7 +22,6 @@ def registrations(
     """
     return {
         rank: RankRegistration(
-            key=key,
             slices={name: tuple(item) for name, item in slices.items()},
             element_sizes={name: element_sizes[name] for name in slices},
             mapping=dict(mapping or {}),
