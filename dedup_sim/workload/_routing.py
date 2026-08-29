@@ -116,7 +116,6 @@ class _RoutingWeightSync(WeightSync):
         return RoutingPlan.build(
             registrations(publishers, element_sizes),
             registrations(requesters, element_sizes),
-            "model",
         )
 
     def items(self, sim) -> List[WorkItem]:
@@ -218,7 +217,6 @@ class _RoutingBurst(Workload):
         return RoutingPlan.build(
             registrations({"p": {KEY: full}}, sizes),
             registrations(requesters, sizes),
-            "model",
         )
 
     def items(self, sim) -> List[WorkItem]:

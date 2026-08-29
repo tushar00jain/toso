@@ -105,7 +105,6 @@ def test_repeated_updates_do_not_reuse_stale_relay_readiness() -> None:
             },
             {"weight": 4},
         ),
-        "model",
     )
     mesh, clients = _routing_clients(plan, rank_volumes)
 
@@ -134,7 +133,6 @@ def test_simulation_can_validate_an_exact_local_snapshot() -> None:
     plan = RoutingPlan.build(
         registrations({"trainer": {"a": full, "b": full}}, sizes),
         registrations({"generator": {"a": full, "b": full}}, sizes),
-        "model",
     )
     mesh, clients = _routing_clients(plan, rank_volumes)
 
@@ -174,7 +172,6 @@ def test_state_dict_helpers_reuse_the_routing_data_path() -> None:
     plan = RoutingPlan.build(
         registrations({"trainer": slices}, element_sizes),
         registrations({"generator": slices}, element_sizes),
-        "model",
     )
     mesh, clients = _routing_clients(plan, rank_volumes)
     destination = {
