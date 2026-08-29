@@ -12,6 +12,7 @@ from torchstore.transport.types import TensorSlice
 
 from dedup_sim.workload.scenarios import RoutingScenario
 from dedup_sim.routing.client import SimulationRoutingClient
+from dedup_sim.routing.plans import registrations
 from realsim.mesh import Mesh
 from realsim.seams.controller_service import ControllerService
 from realsim.seams.routing_handle import LocalRoutingServiceHandle
@@ -92,19 +93,16 @@ def test_repeated_updates_do_not_reuse_stale_relay_readiness() -> None:
     full = _slice((4,))
     ingress = _slice((4,), mesh_size=2)
     replica = _slice((4,), coordinate=1, mesh_size=2)
-    rank_volumes = {
-        "trainer": "trainer-volume",
-        "ingress": "ingress-volume",
-        "replica": "replica-volume",
-    }
+    rank_volumes = {rank: rank for rank in ("trainer", "ingress", "replica")}
     plan = RoutingPlan.build(
-        {"trainer": {"weight": (full,)}},
-        {
-            "ingress": {"weight": (ingress,)},
-            "replica": {"weight": (replica,)},
-        },
-        {"weight": 4},
-        rank_volumes=rank_volumes,
+        registrations({"trainer": {"weight": (full,)}}, {"weight": 4}),
+        registrations(
+            {
+                "ingress": {"weight": (ingress,)},
+                "replica": {"weight": (replica,)},
+            },
+            {"weight": 4},
+        ),
     )
     mesh, clients = _routing_clients(plan, rank_volumes)
 
@@ -128,15 +126,11 @@ def test_repeated_updates_do_not_reuse_stale_relay_readiness() -> None:
 
 def test_simulation_can_validate_an_exact_local_snapshot() -> None:
     full = _slice((2,))
-    rank_volumes = {
-        "trainer": "trainer-volume",
-        "generator": "generator-volume",
-    }
+    rank_volumes = {rank: rank for rank in ("trainer", "generator")}
+    sizes = {"a": 4, "b": 4}
     plan = RoutingPlan.build(
-        {"trainer": {"a": (full,), "b": (full,)}},
-        {"generator": {"a": (full,), "b": (full,)}},
-        {"a": 4, "b": 4},
-        rank_volumes=rank_volumes,
+        registrations({"trainer": {"a": (full,), "b": (full,)}}, sizes),
+        registrations({"generator": {"a": (full,), "b": (full,)}}, sizes),
     )
     mesh, clients = _routing_clients(plan, rank_volumes)
 
@@ -172,16 +166,10 @@ def test_state_dict_helpers_reuse_the_routing_data_path() -> None:
         f"model/{key}": value.element_size()
         for key, value in flattened.items()
     }
-    rank_volumes = {
-        "trainer": "trainer-volume",
-        "generator": "generator-volume",
-    }
+    rank_volumes = {rank: rank for rank in ("trainer", "generator")}
     plan = RoutingPlan.build(
-        {"trainer": slices},
-        {"generator": slices},
-        element_sizes,
-        rank_volumes=rank_volumes,
-        state_dict_mappings={"model": mapping},
+        registrations({"trainer": slices}, element_sizes, mapping=mapping),
+        registrations({"generator": slices}, element_sizes),
     )
     mesh, clients = _routing_clients(plan, rank_volumes)
     destination = {

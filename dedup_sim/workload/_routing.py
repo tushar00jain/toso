@@ -13,6 +13,7 @@ from torchstore.transport.types import TensorSlice
 
 from putget_sim.workload.put_get import FLOPS_PER_ELEMENT, KEY, PutGetBurst
 from dedup_sim.routing.client import SimulationRoutingClient
+from dedup_sim.routing.plans import registrations
 from realsim.run import Run, Workload
 from realsim.runner import ItemDispatch, WorkItem
 from realsim.seams.routing_handle import LocalRoutingServiceHandle
@@ -101,10 +102,8 @@ class _RoutingWeightSync(WeightSync):
             key = _KEYS[tp_rank]
             requesters[rank] = {key: (tensor_slice,)}
         return RoutingPlan.build(
-            publishers,
-            requesters,
-            element_sizes,
-            rank_volumes={rank: rank for rank in publishers | requesters},
+            registrations(publishers, element_sizes),
+            registrations(requesters, element_sizes),
         )
 
     def items(self, sim) -> List[WorkItem]:
@@ -199,11 +198,10 @@ class _RoutingBurst(Workload):
             for index, rank in enumerate(self.reader_ids)
         }
         element_size = torch.empty(0, dtype=self.source.dtype).element_size()
+        sizes = {KEY: element_size}
         return RoutingPlan.build(
-            {"p": {KEY: (full,)}},
-            requesters,
-            {KEY: element_size},
-            rank_volumes={rank: rank for rank in ("p", *self.reader_ids)},
+            registrations({"p": {KEY: (full,)}}, sizes),
+            registrations(requesters, sizes),
         )
 
     def items(self, sim) -> List[WorkItem]:
