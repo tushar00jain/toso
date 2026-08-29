@@ -31,6 +31,22 @@ _QWEN_ELEMENTS = _QWEN_BYTES // _ELEMENT_SIZE
 _TP = 4
 _DP = 2
 _KEYS = tuple(f"W{rank}" for rank in range(_TP))
+# Four weights making up the model, each split across the TP ranks.
+_WEIGHT_ELEMENTS = _QWEN_ELEMENTS // len(_KEYS)
+_SHARD_ELEMENTS = _WEIGHT_ELEMENTS // _TP
+
+
+def _shard(generator_index: int, key: str) -> TensorSlice:
+    """The piece of ``key`` held by one generator, by its TP and DP rank."""
+    del key
+    tp_rank, dp_rank = generator_index % _TP, generator_index // _TP
+    return TensorSlice(
+        offsets=(tp_rank * _SHARD_ELEMENTS,),
+        coordinates=(tp_rank, dp_rank),
+        global_shape=(_WEIGHT_ELEMENTS,),
+        local_shape=(_SHARD_ELEMENTS,),
+        mesh_shape=(_TP, _DP),
+    )
 
 
 def _profile() -> MachineProfile:
@@ -50,7 +66,13 @@ def _profile() -> MachineProfile:
 
 
 class _RoutingWeightSync(WeightSync):
-    """Qwen3.6-27B represented as four TP shard keys, each with two readers."""
+    """Qwen3.6-27B as four weights, each TP-sharded four ways with two DP readers.
+
+    A tensor-parallel generator holds a shard of *every* weight, not one whole
+    weight, so publisher and requester name the same four keys and differ only
+    in geometry. Per-generator bytes are unchanged: a quarter of each of four
+    weights is the same quarter of the model.
+    """
 
     tensor_parallel = _TP
     data_parallel = _DP
@@ -63,9 +85,8 @@ class _RoutingWeightSync(WeightSync):
             dtype=torch.bfloat16,
             profile=_profile(),
         )
-        shard_elements = _QWEN_ELEMENTS // _TP
         self.snapshot = {
-            key: torch.empty(shard_elements, dtype=torch.bfloat16, device="meta")
+            key: torch.empty(_WEIGHT_ELEMENTS, dtype=torch.bfloat16, device="meta")
             for key in _KEYS
         }
 
@@ -77,40 +98,32 @@ class _RoutingWeightSync(WeightSync):
         return {rank: self.snapshot for rank in self.trainer_ids}
 
     def routing(self) -> RoutingPlan:
-        shard_elements = _QWEN_ELEMENTS // _TP
         full = TensorSlice(
             offsets=(0,),
             coordinates=(0,),
-            global_shape=(shard_elements,),
-            local_shape=(shard_elements,),
+            global_shape=(_WEIGHT_ELEMENTS,),
+            local_shape=(_WEIGHT_ELEMENTS,),
             mesh_shape=(1,),
         )
-        trainer_slices = {key: (full,) for key in _KEYS}
         element_sizes = {key: _ELEMENT_SIZE for key in _KEYS}
-        publishers = {rank: trainer_slices for rank in self.trainer_ids}
-        requesters = {}
-        for index, rank in enumerate(self.generator_ids):
-            tp_rank = index % _TP
-            dp_rank = index // _TP
-            tensor_slice = TensorSlice(
-                offsets=(0,),
-                coordinates=(tp_rank, dp_rank),
-                global_shape=(shard_elements,),
-                local_shape=(shard_elements,),
-                mesh_shape=(_TP, _DP),
-            )
-            key = _KEYS[tp_rank]
-            requesters[rank] = {key: (tensor_slice,)}
+        publishers = {
+            rank: {key: (full,) for key in _KEYS} for rank in self.trainer_ids
+        }
+        requesters = {
+            rank: {key: (_shard(index, key),) for key in _KEYS}
+            for index, rank in enumerate(self.generator_ids)
+        }
+        paths = {f"model/{key}": (key,) for key in _KEYS}
         return RoutingPlan.build(
-            registrations(publishers, element_sizes),
-            registrations(requesters, element_sizes),
+            registrations(publishers, element_sizes, paths),
+            registrations(requesters, element_sizes, paths),
             "model",
         )
 
     def items(self, sim) -> List[WorkItem]:
         return [
-            WorkItem(id=rank, release_time=0.0, payload=_KEYS[index % _TP])
-            for index, rank in enumerate(self.generator_ids)
+            WorkItem(id=rank, release_time=0.0, payload=_KEYS)
+            for rank in self.generator_ids
         ]
 
     async def prepare(self, sim) -> None:
@@ -129,15 +142,20 @@ class _CurrentWeightSync(_RoutingWeightSync):
     """The same workload using the existing controller-backed client."""
 
     def items(self, sim) -> List[WorkItem]:
-        def _get(rank: str, key: str):
+        def _get(rank: str, index: int):
             async def call():
                 sim.mesh.bind_source(rank)
-                return await sim.mesh.client(rank).get(key)
+                client = sim.mesh.client(rank)
+                # Same shards the routed arm fetches, so the two are comparable.
+                return [
+                    await client.get(key, tensor_slice_spec=_shard(index, key))
+                    for key in _KEYS
+                ]
 
             return call
 
         return [
-            WorkItem(id=rank, release_time=0.0, run=_get(rank, _KEYS[index % _TP]))
+            WorkItem(id=rank, release_time=0.0, run=_get(rank, index))
             for index, rank in enumerate(self.generator_ids)
         ]
 
@@ -260,7 +278,7 @@ class _RoutingPlane:
         if self._publish_task is None:
             self._publish_task = asyncio.create_task(self._publish())
         await self._publish_task
-        return await self.clients[item.id].get(item.payload)
+        return await self.clients[item.id].get_batch(list(item.payload))
 
 
 def _routing_data(workload: Workload):

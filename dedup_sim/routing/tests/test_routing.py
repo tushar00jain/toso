@@ -76,7 +76,9 @@ def test_qwen_routing_uses_direct_volume_io(monkeypatch) -> None:
     assert direct.ledger.transfer_bytes == 2 * payload
     assert direct.ledger.wallclock == pytest.approx(2 * payload / 17.5e9)
 
-    expected = payload / 17.5e9 + (payload / 4) / 900e9
+    # Sixteen relay groups (four weights, four TP shards each) over eight
+    # generators: every rank is ingress for two and pulls two more over NVLink.
+    expected = payload / 17.5e9 + (payload / 8) / 900e9
     assert routed.ledger.origin_bytes == payload
     assert routed.ledger.transfer_bytes == 2 * payload
     assert routed.ledger.wallclock == pytest.approx(expected)
@@ -170,7 +172,11 @@ def test_state_dict_helpers_reuse_the_routing_data_path() -> None:
     }
     rank_volumes = {rank: rank for rank in ("trainer", "generator")}
     plan = RoutingPlan.build(
-        registrations({"trainer": slices}, element_sizes, mapping=mapping),
+        registrations(
+            {"trainer": slices},
+            element_sizes,
+            {f"model/{flat_key}": path for flat_key, path in mapping.items()},
+        ),
         registrations({"generator": slices}, element_sizes),
         "model",
     )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from torchstore.routing.plan import RankRegistration
+from torchstore.routing.plan import KeyRegistration
 from torchstore.transport.types import TensorSlice
 
 __all__ = ["registrations"]
@@ -13,18 +13,20 @@ __all__ = ["registrations"]
 def registrations(
     entries: Mapping[str, Mapping[str, Sequence[TensorSlice]]],
     element_sizes: Mapping[str, int],
-    mapping: Mapping[str, Sequence[object]] | None = None,
-) -> dict[str, RankRegistration]:
-    """One registration per rank, in the shape that rank's client would report.
+    paths: Mapping[str, Sequence[object]] | None = None,
+) -> dict[str, dict[str, KeyRegistration]]:
+    """Registrations per rank and key, as that rank's client would report them.
 
     Volume IDs are rank names, so a simulated rank must be named for the volume
-    it stores through.
+    it stores through. Pass ``paths`` only for a publisher that stores a
+    mapping object; without it nothing routes ``{namespace}/MAPPING``.
     """
     return {
-        rank: RankRegistration(
-            slices={name: tuple(item) for name, item in slices.items()},
-            element_sizes={name: element_sizes[name] for name in slices},
-            mapping=dict(mapping or {}),
-        )
+        rank: {
+            name: KeyRegistration(
+                tuple(item), element_sizes[name], (paths or {}).get(name)
+            )
+            for name, item in slices.items()
+        }
         for rank, slices in entries.items()
     }
