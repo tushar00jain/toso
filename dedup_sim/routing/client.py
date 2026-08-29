@@ -7,7 +7,9 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 import torch
-from torchstore.routing import RoutingClient, RoutingPlan, RoutingService
+from torchstore.routing.client import RoutingClient
+from torchstore.routing.plan import RoutingPlan
+from torchstore.routing.service import RoutingService
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport.types import Request
 

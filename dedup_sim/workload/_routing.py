@@ -7,12 +7,8 @@ import math
 from typing import List
 
 import torch
-from torchstore.routing import (
-    RoutingPlan,
-)
-from torchstore.routing import (
-    RoutingService as ProductionRoutingService,
-)
+from torchstore.routing.plan import RoutingPlan
+from torchstore.routing.service import RoutingService as ProductionRoutingService
 from torchstore.transport.types import TensorSlice
 
 from putget_sim.workload.put_get import FLOPS_PER_ELEMENT, KEY, PutGetBurst

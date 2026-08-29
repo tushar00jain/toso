@@ -5,9 +5,9 @@ import asyncio
 import pytest
 import torch
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
-import torchstore as ts
-from torchstore.routing import RoutingPlan
-from torchstore.routing import RoutingService as ProductionRoutingService
+from torchstore.routing.plan import RoutingPlan
+from torchstore.routing.service import RoutingService as ProductionRoutingService
+from torchstore.state_dict_utils import get_state_dict, put_state_dict
 from torchstore.transport.types import TensorSlice
 
 from dedup_sim.workload.scenarios import RoutingScenario
@@ -157,7 +157,7 @@ def test_simulation_can_validate_an_exact_local_snapshot() -> None:
             asyncio.run(put_exact_snapshot({"a": torch.ones(2)}))
 
 
-def test_state_dict_api_reuses_the_routing_data_path() -> None:
+def test_state_dict_helpers_reuse_the_routing_data_path() -> None:
     source = {
         "layer": {
             "weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
@@ -193,19 +193,13 @@ def test_state_dict_api_reuses_the_routing_data_path() -> None:
     }
 
     async def run() -> dict[str, object]:
-        ts.set_client(clients["trainer"], store_name="routing-trainer")
-        ts.set_client(clients["generator"], store_name="routing-generator")
-        await ts.put_state_dict(source, "model", store_name="routing-trainer")
-        return await ts.get_state_dict(
-            "model", destination, store_name="routing-generator"
+        await put_state_dict(clients["trainer"], source, "model")
+        return await get_state_dict(
+            clients["generator"], "model", destination
         )
 
-    try:
-        with mesh.installed():
-            result = asyncio.run(run())
-    finally:
-        ts.reset_client("routing-trainer")
-        ts.reset_client("routing-generator")
+    with mesh.installed():
+        result = asyncio.run(run())
     torch.testing.assert_close(
         result["layer"]["weight"], source["layer"]["weight"]
     )
