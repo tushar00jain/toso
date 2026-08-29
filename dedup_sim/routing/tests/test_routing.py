@@ -97,11 +97,11 @@ def test_repeated_updates_do_not_reuse_stale_relay_readiness() -> None:
     replica = _slice((4,), coordinate=1, mesh_size=2)
     rank_volumes = {rank: rank for rank in ("trainer", "ingress", "replica")}
     plan = RoutingPlan.build(
-        registrations({"trainer": {"weight": (full,)}}, {"weight": 4}),
+        registrations({"trainer": {"weight": full}}, {"weight": 4}),
         registrations(
             {
-                "ingress": {"weight": (ingress,)},
-                "replica": {"weight": (replica,)},
+                "ingress": {"weight": ingress},
+                "replica": {"weight": replica},
             },
             {"weight": 4},
         ),
@@ -132,8 +132,8 @@ def test_simulation_can_validate_an_exact_local_snapshot() -> None:
     rank_volumes = {rank: rank for rank in ("trainer", "generator")}
     sizes = {"a": 4, "b": 4}
     plan = RoutingPlan.build(
-        registrations({"trainer": {"a": (full,), "b": (full,)}}, sizes),
-        registrations({"generator": {"a": (full,), "b": (full,)}}, sizes),
+        registrations({"trainer": {"a": full, "b": full}}, sizes),
+        registrations({"generator": {"a": full, "b": full}}, sizes),
         "model",
     )
     mesh, clients = _routing_clients(plan, rank_volumes)
@@ -163,7 +163,7 @@ def test_state_dict_helpers_reuse_the_routing_data_path() -> None:
     }
     flattened, mapping = flatten_state_dict(source)
     slices = {
-        f"model/{key}": (_slice(tuple(value.shape)),)
+        f"model/{key}": _slice(tuple(value.shape))
         for key, value in flattened.items()
     }
     element_sizes = {
@@ -172,11 +172,7 @@ def test_state_dict_helpers_reuse_the_routing_data_path() -> None:
     }
     rank_volumes = {rank: rank for rank in ("trainer", "generator")}
     plan = RoutingPlan.build(
-        registrations(
-            {"trainer": slices},
-            element_sizes,
-            {f"model/{flat_key}": path for flat_key, path in mapping.items()},
-        ),
+        registrations({"trainer": slices}, element_sizes),
         registrations({"generator": slices}, element_sizes),
         "model",
     )

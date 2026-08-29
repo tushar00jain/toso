@@ -107,16 +107,15 @@ class _RoutingWeightSync(WeightSync):
         )
         element_sizes = {key: _ELEMENT_SIZE for key in _KEYS}
         publishers = {
-            rank: {key: (full,) for key in _KEYS} for rank in self.trainer_ids
+            rank: {key: full for key in _KEYS} for rank in self.trainer_ids
         }
         requesters = {
-            rank: {key: (_shard(index, key),) for key in _KEYS}
+            rank: {key: _shard(index, key) for key in _KEYS}
             for index, rank in enumerate(self.generator_ids)
         }
-        paths = {f"model/{key}": (key,) for key in _KEYS}
         return RoutingPlan.build(
-            registrations(publishers, element_sizes, paths),
-            registrations(requesters, element_sizes, paths),
+            registrations(publishers, element_sizes),
+            registrations(requesters, element_sizes),
             "model",
         )
 
@@ -204,14 +203,12 @@ class _RoutingBurst(Workload):
         )
         requesters = {
             rank: {
-                KEY: (
-                    TensorSlice(
-                        offsets=full.offsets,
-                        coordinates=(index,),
-                        global_shape=shape,
-                        local_shape=shape,
-                        mesh_shape=(self.num_readers,),
-                    ),
+                KEY: TensorSlice(
+                    offsets=full.offsets,
+                    coordinates=(index,),
+                    global_shape=shape,
+                    local_shape=shape,
+                    mesh_shape=(self.num_readers,),
                 )
             }
             for index, rank in enumerate(self.reader_ids)
@@ -219,7 +216,7 @@ class _RoutingBurst(Workload):
         element_size = torch.empty(0, dtype=self.source.dtype).element_size()
         sizes = {KEY: element_size}
         return RoutingPlan.build(
-            registrations({"p": {KEY: (full,)}}, sizes),
+            registrations({"p": {KEY: full}}, sizes),
             registrations(requesters, sizes),
             "model",
         )
