@@ -42,7 +42,7 @@ def _routing_clients(
     mesh = Mesh(topology)
     handles = {
         rank: LocalRoutingServiceHandle(
-            RoutingService(ProductionRoutingService())
+            RoutingService(ProductionRoutingService(id_func=lambda r=rank: r))
         )
         for rank in plan.ranks
     }
@@ -50,7 +50,6 @@ def _routing_clients(
         rank: SimulationRoutingClient(
             rank,
             plan.for_rank(rank),
-            handles[rank],
             handles,
             mesh,
         )

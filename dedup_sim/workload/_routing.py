@@ -236,7 +236,7 @@ class _RoutingPlane:
         self.plan = workload.routing()
         service_handles = {
             rank: LocalRoutingServiceHandle(
-                RoutingService(ProductionRoutingService())
+                RoutingService(ProductionRoutingService(id_func=lambda r=rank: r))
             )
             for rank in self.plan.ranks
         }
@@ -244,7 +244,6 @@ class _RoutingPlane:
             rank: SimulationRoutingClient(
                 rank,
                 self.plan.for_rank(rank),
-                service_handles[rank],
                 service_handles,
                 sim.mesh,
             )

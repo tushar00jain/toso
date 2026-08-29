@@ -26,7 +26,6 @@ class SimulationRoutingClient(RoutingClient):
         self,
         rank: str,
         plan: RoutingPlan,
-        service: LocalRoutingServiceHandle,
         services: Mapping[str, LocalRoutingServiceHandle],
         mesh: Mesh,
     ) -> None:
@@ -35,7 +34,6 @@ class SimulationRoutingClient(RoutingClient):
         super().__init__(
             rank,
             plan,
-            cast(RoutingService, service),
             cast(Mapping[str, RoutingService], services),
             cast(TorchStoreStrategy, adapter.strategy),
         )
