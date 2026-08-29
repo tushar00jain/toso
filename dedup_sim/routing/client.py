@@ -39,10 +39,10 @@ class SimulationRoutingClient(RoutingClient):
         )
         self._mesh = mesh
         self._volume_id = volume_id
-        self._adapter = adapter
 
-    def _local_transport(self):
-        return self._adapter.transport_for(self._volume_id)
+    async def put_batch(self, entries: dict[str, torch.Tensor | Any]) -> None:
+        self._mesh.bind_source(self._volume_id)
+        await super().put_batch(entries)
 
     async def _fetch(self, requests: list[Request]) -> dict[str, object]:
         self._mesh.bind_source(self._volume_id)

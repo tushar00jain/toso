@@ -1,10 +1,9 @@
 """The single substitution point for ``create_transport_buffer``.
 
-The real ``LocalClient`` reaches the transport through a **process-wide module
-global**: it does ``from torchstore.transport import create_transport_buffer`` at
-import time, so the only place a sim can substitute the in-memory transport is
-the bound name on the ``torchstore.client`` module object (see
-``docs/des_design.md`` under fidelity boundaries).
+TorchStore clients reach the transport through **process-wide module globals**:
+they import ``create_transport_buffer`` into their client modules. A simulation
+therefore substitutes those bound names together (see ``docs/des_design.md``
+under fidelity boundaries).
 
 Because that global is process-wide, *every* substitution in this repo must go
 through this module. Three call sites used to patch it independently -- the
@@ -82,9 +81,7 @@ def current_owner() -> Optional[Any]:
 
 
 @contextmanager
-def installed(
-    factory: Callable[..., Any], *, owner: Any
-) -> Iterator[None]:
+def installed(factory: Callable[..., Any], *, owner: Any) -> Iterator[None]:
     """Substitute ``create_transport_buffer`` with ``factory`` for the block.
 
     Args:
@@ -108,10 +105,16 @@ def installed(
             "realsim.mesh.Mesh."
         )
     _owner = owner
-    original = _CLIENT_MODULE.create_transport_buffer
-    _CLIENT_MODULE.create_transport_buffer = factory
+    client_modules = [_CLIENT_MODULE]
+    routing_client_module = sys.modules.get("torchstore.routing.client")
+    if routing_client_module is not None:
+        client_modules.append(routing_client_module)
+    originals = [module.create_transport_buffer for module in client_modules]
+    for module in client_modules:
+        module.create_transport_buffer = factory
     try:
         yield
     finally:
-        _CLIENT_MODULE.create_transport_buffer = original
+        for module, original in zip(client_modules, originals):
+            module.create_transport_buffer = original
         _owner = None

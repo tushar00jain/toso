@@ -143,7 +143,7 @@ def test_simulation_can_validate_an_exact_local_snapshot() -> None:
 
     async def put_exact_snapshot(snapshot: dict[str, torch.Tensor]) -> None:
         client = clients["trainer"]
-        expected = set(client.routes.published)
+        expected = {"a", "b"}
         actual = set(snapshot)
         if actual != expected:
             raise KeyError(
