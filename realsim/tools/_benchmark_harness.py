@@ -36,6 +36,7 @@ from sim_common.perfcount import InstructionCount
 
 __all__ = [
     "LAYOUTS",
+    "PLANNERS",
     "MEASURED_METRICS",
     "PRESETS",
     "KeySpec",
@@ -67,6 +68,8 @@ MEASURED_METRICS = ("cpu", "instructions", "memory")
 # "uniform" gives every key one identical 1-D slice; "realistic" builds a
 # per-layer transformer tensor table. See :func:`key_specs`.
 LAYOUTS = ("uniform", "realistic")
+# Where the plan is built: one process for every rank, or each rank its own.
+PLANNERS = ("central", "per-rank")
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,7 @@ class Scale:
     generators: int
     generator_shards: int
     layout: str = "uniform"
+    planner: str = "central"
     # Only the realistic layout reads this; uniform keys are sized from the
     # rank counts alone.
     width: Width = _WIDTH_8B
@@ -418,6 +422,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generators", type=int)
     parser.add_argument("--generator-shards", type=int)
     parser.add_argument("--layout", choices=LAYOUTS, default="uniform")
+    parser.add_argument("--planner", choices=PLANNERS, default="central")
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
@@ -427,8 +432,10 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _in_layout(case: str, scale: Scale, layout: str) -> tuple[str, Scale]:
-    placed = replace(scale, layout=layout)
+def _in_layout(
+    case: str, scale: Scale, layout: str, planner: str
+) -> tuple[str, Scale]:
+    placed = replace(scale, layout=layout, planner=planner)
     return case, replace(placed, keys=len(key_specs(placed)))
 
 
@@ -446,7 +453,10 @@ def resolve_cases(
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     if args.preset == "suite":
-        return [_in_layout(case, PRESETS[case], args.layout) for case in _DEFAULT_SUITE]
+        return [
+            _in_layout(case, PRESETS[case], args.layout, args.planner)
+            for case in _DEFAULT_SUITE
+        ]
 
     preset = PRESETS[args.preset]
     scale = Scale(
@@ -471,15 +481,20 @@ def resolve_cases(
         parser.error("--generators must be at least --generator-shards")
     if scale.generators % scale.generator_shards:
         parser.error("--generators must be divisible by --generator-shards")
-    return [_in_layout(args.preset, scale, args.layout)]
+    return [_in_layout(args.preset, scale, args.layout, args.planner)]
 
 
 def tables(
     selection: str,
     cases: Sequence[tuple[str, Scale]],
+    allow_large: bool = False,
 ) -> Iterator[tuple[str, list[tuple[str, Scale]]]]:
-    """Each metric with the cases it is measured at, skipping empty tables."""
+    """Each metric with the cases it is measured at, skipping empty tables.
+
+    ``allow_large`` runs the slow metrics at any size. The caps assume a metric
+    walks every rank's metadata, which a per-rank planner does not.
+    """
     for metric in _metrics_for(selection):
-        limited = _cases_for(metric, cases)
+        limited = list(cases) if allow_large else _cases_for(metric, cases)
         if limited:
             yield metric, limited

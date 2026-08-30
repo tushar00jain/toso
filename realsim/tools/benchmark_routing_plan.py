@@ -63,6 +63,7 @@ class _Workload:
         from torchstore.transport import TensorSlice
 
         self._plan_type = RoutingPlan
+        self._planner = scale.planner
         specs = key_specs(scale)
         # The trainer is FSDP2 Shard(0) throughout; only the generator varies.
         trainer_dims = (0,) * len(specs)
@@ -103,7 +104,13 @@ class _Workload:
         self.plan: Any | None = None
 
     def build_plan(self) -> Any:
-        self.plan = self._plan_type.build(self.publishers, self.requesters)
+        """Every rank's plan in one process, or just this rank's, in its own."""
+        if self._planner == "central":
+            self.plan = self._plan_type.build(self.publishers, self.requesters)
+        else:
+            self.plan = self._plan_type.build_for(
+                self.rank, self.publishers, self.requesters
+            )
         return self.plan
 
     def rank_lookups(self) -> None:
@@ -221,10 +228,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the selected cases and print one Markdown table per metric."""
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_arguments(parser)
+    parser.add_argument("--allow-large", action="store_true")
     args = parser.parse_args(argv)
     cases = resolve_cases(parser, args)
 
-    for metric, metric_cases in tables(args.metrics, cases):
+    for metric, metric_cases in tables(args.metrics, cases, args.allow_large):
         _print_table_header(metric)
         for case, scale in metric_cases:
 
