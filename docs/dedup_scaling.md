@@ -98,6 +98,19 @@ Measured from TorchStore commit `5a4d5d3`.
 | `moe` | 229.369 ms | 8.150 s | 8.380 s | 16.759 s | — |
 | `kimi-k2` | 3.338 s | 24.223 s | 15.652 s | 43.213 s | — |
 
+## Precomputed routing plan
+
+| Model | Plan build CPU | Plan build wall | Per-rank lookups CPU | Per-rank transfers | Retired instructions | Peak Python memory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `1b` | 6.655 ms | 6.718 ms | 0.027 ms | 120 | 81,773,253 | 886.420 KiB |
+| `8b` | 70.612 ms | 71.203 ms | 0.074 ms | 290 | 873,728,809 | 4.880 MiB |
+| `qwen-27b` | 156.659 ms | 158.007 ms | 0.259 ms | 1,799 | 2,014,086,134 | 12.320 MiB |
+| `70b` | 337.404 ms | 340.419 ms | 0.189 ms | 723 | 4,053,043,213 | 32.784 MiB |
+| `70b-wide` | 5.701 s | 5.757 s | 0.160 ms | 723 | 79,384,214,849 | — |
+| `405b` | 3.884 s | 3.921 s | 0.303 ms | 1,500 | 50,918,213,812 | — |
+| `moe` | 7.926 s | 7.990 s | 0.708 ms | 3,000 | 101,860,484,190 | — |
+| `kimi-k2` | 286.912 s | 289.690 s | 1.033 ms | 10,406 | 4,171,489,152,710 | — |
+
 ## Reusable benchmark
 
 ```bash
@@ -143,5 +156,25 @@ Measured from TorchStore commit `5a4d5d3`.
 # One controller path or a custom topology.
 .venv/bin/python -m realsim.tools.benchmark_weight_sync_control \
   --variant indexed-dedup \
+  --keys 1199 --source-ranks 8 --generators 8 --generator-shards 4
+```
+
+Routing plans use their own tool, with the same presets and metric switches:
+
+```bash
+# Smoke test.
+.venv/bin/python -m realsim.tools.benchmark_routing_plan --preset smoke
+
+# One table per metric, each printing as it finishes. Memory stops at 70b and
+# retired instructions at moe, so the slow passes never run at kimi scale.
+.venv/bin/python -m realsim.tools.benchmark_routing_plan \
+  --preset suite --metrics all --warmups 0 --repeats 1
+
+# Kimi-K2: 256 trainer ranks to 128 inference ranks.
+.venv/bin/python -m realsim.tools.benchmark_routing_plan \
+  --preset kimi-k2 --metrics all --warmups 0 --repeats 1
+
+# A custom topology.
+.venv/bin/python -m realsim.tools.benchmark_routing_plan \
   --keys 1199 --source-ranks 8 --generators 8 --generator-shards 4
 ```

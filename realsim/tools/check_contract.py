@@ -30,8 +30,8 @@ simulated code paths reach for a primitive that would break determinism:
   (e.g. that ``await asyncio.sleep(10)`` cost ~0s). They are assertions about the
   engine, never control flow in a simulated path, so they are permitted in tests
   but still banned in library code.
-* Wall-clock reads in ``benchmark_weight_sync_control.py``, whose only output is an
-  elapsed-time report and which is never imported by a simulated path.
+* Wall-clock reads in the benchmark tools and their shared harness, whose only
+  output is an elapsed-time report and which no simulated path imports.
 
 2. Plane separation
 -------------------
@@ -421,14 +421,22 @@ class _ContractVisitor(ast.NodeVisitor):
         self.violations.append(Violation(self.rel_path, lineno, code, message))
 
 
+# Report elapsed wall time; no simulated path imports them.
+_BENCHMARK_TOOLS = frozenset(
+    {
+        "realsim/tools/_benchmark_harness.py",
+        "realsim/tools/benchmark_routing_plan.py",
+        "realsim/tools/benchmark_weight_sync_control.py",
+    }
+)
+
+
 def scan_source(source: str, rel_path: str, *, is_test: bool) -> List[Violation]:
     """Scan a single source string; return violations (sorted by line)."""
     tree = ast.parse(source, filename=rel_path)
     visitor = _ContractVisitor(
         rel_path,
-        allow_wallclock_reads=is_test or rel_path == (
-            "realsim/tools/benchmark_weight_sync_control.py"
-        ),
+        allow_wallclock_reads=is_test or rel_path in _BENCHMARK_TOOLS,
         is_control=is_control_module(rel_path),
         is_proposed=is_proposed_module(rel_path),
         is_capability_data=is_capability_data_module(rel_path),

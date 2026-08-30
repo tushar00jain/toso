@@ -4,85 +4,36 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import gc
-import math
 import statistics
 import sys
-import time
-import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence, TypeVar
+from typing import Any, Callable, Sequence
 
+from realsim.tools._benchmark_harness import (
+    _DEFAULT_SUITE,
+    PRESETS as _PRESETS,
+    Scale as _Scale,
+    Timing as _Timing,
+    duration as _duration,
+    instruction_count,
+    measurable_rows as _measurable_rows,
+    measured,
+    memory_kib,
+    memory_size as _memory_size,
+    metadata_rows as _metadata_rows,
+    shard_geometry,
+    tables,
+    timed as _timed,
+    worker_thread,
+)
 from sim_common import config
-from sim_common.perfcount import InstructionCount
 
 __all__ = ["main"]
 
-_T = TypeVar("_T")
 _MAX_METADATA_ROWS = 1_000_000
 
 
-@dataclass(frozen=True)
-class _Scale:
-    keys: int
-    source_ranks: int
-    generators: int
-    generator_shards: int
-
-
-_PRESETS = {
-    "smoke": _Scale(keys=8, source_ranks=2, generators=8, generator_shards=2),
-    "1b": _Scale(keys=120, source_ranks=2, generators=8, generator_shards=2),
-    "8b": _Scale(keys=290, source_ranks=8, generators=16, generator_shards=8),
-    "qwen-27b": _Scale(
-        keys=1_199,
-        source_ranks=8,
-        generators=8,
-        generator_shards=4,
-    ),
-    "70b": _Scale(keys=723, source_ranks=8, generators=64, generator_shards=8),
-    "70b-wide": _Scale(
-        keys=723,
-        source_ranks=64,
-        generators=128,
-        generator_shards=64,
-    ),
-    "405b": _Scale(
-        keys=1_500,
-        source_ranks=32,
-        generators=128,
-        generator_shards=32,
-    ),
-    "moe": _Scale(
-        keys=3_000,
-        source_ranks=32,
-        generators=128,
-        generator_shards=32,
-    ),
-    "kimi-k2": _Scale(
-        keys=5_203,
-        source_ranks=256,
-        generators=128,
-        generator_shards=128,
-    ),
-}
-
-_MAX_MEMORY_METADATA_ROWS = (
-    _PRESETS["70b"].keys
-    * (_PRESETS["70b"].source_ranks + _PRESETS["70b"].generators)
-)
-
-_DEFAULT_SUITE = (
-    "1b",
-    "8b",
-    "qwen-27b",
-    "70b",
-    "70b-wide",
-    "405b",
-    "moe",
-)
 _VARIANTS = ("legacy", "legacy-dedup", "indexed-dedup")
 _VARIANT_TITLES = {
     "legacy": "Legacy controller, no dedupe",
@@ -97,12 +48,6 @@ class _Profile:
         if src.id == dst.id:
             return 0.0
         return 10.0 if src.id.startswith("trainer-") else 1.0
-
-
-@dataclass(frozen=True)
-class _Timing:
-    cpu_ns: int
-    wall_ns: int
 
 
 @dataclass(frozen=True)
@@ -214,12 +159,12 @@ def _request_batches(
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[Any, ...], tuple[Any, ...]]:
     trainers = tuple(f"trainer-{index}" for index in range(scale.source_ranks))
     generators = tuple(f"generator-{index}" for index in range(scale.generators))
-    extent = math.lcm(scale.source_ranks, scale.generator_shards)
+    extent, bounds = shard_geometry(scale)
 
     def requests_for_shard(rank: int, shards: int) -> tuple[Any, ...]:
-        width = extent // shards
+        offset, width = bounds(rank, shards)
         tensor_slice = tensor_slice_type(
-            offsets=(rank * width,),
+            offsets=(offset,),
             coordinates=(rank,),
             global_shape=(extent,),
             local_shape=(width,),
@@ -312,15 +257,6 @@ def _workload(
     return _Workload(scale, variant, fanout_cap)
 
 
-def _timed(operation: Callable[[], _T]) -> tuple[_Timing, _T]:
-    wall_started = time.perf_counter_ns()
-    cpu_started = time.thread_time_ns()
-    result = operation()
-    cpu_ns = time.thread_time_ns() - cpu_started
-    wall_ns = time.perf_counter_ns() - wall_started
-    return _Timing(cpu_ns, wall_ns), result
-
-
 def _sample(
     scale: _Scale,
     variant: str,
@@ -329,34 +265,32 @@ def _sample(
 ) -> _Sample:
     workload = _workload(scale, variant, fanout_cap, historical)
     workload.publish_trainers()
-    gc.collect()
-    enabled = gc.isenabled()
-    gc.disable()
-    try:
-        total_wall_started = time.perf_counter_ns()
-        total_cpu_started = time.thread_time_ns()
-        trainer_publish, _ = _timed(workload.publish_trainers)
-        generator_lookups, plans = _timed(workload.generator_lookups)
-        if variant == "legacy":
-            generator_completions = _Timing(0, 0)
-        else:
-            generator_completions, _ = _timed(
-                lambda: workload.complete_generators(plans)
+    with measured():
+        try:
+            total, (trainer_publish, generator_lookups, generator_completions) = _timed(
+                lambda: _lifecycle_timings(workload, variant)
             )
-        total = _Timing(
-            time.thread_time_ns() - total_cpu_started,
-            time.perf_counter_ns() - total_wall_started,
-        )
-    finally:
-        if enabled:
-            gc.enable()
-        workload.close()
+        finally:
+            workload.close()
     return _Sample(
         trainer_publish,
         generator_lookups,
         generator_completions,
         total,
     )
+
+
+def _lifecycle_timings(
+    workload: _Workload | _HistoricalWorkload,
+    variant: str,
+) -> tuple[_Timing, _Timing, _Timing]:
+    trainer_publish, _ = _timed(workload.publish_trainers)
+    generator_lookups, plans = _timed(workload.generator_lookups)
+    if variant == "legacy":
+        generator_completions = _Timing(0, 0)
+    else:
+        generator_completions, _ = _timed(lambda: workload.complete_generators(plans))
+    return trainer_publish, generator_lookups, generator_completions
 
 
 def _execute_lifecycle(workload: _Workload | _HistoricalWorkload) -> None:
@@ -371,21 +305,12 @@ def _instruction_sample(
     fanout_cap: int,
     historical: bool = False,
 ) -> int | None:
-    if not InstructionCount.available():
-        return None
     workload = _workload(scale, variant, fanout_cap, historical)
     workload.publish_trainers()
-    gc.collect()
-    enabled = gc.isenabled()
-    gc.disable()
     try:
-        with InstructionCount() as counter:
-            _execute_lifecycle(workload)
+        return instruction_count(lambda: _execute_lifecycle(workload))
     finally:
-        if enabled:
-            gc.enable()
         workload.close()
-    return counter.count
 
 
 def _memory_sample(
@@ -396,21 +321,10 @@ def _memory_sample(
 ) -> float:
     workload = _workload(scale, variant, fanout_cap, historical)
     workload.publish_trainers()
-    gc.collect()
-    enabled = gc.isenabled()
-    gc.disable()
-    tracemalloc.start()
     try:
-        baseline, _peak = tracemalloc.get_traced_memory()
-        tracemalloc.reset_peak()
-        _execute_lifecycle(workload)
-        _current, peak = tracemalloc.get_traced_memory()
+        return memory_kib(lambda: _execute_lifecycle(workload))
     finally:
-        tracemalloc.stop()
-        if enabled:
-            gc.enable()
         workload.close()
-    return (peak - baseline) / 1024
 
 
 def _median_ms(samples: Sequence[_Sample], field: str, clock: str = "cpu_ns") -> float:
@@ -436,9 +350,7 @@ def _run_case(
     samples: list[_Sample] = []
     total_instructions = None
     peak_python_kib = None
-    with ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="weight-sync-controller"
-    ) as worker:
+    with worker_thread("weight-sync-controller") as worker:
         if measure_cpu:
             if progress is not None:
                 progress("CPU timing")
@@ -605,41 +517,21 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
             ),
         )
         args.cases = tuple((name, _PRESETS[name]) for name in _DEFAULT_SUITE)
-    if args.metrics == "memory":
-        memory_cases = tuple(
+    if args.metrics in ("memory", "instructions"):
+        limited = tuple(
             (case, scale)
             for case, scale in args.cases
-            if _metadata_rows(scale) <= _MAX_MEMORY_METADATA_ROWS
+            if _metadata_rows(scale) <= _measurable_rows(args.metrics)
         )
-        if not memory_cases:
-            parser.error("memory measurement is capped at the 70b preset scale")
-        args.cases = memory_cases
+        if not limited:
+            parser.error(f"{args.metrics} measurement is capped below this scale")
+        args.cases = limited
     args.variants = (
         ("legacy",)
         if args.historical_torchstore_root is not None
         else (_VARIANTS if args.variant == "all" else (args.variant,))
     )
     return args
-
-
-def _metadata_rows(scale: _Scale) -> int:
-    return scale.keys * (scale.source_ranks + scale.generators)
-
-
-def _duration(milliseconds: float | None) -> str:
-    if milliseconds is None:
-        return "—"
-    if milliseconds < 1_000:
-        return f"{milliseconds:.3f} ms"
-    return f"{milliseconds / 1_000:.3f} s"
-
-
-def _memory_size(kibibytes: float | None) -> str:
-    if kibibytes is None:
-        return "—"
-    if kibibytes < 1024:
-        return f"{kibibytes:.3f} KiB"
-    return f"{kibibytes / 1024:.3f} MiB"
 
 
 def _print_table_header(variant: str, metrics: str, historical: bool) -> None:
@@ -730,38 +622,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.path.insert(0, str(args.historical_torchstore_root))
     else:
         config.configure()
-    measure_cpu = args.metrics in ("cpu", "all")
-    measure_instructions = args.metrics in ("instructions", "all")
-    measure_memory = args.metrics in ("memory", "all")
     for variant in args.variants:
-        _print_table_header(variant, args.metrics, historical)
-        for case, scale in args.cases:
-            def progress(phase: str) -> None:
-                prefix = "historical-" if historical else ""
-                print(
-                    f"[{prefix}{variant}/{case}] {phase}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+        for metric, metric_cases in tables(args.metrics, args.cases):
+            _print_table_header(variant, metric, historical)
+            for case, scale in metric_cases:
+                def progress(phase: str) -> None:
+                    prefix = "historical-" if historical else ""
+                    print(
+                        f"[{prefix}{variant}/{case}] {phase}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
-            result = _run_case(
-                case,
-                scale,
-                variant,
-                fanout_cap=args.fanout_cap,
-                warmups=args.warmups,
-                repeats=args.repeats,
-                measure_cpu=measure_cpu,
-                measure_instructions=measure_instructions,
-                measure_memory=(
-                    measure_memory
-                    and _metadata_rows(scale) <= _MAX_MEMORY_METADATA_ROWS
-                ),
-                historical=historical,
-                progress=progress,
-            )
-            _print_result(result, args.metrics)
-        print(flush=True)
+                result = _run_case(
+                    case,
+                    scale,
+                    variant,
+                    fanout_cap=args.fanout_cap,
+                    warmups=args.warmups,
+                    repeats=args.repeats,
+                    measure_cpu=metric == "cpu",
+                    measure_instructions=metric == "instructions",
+                    measure_memory=metric == "memory",
+                    historical=historical,
+                    progress=progress,
+                )
+                _print_result(result, metric)
+            print(flush=True)
     return 0
 
 
