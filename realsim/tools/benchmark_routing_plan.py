@@ -25,12 +25,13 @@ from realsim.tools._benchmark_harness import (
     add_common_arguments,
     duration,
     instruction_count,
+    key_specs,
     measured,
     median_ms,
     memory_kib,
     memory_size,
     resolve_cases,
-    shard_geometry,
+    shard_bounds,
     tables,
     timed,
     worker_thread,
@@ -62,29 +63,38 @@ class _Workload:
         from torchstore.transport import TensorSlice
 
         self._plan_type = RoutingPlan
-        extent, bounds = shard_geometry(scale)
+        specs = key_specs(scale)
+        # The trainer is FSDP2 Shard(0) throughout; only the generator varies.
+        trainer_dims = (0,) * len(specs)
+        generator_dims = tuple(spec.generator_dim for spec in specs)
 
-        def registrations(rank: int, shards: int) -> dict[str, Any]:
-            offset, width = bounds(rank, shards)
-            tensor_slice = TensorSlice(
-                offsets=(offset,),
-                coordinates=(rank,),
-                global_shape=(extent,),
-                local_shape=(width,),
-                mesh_shape=(shards,),
-            )
-            return {
-                f"model.weight.{index}": KeyRegistration(tensor_slice, _ELEMENT_SIZE)
-                for index in range(scale.keys)
-            }
+        def registrations(
+            rank: int,
+            shards: int,
+            dims: Sequence[int | None],
+        ) -> dict[str, Any]:
+            entries: dict[str, Any] = {}
+            for spec, dim in zip(specs, dims):
+                offsets, local_shape = shard_bounds(spec, dim, rank, shards)
+                entries[spec.name] = KeyRegistration(
+                    TensorSlice(
+                        offsets=offsets,
+                        coordinates=(0,) if dim is None else (rank,),
+                        global_shape=spec.global_shape,
+                        local_shape=local_shape,
+                        mesh_shape=(1,) if dim is None else (shards,),
+                    ),
+                    _ELEMENT_SIZE,
+                )
+            return entries
 
         self.publishers = {
-            f"trainer-{rank}": registrations(rank, scale.source_ranks)
+            f"trainer-{rank}": registrations(rank, scale.source_ranks, trainer_dims)
             for rank in range(scale.source_ranks)
         }
         self.requesters = {
             f"generator-{rank}": registrations(
-                rank % scale.generator_shards, scale.generator_shards
+                rank % scale.generator_shards, scale.generator_shards, generator_dims
             )
             for rank in range(scale.generators)
         }

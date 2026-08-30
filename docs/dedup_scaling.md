@@ -48,14 +48,15 @@ stops at the `70b` preset because tracing larger lifecycles is disproportionatel
 
 Notation follows the uniform assumption in [toso.md](toso.md), with `Q` used for
 `|Q|` and `T = Θ(G)`. Each dedupe lookup includes its pending generator
-publication.
+publication. `DP` is the generator replica degree, so `G/DP` is the number of
+distinct requester geometries per key.
 
-| Operation | Legacy, no dedupe | Legacy + dedupe | Indexed + dedupe |
-| --- | --- | --- | --- |
-| Trainer publish/refresh | `O(GQ)` | `O(GQ)` | `O(GQ)` with an existing geometry index |
-| `G` generator lookups | `O(QG²)` | `O(QG² + G² log G)` | `O(GQ log S + G² log G)` |
-| `G` generator completions | — | `O(GQ + ΣWₐ)` | `O(GQ + ΣWₐ)` |
-| Total | `O(QG²)` | `O(QG² + G² log G + ΣWₐ)` | `O(GQ log S + G² log G + ΣWₐ)` |
+| Operation | Legacy, no dedupe | Legacy + dedupe | Indexed + dedupe | Precomputed plan |
+| --- | --- | --- | --- | --- |
+| Trainer publish/refresh | `O(GQ)` | `O(GQ)` | `O(GQ)` with an existing geometry index | Folded into the plan build; no per-update control work |
+| `G` generator lookups | `O(QG²)` | `O(QG² + G² log G)` | `O(GQ log S + G² log G)` | `O(GQ)` rank-local dict lookups, no controller |
+| `G` generator completions | — | `O(GQ + ΣWₐ)` | `O(GQ + ΣWₐ)` | `O(ΣWₐ)` rank-local relay signals |
+| Total | `O(QG²)` | `O(QG² + G² log G + ΣWₐ)` | `O(GQ log S + G² log G + ΣWₐ)` | `O(GQ + ΣWₐ)` per update, after one `O(QG²/DP)` build |
 
 ## Historical legacy controller, no dedupe
 
@@ -100,16 +101,33 @@ Measured from TorchStore commit `5a4d5d3`.
 
 ## Precomputed routing plan
 
+Two tensor layouts, selected by `--layout`, at the same topologies:
+
+- **[u] `--layout uniform`** — every key is the same 1-D tensor of
+  `lcm(source_ranks, generator_shards)` elements, sharded on that one dimension by
+  both sides. All `Q` keys are byte-identical, so the plan build sees **one**
+  layout signature and factors the publisher scan across the whole state dict.
+- **[r] `--layout realistic`** — a transformer state dict: `embed_tokens`,
+  `lm_head`, `model.norm`, and a nine-tensor block per layer, with the layer count
+  chosen to land on the preset's key count. The trainer is FSDP2 `Shard(0)` on
+  every parameter; the generator replicates the norms, shards `o_proj`/`down_proj`
+  on dim 1 (row-parallel) and everything else on dim 0. That yields **7** distinct
+  layout signatures and, for the two cross-axis tensors, a requested slice that
+  overlaps every publisher shard.
+
+CPU and wall are medians of one repeat. Retired instructions and peak memory were
+measured for `[u]` only.
+
 | Model | Plan build CPU | Plan build wall | Per-rank lookups CPU | Per-rank transfers | Retired instructions | Peak Python memory |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `1b` | 6.655 ms | 6.718 ms | 0.027 ms | 120 | 81,773,253 | 886.420 KiB |
-| `8b` | 70.612 ms | 71.203 ms | 0.074 ms | 290 | 873,728,809 | 4.880 MiB |
-| `qwen-27b` | 156.659 ms | 158.007 ms | 0.259 ms | 1,799 | 2,014,086,134 | 12.320 MiB |
-| `70b` | 337.404 ms | 340.419 ms | 0.189 ms | 723 | 4,053,043,213 | 32.784 MiB |
-| `70b-wide` | 5.701 s | 5.757 s | 0.160 ms | 723 | 79,384,214,849 | — |
-| `405b` | 3.884 s | 3.921 s | 0.303 ms | 1,500 | 50,918,213,812 | — |
-| `moe` | 7.926 s | 7.990 s | 0.708 ms | 3,000 | 101,860,484,190 | — |
-| `kimi-k2` | 286.912 s | 289.690 s | 1.033 ms | 10,406 | 4,171,489,152,710 | — |
+| `1b` | [u] 7.849 ms<br>[r] 7.381 ms | [u] 7.932 ms<br>[r] 7.434 ms | [u] 0.037 ms<br>[r] 0.028 ms | [u] 120<br>[r] 122 | [u] 82,068,962 | [u] 989.287 KiB |
+| `8b` | [u] 52.832 ms<br>[r] 71.147 ms | [u] 53.272 ms<br>[r] 71.832 ms | [u] 0.060 ms<br>[r] 0.057 ms | [u] 290<br>[r] 550 | [u] 662,065,626 | [u] 6.352 MiB |
+| `qwen-27b` | [u] 145.544 ms<br>[r] 181.121 ms | [u] 146.474 ms<br>[r] 182.704 ms | [u] 0.222 ms<br>[r] 0.231 ms | [u] 1,799<br>[r] 2,704 | [u] 1,752,170,502 | [u] 18.420 MiB |
+| `70b` | [u] 308.853 ms<br>[r] 363.298 ms | [u] 311.645 ms<br>[r] 366.555 ms | [u] 0.133 ms<br>[r] 0.141 ms | [u] 723<br>[r] 863 | [u] 3,534,449,342 | [u] 36.577 MiB |
+| `70b-wide` | [u] 2.645 s<br>[r] 4.468 s | [u] 2.668 s<br>[r] 4.508 s | [u] 0.134 ms<br>[r] 0.142 ms | [u] 723<br>[r] 5,952 | [u] 34,608,007,876 | — |
+| `405b` | [u] 2.388 s<br>[r] 3.388 s | [u] 2.409 s<br>[r] 3.420 s | [u] 0.296 ms<br>[r] 0.288 ms | [u] 1,500<br>[r] 4,132 | [u] 28,485,495,638 | — |
+| `moe` | [u] 4.800 s<br>[r] 6.911 s | [u] 4.847 s<br>[r] 6.980 s | [u] 0.577 ms<br>[r] 0.579 ms | [u] 3,000<br>[r] 8,332 | [u] 56,968,262,699 | — |
+| `kimi-k2` | [u] 113.522 s<br>[r] 219.216 s | [u] 114.579 s<br>[r] 221.354 s | [u] 1.030 ms<br>[r] 1.041 ms | [u] 10,406<br>[r] 305,427 | — | — |
 
 ## Reusable benchmark
 
@@ -170,9 +188,17 @@ Routing plans use their own tool, with the same presets and metric switches:
 .venv/bin/python -m realsim.tools.benchmark_routing_plan \
   --preset suite --metrics all --warmups 0 --repeats 1
 
+# The [u] and [r] CPU lines of the routing table.
+.venv/bin/python -m realsim.tools.benchmark_routing_plan \
+  --preset suite --layout uniform --metrics cpu --warmups 0 --repeats 1
+.venv/bin/python -m realsim.tools.benchmark_routing_plan \
+  --preset suite --layout realistic --metrics cpu --warmups 0 --repeats 1
+
 # Kimi-K2: 256 trainer ranks to 128 inference ranks.
 .venv/bin/python -m realsim.tools.benchmark_routing_plan \
   --preset kimi-k2 --metrics all --warmups 0 --repeats 1
+.venv/bin/python -m realsim.tools.benchmark_routing_plan \
+  --preset kimi-k2 --layout realistic --metrics cpu --warmups 0 --repeats 1
 
 # A custom topology.
 .venv/bin/python -m realsim.tools.benchmark_routing_plan \
